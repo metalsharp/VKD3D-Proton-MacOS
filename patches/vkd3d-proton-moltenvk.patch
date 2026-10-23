@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 1/2] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
+Subject: [PATCH 1/3] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
  texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 2/2] Keep the transform feedback structures linked when stream
+Subject: [PATCH 2/3] Keep the transform feedback structures linked when stream
  output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -213,6 +213,37 @@ index 8334e3b1..836a7441 100644
 +                0, sizeof(physical_device_info->xfb_properties) - offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams));
          vulkan_info->rasterization_stream = false;
      }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 16:59:26 -0600
+Subject: [PATCH 3/3] device: accept FTZ-only FP32 denorm control on MoltenVK
+ for SM 6.2
+
+---
+ libs/vkd3d/device.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 836a7441..e4eecfcf 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9814,6 +9814,12 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
+             {
+                 denorm_behavior = device->device_info.vulkan_1_2_properties.shaderDenormFlushToZeroFloat32 &&
+                         device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat32;
++
++                /* MoltenVK: Apple GPUs always flush FP32 denorms and Metal has no preserve control.
++                 * DXIL defaults to "any" denorm mode, so only shaders that explicitly request
++                 * preserve (-denorm preserve) observe a deviation. Accept FTZ-only. */
++                if (!denorm_behavior && device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++                    denorm_behavior = device->device_info.vulkan_1_2_properties.shaderDenormFlushToZeroFloat32;
+             }
+         }
  
 -- 
 2.54.0 (Apple Git-157)

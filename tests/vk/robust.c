@@ -26,8 +26,10 @@ int main(int argc, char **argv)
     if (!r2.robustBufferAccess2 || !r2.nullDescriptor)
         return 1;
 
+    /* Chained like vkd3d-proton: other feature structures around robustness2. */
     VkPhysicalDeviceRobustness2FeaturesEXT r2e = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, NULL, VK_TRUE, VK_TRUE, VK_TRUE };
-    VkPhysicalDeviceVulkan12Features v12e = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &r2e };
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, &r2e, VK_TRUE, VK_FALSE };
+    VkPhysicalDeviceVulkan12Features v12e = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, getenv("WITH_XFB") ? (void *)&xfb : (void *)&r2e };
     v12e.descriptorIndexing = VK_TRUE;
     v12e.runtimeDescriptorArray = VK_TRUE;
     v12e.descriptorBindingVariableDescriptorCount = VK_TRUE;
@@ -36,8 +38,8 @@ int main(int argc, char **argv)
     v12e.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2e = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12e };
     f2e.features.robustBufferAccess = VK_TRUE;
-    static const char *const de[] = { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_portability_subset" };
-    vkctx_init(&c, &f2e, de, 2);
+    static const char *const de[] = { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_portability_subset", "VK_EXT_transform_feedback" };
+    vkctx_init(&c, &f2e, de, getenv("WITH_XFB") ? 3 : 2);
 
     /* Heap set: variable-count storage buffer array. */
     VkDescriptorBindingFlags heap_flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |

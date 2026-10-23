@@ -271,7 +271,7 @@ static const uint32_t *read_buffer(ID3D12Resource *src, D3D12_RESOURCE_STATES st
 static bool test_caps()
 {
     printf("  feature level 0x%x\n", g.feature_level);
-    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_7 };
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)0x69 };
     if (SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))))
         printf("  shader model 0x%x\n", sm.HighestShaderModel);
     D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
@@ -337,6 +337,63 @@ static bool run_uav_test(const std::vector<char> &cs)
 }
 
 static bool test_compute_dxil() { return run_uav_test(compile_dxc(cs_uav_src, "main", "cs_6_0")); }
+
+// SM 6.6/6.7: 64-bit buffer atomics, compute-shader derivatives on a 2D thread group, QuadAny.
+static const char *cs_sm67_src = R"(
+RWByteAddressBuffer o : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    float f = gtid.x * 3.0 + gtid.y * 5.0 + (gtid.x & 1) * gtid.y * 2.0;
+    int64_t prev;
+    o.InterlockedAdd64(0, 0x100000001ll, prev);
+    int64_t unused;
+    o.InterlockedMin64(8, int64_t(gi) - 32, unused);
+    o.Store4(16 + gi * 16, uint4(asuint(ddx_fine(f)), asuint(ddy_fine(f)), QuadAny(gtid.x == 1 && gtid.y == 1) ? 1 : 0,
+                                 uint(uint64_t(prev) >> 32)));
+}
+)";
+
+static bool test_sm67()
+{
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(cs_sm67_src, "main", "cs_6_7"));
+    if (!rs || !ps)
+        return false;
+    const UINT64 size = 16 + 64 * 16;
+    ID3D12Resource *buf = create_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, size, &rb);
+    if (!v)
+        return false;
+    EXPECT(v[0] == 64 && v[1] == 64, "add64 = %08x%08x, want 0000004000000040", v[1], v[0]);
+    EXPECT((int32_t)v[2] == -32 && v[3] == 0xffffffffu, "min64 = %08x%08x, want ffffffffffffffe0", v[3], v[2]);
+    uint64_t seen = 0;
+    for (uint32_t gi = 0; gi < 64; gi++)
+    {
+        uint32_t x = gi % 8, y = gi / 8;
+        const uint32_t *t = v + 4 + gi * 4;
+        float dx, dy;
+        memcpy(&dx, &t[0], 4);
+        memcpy(&dy, &t[1], 4);
+        EXPECT(dx == 3.0f + 2.0f * (y & ~1u) + 2.0f * (y & 1u), "ddx_fine at (%u,%u) = %f", x, y, dx);
+        EXPECT(dy == 5.0f + 2.0f * (x & 1u), "ddy_fine at (%u,%u) = %f", x, y, dy);
+        EXPECT(t[2] == (x < 2 && y < 2 ? 1u : 0u), "QuadAny at (%u,%u) = %u", x, y, t[2]);
+        EXPECT(t[3] < 64 && !(seen & (1ull << t[3])), "add64 returned %u twice or out of range", t[3]);
+        seen |= 1ull << (t[3] & 63);
+    }
+    rb->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
 static bool test_compute_dxbc() { return run_uav_test(compile_fxc(cs_uav_src, "main", "cs_5_0")); }
 
 static bool test_draw()
@@ -622,6 +679,7 @@ static const Test tests[] = {
     { "caps", test_caps },
     { "compute_dxil", test_compute_dxil },
     { "compute_dxbc", test_compute_dxbc },
+    { "sm67", test_sm67 },
     { "draw", test_draw },
     { "robust", test_robust },
     { "logicop", test_logicop },

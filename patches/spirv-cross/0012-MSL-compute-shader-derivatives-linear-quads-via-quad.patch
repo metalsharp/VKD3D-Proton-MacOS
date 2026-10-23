@@ -1,0 +1,564 @@
+From 984dcd6ac25ebb15068a771d39450a4b8140e70e Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 16:59:26 -0600
+Subject: [PATCH 12/12] MSL: compute-shader derivatives (linear quads via
+ quad_shuffle) and lock-table 64-bit buffer atomics
+
+---
+ spirv_msl.cpp | 361 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ spirv_msl.hpp |  13 ++
+ 2 files changed, 361 insertions(+), 13 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 6cd181eb..2700052c 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1081,6 +1081,17 @@ void CompilerMSL::build_implicit_builtins()
+ 		set_extended_decoration(var_id, SPIRVCrossDecorationResourceIndexPrimary, msl_options.buffer_size_buffer_index);
+ 		buffer_size_buffer_id = var_id;
+ 	}
++	if (needs_atomic64_locks)
++	{
++		uint32_t var_id = build_device_uint_array_pointer();
++		set_name(var_id, "spvAtomic64Locks");
++		// This should never match anything.
++		set_decoration(var_id, DecorationDescriptorSet, ~(7u));
++		set_decoration(var_id, DecorationBinding, msl_options.atomic64_lock_buffer_index);
++		set_extended_decoration(var_id, SPIRVCrossDecorationResourceIndexPrimary, msl_options.atomic64_lock_buffer_index);
++		atomic64_lock_buffer_id = var_id;
++	}
++
+ 	if (uses_acceleration_structure_address)
+ 	{
+ 		acceleration_structure_address_table_id = build_constant_uint_array_pointer();
+@@ -1328,6 +1339,15 @@ uint32_t CompilerMSL::build_constant_uint_array_pointer()
+ 	return var_id;
+ }
+ 
++uint32_t CompilerMSL::build_device_uint_array_pointer()
++{
++	uint32_t var_id = build_constant_uint_array_pointer();
++	auto &var = get<SPIRVariable>(var_id);
++	auto &ptr_ptr_type = get<SPIRType>(var.basetype);
++	get<SPIRType>(ptr_ptr_type.parent_type).storage = StorageClassStorageBuffer;
++	return var_id;
++}
++
+ static string create_sampler_address(const char *prefix, MSLSamplerAddress addr)
+ {
+ 	switch (addr)
+@@ -2268,6 +2288,8 @@ string CompilerMSL::compile()
+ 		add_active_interface_variable(swizzle_buffer_id);
+ 	if (buffer_size_buffer_id)
+ 		add_active_interface_variable(buffer_size_buffer_id);
++	if (atomic64_lock_buffer_id)
++		add_active_interface_variable(atomic64_lock_buffer_id);
+ 	if (acceleration_structure_address_table_id)
+ 		add_active_interface_variable(acceleration_structure_address_table_id);
+ 	if (view_mask_buffer_id)
+@@ -2441,7 +2463,11 @@ void CompilerMSL::preprocess_op_codes()
+ 
+ 	if (preproc.needs_local_invocation_index)
+ 		needs_local_invocation_index = true;
+-	if (preproc.needs_subgroup_invocation_id)
++	// 64-bit buffer atomics need the lock table (see maybe_emit_atomic64_op()).
++	for (auto &cap : ir.declared_capabilities)
++		if (cap == CapabilityInt64Atomics)
++			needs_atomic64_locks = true;
++	if (preproc.needs_subgroup_invocation_id || uses_compute_derivatives())
+ 		needs_subgroup_invocation_id = true;
+ 	if (preproc.needs_subgroup_size)
+ 		needs_subgroup_size = true;
+@@ -2726,6 +2752,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 
+ 			switch (op)
+ 			{
++			case OpAtomicLoad:
++				if (atomic64_lock_buffer_id)
++					added_arg_ids.insert(atomic64_lock_buffer_id);
++				if (global_var_ids.find(ops[2]) != global_var_ids.end())
++					added_arg_ids.insert(ops[2]);
++				break;
++
+ 			case OpCopyObject:
+ 			case OpLoad:
+ 			case OpInBoundsAccessChain:
+@@ -2839,6 +2872,8 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 			case OpAtomicXor:
+ 			case OpImageWrite:
+ 			{
++				if (atomic64_lock_buffer_id && op != OpImageWrite)
++					added_arg_ids.insert(atomic64_lock_buffer_id);
+ 				if (needs_frag_discard_checks())
+ 					added_arg_ids.insert(builtin_helper_invocation_id);
+ 				uint32_t ptr = 0;
+@@ -2914,6 +2949,25 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 				break;
+ 			}
+ 
++			case OpDPdx:
++			case OpDPdy:
++			case OpDPdxFine:
++			case OpDPdyFine:
++			case OpDPdxCoarse:
++			case OpDPdyCoarse:
++			case OpFwidth:
++			case OpFwidthFine:
++			case OpFwidthCoarse:
++			case OpImageSampleImplicitLod:
++			case OpImageSampleDrefImplicitLod:
++			case OpImageSampleProjImplicitLod:
++			case OpImageSampleProjDrefImplicitLod:
++			case OpImageSparseSampleImplicitLod:
++			case OpImageSparseSampleDrefImplicitLod:
++				if (uses_compute_derivatives())
++					added_arg_ids.insert(builtin_subgroup_invocation_id_id);
++				break;
++
+ 			case OpGroupNonUniformBallotFindLSB:
+ 			case OpGroupNonUniformBallotFindMSB:
+ 			{
+@@ -9297,6 +9351,101 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplAtomic64:
++			statement("// 64-bit atomics emulated with a hashed spin lock; returns the previous value.");
++			statement("// op: 0 add, 1 sub, 2 smin, 3 umin, 4 smax, 5 umax, 6 and, 7 or, 8 xor, 9 exchange,");
++			statement("// 10 compare-exchange (a = value, b = comparator), 11 load, 12 store.");
++			statement("static inline ulong spvAtomic64(device ulong *p, device uint *locks, uint op, ulong a, ulong b)");
++			begin_scope();
++			statement("ulong h = reinterpret_cast<ulong>(p) >> 3;");
++			statement("device atomic_uint *lock = reinterpret_cast<device atomic_uint *>(&locks[uint(h ^ (h >> 16)) & 65535u]);");
++			statement("device atomic_uint *w = reinterpret_cast<device atomic_uint *>(p);");
++			statement("ulong old = 0;");
++			statement("bool done = false;");
++			statement("// The lock is taken and released in the same iteration, so lanes of one SIMD group");
++			statement("// contending for a lock cannot deadlock each other.");
++			statement("while (!done)");
++			begin_scope();
++			statement("uint expected = 0u;");
++			statement("if (atomic_compare_exchange_weak_explicit(lock, &expected, 1u, memory_order_relaxed, memory_order_relaxed))");
++			begin_scope();
++			statement("atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);");
++			statement("old = ulong(atomic_load_explicit(&w[0], memory_order_relaxed)) |");
++			statement("      (ulong(atomic_load_explicit(&w[1], memory_order_relaxed)) << 32);");
++			statement("ulong v;");
++			statement("switch (op)");
++			begin_scope();
++			statement("case 0: v = old + a; break;");
++			statement("case 1: v = old - a; break;");
++			statement("case 2: v = as_type<ulong>(min(as_type<long>(old), as_type<long>(a))); break;");
++			statement("case 3: v = min(old, a); break;");
++			statement("case 4: v = as_type<ulong>(max(as_type<long>(old), as_type<long>(a))); break;");
++			statement("case 5: v = max(old, a); break;");
++			statement("case 6: v = old & a; break;");
++			statement("case 7: v = old | a; break;");
++			statement("case 8: v = old ^ a; break;");
++			statement("case 10: v = old == b ? a : old; break;");
++			statement("case 11: v = old; break;");
++			statement("default: v = a; break;");
++			end_scope();
++			statement("if (v != old)");
++			begin_scope();
++			statement("atomic_store_explicit(&w[0], uint(v), memory_order_relaxed);");
++			statement("atomic_store_explicit(&w[1], uint(v >> 32), memory_order_relaxed);");
++			end_scope();
++			statement("atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);");
++			statement("atomic_store_explicit(lock, 0u, memory_order_relaxed);");
++			statement("done = true;");
++			end_scope();
++			end_scope();
++			statement("return old;");
++			end_scope();
++			statement("");
++			break;
++
++		case SPVFuncImplComputeDerivatives:
++			statement("// Compute shader derivatives: a quad is four consecutive SIMD lanes laid out as");
++			statement("// 0 1 / 2 3. l is the lane index in the SIMD group.");
++			statement("template <typename T>");
++			statement("static inline T spvDdxFine(T v, uint l)");
++			begin_scope();
++			statement("ushort r = ushort(l & 2u);");
++			statement("return quad_shuffle(v, r | 1) - quad_shuffle(v, r);");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline T spvDdyFine(T v, uint l)");
++			begin_scope();
++			statement("ushort c = ushort(l & 1u);");
++			statement("return quad_shuffle(v, c | 2) - quad_shuffle(v, c);");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline T spvDdxCoarse(T v, uint)");
++			begin_scope();
++			statement("return quad_shuffle(v, 1) - quad_shuffle(v, 0);");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline T spvDdyCoarse(T v, uint)");
++			begin_scope();
++			statement("return quad_shuffle(v, 2) - quad_shuffle(v, 0);");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline T spvFwidthFine(T v, uint l)");
++			begin_scope();
++			statement("return abs(spvDdxFine(v, l)) + abs(spvDdyFine(v, l));");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline T spvFwidthCoarse(T v, uint l)");
++			begin_scope();
++			statement("return abs(spvDdxCoarse(v, l)) + abs(spvDdyCoarse(v, l));");
++			end_scope();
++			statement("");
++			break;
++
+ 		case SPVFuncImplDepthCast:
+ 			statement("template <typename T>");
+ 			statement("static inline depth2d<T> spvDepthCast(texture2d<T> t)");
+@@ -10929,25 +11078,47 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	// Derivatives
+ 	case OpDPdx:
+-	case OpDPdxFine:
+-	case OpDPdxCoarse:
+-		MSL_UFOP(dfdx);
+-		register_control_dependent_expression(ops[1]);
+-		break;
+-
+ 	case OpDPdy:
++	case OpDPdxFine:
+ 	case OpDPdyFine:
++	case OpDPdxCoarse:
+ 	case OpDPdyCoarse:
+-		MSL_UFOP(dfdy);
+-		register_control_dependent_expression(ops[1]);
+-		break;
+-
+ 	case OpFwidth:
+-	case OpFwidthCoarse:
+ 	case OpFwidthFine:
+-		MSL_UFOP(fwidth);
++	case OpFwidthCoarse:
++	{
++		if (!uses_compute_derivatives())
++		{
++			if (opcode == OpDPdx || opcode == OpDPdxFine || opcode == OpDPdxCoarse)
++				MSL_UFOP(dfdx);
++			else if (opcode == OpDPdy || opcode == OpDPdyFine || opcode == OpDPdyCoarse)
++				MSL_UFOP(dfdy);
++			else
++				MSL_UFOP(fwidth);
++			register_control_dependent_expression(ops[1]);
++			break;
++		}
++
++		const char *func;
++		switch (opcode)
++		{
++		case OpDPdxCoarse: func = "spvDdxCoarse"; break;
++		case OpDPdyCoarse: func = "spvDdyCoarse"; break;
++		case OpDPdx:
++		case OpDPdxFine: func = "spvDdxFine"; break;
++		case OpDPdy:
++		case OpDPdyFine: func = "spvDdyFine"; break;
++		case OpFwidthCoarse: func = "spvFwidthCoarse"; break;
++		default: func = "spvFwidthFine"; break;
++		}
++		add_spv_func_and_recompile(SPVFuncImplComputeDerivatives);
++		emit_op(ops[0], ops[1], join(func, "(", to_unpacked_expression(ops[2]), ", ", to_expression(builtin_subgroup_invocation_id_id), ")"),
++		        should_forward(ops[2]));
++		inherit_expression_dependencies(ops[1], ops[2]);
+ 		register_control_dependent_expression(ops[1]);
+ 		break;
++	}
++
+ 
+ 	// Bitfield
+ 	case OpBitFieldInsert:
+@@ -11024,6 +11195,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	// Atomics
+ 	case OpAtomicExchange:
+ 	{
++		if (maybe_emit_atomic64_op(opcode, ops))
++			break;
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t ptr = ops[2];
+@@ -11035,6 +11208,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpAtomicCompareExchange:
+ 	{
++		if (maybe_emit_atomic64_op(opcode, ops))
++			break;
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t ptr = ops[2];
+@@ -11053,6 +11228,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpAtomicLoad:
+ 	{
++		if (maybe_emit_atomic64_op(opcode, ops))
++			break;
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t ptr = ops[2];
+@@ -11064,6 +11241,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpAtomicStore:
+ 	{
++		if (maybe_emit_atomic64_op(opcode, ops))
++			break;
+ 		uint32_t result_type = expression_type(ops[0]).self;
+ 		uint32_t id = ops[0];
+ 		uint32_t ptr = ops[0];
+@@ -11077,6 +11256,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ #define MSL_AFMO_IMPL(op, valsrc, valconst)                                                                      \
+ 	do                                                                                                           \
+ 	{                                                                                                            \
++		if (maybe_emit_atomic64_op(opcode, ops))                                                                 \
++			break;                                                                                               \
+ 		uint32_t result_type = ops[0];                                                                           \
+ 		uint32_t id = ops[1];                                                                                    \
+ 		uint32_t ptr = ops[2];                                                                                   \
+@@ -12755,6 +12936,82 @@ bool CompilerMSL::maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs)
+ }
+ 
+ // Emits one of the atomic functions. In MSL, the atomic functions operate on pointers
++// Metal has no 64-bit atomics except non-returning min/max, so 64-bit buffer atomics take a
++// spin lock from a hashed lock table and do the read-modify-write on the two 32-bit halves.
++bool CompilerMSL::maybe_emit_atomic64_op(Op opcode, const uint32_t *ops)
++{
++	uint32_t ptr = opcode == OpAtomicStore ? ops[0] : ops[2];
++	auto &ptr_type = expression_type(ptr);
++	auto &type = get_pointee_type(ptr_type);
++	if (type.width != 64 || ptr_type.storage == StorageClassWorkgroup || ptr_type.storage == StorageClassImage ||
++	    !atomic64_lock_buffer_id)
++		return false;
++	if (!msl_options.supports_msl_version(3, 2))
++		SPIRV_CROSS_THROW("Emulated 64-bit atomics require MSL 3.2.");
++
++	uint32_t op_code;
++	uint32_t a = 0, b = 0;
++	bool a_is_one = false;
++	switch (opcode)
++	{
++	case OpAtomicIAdd: op_code = 0; a = ops[5]; break;
++	case OpAtomicIIncrement: op_code = 0; a_is_one = true; break;
++	case OpAtomicISub: op_code = 1; a = ops[5]; break;
++	case OpAtomicIDecrement: op_code = 1; a_is_one = true; break;
++	case OpAtomicSMin: op_code = 2; a = ops[5]; break;
++	case OpAtomicUMin: op_code = 3; a = ops[5]; break;
++	case OpAtomicSMax: op_code = 4; a = ops[5]; break;
++	case OpAtomicUMax: op_code = 5; a = ops[5]; break;
++	case OpAtomicAnd: op_code = 6; a = ops[5]; break;
++	case OpAtomicOr: op_code = 7; a = ops[5]; break;
++	case OpAtomicXor: op_code = 8; a = ops[5]; break;
++	case OpAtomicExchange: op_code = 9; a = ops[5]; break;
++	case OpAtomicCompareExchange: op_code = 10; a = ops[6]; b = ops[7]; break;
++	case OpAtomicLoad: op_code = 11; break;
++	case OpAtomicStore: op_code = 12; a = ops[3]; break;
++	default:
++		SPIRV_CROSS_THROW("Unsupported 64-bit atomic operation.");
++	}
++
++	add_spv_func_and_recompile(SPVFuncImplAtomic64);
++
++	auto to_u64 = [&](uint32_t id) -> string {
++		return id ? join("as_type<ulong>(", to_unpacked_expression(id), ")") : string("0ul");
++	};
++	string call = join("spvAtomic64(reinterpret_cast<device ulong *>(", to_enclosed_pointer_expression(ptr), "), ",
++	                   to_expression(atomic64_lock_buffer_id), ", ", op_code, "u, ",
++	                   a_is_one ? string("1ul") : to_u64(a), ", ", to_u64(b), ")");
++
++	// Atomics are skipped (and return zero) when not executed: a helper invocation,
++	// or an out-of-bounds robust buffer access.
++	string guard;
++	if (opcode != OpAtomicLoad && needs_frag_discard_checks())
++		guard = join("!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput));
++	auto robust_condition = robust_access_condition(ptr);
++	if (!robust_condition.empty())
++		guard = guard.empty() ? robust_condition : join(guard, " && ", robust_condition);
++
++	if (opcode == OpAtomicStore)
++	{
++		if (guard.empty())
++			statement(call, ";");
++		else
++			statement("if (", guard, ") ", call, ";");
++		return true;
++	}
++
++	if (!guard.empty())
++		call = join("((", guard, ") ? ", call, " : 0ul)");
++
++	uint32_t result_type = ops[0];
++	uint32_t id = ops[1];
++	auto &res_type = get<SPIRType>(result_type);
++	if (res_type.basetype != SPIRType::UInt64)
++		call = join("as_type<", type_to_glsl(res_type), ">(", call, ")");
++	emit_op(result_type, id, call, false);
++	return true;
++}
++
+ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, const char *op, Op opcode,
+                                       uint32_t mem_order_1, uint32_t mem_order_2, bool has_mem_order_2, uint32_t obj, uint32_t op1,
+                                       bool op1_is_pointer, bool op1_is_literal, uint32_t op2)
+@@ -14131,6 +14388,19 @@ static inline bool sampling_type_needs_f32_conversion(const SPIRType &type)
+ }
+ 
+ // Returns the function args for a texture sampling function for the specified image and sampling characteristics.
++// SPV_KHR_compute_shader_derivatives (linear): a quad is four consecutive local invocations,
++// which on Metal are four consecutive SIMD lanes, so quad_shuffle() reaches the quad's lanes.
++bool CompilerMSL::uses_compute_derivatives() const
++{
++	auto model = get_execution_model();
++	if (model != ExecutionModelGLCompute && model != ExecutionModelTaskEXT && model != ExecutionModelMeshEXT)
++		return false;
++	auto &flags = get_entry_point().flags;
++	if (flags.get(ExecutionModeDerivativeGroupQuadsKHR))
++		SPIRV_CROSS_THROW("DerivativeGroupQuadsKHR is not supported in MSL; use DerivativeGroupLinearKHR.");
++	return flags.get(ExecutionModeDerivativeGroupLinearKHR);
++}
++
+ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool *p_forward)
+ {
+ 	VariableID img = args.base.img;
+@@ -14491,6 +14761,71 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+ 		}
+ 	}
+ 
++	// Implicit LOD in a compute shader with derivatives: Metal kernels cannot sample with an
++	// implicit LOD, so pass the quad gradient of the coordinate (scaled by the bias, if any).
++	bool compute_grad = uses_compute_derivatives() && !lod && !grad_x && !grad_y && !args.base.is_fetch &&
++	                    !args.base.is_gather && imgtype.image.dim != DimBuffer && imgtype.image.sampled != 2 &&
++	                    (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D);
++	if (compute_grad)
++	{
++		add_spv_func_and_recompile(SPVFuncImplComputeDerivatives);
++		string lane = to_expression(builtin_subgroup_invocation_id_id);
++		string coord_expr = to_enclosed_unpacked_expression(args.coord);
++		string grad_opt, grad_coord, dx, dy;
++		auto grad_of = [&](const string &v) {
++			return make_pair(join("spvDdxFine(", v, ", ", lane, ")"), join("spvDdyFine(", v, ", ", lane, ")"));
++		};
++		switch (imgtype.image.dim)
++		{
++		case Dim1D:
++		{
++			string x = expression_type(args.coord).vecsize > 1 ? coord_expr + ".x" : coord_expr;
++			auto g = grad_of(x);
++			grad_opt = "gradient2d";
++			dx = join("float2(", g.first, ", 0.0)");
++			dy = join("float2(", g.second, ", 0.0)");
++			break;
++		}
++		case Dim2D:
++		{
++			auto g = grad_of(coord_expr + ".xy");
++			grad_opt = "gradient2d";
++			dx = g.first;
++			dy = g.second;
++			break;
++		}
++		case Dim3D:
++		case DimCube:
++		{
++			auto g = grad_of(coord_expr + ".xyz");
++			dx = g.first;
++			dy = g.second;
++			if (imgtype.image.dim == Dim3D)
++				grad_opt = "gradient3d";
++			else if (msl_options.agx_manual_cube_grad_fixup)
++			{
++				add_spv_func_and_recompile(SPVFuncImplGradientCube);
++				grad_opt = "spvGradientCube";
++				grad_coord = tex_coords + ", ";
++			}
++			else
++				grad_opt = "gradientcube";
++			break;
++		}
++		default:
++			SPIRV_CROSS_THROW("Unsupported image dimension for implicit LOD sampling in compute.");
++		}
++		if (bias)
++		{
++			forward = forward && should_forward(bias);
++			string scale = join("exp2(", to_unpacked_expression(bias), ")");
++			dx = join("(", dx, ") * ", scale);
++			dy = join("(", dy, ") * ", scale);
++			bias = 0;
++		}
++		farg_str += join(", ", grad_opt, "(", grad_coord, dx, ", ", dy, ")");
++	}
++
+ 	// LOD Options
+ 	// Metal does not support LOD for 1D textures.
+ 	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 21443ab5..07670135 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -347,6 +347,9 @@ public:
+ 		uint32_t xfb_counter_buffer_index_base = 16;
+ 		uint32_t xfb_output_buffer_index_base = 12;
+ 		uint32_t draw_info_index = 20;
++		// Device buffer of 65536 uints used as spin locks to emulate 64-bit buffer atomics,
++		// which Metal lacks (apart from non-returning min/max).
++		uint32_t atomic64_lock_buffer_index = 15;
+ 		uint32_t shader_input_wg_index = 0;
+ 		uint32_t device_index = 0;
+ 		uint32_t enable_frag_output_mask = 0xffffffff;
+@@ -728,6 +731,9 @@ public:
+ 	}
+ 	bool needs_acceleration_structure_address_table() const { return uses_acceleration_structure_address; }
+ 
++	// Provide feedback to calling API to allow it to pass the 64-bit atomic lock buffer.
++	bool needs_atomic64_lock_buffer() const { return atomic64_lock_buffer_id != 0; }
++
+ 	// Provide feedback to calling API to determine if the vertex shader writes
+ 	// to PointSize. This allows the API to avoid declaring a point size output
+ 	// when it is not needed.
+@@ -1028,6 +1034,8 @@ protected:
+ 		SPVFuncImplTextureCast,
+ 		SPVFuncImplDepthCast,
+ 		SPVFuncImplSparseValue,
++		SPVFuncImplComputeDerivatives,
++		SPVFuncImplAtomic64,
+ 		SPVFuncImplSampleReduce,
+ 		SPVFuncImplMulExtended,
+ 		SPVFuncImplSetMeshOutputsEXT,
+@@ -1122,6 +1130,7 @@ protected:
+ 	                                     bool is_packed, bool relaxed) override;
+ 
+ 	bool is_tesc_shader() const;
++	bool uses_compute_derivatives() const;
+ 	bool is_tese_shader() const;
+ 	bool is_mesh_shader() const;
+ 
+@@ -1328,6 +1337,8 @@ protected:
+ 	void validate_cooperative_matrix_type(const SPIRType &type);
+ 	void validate_cooperative_matrix_types();
+ 	uint32_t build_constant_uint_array_pointer();
++	uint32_t build_device_uint_array_pointer();
++	bool maybe_emit_atomic64_op(Op opcode, const uint32_t *ops);
+ 	void emit_entry_point_declarations() override;
+ 	bool uses_explicit_early_fragment_test();
+ 
+@@ -1357,6 +1368,8 @@ protected:
+ 	uint32_t buffer_size_buffer_id = 0;
+ 	uint32_t acceleration_structure_address_table_id = 0;
+ 	uint32_t view_mask_buffer_id = 0;
++	uint32_t atomic64_lock_buffer_id = 0;
++	bool needs_atomic64_locks = false;
+ 	uint32_t draw_index_buffer_id = 0;
+ 	uint32_t dynamic_offsets_buffer_id = 0;
+ 	uint32_t uint_type_id = 0;
+-- 
+2.54.0 (Apple Git-157)
+
