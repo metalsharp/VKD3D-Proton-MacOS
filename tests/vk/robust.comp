@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+// robustBufferAccess2 / nullDescriptor through a vkd3d-style descriptor heap:
+// a variable-count, update-after-bind array of storage buffers with suballocated ranges.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Heap { uint d[]; } heap[];
+layout(set = 1, binding = 0) buffer Out { uint r[]; } o;
+layout(set = 1, binding = 1) uniform CB { uvec4 c[64]; } cb;
+layout(set = 1, binding = 2) uniform NullCB { uvec4 c[4]; } nullcb;
+layout(push_constant) uniform P { uint in_desc, null_desc, out_desc; } p;
+
+void main()
+{
+    uint t = gl_LocalInvocationIndex;
+    o.r[t] = heap[nonuniformEXT(p.in_desc)].d[t];            // 16 in range, the rest read 0
+    o.r[64 + t] = heap[nonuniformEXT(p.null_desc)].d[t];     // null descriptor reads 0
+    heap[nonuniformEXT(p.out_desc)].d[t] = 0xA0000000u | t;  // 8 in range, the rest dropped
+    heap[nonuniformEXT(p.null_desc)].d[t] = 0xDEADu;         // dropped
+    o.r[128 + t] = atomicAdd(heap[nonuniformEXT(p.in_desc)].d[t + 100u], 1u); // out of range: 0, no write
+    o.r[192 + t] = cb.c[t].x;                                // 4 vec4s in range, the rest read 0
+    o.r[256 + t] = nullcb.c[t & 3u].y;                       // null uniform buffer reads 0
+}
