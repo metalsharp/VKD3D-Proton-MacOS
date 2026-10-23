@@ -1,0 +1,162 @@
+From 4b0922ca11c2ddc9c47bbad87dd502fc36382182 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 23 Oct 2026 15:58:08 -0600
+Subject: [PATCH 4/4] MSL: Support sparse residency feedback
+
+OpImageSparseSample*, Fetch, Gather and DrefGather use Metal's sparse_sample, sparse_read,
+sparse_gather and their _compare forms; spvSparseValue() splits the sparse_color result into
+the texel and a residency code (0: resident, so OR-combined codes stay meaningful), and
+OpImageSparseTexelsResident tests the code for 0.
+---
+ spirv_msl.cpp | 69 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ spirv_msl.hpp |  4 +++
+ 2 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 5b6501ef..23ca3722 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -8519,6 +8519,17 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplSparseValue:
++			statement("// Splits a sparse texture result into its value and a residency code (0: all texels resident).");
++			statement("template <typename T>");
++			statement("static inline T spvSparseValue(thread int &code, sparse_color<T> c)");
++			begin_scope();
++			statement("code = c.resident() ? 0 : 1;");
++			statement("return c.value();");
++			end_scope();
++			statement("");
++			break;
++
+ 		case SPVFuncImplDepthCast:
+ 			statement("template <typename T>");
+ 			statement("static inline depth2d<T> spvDepthCast(texture2d<T> t)");
+@@ -10344,6 +10355,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	// Images
+ 
+ 	// Reads == Fetches in Metal
++	case OpImageSparseTexelsResident:
++		// spvSparseValue() codes: 0 means every texel was resident.
++		emit_op(ops[0], ops[1], join("(", to_enclosed_expression(ops[2]), " == 0)"), should_forward(ops[2]));
++		inherit_expression_dependencies(ops[1], ops[2]);
++		break;
++
++	case OpImageSparseRead:
++		// Metal has no sparse_read for read_write textures.
++		SPIRV_CROSS_THROW("Sparse feedback on storage image reads is not supported in MSL.");
++
+ 	case OpImageRead:
+ 	{
+ 		// Mark that this shader reads from this image
+@@ -11522,7 +11543,35 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
+ {
+ 	if (sparse)
+-		SPIRV_CROSS_THROW("Sparse feedback not yet supported in MSL.");
++	{
++		// The result is struct { int residency code; texel }: sparse_sample() and friends return
++		// sparse_color, which spvSparseValue() splits into the two.
++		if (!msl_options.supports_msl_version(2, 3))
++			SPIRV_CROSS_THROW("Sparse feedback requires MSL 2.3.");
++		auto *ops = stream(i);
++		uint32_t result_type_id = ops[0];
++		uint32_t id = ops[1];
++		auto &return_type = get<SPIRType>(result_type_id);
++		if (return_type.basetype != SPIRType::Struct || return_type.member_types.size() != 2)
++			SPIRV_CROSS_THROW("Invalid return type for sparse feedback.");
++		auto &temps = extra_sub_expressions[id];
++		if (temps == 0)
++			temps = ir.increase_bound_by(2);
++		emit_uninitialized_temporary(return_type.member_types[0], temps);
++		add_spv_func_and_recompile(SPVFuncImplSparseValue);
++
++		bool forward = false;
++		SmallVector<uint32_t> inherited_expressions;
++		sparse_feedback_code_id = temps;
++		string texel = to_texture_op(i, true, &forward, inherited_expressions);
++		sparse_feedback_code_id = 0;
++
++		emit_uninitialized_temporary(return_type.member_types[1], temps + 1);
++		statement(to_expression(temps + 1), " = ", texel, ";");
++		emit_op(result_type_id, id,
++		        join(type_to_glsl(return_type), "{ ", to_expression(temps), ", ", to_expression(temps + 1), " }"), true);
++		return;
++	}
+ 
+ 	if (msl_options.use_framebuffer_fetch_subpasses)
+ 	{
+@@ -13097,8 +13146,11 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+ 		is_dynamic_img_sampler = has_extended_decoration(var->self, SPIRVCrossDecorationDynamicImageSampler);
+ 	}
+ 
++	if (args.is_sparse_feedback && args.has_array_offsets)
++		SPIRV_CROSS_THROW("Sparse feedback is not supported with gathers of constant offsets.");
++
+ 	// Special-case gather. We have to alter the component being looked up in the swizzle case.
+-	if (msl_options.swizzle_texture_samples && args.base.is_gather && !is_dynamic_img_sampler &&
++	if (!args.is_sparse_feedback && msl_options.swizzle_texture_samples && args.base.is_gather && !is_dynamic_img_sampler &&
+ 	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
+ 	{
+ 		bool is_compare = args.has_dref;
+@@ -13121,6 +13173,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+ 	string fname;
+ 	if (needs_chroma_reconstruction(constexpr_sampler) && !is_dynamic_img_sampler)
+ 	{
++		if (args.is_sparse_feedback)
++			SPIRV_CROSS_THROW("Sparse feedback is not supported with Y'CbCr conversion.");
+ 		if (constexpr_sampler->planes != 2 && constexpr_sampler->planes != 3)
+ 			SPIRV_CROSS_THROW("Unhandled number of color image planes!");
+ 		// 444 images aren't downsampled, so we don't need to do linear filtering.
+@@ -13237,6 +13291,13 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+ 		}
+ 
+ 		fname = img_expr + ".";
++		if (args.is_sparse_feedback)
++		{
++			// Closed by to_function_args().
++			if (!sparse_feedback_code_id)
++				SPIRV_CROSS_THROW("Sparse feedback outside a sparse texture operation.");
++			fname = join("spvSparseValue(", to_expression(sparse_feedback_code_id), ", ", img_expr, ".sparse_");
++		}
+ 
+ 		// Texture function and sampler
+ 		if (args.base.is_fetch)
+@@ -13834,6 +13895,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+ 
+ 	*p_forward = forward;
+ 
++	// Closes the spvSparseValue() that to_function_name() opened.
++	if (args.sparse_texel)
++		farg_str += ")";
++
+ 	return farg_str;
+ }
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 8a748059..b2be39e8 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -954,6 +954,7 @@ protected:
+ 		SPVFuncImplImageFence,
+ 		SPVFuncImplTextureCast,
+ 		SPVFuncImplDepthCast,
++		SPVFuncImplSparseValue,
+ 		SPVFuncImplMulExtended,
+ 		SPVFuncImplSetMeshOutputsEXT,
+ 		SPVFuncImplAssume,
+@@ -1425,6 +1426,9 @@ protected:
+ 
+ 	// Logic operations: the fragment outputs they apply to, by location, and their base types.
+ 	std::map<uint32_t, uint32_t> logic_op_outputs; // location -> output variable
++
++	// Sparse residency: the residency code temporary of the texture operation being emitted.
++	uint32_t sparse_feedback_code_id = 0;
+ 	void emit_logic_op(const SPIRVariable &var, uint32_t location, uint32_t kind);
+ 	bool is_robust_buffer_variable(const SPIRVariable &var) const;
+ 	void track_robust_access_chain(const uint32_t *ops, uint32_t length, bool ptr_chain);
+-- 
+2.54.0 (Apple Git-157)
+

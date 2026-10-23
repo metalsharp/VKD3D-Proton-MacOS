@@ -1,0 +1,23 @@
+#version 460
+#extension GL_ARB_sparse_texture2 : require
+// Residency feedback from a partially bound sparse image, and writes through a sparse buffer.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 1) buffer Out { vec4 color[4]; uint resident[4]; } o;
+layout(set = 0, binding = 2) buffer Sparse { uint words[]; } sb;
+layout(push_constant) uniform P { uint write_buffer; } p;
+void main()
+{
+    uint t = gl_LocalInvocationIndex;
+    if (t == 0)
+    {
+        vec4 c;
+        // mip 0: tile (0,0) is bound, tile (1,0) is not; mip 5 is in the bound mip tail.
+        int r0 = sparseTextureLodARB(tex, vec2(8.5, 8.5) / 512.0, 0.0, c); o.color[0] = c; o.resident[0] = sparseTexelsResidentARB(r0) ? 1u : 0u;
+        int r1 = sparseTextureLodARB(tex, vec2(200.5, 8.5) / 512.0, 0.0, c); o.color[1] = c; o.resident[1] = sparseTexelsResidentARB(r1) ? 1u : 0u;
+        int r2 = sparseTextureLodARB(tex, vec2(0.5, 0.5), 5.0, c); o.color[2] = c; o.resident[2] = sparseTexelsResidentARB(r2) ? 1u : 0u;
+    }
+    if (p.write_buffer != 0u)
+        for (uint i = t; i < 4u * 16384u; i += 64u)
+            sb.words[i] = 0xA0000000u | i;
+}

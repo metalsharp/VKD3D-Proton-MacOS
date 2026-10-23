@@ -278,6 +278,16 @@ static bool test_caps()
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
     printf("  binding %d tiled %d conservative %d rovs %d logicop %d\n", o.ResourceBindingTier, o.TiledResourcesTier,
            o.ConservativeRasterizationTier, o.ROVsSupported, o.OutputMergerLogicOp);
+    printf("  typed-uav-load-additional %d\n", o.TypedUAVLoadAdditionalFormats);
+    static const DXGI_FORMAT typed[] = { DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                         DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16_UINT };
+    for (DXGI_FORMAT f : typed)
+    {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { f };
+        g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs));
+        if (!(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+            printf("  no typed UAV load: format %d\n", f);
+    }
     D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2 = {};
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2));
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};

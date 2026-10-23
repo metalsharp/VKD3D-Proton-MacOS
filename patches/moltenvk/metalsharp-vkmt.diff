@@ -7160,7 +7160,7 @@ index 00000000..793644e2
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
-index 9b6a7351..6ddded62 100644
+index 9b6a7351..4188629f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
 @@ -22,6 +22,7 @@
@@ -7171,7 +7171,17 @@ index 9b6a7351..6ddded62 100644
  
  
  #pragma mark MVKBuffer
-@@ -86,15 +87,20 @@ public:
+@@ -76,6 +77,9 @@ public:
+ 	/** Returns the GPU address for this MTLBuffer, respecting its offset. */
+ 	uint64_t getMTLBufferGPUAddress();
+ 
++	/** Returns whether this is a sparse buffer, whose memory is bound with vkQueueBindSparse(). */
++	bool isSparse() const { return _isSparse; }
++
+ #pragma mark Construction
+ 	
+ 	MVKBuffer(MVKDevice* device, const VkBufferCreateInfo* pCreateInfo);
+@@ -86,15 +90,22 @@ public:
  
  protected:
  	friend class MVKDeviceMemory;
@@ -7181,6 +7191,7 @@ index 9b6a7351..6ddded62 100644
  	bool needsHostReadSync(MVKPipelineBarrier& barrier);
      bool overlaps(VkDeviceSize offset, VkDeviceSize size, VkDeviceSize &overlapOffset, VkDeviceSize &overlapSize);
  	void initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes);
++	void initSparse();
  	void detachMemory();
 +	bool addAccelerationStructure(MVKAccelerationStructure* accelerationStructure);
 +	void removeAccelerationStructure(MVKAccelerationStructure* accelerationStructure);
@@ -7188,17 +7199,18 @@ index 9b6a7351..6ddded62 100644
  
  	VkBufferUsageFlags2 _usage;
  	id<MTLBuffer> _mtlBuffer = nil;
++	bool _isSparse = false;
 +	MVKSmallVector<MVKAccelerationStructure*> _accelerationStructures;
      std::mutex _lock;
  };
  
-@@ -139,4 +145,3 @@ protected:
+@@ -139,4 +150,3 @@ protected:
  	VkExtent2D _textureSize;
  	std::mutex _lock;
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
-index a00c09bd..f82bfacf 100644
+index a00c09bd..9ea56253 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 @@ -17,6 +17,7 @@
@@ -7209,10 +7221,18 @@ index a00c09bd..f82bfacf 100644
  #include "MVKCommandBuffer.h"
  #include "MVKFoundation.h"
  #include "mvk_datatypes.hpp"
-@@ -42,11 +43,19 @@
+@@ -42,11 +43,27 @@
  #pragma mark Resource memory
  
  VkResult MVKBuffer::getMemoryRequirements(VkMemoryRequirements* pMemoryRequirements) {
++	if (_isSparse) {
++		// Bound in sparse blocks from private (heap-backed) memory.
++		VkDeviceSize block = MVKPhysicalDevice::kSparseBlockSize;
++		pMemoryRequirements->size = mvkAlignByteCount(getByteCount(), block);
++		pMemoryRequirements->alignment = block;
++		pMemoryRequirements->memoryTypeBits = getPhysicalDevice()->getPrivateMemoryTypes();
++		return VK_SUCCESS;
++	}
 +	bool accelerationStructure = mvkIsAnyFlagEnabled(_usage, VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
  	if (getMetalFeatures().placementHeaps) {
 -		MTLSizeAndAlign sizeAndAlign = [getMTLDevice() heapBufferSizeAndAlignWithLength: getByteCount() 
@@ -7230,12 +7250,13 @@ index a00c09bd..f82bfacf 100644
  	} else {
  		pMemoryRequirements->size = getByteCount();
  		pMemoryRequirements->alignment = _byteAlignment;
-@@ -76,12 +85,70 @@
+@@ -76,12 +93,71 @@
  }
  
  VkResult MVKBuffer::bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset) {
 -	if (_deviceMemory) { MVKDeviceMemory::removeBuffer(&_deviceMemory, this); }
 -	MVKResource::bindDeviceMemory(mvkMem, memOffset);
++	if (_isSparse) { return reportError(VK_ERROR_VALIDATION_FAILED_EXT, "vkBindBufferMemory(): Sparse buffers are bound with vkQueueBindSparse()."); }
 +	if (!getEnabledAccelerationStructureFeatures().accelerationStructure) {
 +		if (_deviceMemory) { MVKDeviceMemory::removeBuffer(&_deviceMemory, this); }
 +		MVKResource::bindDeviceMemory(mvkMem, memOffset);
@@ -7305,7 +7326,7 @@ index a00c09bd..f82bfacf 100644
  }
  
  VkResult MVKBuffer::bindDeviceMemory2(const VkBindBufferMemoryInfo* pBindInfo) {
-@@ -157,6 +224,7 @@
+@@ -157,6 +233,7 @@
  			id<MTLBuffer> buf = [_deviceMemory->getMTLHeap() newBufferWithLength: getByteCount()
  			                                                             options: _deviceMemory->getMTLResourceOptions()
  			                                                              offset: _deviceMemoryOffset];	// retained
@@ -7313,7 +7334,7 @@ index a00c09bd..f82bfacf 100644
  			_device->makeResident(buf);
  			_device->getLiveResources().add(buf);
  			_mtlBuffer = buf;
-@@ -170,7 +238,9 @@
+@@ -170,7 +247,9 @@
  }
  
  uint64_t MVKBuffer::getMTLBufferGPUAddress() {
@@ -7324,7 +7345,37 @@ index a00c09bd..f82bfacf 100644
  }
  
  #pragma mark Construction
-@@ -236,16 +306,54 @@
+@@ -200,6 +279,29 @@
+ 				break;
+ 		}
+ 	}
++
++	if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_BUFFER_CREATE_SPARSE_BINDING_BIT)) { initSparse(); }
++}
++
++// A placement sparse MTLBuffer, which vkQueueBindSparse() maps onto memory heaps in 64 KiB blocks.
++// Unmapped blocks read zero and drop writes.
++void MVKBuffer::initSparse() {
++	if ( !getPhysicalDevice()->supportsSparseResources() ) {
++		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateBuffer(): Sparse buffers are not supported on this device."));
++		return;
++	}
++	_isSparse = true;
++#if MVK_XCODE_26 && MVK_MACOS
++	_mtlBuffer = [getMTLDevice() newBufferWithLength: mvkAlignByteCount(getByteCount(), MVKPhysicalDevice::kSparseBlockSize)
++											 options: MTLResourceStorageModePrivate
++							 placementSparsePageSize: MTLSparsePageSize64];	// retained
++#endif
++	if ( !_mtlBuffer ) {
++		setConfigurationResult(reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkCreateBuffer(): Could not create a sparse buffer of %llu bytes.", getByteCount()));
++		return;
++	}
++	_device->makeResident(_mtlBuffer);
++	_device->getLiveResources().add(_mtlBuffer);
+ }
+ 
+ void MVKBuffer::initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes) {
+@@ -236,16 +338,54 @@
  
  // Potentially called twice, from destroy() and destructor, so ensure everything is nulled out.
  void MVKBuffer::detachMemory() {
@@ -8690,7 +8741,7 @@ index 3cdc6234..9d844b81 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..d3ae786a 100644
+index 534a414f..6a3b1ffa 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,10 @@
@@ -8736,7 +8787,31 @@ index 534a414f..d3ae786a 100644
  static constexpr uint32_t   kMVKMaxSamplerCount = 16;
  static constexpr uint32_t   kMVKMaxSampleCount = 8;
  static constexpr uint32_t   kMVKSampleLocationCoordinateGridSize = 16;
-@@ -437,6 +451,7 @@ public:
+@@ -426,6 +440,23 @@ public:
+ 	/** Returns whether argument buffers are in use. */
+ 	bool isUsingMetalArgumentBuffers() const { return _isUsingMetalArgumentBuffers; }
+ 
++	/**
++	 * Returns whether sparse buffers and images are supported: Metal placement sparse resources
++	 * (64 KiB pages), mapped through MTL4CommandQueue (macOS 26, Apple GPUs).
++	 */
++	bool supportsSparseResources() const { return _supportsSparseResources; }
++
++	/** The Vulkan sparse block size: one Metal 64 KiB sparse page. */
++	static constexpr VkDeviceSize kSparseBlockSize = 64 * 1024;
++
++	/** Returns the sparse block shape of a format and image type, in texels, or zero if sparse images of it are not supported. */
++	VkExtent3D getSparseImageGranularity(VkFormat format, VkImageType type);
++
++	/** Populates the sparse image format properties (vkGetPhysicalDeviceSparseImageFormatProperties). */
++	void getSparseImageFormatProperties(VkFormat format, VkImageType type, VkSampleCountFlagBits samples,
++										VkImageUsageFlags usage, VkImageTiling tiling,
++										uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties);
++
+ 	/** Returns whether or not vertex instancing can be used to implement multiview. */
+ 	bool canUseInstancingForMultiview() { return _metalFeatures.layeredRendering; }
+ 
+@@ -437,6 +468,7 @@ public:
  
  	/** Returns the MTLDevice capabilities. */
  	const MVKMTLDeviceCapabilities getMTLDeviceCapabilities() { return _gpuCapabilities; }
@@ -8744,7 +8819,7 @@ index 534a414f..d3ae786a 100644
  
  	/** Returns info on the sizes of argument buffers. */
  	const MVKPhysicalDeviceArgumentBufferSizes& getArgumentBufferSizes() const { return _argumentBufferSizes; }
-@@ -486,6 +501,7 @@ protected:
+@@ -486,6 +518,7 @@ protected:
  	uint32_t getMaxPerSetDescriptorCount();
  	void initExternalMemoryProperties();
  	void initExtensions();
@@ -8752,16 +8827,26 @@ index 534a414f..d3ae786a 100644
  	void initCounterSets();
  	bool needsCounterSetRetained();
  	void updateTimestampPeriod();
-@@ -528,6 +544,8 @@ protected:
+@@ -498,6 +531,7 @@ protected:
+ 	template<typename HostImageCopyProps> void populateHostImageCopyProperties(HostImageCopyProps* pHostImageCopyProps);
+ 	bool isTier2MetalArgumentBuffers();
+ 	void logGPUInfo();
++	void initSparseResources();
+ 
+ 	MVKInstance* _mvkInstance;
+ 	id<MTLDevice> _mtlDevice;
+@@ -528,7 +562,10 @@ protected:
  	uint32_t _lazilyAllocatedMemoryTypes;
  	MVKPhysicalDeviceArgumentBufferSizes _argumentBufferSizes;
  	bool _hasUnifiedMemory = true;
 +	bool _supportsFunctionPointers = false;
 +	bool _supportsRaytracingFromRender = false;
  	bool _isUsingMetalArgumentBuffers = true;
++	bool _supportsSparseResources = false;
  };
  
-@@ -792,6 +810,14 @@ public:
+ 
+@@ -792,6 +829,14 @@ public:
  	void destroyPipelineLayout(MVKPipelineLayout* mvkPLL,
  							   const VkAllocationCallbacks* pAllocator);
  
@@ -8776,7 +8861,7 @@ index 534a414f..d3ae786a 100644
      /**
       * Template function that creates count number of pipelines of type PipelineType,
       * using a collection of configuration information of type PipelineInfoType,
-@@ -868,7 +894,32 @@ public:
+@@ -868,7 +913,32 @@ public:
  #pragma mark Operations
  
  	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
@@ -8810,7 +8895,7 @@ index 534a414f..d3ae786a 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -943,6 +994,12 @@ public:
+@@ -943,6 +1013,12 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -8823,7 +8908,7 @@ index 534a414f..d3ae786a 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -1050,12 +1107,21 @@ public:
+@@ -1050,12 +1126,21 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -8845,7 +8930,7 @@ index 534a414f..d3ae786a 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1097,7 +1163,16 @@ protected:
+@@ -1097,7 +1182,16 @@ protected:
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
  	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
  	MVKSmallVector<MVKResource*> _resources;
@@ -8862,7 +8947,7 @@ index 534a414f..d3ae786a 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1180,20 @@ protected:
+@@ -1105,16 +1199,20 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -8883,7 +8968,7 @@ index 534a414f..d3ae786a 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1168,9 +1247,11 @@ public:
+@@ -1168,9 +1266,11 @@ public:
  
  	// List of extended device feature enabling structures, as getEnabledXXXFeatures() functions.
  #define MVK_DEVICE_FEATURE(structName, enumName, flagCount) \
@@ -8898,7 +8983,7 @@ index 534a414f..d3ae786a 100644
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..29b68252 100644
+index 359f8a2b..cbe2cb0f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -9065,7 +9150,61 @@ index 359f8a2b..29b68252 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
  				auto* multiDrawProps = (VkPhysicalDeviceMultiDrawPropertiesEXT*)next;
  				// Each draw is encoded as a separate command, so no limit is imposed.
-@@ -2668,6 +2776,15 @@
+@@ -1588,6 +1696,13 @@
+ 	const auto placementHeapFlags = VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT |
+ 	                                VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+ 	                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
++	// Sparse images: placement sparse textures, single-sampled 2D only, optimal tiling.
++	const auto sparseFlags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
++	if (mvkIsAnyFlagEnabled(flags, sparseFlags) &&
++		(tiling != VK_IMAGE_TILING_OPTIMAL || !getSparseImageGranularity(format, type).width)) {
++		return VK_ERROR_FORMAT_NOT_SUPPORTED;
++	}
++
+ 	if (!_metalFeatures.placementHeaps && mvkIsAnyFlagEnabled(flags, placementHeapFlags)) {
+ 		return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 	}
+@@ -1742,7 +1857,7 @@
+ 	pImageFormatProperties->maxExtent = maxExt;
+ 	pImageFormatProperties->maxMipLevels = maxLevels;
+ 	pImageFormatProperties->maxArrayLayers = maxLayers;
+-	pImageFormatProperties->sampleCounts = sampleCounts;
++	pImageFormatProperties->sampleCounts = mvkIsAnyFlagEnabled(flags, sparseFlags) ? VK_SAMPLE_COUNT_1_BIT : sampleCounts;
+ 	pImageFormatProperties->maxResourceSize = kMVKUndefinedLargeUInt64;
+ 
+ 	return VK_SUCCESS;
+@@ -2242,24 +2357,26 @@
+ 		qfProps.queueCount = kMVKQueueCountPerQueueFamily;
+ 		qfProps.timestampValidBits = 64;
+ 		qfProps.minImageTransferGranularity = { 1, 1, 1};
++		// Every queue can map sparse resources, through its own MTL4CommandQueue.
++		VkQueueFlags sparseFlag = _supportsSparseResources ? VK_QUEUE_SPARSE_BINDING_BIT : 0;
+ 
+ 		// General-purpose queue family
+-		qfProps.queueFlags = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
++		qfProps.queueFlags = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT) | sparseFlag;
+ 		_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
+ 
+ 		// Single queue semaphore requires using a single queue for everything
+ 		// So don't allow anyone to have more than one
+ 		if (_vkSemaphoreStyle != MVKSemaphoreStyleSingleQueue) {
+ 			// Dedicated graphics queue family...or another general-purpose queue family.
+-			if (specialize) { qfProps.queueFlags = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT); }
++			if (specialize) { qfProps.queueFlags = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT) | sparseFlag; }
+ 			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
+ 
+ 			// Dedicated compute queue family...or another general-purpose queue family.
+-			if (specialize) { qfProps.queueFlags = (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT); }
++			if (specialize) { qfProps.queueFlags = (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT) | sparseFlag; }
+ 			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
+ 
+ 			// Dedicated transfer queue family...or another general-purpose queue family.
+-			if (specialize) { qfProps.queueFlags = VK_QUEUE_TRANSFER_BIT; }
++			if (specialize) { qfProps.queueFlags = VK_QUEUE_TRANSFER_BIT | sparseFlag; }
+ 			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
+ 		}
+ 
+@@ -2668,6 +2785,15 @@
  	_metalFeatures.programmableSamplePositions = _mtlDevice.areProgrammableSamplePositionsSupported;
  	_metalFeatures.rasterOrderGroups = _mtlDevice.areRasterOrderGroupsSupported;
  	_metalFeatures.pullModelInterpolation = _mtlDevice.supportsPullModelInterpolation;
@@ -9081,7 +9220,7 @@ index 359f8a2b..29b68252 100644
  
  	// Both current and deprecated properties are retrieved and OR'd together, due to a
  	// Metal bug that, in some environments, returned true for one and false for the other.
-@@ -2726,6 +2843,9 @@
+@@ -2726,6 +2852,9 @@
  
  	// Argument buffers
  	_metalFeatures.argumentBuffersTier = _mtlDevice.argumentBuffersSupport;
@@ -9091,7 +9230,7 @@ index 359f8a2b..29b68252 100644
  
  	// Metal argument buffer support for descriptor sets is supported on macOS 11.0 or later,
  	// or on older versions of macOS using an Intel GPU, or on iOS & tvOS 16.0 or later (Metal 3).
-@@ -2738,6 +2858,8 @@
+@@ -2738,6 +2867,8 @@
  													_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  
  	_isUsingMetalArgumentBuffers = _metalFeatures.descriptorSetArgumentBuffers && getMVKConfig().useMetalArgumentBuffers;
@@ -9100,7 +9239,85 @@ index 359f8a2b..29b68252 100644
  
  #define checkSupportsMTLCounterSamplingPoint(mtlSP, mvkSP)  \
  	if ([_mtlDevice supportsCounterSampling: MTLCounterSamplingPointAt ##mtlSP ##Boundary]) {  \
-@@ -2799,7 +2921,7 @@
+@@ -2787,6 +2918,71 @@
+ 	_metalFeatures.renderWithoutAttachments = true;
+ }
+ 
++void MVKPhysicalDevice::initSparseResources() {
++	_supportsSparseResources = false;
++#if MVK_XCODE_26 && MVK_MACOS
++	if (mvkOSVersionIsAtLeast(26.0) && _gpuCapabilities.isAppleGPU && _metalFeatures.placementHeaps &&
++		[_mtlDevice respondsToSelector: @selector(newMTL4CommandQueueWithDescriptor:error:)] &&
++		[_mtlDevice sparseTileSizeInBytesForSparsePageSize: MTLSparsePageSize64] == kSparseBlockSize) {
++		_supportsSparseResources = true;
++	}
++#endif
++}
++
++// The Vulkan standard sparse block shapes (64 KiB) by texel block size, in blocks.
++static VkExtent3D mvkStandardSparseBlockShape2D(uint32_t bytesPerBlock) {
++	switch (bytesPerBlock) {
++		case 1:  return { 256, 256, 1 };
++		case 2:  return { 256, 128, 1 };
++		case 4:  return { 128, 128, 1 };
++		case 8:  return { 128,  64, 1 };
++		case 16: return {  64,  64, 1 };
++		default: return { 0, 0, 0 };
++	}
++}
++
++VkExtent3D MVKPhysicalDevice::getSparseImageGranularity(VkFormat format, VkImageType type) {
++#if MVK_XCODE_26 && MVK_MACOS
++	if (_supportsSparseResources && type == VK_IMAGE_TYPE_2D) {
++		MTLPixelFormat mtlFormat = _pixelFormats.getMTLPixelFormat(format);
++		if (mtlFormat == MTLPixelFormatInvalid || _pixelFormats.isStencilFormat(mtlFormat)) { return { 0, 0, 0 }; }
++		MTLSize tile = [_mtlDevice sparseTileSizeWithTextureType: MTLTextureType2D
++													 pixelFormat: mtlFormat
++													 sampleCount: 1
++												  sparsePageSize: MTLSparsePageSize64];
++		return { (uint32_t)tile.width, (uint32_t)tile.height, (uint32_t)tile.depth };
++	}
++#endif
++	return { 0, 0, 0 };
++}
++
++void MVKPhysicalDevice::getSparseImageFormatProperties(VkFormat format, VkImageType type, VkSampleCountFlagBits samples,
++													   VkImageUsageFlags usage, VkImageTiling tiling,
++													   uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties) {
++	VkExtent3D granularity = getSparseImageGranularity(format, type);
++	if (samples != VK_SAMPLE_COUNT_1_BIT || tiling != VK_IMAGE_TILING_OPTIMAL || !granularity.width) {
++		*pPropertyCount = 0;
++		return;
++	}
++	if ( !pProperties ) {
++		*pPropertyCount = 1;
++		return;
++	}
++	if (*pPropertyCount == 0) { return; }
++	*pPropertyCount = 1;
++
++	MTLPixelFormat mtlFormat = _pixelFormats.getMTLPixelFormat(format);
++	VkExtent2D blockTexels = _pixelFormats.getBlockTexelSize(format);
++	VkExtent3D standard = mvkStandardSparseBlockShape2D(_pixelFormats.getBytesPerBlock(format));
++	bool isStandard = granularity.width == standard.width * blockTexels.width &&
++					  granularity.height == standard.height * blockTexels.height && granularity.depth == 1;
++
++	pProperties->aspectMask = _pixelFormats.isDepthFormat(mtlFormat) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++	pProperties->imageGranularity = granularity;
++	// Each array layer has its own mip tail.
++	pProperties->flags = isStandard ? 0 : VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT;
++}
++
+ bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
+ 	return _isUsingMetalArgumentBuffers && (_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
+ }
+@@ -2794,12 +2990,13 @@
+ // Initializes the physical device features of this instance.
+ void MVKPhysicalDevice::initFeatures() {
+ 	mvkClear(&_features);	// Start with everything cleared
++	initSparseResources();
+ 
+     _features.robustBufferAccess = true; // NOTE: Required by spec, not fully supported by non-Apple GPUs.
      _features.fullDrawIndexUint32 = true;
      _features.independentBlend = true;
      _features.sampleRateShading = true;
@@ -9109,7 +9326,22 @@ index 359f8a2b..29b68252 100644
      _features.depthBiasClamp = true;
      _features.fillModeNonSolid = true;
      _features.largePoints = true;
-@@ -2931,6 +3053,14 @@
+@@ -2808,6 +3005,14 @@
+     _features.samplerAnisotropy = true;
+     _features.shaderImageGatherExtended = true;
+     _features.shaderStorageImageExtendedFormats = true;
++
++	// Sparse resources (see initSparseResources()). Metal's 2D sparse tiles have the Vulkan standard
++	// block shapes; its 3D tiles do not, and multisampled sparse textures are not supported.
++	_features.sparseBinding = _supportsSparseResources;
++	_features.sparseResidencyBuffer = _supportsSparseResources;
++	_features.sparseResidencyImage2D = _supportsSparseResources;
++	_features.sparseResidencyAliased = _supportsSparseResources;
++	_features.shaderResourceResidency = _supportsSparseResources;	// MSL sparse_sample() and friends
+     _features.shaderStorageImageReadWithoutFormat = true;
+     _features.shaderStorageImageWriteWithoutFormat = true;
+     _features.shaderUniformBufferArrayDynamicIndexing = true;
+@@ -2931,6 +3136,14 @@
  	_properties.limits.maxPerStageDescriptorStorageImages = _metalFeatures.maxPerStageStorageTextureCount;
  	_properties.limits.maxPerStageDescriptorInputAttachments = _metalFeatures.maxPerStageTextureCount;
  
@@ -9124,7 +9356,21 @@ index 359f8a2b..29b68252 100644
      _properties.limits.maxPerStageResources = (_metalFeatures.maxPerStageBufferCount + _metalFeatures.maxPerStageTextureCount);
      _properties.limits.maxFragmentCombinedOutputResources = _properties.limits.maxPerStageResources;
  
-@@ -3313,6 +3443,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3143,7 +3356,12 @@
+ 
+     // Unsupported features - set to zeros generally
+ 
+-    _properties.limits.sparseAddressSpaceSize = 0;
++    _properties.limits.sparseAddressSpaceSize = _supportsSparseResources ? (1ull << 40) : 0;
++	_properties.sparseProperties.residencyStandard2DBlockShape = _supportsSparseResources;
++	_properties.sparseProperties.residencyStandard2DMultisampleBlockShape = false;
++	_properties.sparseProperties.residencyStandard3DBlockShape = false;
++	_properties.sparseProperties.residencyAlignedMipSize = false;	// Metal packs the small mips into a tail.
++	_properties.sparseProperties.residencyNonResidentStrict = _supportsSparseResources;	// Unmapped tiles read 0, writes are dropped.
+ 
+     _properties.limits.maxGeometryShaderInvocations = 0;
+     _properties.limits.maxGeometryInputComponents = 0;
+@@ -3313,6 +3531,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// might affect the contents of the pipeline cache (mostly MSL content).
  	uint32_t mtlFeatures = 0;
  	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
@@ -9132,7 +9378,7 @@ index 359f8a2b..29b68252 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mtlFeatures);
  	uuidComponentOffset += sizeof(mtlFeatures);
  }
-@@ -3545,6 +3676,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3545,6 +3764,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -9155,7 +9401,7 @@ index 359f8a2b..29b68252 100644
  void MVKPhysicalDevice::initExtensions() {
  	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
  	pWritableExtns->disableAllButEnabledDeviceExtensions();
-@@ -3595,12 +3742,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3595,12 +3830,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_gpuCapabilities.supportsSamplerReduction) {
  		pWritableExtns->vk_EXT_sampler_filter_minmax.enabled = false;
  	}
@@ -9183,7 +9429,7 @@ index 359f8a2b..29b68252 100644
  
  	if (!_gpuCapabilities.isAppleGPU) {
  		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
-@@ -4034,6 +4196,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4034,6 +4284,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  			maxVarDescCount = mtlFeats.maxPerStageBufferCount - mtlBuffCnt;
  			break;
@@ -9193,7 +9439,7 @@ index 359f8a2b..29b68252 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			maxVarDescCount = (uint32_t)min<VkDeviceSize>(mtlFeats.maxMTLBufferSize, numeric_limits<uint32_t>::max());
  			break;
-@@ -4045,7 +4210,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4045,7 +4298,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
  		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
  				maxVarDescCount = min(mtlFeats.maxPerStageTextureCount - mtlTexCnt,
@@ -9202,7 +9448,7 @@ index 359f8a2b..29b68252 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4355,6 +4520,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,6 +4608,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -9214,7 +9460,7 @@ index 359f8a2b..29b68252 100644
  			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
  				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
  			default:
-@@ -4398,6 +4568,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4398,6 +4656,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -9260,7 +9506,7 @@ index 359f8a2b..29b68252 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +4673,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +4761,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -9273,7 +9519,7 @@ index 359f8a2b..29b68252 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4629,6 +4844,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +4932,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -9283,7 +9529,7 @@ index 359f8a2b..29b68252 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +4858,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +4946,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -9314,9 +9560,7 @@ index 359f8a2b..29b68252 100644
 +											bool write,
 +											MVKSmallVector<id<MTLBuffer>, 16>* retainedBuffers) {
 +	if (hasResidencySet()) { return; }
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	for (auto* buffer : _gpuAddressableBuffers) {
 +		id<MTLBuffer> mtlBuffer = buffer->getMTLBuffer();
 +		if (!mtlBuffer) { continue; }
@@ -9542,7 +9786,9 @@ index 359f8a2b..29b68252 100644
 +}
 +
 +void MVKDevice::addGPUAddressableAccelerationStructure(MVKAccelerationStructure* accelerationStructure) {
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	_gpuAddressableAccelerationStructures.push_back(accelerationStructure);
 +}
 +
@@ -9609,7 +9855,7 @@ index 359f8a2b..29b68252 100644
  	}
  }
  
-@@ -4967,6 +5493,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +5581,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -9629,7 +9875,7 @@ index 359f8a2b..29b68252 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -5016,7 +5555,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5016,7 +5643,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Can't use prefilled Metal command buffers if any of the resource descriptors can be updated after binding.
  bool MVKDevice::shouldPrefillMTLCommandBuffers() {
@@ -9642,7 +9888,7 @@ index 359f8a2b..29b68252 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5267,7 +5810,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +5898,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -9655,7 +9901,7 @@ index 359f8a2b..29b68252 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5601,6 +6148,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5601,6 +6236,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  #endif
  	[_defaultMTLSamplerState release];
  	[_dummyBlitMTLBuffer release];
@@ -9694,7 +9940,7 @@ index 9342deb9..c005c281 100644
  MVK_DEVICE_FEATURE_EXTN(NestedCommandBuffer,              NESTED_COMMAND_BUFFER,                EXT,   3)
  MVK_DEVICE_FEATURE_EXTN(NonSeamlessCubeMap,               NON_SEAMLESS_CUBE_MAP,                EXT,   1)
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h
-index b349d6ea..69de78de 100644
+index b349d6ea..eb4da9a9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h
 @@ -25,6 +25,7 @@
@@ -9705,16 +9951,19 @@ index b349d6ea..69de78de 100644
  
  #pragma mark MVKDeviceMemory
  
-@@ -122,6 +123,8 @@ public:
+@@ -122,6 +123,11 @@ public:
  	/** Returns the Metal heap underlying this memory allocation. */
  	id<MTLHeap> getMTLHeap() { return _mtlHeap; }
  
++	/** Returns the MTLHeap that sparse resource blocks are mapped onto, creating it if needed, or nil if this memory cannot back them. */
++	id<MTLHeap> getSparseBindingMTLHeap() { ensureMTLHeap(); return _mtlHeap; }
++
 +	bool isAccelerationStructurePlacementCompatible() const;
 +
  	/** Returns the Metal storage mode used by this memory allocation. */
  	MTLStorageMode getMTLStorageMode() { return _mtlStorageMode; }
  
-@@ -145,6 +148,7 @@ public:
+@@ -145,6 +151,7 @@ public:
  
  protected:
  	friend class MVKBuffer;
@@ -9722,7 +9971,7 @@ index b349d6ea..69de78de 100644
  	friend class MVKImage;
      friend class MVKImageMemoryBinding;
      friend class MVKImagePlane;
-@@ -161,9 +165,12 @@ protected:
+@@ -161,9 +168,12 @@ protected:
  	void freeHostMemory();
  	MVKResource* getDedicatedResource();
  	void initExternalMemory(MVKImage* dedicatedImage, bool wantsHeap);
@@ -9735,13 +9984,13 @@ index b349d6ea..69de78de 100644
  	std::mutex _rezLock;
      VkDeviceSize _allocationSize = 0;
  	MVKMappedMemoryRange _mappedRange;
-@@ -187,4 +194,3 @@ protected:
+@@ -187,4 +197,3 @@ protected:
  	bool _isHostMemImported = false;
  	VkExternalMemoryHandleTypeFlags _externalMemoryHandleType = 0u;
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
-index 00b182b8..4508168a 100644
+index 00b182b8..c1f3dc3b 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
 @@ -17,6 +17,7 @@
@@ -9760,7 +10009,24 @@ index 00b182b8..4508168a 100644
  
  using namespace std;
  
-@@ -234,6 +236,39 @@
+@@ -225,15 +227,56 @@
+ 	// to untracked, since Vulkan uses explicit barriers anyway.
+ 	heapDesc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+ 	heapDesc.size = _allocationSize;
++#if MVK_XCODE_26 && MVK_MACOS
++	// Any memory can back sparse resource tiles (vkQueueBindSparse()).
++	if (getPhysicalDevice()->supportsSparseResources() && _mtlStorageMode == MTLStorageModePrivate) {
++		heapDesc.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
++	}
++#endif
+ 	_mtlHeap = [getMTLDevice() newHeapWithDescriptor: heapDesc];	// retained
+ 	[heapDesc release];
+ 	if (!_mtlHeap) { return false; }
++	// Sparse resources reach the heap's memory only through their mappings.
++	if (getPhysicalDevice()->supportsSparseResources()) { _device->makeResident(_mtlHeap); }
+ 
+ 	propagateDebugName();
+ 
  	return true;
  }
  
@@ -9800,7 +10066,7 @@ index 00b182b8..4508168a 100644
  // Ensures that this instance is backed by a MTLBuffer object,
  // creating the MTLBuffer if needed, and returns whether it was successful.
  bool MVKDeviceMemory::ensureMTLBuffer() {
-@@ -505,6 +540,10 @@
+@@ -505,6 +548,10 @@
  }
  
  MVKDeviceMemory::~MVKDeviceMemory() {
@@ -9811,7 +10077,7 @@ index 00b182b8..4508168a 100644
  	// Unbind any resources that are using me.
  	// Manually null the binding parameter to prevent them from trying to remove themselves from the array.
  	// This will leave texture buffer pointers dangling, but according to Vulkan, those are not supposed to be used again anyways.
-@@ -513,6 +552,9 @@
+@@ -513,6 +560,9 @@
  	for (auto& img : _imageMemoryBindings) { img->_deviceMemory = nullptr; }
  	os_unfair_lock_unlock(&s_device_memory_destruction_lock);
  
@@ -9821,6 +10087,294 @@ index 00b182b8..4508168a 100644
  	if (_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
  		[_mtlTexture release];
  		_mtlTexture = nil;
+@@ -526,6 +576,7 @@
+ 		[buf release];
+ 	}
+ 
++	if (_mtlHeap && getPhysicalDevice()->supportsSparseResources()) { _device->removeResidency(_mtlHeap); }
+ 	[_mtlHeap release];
+ 	_mtlHeap = nil;
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+index 45ddd3a4..1d50d42d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+@@ -152,6 +152,19 @@ protected:
+ #pragma mark MVKImage
+ 
+ /** Represents a Vulkan image. */
++/**
++ * A sparse texture mapping: a region of tiles in one mip level and array layer of a sparse image,
++ * mapped onto consecutive 64 KiB blocks of a memory heap (or unmapped, when heap is nil).
++ * MVKQueue applies these through MTL4CommandQueue.
++ */
++typedef struct {
++	id<MTLHeap> heap;
++	MTLRegion region;
++	uint32_t level;
++	uint32_t slice;
++	NSUInteger heapOffset;
++} MVKSparseTextureMapping;
++
+ class MVKImage : public MVKVulkanAPIDeviceObject {
+ 
+ public:
+@@ -252,6 +265,19 @@ public:
+ 
+ 	/** Binds this resource to the specified offset within the specified memory allocation. */
+ 	virtual VkResult bindDeviceMemory2(const VkBindImageMemoryInfo* pBindInfo);
++	VkExtent3D getSparseMipBlockCounts(uint32_t mipLevel);
++
++	/** Returns whether this is a sparse image, whose memory is bound with vkQueueBindSparse(). */
++	bool isSparse() const { return _isSparse; }
++
++	/** Populates the sparse memory requirements (vkGetImageSparseMemoryRequirements). */
++	void getSparseMemoryRequirements(uint32_t* pCount, VkSparseImageMemoryRequirements* pRequirements);
++
++	/** Appends the texture mappings of a sparse image memory bind. */
++	VkResult getSparseMappings(const VkSparseImageMemoryBind& bind, MVKSmallVector<MVKSparseTextureMapping, 8>& mappings);
++
++	/** Appends the texture mappings of an opaque sparse memory bind (a range of the image's sparse blocks). */
++	VkResult getSparseMappings(const VkSparseMemoryBind& bind, MVKSmallVector<MVKSparseTextureMapping, 8>& mappings);
+ 
+ 	/** Applies the specified image memory barrier. */
+ 	void applyImageMemoryBarrier(MVKPipelineBarrier& barrier,
+@@ -357,6 +383,7 @@ protected:
+ 	friend MVKImageView;
+ 
+ 	void propagateDebugName() override;
++	void initSparse(const VkImageCreateInfo* pCreateInfo);
+ 	void validateConfig(const VkImageCreateInfo* pCreateInfo, bool isAttachment);
+ 	VkSampleCountFlagBits validateSamples(const VkImageCreateInfo* pCreateInfo, bool isAttachment);
+ 	uint32_t validateMipLevels(const VkImageCreateInfo* pCreateInfo, bool isAttachment);
+@@ -396,6 +423,14 @@ protected:
+     bool _hasChromaSubsampling;
+ 	bool _isLinear;
+ 	bool _isAliasable;
++	bool _isSparse = false;
++	// Sparse layout: each array layer holds the blocks of its mips below the tail, mip by mip in
++	// row-major tile order, then its mip tail.
++	VkExtent3D _sparseGranularity = {};
++	uint32_t _sparseMipTailFirstLod = 0;
++	uint32_t _sparseMipTailBlocks = 0;
++	uint32_t _sparseLayerBlocks = 0;
++	MVKSmallVector<uint32_t, 16> _sparseMipFirstBlock;
+ 	bool _hasExtendedUsage;
+ 	bool _hasMutableFormat;
+ 	bool _shouldSupportAtomics;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 2b394922..83708e1f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+         }
+ 
+         id<MTLTexture> tex;
++        if (_image->_isSparse) {
++            // A placement sparse texture, mapped onto memory heaps by vkQueueBindSparse().
++            tex = [_image->getMTLDevice() newTextureWithDescriptor: mtlTexDesc];
++        } else
+         // Use imported texture if we are binding to a VkDeviceMemory that was created with an import operation
+         if (dvcMem && (dvcMem->_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) && dvcMem->_mtlTexture) {
+             tex = [dvcMem->_mtlTexture retain];		// retained
+@@ -180,6 +184,15 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     // For 2D views of 3D and block texel views, we alias the underlying memory.
+     // Ensure that it remains consistent by disabling GPU layout optimization.
+     mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible;
++#if MVK_XCODE_26 && MVK_MACOS
++	if (_image->_isSparse) {
++		mtlTexDesc.placementSparsePageSize = MTLSparsePageSize64;
++		mtlTexDesc.storageMode = MTLStorageModePrivate;
++		// Shader write usage selects Metal's sparse texture tier 1, which writes reliably
++		// (writes to tier 2 placement sparse textures fault on Apple9 GPUs).
++		mtlTexDesc.usage |= MTLTextureUsageShaderWrite;
++	}
++#endif
+ 
+     return mtlTexDesc;
+ }
+@@ -940,6 +953,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 	MVKPhysicalDevice* mvkPD = getPhysicalDevice();
+ 	VkImageUsageFlags combinedUsage = getCombinedUsage();
+ 
++	if (_isSparse) {
++		// Bound in sparse blocks from private (heap-backed) memory.
++		pMemoryRequirements->size = (VkDeviceSize)_sparseLayerBlocks * _arrayLayers * MVKPhysicalDevice::kSparseBlockSize;
++		pMemoryRequirements->alignment = MVKPhysicalDevice::kSparseBlockSize;
++		pMemoryRequirements->memoryTypeBits = mvkPD->getPrivateMemoryTypes();
++		return VK_SUCCESS;
++	}
++
+     pMemoryRequirements->memoryTypeBits = (_isDepthStencilAttachment)
+                                           ? mvkPD->getPrivateMemoryTypes()
+                                           : mvkPD->getAllMemoryTypes();
+@@ -987,9 +1008,157 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ }
+ 
+ VkResult MVKImage::bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset, uint8_t planeIndex) {
++	if (_isSparse) { return reportError(VK_ERROR_VALIDATION_FAILED_EXT, "vkBindImageMemory(): Sparse images are bound with vkQueueBindSparse()."); }
+     return getMemoryBinding(planeIndex)->bindDeviceMemory(mvkMem, memOffset);
+ }
+ 
++#pragma mark Sparse resources
++
++// Creates the placement sparse texture and lays out the image's sparse blocks.
++void MVKImage::initSparse(const VkImageCreateInfo* pCreateInfo) {
++	MVKPhysicalDevice* mvkPD = getPhysicalDevice();
++	_sparseGranularity = mvkPD->getSparseImageGranularity(pCreateInfo->format, pCreateInfo->imageType);
++	if ( !mvkPD->supportsSparseResources() || !_sparseGranularity.width || _planes.size() != 1 ||
++		_samples != VK_SAMPLE_COUNT_1_BIT || _isLinear || _isLinearForAtomics ) {
++		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage(): Sparse images of format %s and this configuration are not supported.", getPixelFormats()->getName(pCreateInfo->format)));
++		return;
++	}
++	_isSparse = true;
++
++	id<MTLTexture> tex = getMTLTexture(0);
++	if ( !tex ) {
++		setConfigurationResult(reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkCreateImage(): Could not create a sparse texture."));
++		return;
++	}
++	_sparseMipTailFirstLod = std::min((uint32_t)tex.firstMipmapInTail, _mipLevels);
++	_sparseMipTailBlocks = _sparseMipTailFirstLod < _mipLevels
++		? (uint32_t)mvkCeilingDivide(std::max(tex.tailSizeInBytes, (NSUInteger)1), (NSUInteger)MVKPhysicalDevice::kSparseBlockSize) : 0;
++	_sparseMipFirstBlock.clear();
++	uint32_t blocks = 0;
++	for (uint32_t mipLvl = 0; mipLvl < _sparseMipTailFirstLod; mipLvl++) {
++		_sparseMipFirstBlock.push_back(blocks);
++		VkExtent3D count = getSparseMipBlockCounts(mipLvl);
++		blocks += count.width * count.height * count.depth;
++	}
++	_sparseMipFirstBlock.push_back(blocks);	// The tail
++	_sparseLayerBlocks = blocks + _sparseMipTailBlocks;
++
++	MVKImageMemoryBinding* memoryBinding = _planes[0]->getMemoryBinding();
++	memoryBinding->_byteCount = (VkDeviceSize)_sparseLayerBlocks * _arrayLayers * MVKPhysicalDevice::kSparseBlockSize;
++	memoryBinding->_byteAlignment = MVKPhysicalDevice::kSparseBlockSize;
++}
++
++VkExtent3D MVKImage::getSparseMipBlockCounts(uint32_t mipLevel) {
++	VkExtent3D extent = getExtent3D(0, mipLevel);
++	return { mvkCeilingDivide(extent.width, _sparseGranularity.width),
++			 mvkCeilingDivide(extent.height, _sparseGranularity.height),
++			 mvkCeilingDivide(extent.depth, _sparseGranularity.depth) };
++}
++
++void MVKImage::getSparseMemoryRequirements(uint32_t* pCount, VkSparseImageMemoryRequirements* pRequirements) {
++	if ( !_isSparse ) {
++		*pCount = 0;
++		return;
++	}
++	if ( !pRequirements ) {
++		*pCount = 1;
++		return;
++	}
++	if (*pCount == 0) { return; }
++	*pCount = 1;
++
++	uint32_t propCount = 1;
++	getPhysicalDevice()->getSparseImageFormatProperties(_vkFormat, getImageType(), _samples, _usage, VK_IMAGE_TILING_OPTIMAL,
++														&propCount, &pRequirements->formatProperties);
++	VkDeviceSize block = MVKPhysicalDevice::kSparseBlockSize;
++	pRequirements->imageMipTailFirstLod = _sparseMipTailFirstLod;
++	pRequirements->imageMipTailSize = (VkDeviceSize)_sparseMipTailBlocks * block;
++	pRequirements->imageMipTailOffset = (VkDeviceSize)_sparseMipFirstBlock.back() * block;
++	pRequirements->imageMipTailStride = (VkDeviceSize)_sparseLayerBlocks * block;
++}
++
++// Returns the heap a sparse bind maps onto, or nil to unmap; false if the memory cannot back sparse blocks.
++static bool mvkGetSparseBindHeap(VkDeviceMemory memory, id<MTLHeap>* pHeap) {
++	*pHeap = nil;
++	if ( !memory ) { return true; }
++	*pHeap = ((MVKDeviceMemory*)memory)->getSparseBindingMTLHeap();
++	return *pHeap != nil;
++}
++
++VkResult MVKImage::getSparseMappings(const VkSparseImageMemoryBind& bind, MVKSmallVector<MVKSparseTextureMapping, 8>& mappings) {
++	MVKSparseTextureMapping mapping = {};
++	if ( !mvkGetSparseBindHeap(bind.memory, &mapping.heap) ) {
++		return reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): The memory cannot back sparse blocks.");
++	}
++	if (bind.subresource.mipLevel >= _sparseMipTailFirstLod) {
++		return reportError(VK_ERROR_VALIDATION_FAILED_EXT, "vkQueueBindSparse(): Mip level %u is in the mip tail, which is bound with opaque binds.", bind.subresource.mipLevel);
++	}
++	const VkExtent3D& g = _sparseGranularity;
++	VkExtent3D mipExtent = getExtent3D(0, bind.subresource.mipLevel);
++	uint32_t x = (uint32_t)bind.offset.x / g.width, y = (uint32_t)bind.offset.y / g.height, z = (uint32_t)bind.offset.z / g.depth;
++	// The extent may end at the mip's edge, short of a whole block.
++	uint32_t w = mvkCeilingDivide(std::min(bind.extent.width, mipExtent.width - bind.offset.x), g.width);
++	uint32_t h = mvkCeilingDivide(std::min(bind.extent.height, mipExtent.height - bind.offset.y), g.height);
++	uint32_t d = mvkCeilingDivide(std::min(bind.extent.depth, mipExtent.depth - bind.offset.z), g.depth);
++	mapping.region = MTLRegionMake3D(x, y, z, w, h, d);
++	mapping.level = bind.subresource.mipLevel;
++	mapping.slice = bind.subresource.arrayLayer;
++	mapping.heapOffset = bind.memoryOffset / MVKPhysicalDevice::kSparseBlockSize;
++	mappings.push_back(mapping);
++	return VK_SUCCESS;
++}
++
++VkResult MVKImage::getSparseMappings(const VkSparseMemoryBind& bind, MVKSmallVector<MVKSparseTextureMapping, 8>& mappings) {
++	id<MTLHeap> heap = nil;
++	if ( !mvkGetSparseBindHeap(bind.memory, &heap) ) {
++		return reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): The memory cannot back sparse blocks.");
++	}
++	VkDeviceSize block = MVKPhysicalDevice::kSparseBlockSize;
++	uint32_t first = (uint32_t)(bind.resourceOffset / block);
++	uint32_t count = (uint32_t)mvkCeilingDivide(bind.size, block);
++	NSUInteger heapBlock = bind.memoryOffset / block;
++	uint32_t regularBlocks = _sparseMipFirstBlock.back();
++
++	for (uint32_t b = first; b < first + count; b++, heapBlock++) {
++		uint32_t layer = b / _sparseLayerBlocks;
++		uint32_t r = b % _sparseLayerBlocks;
++		if (layer >= _arrayLayers) { break; }
++
++		MVKSparseTextureMapping mapping = {};
++		mapping.heap = heap;
++		mapping.slice = layer;
++		mapping.heapOffset = heapBlock;
++		if (r >= regularBlocks) {
++			// A mip tail block.
++			mapping.level = _sparseMipTailFirstLod;
++			mapping.region = MTLRegionMake2D(r - regularBlocks, 0, 1, 1);
++		} else {
++			uint32_t mip = 0;
++			while (mip + 1 < _sparseMipTailFirstLod && _sparseMipFirstBlock[mip + 1] <= r) { mip++; }
++			VkExtent3D counts = getSparseMipBlockCounts(mip);
++			uint32_t local = r - _sparseMipFirstBlock[mip];
++			mapping.level = mip;
++			mapping.region = MTLRegionMake3D(local % counts.width, (local / counts.width) % counts.height,
++											 local / (counts.width * counts.height), 1, 1, 1);
++		}
++
++		// Extend the previous mapping along its row when this block follows it.
++		if ( !mappings.empty() ) {
++			auto& prev = mappings.back();
++			if (prev.heap == mapping.heap && prev.level == mapping.level && prev.slice == mapping.slice &&
++				r < regularBlocks && prev.region.origin.y == mapping.region.origin.y && prev.region.origin.z == mapping.region.origin.z &&
++				prev.region.size.height == 1 && prev.region.size.depth == 1 &&
++				prev.region.origin.x + prev.region.size.width == mapping.region.origin.x &&
++				(!heap || prev.heapOffset + prev.region.size.width == mapping.heapOffset)) {
++				prev.region.size.width++;
++				continue;
++			}
++		}
++		mappings.push_back(mapping);
++	}
++	return VK_SUCCESS;
++}
++
+ VkResult MVKImage::bindDeviceMemory2(const VkBindImageMemoryInfo* pBindInfo) {
+     uint8_t planeIndex = 0;
+     for (const auto* next = (const VkBaseInStructure*)pBindInfo->pNext; next; next = next->pNext) {
+@@ -1312,6 +1481,8 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+     }
+     _hasExpectedTexelSize = _hasChromaSubsampling || (pixFmts->getBytesPerBlock(_planes[0]->_mtlPixFmt) == pixFmts->getBytesPerBlock(_vkFormat));
+ 
++	if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) { initSparse(pCreateInfo); }
++
+ 	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
+ 
+ 	// Setting Metal objects directly will override Vulkan settings.
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
 index ef69994a..6fa84475 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
@@ -12139,10 +12693,24 @@ index e5d4baeb..b98b687e 100644
  #pragma mark MVKPipelineStatisticsQueryPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
-index b18549c7..df56184f 100644
+index b18549c7..1e85cd4c 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
-@@ -138,7 +138,7 @@ protected:
+@@ -99,6 +99,9 @@ public:
+ 	/** Submits the specified presentation command to the queue. */
+ 	VkResult submit(const VkPresentInfoKHR* pPresentInfo);
+ 
++	/** Binds sparse resource memory (vkQueueBindSparse). */
++	VkResult bindSparse(uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence);
++
+ 	/** Block the current thread until this queue is idle. */
+ 	VkResult waitIdle(MVKCommandUse cmdUse);
+ 
+@@ -135,10 +138,11 @@ protected:
+ 	friend class MVKQueueSubmission;
+ 	friend class MVKQueueCommandBufferSubmission;
+ 	friend class MVKQueuePresentSurfaceSubmission;
++	friend class MVKQueueSparseBindSubmission;
  
  	void propagateDebugName() override;
  	void initName();
@@ -12151,7 +12719,7 @@ index b18549c7..df56184f 100644
  	void initMTLCommandQueue();
  	void destroyExecQueue();
  	VkResult submit(MVKQueueSubmission* qSubmit);
-@@ -147,7 +147,7 @@ protected:
+@@ -147,7 +151,7 @@ protected:
  
  	MVKQueueFamily* _queueFamily;
  	std::string _name;
@@ -12160,7 +12728,22 @@ index b18549c7..df56184f 100644
  	std::mutex _execQueueMutex;
  	std::condition_variable _execQueueConditionVariable;
  	uint32_t _execQueueJobCount = 0;
-@@ -180,12 +180,21 @@ public:
+@@ -164,6 +168,14 @@ protected:
+ 	float _priority;
+ 	VkQueueGlobalPriority _globalPriority;
+ 	uint32_t _index;
++
++	// Sparse mappings are applied on an MTL4CommandQueue. Every MTLCommandBuffer of this queue
++	// waits for the mappings made before it was created, signalled on this event.
++	id _mtl4Queue = nil;	// id<MTL4CommandQueue>
++	id<MTLSharedEvent> _sparseMappingEvent = nil;
++	uint64_t _sparseMappingEventValue = 0;	// Last value used, by sparse bind submissions only
++	std::atomic<uint64_t> _sparseMappingsDoneValue = 0;
++	bool ensureSparseMappingQueue();
+ };
+ 
+ 
+@@ -180,12 +192,21 @@ public:
  
  	void encodeWait(id<MTLCommandBuffer> mtlCmdBuff);
  	void encodeSignal(id<MTLCommandBuffer> mtlCmdBuff);
@@ -12182,7 +12765,7 @@ index b18549c7..df56184f 100644
  } MVKSemaphoreSubmitInfo;
  
  /** This is an abstract class for an operation that can be submitted to an MVKQueue. */
-@@ -218,6 +227,9 @@ protected:
+@@ -218,6 +239,9 @@ protected:
  	friend class MVKQueue;
  
  	virtual void finish() = 0;
@@ -12192,7 +12775,7 @@ index b18549c7..df56184f 100644
  	MVKDevice* getDevice() { return _queue->getDevice(); }
  
  	MVKQueue* _queue;
-@@ -261,12 +273,16 @@ public:
+@@ -261,12 +285,16 @@ public:
  
  protected:
  	friend MVKCommandBuffer;
@@ -12209,7 +12792,7 @@ index b18549c7..df56184f 100644
  
  	MVKCommandEncodingContext _encodingContext;
  	MVKSmallVector<MVKSemaphoreSubmitInfo> _signalSemaphores;
-@@ -297,6 +313,9 @@ public:
+@@ -297,11 +325,48 @@ public:
  
  protected:
  	void submitCommandBuffers() override;
@@ -12219,16 +12802,64 @@ index b18549c7..df56184f 100644
  
  	MVKSmallVector<MVKCommandBufferSubmitInfo, N> _cmdBuffers;
  };
-@@ -319,4 +338,3 @@ protected:
+ 
+ 
++#pragma mark -
++#pragma mark MVKQueueSparseBindSubmission
++
++/**
++ * Binds sparse resource memory. Waits on the semaphores in a MTLCommandBuffer that then signals the
++ * queue's sparse mapping event, which the MTL4CommandQueue waits on before applying the mappings and
++ * signalling the event again. The semaphores and fence are signalled after that, by a MTLCommandBuffer
++ * that waits for the mappings like every later MTLCommandBuffer of the queue.
++ */
++class MVKQueueSparseBindSubmission : public MVKQueueCommandBufferSubmission {
++
++public:
++	MVKQueueSparseBindSubmission(MVKQueue* queue, const VkBindSparseInfo* pBindInfo, VkFence fence);
++
++	~MVKQueueSparseBindSubmission() override;
++
++protected:
++	void submitCommandBuffers() override;
++
++	struct BufferMapping {
++		id<MTLBuffer> buffer;	// retained
++		id<MTLHeap> heap;		// retained; nil to unmap
++		NSRange blocks;
++		NSUInteger heapOffset;
++	};
++	struct TextureMapping {
++		id<MTLTexture> texture;	// retained
++		MVKSparseTextureMapping mapping;	// heap retained
++	};
++	MVKSmallVector<BufferMapping, 4> _bufferMappings;
++	MVKSmallVector<TextureMapping, 8> _textureMappings;
++};
++
++
+ #pragma mark -
+ #pragma mark MVKQueuePresentSurfaceSubmission
+ 
+@@ -319,4 +384,3 @@ protected:
  
  	MVKSmallVector<MVKImagePresentInfo, 4> _presentInfo;
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-index dec4b452..6c0f63c6 100644
+index dec4b452..941ee881 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-@@ -79,6 +79,12 @@
+@@ -18,6 +18,8 @@
+ 
+ #include "MVKInstance.h"
+ #include "MVKQueue.h"
++#include "MVKBuffer.h"
++#include "MVKDeviceMemory.h"
+ #include "MVKSurface.h"
+ #include "MVKSwapchain.h"
+ #include "MVKSync.h"
+@@ -79,6 +81,12 @@
  	if (_device->getConfigurationResult() != VK_SUCCESS) { return _device->getConfigurationResult(); }
  
  	if ( !qSubmit ) { return VK_SUCCESS; }     // Ignore nils
@@ -12241,7 +12872,66 @@ index dec4b452..6c0f63c6 100644
  
  	// Extract result before submission to avoid race condition with early destruction
  	// Submit regardless of config result, to ensure submission semaphores and fences are signalled.
-@@ -300,9 +306,8 @@
+@@ -149,6 +157,47 @@
+ 	return submit(new MVKQueuePresentSurfaceSubmission(this, pPresentInfo));
+ }
+ 
++VkResult MVKQueue::bindSparse(uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence) {
++	if ( !getPhysicalDevice()->supportsSparseResources() || !ensureSparseMappingQueue() ) {
++		return reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): Sparse binding is not supported.");
++	}
++
++	// Fence-only submission
++	if (bindInfoCount == 0 && fence) {
++		return submit(new MVKQueueCommandBufferSubmission(this, (VkSubmitInfo*)nullptr, fence, kMVKCommandUseQueueSubmit));
++	}
++
++	VkResult rslt = VK_SUCCESS;
++	for (uint32_t bIdx = 0; bIdx < bindInfoCount; bIdx++) {
++		VkFence fenceOrNil = (bIdx == (bindInfoCount - 1)) ? fence : VK_NULL_HANDLE; // last one gets the fence
++		VkResult subRslt = submit(new MVKQueueSparseBindSubmission(this, &pBindInfo[bIdx], fenceOrNil));
++		if (rslt == VK_SUCCESS) { rslt = subRslt; }
++	}
++	return rslt;
++}
++
++bool MVKQueue::ensureSparseMappingQueue() {
++#if MVK_XCODE_26 && MVK_MACOS
++	if (_mtl4Queue) { return true; }
++	std::unique_lock lock(_execQueueMutex);
++	if (_mtl4Queue) { return true; }
++	@autoreleasepool {
++		NSError* err = nil;
++		id<MTL4CommandQueue> mtl4Queue = [getMTLDevice() newMTL4CommandQueueWithDescriptor: [[MTL4CommandQueueDescriptor new] autorelease]
++																					 error: &err];	// retained
++		if ( !mtl4Queue ) {
++			reportError(VK_ERROR_INITIALIZATION_FAILED, "Could not create the MTL4CommandQueue for sparse binding: %s", err.localizedDescription.UTF8String);
++			return false;
++		}
++		_sparseMappingEvent = [getMTLDevice() newSharedEvent];	// retained
++		_mtl4Queue = mtl4Queue;
++	}
++	return true;
++#else
++	return false;
++#endif
++}
++
+ VkResult MVKQueue::waitIdle(MVKCommandUse cmdUse) {
+ 	if (_execQueue) {
+ 		std::unique_lock lock(_execQueueMutex);
+@@ -176,6 +225,10 @@
+ 	[mtlCmdBuffDesc release];														// temp release
+ 
+ 	addPerformanceInterval(getPerformanceStats().queue.retrieveMTLCommandBuffer, startTime);
++	// Sparse mappings made on this queue precede its later work.
++	if (uint64_t sparseMappingsDone = _sparseMappingsDoneValue.load()) {
++		[mtlCmdBuff encodeWaitForEvent: _sparseMappingEvent value: sparseMappingsDone];
++	}
+ 	NSString* mtlCmdBuffLabel = getMTLCommandBufferLabel(cmdUse);
+ 	setMetalObjectLabel(mtlCmdBuff, mtlCmdBuffLabel);
+ 	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) { handleMTLCommandBufferError(mtlCB); }];
+@@ -300,9 +353,8 @@
  	_name = name;
  }
  
@@ -12253,7 +12943,16 @@ index dec4b452..6c0f63c6 100644
  		// Determine the dispatch queue priority
  		dispatch_qos_class_t dqQOS;
  		switch (_globalPriority) {
-@@ -366,11 +371,145 @@
+@@ -341,6 +393,8 @@
+ 
+ MVKQueue::~MVKQueue() {
+ 	destroyExecQueue();
++	[_mtl4Queue release];
++	[_sparseMappingEvent release];
+ 	_submissionCaptureScope->destroy();
+ 	_device->removeResidencySet(_mtlQueue);
+ 
+@@ -366,11 +420,145 @@
  #pragma mark MVKQueueSubmission
  
  void MVKSemaphoreSubmitInfo::encodeWait(id<MTLCommandBuffer> mtlCmdBuff) {
@@ -12401,7 +13100,7 @@ index dec4b452..6c0f63c6 100644
  }
  
  MVKSemaphoreSubmitInfo::MVKSemaphoreSubmitInfo(const VkSemaphoreSubmitInfo& semaphoreSubmitInfo) :
-@@ -394,7 +533,8 @@
+@@ -394,7 +582,8 @@
  	_semaphore(other._semaphore),
  	value(other.value),
  	stageMask(other.stageMask),
@@ -12411,7 +13110,7 @@ index dec4b452..6c0f63c6 100644
  		if (_semaphore) { _semaphore->retain(); }
  }
  
-@@ -407,6 +547,7 @@
+@@ -407,6 +596,7 @@
  	value = other.value;
  	stageMask = other.stageMask;
  	deviceIndex = other.deviceIndex;
@@ -12419,7 +13118,7 @@ index dec4b452..6c0f63c6 100644
  	return *this;
  }
  
-@@ -435,6 +576,9 @@
+@@ -435,6 +625,9 @@
  	for (uint32_t i = 0; i < waitSemaphoreInfoCount; i++) {
  		_waitSemaphores.emplace_back(pWaitSemaphoreSubmitInfos[i]);
  	}
@@ -12429,7 +13128,7 @@ index dec4b452..6c0f63c6 100644
  }
  
  MVKQueueSubmission::MVKQueueSubmission(MVKQueue* queue,
-@@ -451,12 +595,20 @@
+@@ -451,12 +644,20 @@
  	for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
  		_waitSemaphores.emplace_back(pWaitSemaphores[i], pWaitDstStageMask ? pWaitDstStageMask[i] : 0);
  	}
@@ -12450,7 +13149,7 @@ index dec4b452..6c0f63c6 100644
  
  #pragma mark -
  #pragma mark MVKQueueCommandBufferSubmission
-@@ -467,12 +619,43 @@
+@@ -467,12 +668,43 @@
  
  	// If using encoded semaphore waiting, do so now.
  	for (auto& ws : _waitSemaphores) { ws.encodeWait(getActiveMTLCommandBuffer()); }
@@ -12494,7 +13193,7 @@ index dec4b452..6c0f63c6 100644
  
  	// If using encoded semaphore signaling, do so now.
  	for (auto& ss : _signalSemaphores) { ss.encodeSignal(getActiveMTLCommandBuffer()); }
-@@ -486,7 +669,9 @@
+@@ -486,7 +718,9 @@
  id<MTLCommandBuffer> MVKQueueCommandBufferSubmission::getActiveMTLCommandBuffer() {
  	if ( !_activeMTLCommandBuffer ) {
  		bool needsRetain = false;
@@ -12505,7 +13204,7 @@ index dec4b452..6c0f63c6 100644
  			// Partially bound descriptors will get bound by us even if they're not used at runtime by the shader.
  			// The application is free to destroy them even if they're not used at runtime even if we bound them.
  			// Metal will be very unhappy if we destroy something we bound, even if it isn't used at runtime.
-@@ -563,6 +748,18 @@
+@@ -563,6 +797,18 @@
  	return rslt;
  }
  
@@ -12524,7 +13223,7 @@ index dec4b452..6c0f63c6 100644
  // Be sure to retain() any API objects referenced in this function, and release() them in the
  // destructor (or superclass destructor). It is possible for rare race conditions to result
  // in the app destroying API objects before this function completes execution. For example,
-@@ -605,6 +802,9 @@
+@@ -605,6 +851,9 @@
  		for (uint32_t i = 0; i < ssCnt; i++) {
  			_signalSemaphores.emplace_back(pSubmit->pSignalSemaphoreInfos[i]);
  		}
@@ -12534,7 +13233,7 @@ index dec4b452..6c0f63c6 100644
  	}
  }
  
-@@ -654,6 +854,9 @@
+@@ -654,6 +903,9 @@
  				_signalSemaphores[i].value = pTimelineSubmit->pSignalSemaphoreValues[i];
  			}
          }
@@ -12544,7 +13243,7 @@ index dec4b452..6c0f63c6 100644
      }
  }
  
-@@ -671,6 +874,30 @@
+@@ -671,6 +923,30 @@
  	addPerformanceInterval(getPerformanceStats().queue.submitCommandBuffers, startTime);
  }
  
@@ -12575,11 +13274,153 @@ index dec4b452..6c0f63c6 100644
  template <size_t N>
  MVKQueueFullCommandBufferSubmission<N>::MVKQueueFullCommandBufferSubmission(MVKQueue* queue,
  																			const VkSubmitInfo2* pSubmit,
-@@ -850,4 +1077,3 @@
- 		setConfigurationResult(scRslt);
+@@ -851,3 +1127,146 @@
  	}
  }
--
+ 
++
++#pragma mark -
++#pragma mark MVKQueueSparseBindSubmission
++
++// VkBindSparseInfo carries its semaphores like VkSubmitInfo does, including the timeline values in its
++// pNext chain, but with no wait stage masks.
++static const VkSubmitInfo* mvkSubmitInfoFromBindSparseInfo(const VkBindSparseInfo* pBindInfo) {
++	static thread_local MVKSmallVector<VkPipelineStageFlags, 8> waitStages;
++	static thread_local VkSubmitInfo submitInfo;
++	waitStages.resize(pBindInfo->waitSemaphoreCount);
++	for (auto& stage : waitStages) { stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; }
++	submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++	submitInfo.pNext = pBindInfo->pNext;
++	submitInfo.waitSemaphoreCount = pBindInfo->waitSemaphoreCount;
++	submitInfo.pWaitSemaphores = pBindInfo->pWaitSemaphores;
++	submitInfo.pWaitDstStageMask = waitStages.data();
++	submitInfo.signalSemaphoreCount = pBindInfo->signalSemaphoreCount;
++	submitInfo.pSignalSemaphores = pBindInfo->pSignalSemaphores;
++	return &submitInfo;
++}
++
++MVKQueueSparseBindSubmission::MVKQueueSparseBindSubmission(MVKQueue* queue, const VkBindSparseInfo* pBindInfo, VkFence fence) :
++	MVKQueueCommandBufferSubmission(queue, mvkSubmitInfoFromBindSparseInfo(pBindInfo), fence, kMVKCommandUseQueueSubmit) {
++
++	VkDeviceSize block = MVKPhysicalDevice::kSparseBlockSize;
++
++	for (uint32_t i = 0; i < pBindInfo->bufferBindCount; i++) {
++		const auto& bufferBind = pBindInfo->pBufferBinds[i];
++		auto* mvkBuff = (MVKBuffer*)bufferBind.buffer;
++		for (uint32_t j = 0; j < bufferBind.bindCount; j++) {
++			const auto& bind = bufferBind.pBinds[j];
++			id<MTLHeap> heap = nil;
++			if (bind.memory) {
++				heap = ((MVKDeviceMemory*)bind.memory)->getSparseBindingMTLHeap();
++				if ( !heap ) {
++					setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): The memory cannot back sparse blocks."));
++					continue;
++				}
++			}
++			BufferMapping mapping;
++			mapping.buffer = [mvkBuff->getMTLBuffer() retain];
++			mapping.heap = [heap retain];
++			mapping.blocks = NSMakeRange(bind.resourceOffset / block, mvkCeilingDivide(bind.size, block));
++			mapping.heapOffset = bind.memoryOffset / block;
++			_bufferMappings.push_back(mapping);
++		}
++	}
++
++	MVKSmallVector<MVKSparseTextureMapping, 8> mappings;
++	auto addTextureMappings = [&](MVKImage* mvkImg) {
++		id<MTLTexture> texture = mvkImg->getMTLTexture(0);
++		for (auto& mapping : mappings) {
++			[mapping.heap retain];
++			_textureMappings.push_back({ [texture retain], mapping });
++		}
++		mappings.clear();
++	};
++	for (uint32_t i = 0; i < pBindInfo->imageOpaqueBindCount; i++) {
++		const auto& opaqueBind = pBindInfo->pImageOpaqueBinds[i];
++		auto* mvkImg = (MVKImage*)opaqueBind.image;
++		for (uint32_t j = 0; j < opaqueBind.bindCount; j++) {
++			VkResult rslt = mvkImg->getSparseMappings(opaqueBind.pBinds[j], mappings);
++			if (rslt != VK_SUCCESS) { setConfigurationResult(rslt); }
++		}
++		addTextureMappings(mvkImg);
++	}
++	for (uint32_t i = 0; i < pBindInfo->imageBindCount; i++) {
++		const auto& imageBind = pBindInfo->pImageBinds[i];
++		auto* mvkImg = (MVKImage*)imageBind.image;
++		for (uint32_t j = 0; j < imageBind.bindCount; j++) {
++			VkResult rslt = mvkImg->getSparseMappings(imageBind.pBinds[j], mappings);
++			if (rslt != VK_SUCCESS) { setConfigurationResult(rslt); }
++		}
++		addTextureMappings(mvkImg);
++	}
++}
++
++void MVKQueueSparseBindSubmission::submitCommandBuffers() {
++#if MVK_XCODE_26 && MVK_MACOS
++	id<MTL4CommandQueue> mtl4Queue = _queue->_mtl4Queue;
++	id<MTLSharedEvent> event = _queue->_sparseMappingEvent;
++
++	// The semaphore waits were encoded in the active MTLCommandBuffer (or done on the CPU when it is committed).
++	uint64_t waitsDone = ++_queue->_sparseMappingEventValue;
++	[getActiveMTLCommandBuffer() encodeSignalEvent: event value: waitsDone];
++	commitActiveMTLCommandBuffer();
++	[mtl4Queue waitForEvent: event value: waitsDone];
++
++	// Apply the mappings, batching consecutive operations on the same resource and heap.
++	size_t count = _bufferMappings.size();
++	for (size_t i = 0; i < count; ) {
++		size_t n = 1;
++		while (i + n < count && _bufferMappings[i + n].buffer == _bufferMappings[i].buffer &&
++			   _bufferMappings[i + n].heap == _bufferMappings[i].heap) { n++; }
++		MVKSmallVector<MTL4UpdateSparseBufferMappingOperation, 8> ops;
++		for (size_t k = i; k < i + n; k++) {
++			MTL4UpdateSparseBufferMappingOperation op = {};
++			op.mode = _bufferMappings[k].heap ? MTLSparseTextureMappingModeMap : MTLSparseTextureMappingModeUnmap;
++			op.bufferRange = _bufferMappings[k].blocks;
++			op.heapOffset = _bufferMappings[k].heapOffset;
++			ops.push_back(op);
++		}
++		[mtl4Queue updateBufferMappings: _bufferMappings[i].buffer heap: _bufferMappings[i].heap operations: ops.data() count: ops.size()];
++		i += n;
++	}
++	count = _textureMappings.size();
++	for (size_t i = 0; i < count; ) {
++		size_t n = 1;
++		while (i + n < count && _textureMappings[i + n].texture == _textureMappings[i].texture &&
++			   _textureMappings[i + n].mapping.heap == _textureMappings[i].mapping.heap) { n++; }
++		MVKSmallVector<MTL4UpdateSparseTextureMappingOperation, 8> ops;
++		for (size_t k = i; k < i + n; k++) {
++			const auto& mapping = _textureMappings[k].mapping;
++			MTL4UpdateSparseTextureMappingOperation op = {};
++			op.mode = mapping.heap ? MTLSparseTextureMappingModeMap : MTLSparseTextureMappingModeUnmap;
++			op.textureRegion = mapping.region;
++			op.textureLevel = mapping.level;
++			op.textureSlice = mapping.slice;
++			op.heapOffset = mapping.heapOffset;
++			ops.push_back(op);
++		}
++		[mtl4Queue updateTextureMappings: _textureMappings[i].texture heap: _textureMappings[i].mapping.heap operations: ops.data() count: ops.size()];
++		i += n;
++	}
++
++	// Every MTLCommandBuffer created from now on, starting with the one that signals the
++	// semaphores and fence, waits for the mappings.
++	uint64_t mappingsDone = ++_queue->_sparseMappingEventValue;
++	[mtl4Queue signalEvent: event value: mappingsDone];
++	_queue->_sparseMappingsDoneValue.store(mappingsDone);
++#endif
++}
++
++MVKQueueSparseBindSubmission::~MVKQueueSparseBindSubmission() {
++	for (auto& mapping : _bufferMappings) {
++		[mapping.buffer release];
++		[mapping.heap release];
++	}
++	for (auto& mapping : _textureMappings) {
++		[mapping.texture release];
++		[mapping.mapping.heap release];
++	}
++}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 index c5b74991..94fc54d7 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
@@ -13140,7 +13981,7 @@ index 9ee4db10..ac1da26c 100644
          result |= 1 << kMVKBarrierStageCopy;
  
 diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
-index 9ee0c4eb..fdffc98d 100644
+index 9ee0c4eb..795e7a56 100644
 --- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 +++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 @@ -41,6 +41,7 @@
@@ -13169,7 +14010,46 @@ index 9ee0c4eb..fdffc98d 100644
  // Add one of two commands, based on comparing a command parameter against a threshold value
  #define MVKAddCmdFromThreshold(baseCmdType, value, threshold, vkCmdBuff, ...)					\
  	if (value <= threshold) {																	\
-@@ -1096,6 +1108,116 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateComputePipelines(
+@@ -624,12 +636,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetImageSparseMemoryRequirements(
+     VkSparseImageMemoryRequirements*            pSparseMemoryRequirements) {
+ 
+ 	MVKTraceVulkanCallStart();
+-
+-	// Metal does not support sparse images.
+-	// Vulkan spec: "If the image was not created with VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT then
+-	// pSparseMemoryRequirementCount will be set to zero and pSparseMemoryRequirements will not be written to.".
+-
+-	*pNumRequirements = 0;
++	MVKImage* mvkImg = (MVKImage*)image;
++	mvkImg->getSparseMemoryRequirements(pNumRequirements, pSparseMemoryRequirements);
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -644,12 +652,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetPhysicalDeviceSparseImageFormatProperties(
+ 	VkSparseImageFormatProperties*              pProperties) {
+ 
+ 	MVKTraceVulkanCallStart();
+-
+-	// Metal does not support sparse images.
+-	// Vulkan spec: "If VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT is not supported for the given arguments,
+-	// pPropertyCount will be set to zero upon return, and no data will be written to pProperties.".
+-
+-	*pPropertyCount = 0;
++	MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
++	mvkPD->getSparseImageFormatProperties(format, type, samples, usage, tiling, pPropertyCount, pProperties);
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -661,7 +665,7 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueueBindSparse(
+ 
+ 	MVKTraceVulkanCallStart();
+ 	MVKQueue* mvkQ = MVKQueue::getMVKQueue(queue);
+-	VkResult rslt = mvkQ->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): Sparse binding is not supported.");
++	VkResult rslt = mvkQ->bindSparse(bindInfoCount, pBindInfo, fence);
+ 	MVKTraceVulkanCallEnd();
+ 	return rslt;
+ }
+@@ -1096,6 +1100,116 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateComputePipelines(
  	return rslt;
  }
  
@@ -13286,7 +14166,7 @@ index 9ee0c4eb..fdffc98d 100644
  MVK_PUBLIC_VULKAN_SYMBOL void vkDestroyPipeline(
      VkDevice                                    device,
  	VkPipeline                                  pipeline,
-@@ -1439,6 +1561,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindPipeline(
+@@ -1439,6 +1553,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindPipeline(
  			MVKAddCmd(BindComputePipeline, commandBuffer, pipeline);
  			break;
  		}
@@ -13297,7 +14177,70 @@ index 9ee0c4eb..fdffc98d 100644
  		default:
  			break;
  	}
-@@ -2967,6 +3093,14 @@ MVK_PUBLIC_VULKAN_SYMBOL void  vkGetDeviceImageSubresourceLayout(
+@@ -2118,12 +2236,15 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetPhysicalDeviceSparseImageFormatProperties2(
+     VkSparseImageFormatProperties2*               pProperties) {
+ 
+ 	MVKTraceVulkanCallStart();
+-
+-	// Metal does not support sparse images.
+-	// Vulkan spec: "If VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT is not supported for the given arguments,
+-	// pPropertyCount will be set to zero upon return, and no data will be written to pProperties.".
+-
+-    *pPropertyCount = 0;
++	MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
++	uint32_t count = pProperties ? std::min(*pPropertyCount, 1u) : 0;
++	VkSparseImageFormatProperties props = {};
++	mvkPD->getSparseImageFormatProperties(pFormatInfo->format, pFormatInfo->type, pFormatInfo->samples, pFormatInfo->usage,
++										  pFormatInfo->tiling, pProperties ? &count : pPropertyCount, pProperties ? &props : nullptr);
++	if (pProperties) {
++		*pPropertyCount = count;
++		if (count) { pProperties[0].properties = props; }
++	}
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -2232,12 +2353,15 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetImageSparseMemoryRequirements2(
+     VkSparseImageMemoryRequirements2*               pSparseMemoryRequirements) {
+ 
+ 	MVKTraceVulkanCallStart();
+-
+-	// Metal does not support sparse images.
+-	// Vulkan spec: "If the image was not created with VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT then
+-	// pSparseMemoryRequirementCount will be set to zero and pSparseMemoryRequirements will not be written to.".
+-
+-    *pSparseMemoryRequirementCount = 0;
++	MVKImage* mvkImg = (MVKImage*)pInfo->image;
++	uint32_t count = pSparseMemoryRequirements ? std::min(*pSparseMemoryRequirementCount, 1u) : 0;
++	VkSparseImageMemoryRequirements reqs = {};
++	mvkImg->getSparseMemoryRequirements(pSparseMemoryRequirements ? &count : pSparseMemoryRequirementCount,
++										pSparseMemoryRequirements ? &reqs : nullptr);
++	if (pSparseMemoryRequirements) {
++		*pSparseMemoryRequirementCount = count;
++		if (count) { pSparseMemoryRequirements[0].memoryRequirements = reqs; }
++	}
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -2859,8 +2983,16 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetDeviceImageSparseMemoryRequirements(
+ 	VkSparseImageMemoryRequirements2*           pSparseMemoryRequirements) {
+ 	
+ 	MVKTraceVulkanCallStart();
+-	// Sparse images are not currently supported
+-	*pSparseMemoryRequirementCount = 0;
++	auto* mvkDev = MVKDevice::getMVKDevice(device);
++	MVKImage mvkImg(mvkDev, pInfo->pCreateInfo);
++	uint32_t count = pSparseMemoryRequirements ? std::min(*pSparseMemoryRequirementCount, 1u) : 0;
++	VkSparseImageMemoryRequirements reqs = {};
++	mvkImg.getSparseMemoryRequirements(pSparseMemoryRequirements ? &count : pSparseMemoryRequirementCount,
++									   pSparseMemoryRequirements ? &reqs : nullptr);
++	if (pSparseMemoryRequirements) {
++		*pSparseMemoryRequirementCount = count;
++		if (count) { pSparseMemoryRequirements[0].memoryRequirements = reqs; }
++	}
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -2967,6 +3099,14 @@ MVK_PUBLIC_VULKAN_SYMBOL void  vkGetDeviceImageSubresourceLayout(
  	MVKTraceVulkanCallEnd();
  }
  
@@ -13312,7 +14255,7 @@ index 9ee0c4eb..fdffc98d 100644
  MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
      VkCommandBuffer                             commandBuffer,
      const VkBindDescriptorSetsInfo*             pBindDescriptorSetsInfo) {
-@@ -2975,7 +3109,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
+@@ -2975,7 +3115,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
  	// If stageFlags specifies a subset of all stages corresponding to one or more pipeline bind points,
  	// the binding operation still affects all stages corresponding to the given pipeline bind point(s)
  	// as if the equivalent original version of this command had been called with the same parameters.
@@ -13321,7 +14264,7 @@ index 9ee0c4eb..fdffc98d 100644
  		if (pBindDescriptorSetsInfo->dynamicOffsetCount) {
  			MVKAddCmdFromThreshold(BindDescriptorSetsDynamic, pBindDescriptorSetsInfo->descriptorSetCount, 4, commandBuffer,
  					VK_PIPELINE_BIND_POINT_GRAPHICS, pBindDescriptorSetsInfo->layout, pBindDescriptorSetsInfo->firstSet,
-@@ -2999,6 +3133,18 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
+@@ -2999,6 +3139,18 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
  					pBindDescriptorSetsInfo->descriptorSetCount, pBindDescriptorSetsInfo->pDescriptorSets);
  		}
  	}
@@ -13340,7 +14283,7 @@ index 9ee0c4eb..fdffc98d 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -3020,7 +3166,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
+@@ -3020,7 +3172,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
  	// If stageFlags specifies a subset of all stages corresponding to one or more pipeline bind points,
  	// the binding operation still affects all stages corresponding to the given pipeline bind point(s)
  	// as if the equivalent original version of this command had been called with the same parameters.
@@ -13349,7 +14292,7 @@ index 9ee0c4eb..fdffc98d 100644
  		MVKAddCmd(PushDescriptorSet, commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pPushDescriptorSetInfo->layout,
  				pPushDescriptorSetInfo->set, pPushDescriptorSetInfo->descriptorWriteCount, pPushDescriptorSetInfo->pDescriptorWrites);
  	}
-@@ -3028,6 +3174,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
+@@ -3028,6 +3180,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
  		MVKAddCmd(PushDescriptorSet, commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pPushDescriptorSetInfo->layout,
  				pPushDescriptorSetInfo->set, pPushDescriptorSetInfo->descriptorWriteCount, pPushDescriptorSetInfo->pDescriptorWrites);
  	}
@@ -13360,7 +14303,7 @@ index 9ee0c4eb..fdffc98d 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -3160,6 +3310,214 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRenderingInputAttachmentIndices(
+@@ -3160,6 +3316,214 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRenderingInputAttachmentIndices(
  }
  
  
@@ -13575,7 +14518,7 @@ index 9ee0c4eb..fdffc98d 100644
  #pragma mark -
  #pragma mark VK_KHR_bind_memory2 extension
  
-@@ -4297,6 +4655,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
+@@ -4297,6 +4661,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkCmdSetLineStipple, EXT);
  
  
