@@ -1,0 +1,328 @@
+From e4453a5ba6b1361a48d087ffaa073ad7c5ed87f9 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 17:18:21 -0600
+Subject: [PATCH 13/13] MSL: conservative-rasterization mesh stage for vertex
+ shaders; mesh wrappers pass argument buffers, base vertex/instance and
+ dynamic strides
+
+---
+ spirv_msl.cpp | 196 ++++++++++++++++++++++++++++++++++++++++++++++----
+ spirv_msl.hpp |   7 ++
+ 2 files changed, 190 insertions(+), 13 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 2700052c..0a719024 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1811,6 +1811,146 @@ static const char *get_variable_format_string(SPIRType::BaseType type) {
+ 	}
+ }
+ 
++// Overestimating conservative rasterization for a vertex shader in a mesh pipeline. The mesh stage
++// emits the Minkowski sum of the projected triangle and the pixel box (at most 7 vertices: each
++// triangle vertex contributes the box corners between its edges' outward normals). Each new vertex
++// gets perspective-correct weights for the original vertices, so attributes and depth extrapolate
++// along the triangle's plane. Degenerate triangles are culled; triangles crossing w <= 0 are
++// passed through unexpanded.
++void CompilerMSL::emit_conservative_raster_mesh(const SPIRType &out_type)
++{
++	if (msl_options.input_primitive_type != Options::PrimitiveTopology::Triangles)
++		SPIRV_CROSS_THROW("Conservative rasterization needs a triangle list.");
++
++	string out_name = type_to_glsl(out_type);
++	string pos;
++	for (uint32_t i = 0; i < uint32_t(out_type.member_types.size()); i++)
++		if (has_member_decoration(out_type.self, i, DecorationBuiltIn) &&
++		    get_member_decoration(out_type.self, i, DecorationBuiltIn) == BuiltInPosition)
++			pos = to_member_name(out_type, i);
++	if (pos.empty())
++		SPIRV_CROSS_THROW("Conservative rasterization needs a position output.");
++
++	statement("");
++	statement("[[mesh]] void ", get_entry_point().name, "_PassThru(mesh<", out_name,
++	          ", void, 7, 5, topology::triangle> outputMesh, const object_data Payload &payload [[payload]])");
++	begin_scope();
++	statement(out_name, " v[3] = { payload.vertices[0], payload.vertices[1], payload.vertices[2] };");
++	statement("float4 c[3] = { v[0].", pos, ", v[1].", pos, ", v[2].", pos, " };");
++	statement("float2 e = payload.conservativeExtent;");
++	statement("float3 w[7];");
++	statement("uint n = 0;");
++	statement("bool ccw = true;");
++	statement("if (c[0].w > 1e-6 && c[1].w > 1e-6 && c[2].w > 1e-6 && e.x > 0.0 && e.y > 0.0)");
++	begin_scope();
++	statement("float2 p[3] = { c[0].xy / c[0].w, c[1].xy / c[1].w, c[2].xy / c[2].w };");
++	statement("float2 d1 = p[1] - p[0], d2 = p[2] - p[0];");
++	statement("float area = d1.x * d2.y - d1.y * d2.x;");
++	statement("if (abs(area) < 1e-14)");
++	begin_scope();
++	statement("outputMesh.set_primitive_count(0);");
++	statement("return;");
++	end_scope();
++	statement("ccw = area > 0.0;");
++	statement("uint order[3] = { 0u, ccw ? 1u : 2u, ccw ? 2u : 1u };");
++	statement("float2 corner[4] = { float2(e.x, e.y), float2(-e.x, e.y), float2(-e.x, -e.y), float2(e.x, -e.y) };");
++	statement("uint q[3];");
++	statement("for (uint k = 0; k < 3; k++)");
++	begin_scope();
++	statement("float2 d = p[order[(k + 1) % 3]] - p[order[k]];");
++	statement("float2 nrm = float2(d.y, -d.x);");
++	statement("q[k] = nrm.x >= 0.0 ? (nrm.y >= 0.0 ? 0u : 3u) : (nrm.y >= 0.0 ? 1u : 2u);");
++	end_scope();
++	statement("bool ok = true;");
++	statement("for (uint k = 0; k < 3 && ok; k++)");
++	begin_scope();
++	statement("for (uint s = q[(k + 2) % 3];; s = (s + 1) & 3u)");
++	begin_scope();
++	statement("float2 h = p[order[k]] + corner[s];");
++	statement("float2 r = h - p[0];");
++	statement("float bs = (r.x * d2.y - r.y * d2.x) / area, bt = (d1.x * r.y - d1.y * r.x) / area;");
++	statement("float3 l = float3(1.0 - bs - bt, bs, bt) / float3(c[0].w, c[1].w, c[2].w);");
++	statement("float sum = l.x + l.y + l.z;");
++	statement("if (!(sum > 0.0) || n == 7)");
++	begin_scope();
++	statement("ok = false;");
++	statement("break;");
++	end_scope();
++	statement("w[n++] = l / sum;");
++	statement("if (s == q[k])");
++	statement("    break;");
++	end_scope();
++	end_scope();
++	statement("if (!ok)");
++	statement("    n = 0;");
++	end_scope();
++	statement("if (n == 0)");
++	begin_scope();
++	statement("n = 3;");
++	statement("w[0] = float3(1, 0, 0);");
++	statement("w[1] = ccw ? float3(0, 1, 0) : float3(0, 0, 1);");
++	statement("w[2] = ccw ? float3(0, 0, 1) : float3(0, 1, 0);");
++	end_scope();
++
++	statement("for (uint k = 0; k < n; k++)");
++	begin_scope();
++	statement("float3 l = w[k];");
++	statement(out_name, " o = v[0];");
++	for (uint32_t i = 0; i < uint32_t(out_type.member_types.size()); i++)
++	{
++		auto &mtype = get<SPIRType>(out_type.member_types[i]);
++		if ((mtype.basetype != SPIRType::Float && mtype.basetype != SPIRType::Half) || mtype.columns != 1)
++			continue;
++		string m = to_member_name(out_type, i);
++		string elem_type = type_to_glsl(get<SPIRType>(mtype.self));
++		if (mtype.array.empty())
++			statement("o.", m, " = ", elem_type, "(v[0].", m, " * l.x + v[1].", m, " * l.y + v[2].", m, " * l.z);");
++		else if (mtype.array.size() == 1 && mtype.array_size_literal[0])
++		{
++			statement("for (uint a = 0; a < ", mtype.array[0], "; a++)");
++			statement("    o.", m, "[a] = ", elem_type, "(v[0].", m, "[a] * l.x + v[1].", m, "[a] * l.y + v[2].", m, "[a] * l.z);");
++		}
++	}
++	statement("o.", pos, ".y = -o.", pos, ".y;");
++	statement("outputMesh.set_vertex(k, o);");
++	end_scope();
++	statement("for (uint t = 0; t + 2 < n; t++)");
++	begin_scope();
++	statement("outputMesh.set_index(t * 3, 0);");
++	statement("outputMesh.set_index(t * 3 + 1, ccw ? t + 1 : t + 2);");
++	statement("outputMesh.set_index(t * 3 + 2, ccw ? t + 2 : t + 1);");
++	end_scope();
++	statement("outputMesh.set_primitive_count(n - 2);");
++	end_scope();
++}
++
++// The object/mesh wrappers of a mesh pipeline own the buffer bindings; the wrapped function takes the
++// argument buffers right after its stage input (see entry_point_args_argument_buffer()).
++void CompilerMSL::mesh_wrapper_argument_buffers(SmallVector<string> &decls, SmallVector<string> &names)
++{
++	if (!msl_options.argument_buffers)
++		return;
++	Bitset claimed_bindings;
++	for (uint32_t i = 0; i < kMaxArgumentBuffers; i++)
++	{
++		uint32_t id = argument_buffer_ids[i];
++		if (id == 0)
++			continue;
++		auto &var = get<SPIRVariable>(id);
++		auto &type = get_variable_data_type(var);
++		uint32_t buffer_binding;
++		auto itr = resource_bindings.find({ get_entry_point().model, i, kArgumentBufferBinding });
++		if (itr != end(resource_bindings))
++			buffer_binding = itr->second.first.msl_buffer;
++		else
++			buffer_binding = claimed_bindings.get(i) ? next_metal_resource_index_buffer : i;
++		claimed_bindings.set(buffer_binding);
++		decls.push_back(join(get_variable_address_space(var), " ", type_to_glsl(type), "& ", to_name(id), " [[buffer(",
++		                     buffer_binding, ")]],"));
++		names.push_back(to_name(id));
++	}
++}
++
+ void CompilerMSL::emit_mesh_wrapper() {
+ 	auto &execution = get_entry_point();
+ 
+@@ -1821,6 +1961,8 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		statement("struct Payload");
+ 		begin_scope();
+ 		statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
++		if (msl_options.conservative_raster_mesh)
++			statement("float2 conservativeExtent;");
+ 		end_scope(";");
+ 
+ 		// Emit struct with info about the draw call.
+@@ -1830,6 +1972,10 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		statement("int32_t indexed;");
+ 		statement("int32_t indexSize;");
+ 		statement("int64_t indexBuffer;");
++		statement("int32_t baseVertex;");
++		statement("uint32_t baseInstance;");
++		statement("float2 conservativeExtent;");
++		statement("uint32_t vertexStrides[31];");
+ 
+ 		end_scope(";");
+ 
+@@ -1857,6 +2003,11 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		if (!object_arguments.empty()) object_arguments += ",";
+ 		statement(object_arguments);
+ 
++		SmallVector<string> arg_buffer_decls, arg_buffer_names;
++		mesh_wrapper_argument_buffers(arg_buffer_decls, arg_buffer_names);
++		for (auto &decl : arg_buffer_decls)
++			statement(decl);
++
+ 		statement("uint3 positionInGrid [[thread_position_in_grid]])");
+ 
+ 		begin_scope();
+@@ -1874,7 +2025,7 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 			SPIRV_CROSS_THROW("Input primitive type not supported");
+ 		}
+ 
+-		statement("int instanceIndex = positionInGrid.y;");
++		statement("int instanceIndex = positionInGrid.y + drawInfo->baseInstance;");
+ 
+ 		statement("for (int i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+@@ -1901,8 +2052,9 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 			}
+ 		})END");
+ 
++			statement("vertexIndex += drawInfo->baseVertex;");
+ 		end_scope();
+-		statement("else vertexIndex = startingIndex + i;");
++		statement("else vertexIndex = startingIndex + i + drawInfo->baseVertex;");
+ 
+ 		if (stage_in_var_id) {
+ 			auto in_var_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
+@@ -1946,7 +2098,10 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 			std::string type_name = get_variable_format_string(variable.format);
+ 			std::string component = type_name + get_vertex_loader_component_suffix(load_elements);
+ 			std::string packed = variable.vecsize > 1 ? "packed_" : "";
+-			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + vertexIndex * " + std::to_string(variable.stride) + ")";
++			// A stride of ~0u marks a dynamic vertex stride, which comes with the draw.
++			std::string stride = variable.stride == ~0u ? join("drawInfo->vertexStrides[", variable.binding, "]")
++			                                            : std::to_string(variable.stride);
++			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + vertexIndex * " + stride + ")";
+ 			if (load_elements != parent_type.vecsize) {
+ 				component = type_name + get_vertex_loader_component_suffix(parent_type.vecsize);
+ 				load_string = component + "(" + load_string;
+@@ -1965,6 +2120,10 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 			need_semicolon = true;
+ 			statement(to_name(stage_in_var_id));
+ 		}
++		for (auto &name : arg_buffer_names) {
++			statement(need_semicolon ? ", " : "", name);
++			need_semicolon = true;
++		}
+ 
+ 		auto resources = get_sorted_entry_point_args(false);
+ 
+@@ -1984,7 +2143,12 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 					break;
+ 				}
+ 				case BuiltInBaseInstance: {
+-					statement(need_semicolon ? ", " : "", "0");
++					statement(need_semicolon ? ", " : "", "drawInfo->baseInstance");
++					need_semicolon = true;
++					break;
++				}
++				case BuiltInBaseVertex: {
++					statement(need_semicolon ? ", " : "", "drawInfo->baseVertex");
+ 					need_semicolon = true;
+ 					break;
+ 				}
+@@ -2005,9 +2169,14 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 
+ 		end_scope();
+ 
++		if (msl_options.conservative_raster_mesh)
++			statement("payload.conservativeExtent = drawInfo->conservativeExtent;");
+ 		statement("meshGridProperties.set_threadgroups_per_grid(uint3(1, 1, 1));");
+ 
+ 		end_scope();
++
++		if (msl_options.conservative_raster_mesh)
++			emit_conservative_raster_mesh(out_var_type);
+ 	} else {
+ 		assert(execution.model == ExecutionModelGeometry);
+ 
+@@ -2056,6 +2225,11 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		if (!mesh_arguments.empty()) mesh_arguments += ",";
+ 		statement(mesh_arguments);
+ 
++		SmallVector<string> arg_buffer_decls, arg_buffer_names;
++		mesh_wrapper_argument_buffers(arg_buffer_decls, arg_buffer_names);
++		for (auto &decl : arg_buffer_decls)
++			statement(decl);
++
+ 		statement("uint lid [[thread_index_in_threadgroup]], uint tid [[threadgroup_position_in_grid]])");
+ 
+ 		begin_scope();
+@@ -2167,15 +2341,11 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		end_scope();
+ 
+ 		statement(join(execution.name, "(outputMesh, ", to_name(stage_in_var_id)));
+-
+-		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
+-			if ((var.storage == StorageClassUniform || var.storage == StorageClassUniformConstant ||
+-			     var.storage == StorageClassPushConstant || var.storage == StorageClassStorageBuffer) &&
+-			    !is_hidden_variable(var))
+-			{
+-				statement(", ", to_name(var_id)); // TODO sort? they're sorted in entry_point_args_discrete_descriptors.
+-			}
+-		});
++		for (auto &name : arg_buffer_names)
++			statement(", ", name);
++		// Same order as entry_point_args_discrete_descriptors().
++		for (auto &resource : get_sorted_entry_point_args(false))
++			statement(", ", resource.name);
+ 
+ 		statement(");");
+ 		end_scope();
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 07670135..76769279 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -626,6 +626,11 @@ public:
+         // functions, and geometry shaders as [[mesh]].
+ 		bool for_mesh_pipeline = false;
+ 
++		// With for_mesh_pipeline on a vertex shader: also emit "<entry>_PassThru", a mesh function that
++		// rasterizes each triangle conservatively (overestimate): it emits the triangle grown by the
++		// pixel box given in DrawInfo::conservativeExtent (NDC units), with extrapolated attributes.
++		bool conservative_raster_mesh = false;
++
+ 		enum class PrimitiveTopology {
+ 			Triangles, TriangleStrip, Points
+ 		} input_primitive_type;
+@@ -1339,6 +1344,8 @@ protected:
+ 	uint32_t build_constant_uint_array_pointer();
+ 	uint32_t build_device_uint_array_pointer();
+ 	bool maybe_emit_atomic64_op(Op opcode, const uint32_t *ops);
++	void emit_conservative_raster_mesh(const SPIRType &out_type);
++	void mesh_wrapper_argument_buffers(SmallVector<std::string> &decls, SmallVector<std::string> &names);
+ 	void emit_entry_point_declarations() override;
+ 	bool uses_explicit_early_fragment_test();
+ 
+-- 
+2.54.0 (Apple Git-157)
+

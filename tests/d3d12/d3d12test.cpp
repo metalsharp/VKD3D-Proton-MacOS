@@ -1,6 +1,7 @@
 // D3D12 functional tests for VKD3D-Proton on MoltenVK (run under MetalSharp Wine).
 // Shaders are compiled at run time: SM 6.x with dxcompiler.dll, SM 5.x with d3dcompiler_47.dll.
 //   d3d12test.exe [test-name ...]     (no arguments runs every test)
+#include <math.h>
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -477,6 +478,164 @@ float4 ps() : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
     return true;
 }
 
+// Separating axis test: does triangle t (pixel coordinates) intersect the square [x0,x1]x[y0,y1]?
+static bool tri_box(const float t[3][2], float x0, float y0, float x1, float y1)
+{
+    float minx = fminf(t[0][0], fminf(t[1][0], t[2][0])), maxx = fmaxf(t[0][0], fmaxf(t[1][0], t[2][0]));
+    float miny = fminf(t[0][1], fminf(t[1][1], t[2][1])), maxy = fmaxf(t[0][1], fmaxf(t[1][1], t[2][1]));
+    if (maxx < x0 || minx > x1 || maxy < y0 || miny > y1)
+        return false;
+    for (int e = 0; e < 3; e++)
+    {
+        const float *a = t[e], *b = t[(e + 1) % 3];
+        float nx = b[1] - a[1], ny = a[0] - b[0], tmin = INFINITY, tmax = -INFINITY, bmin = INFINITY, bmax = -INFINITY;
+        for (int k = 0; k < 3; k++)
+        {
+            float d = nx * t[k][0] + ny * t[k][1];
+            tmin = fminf(tmin, d); tmax = fmaxf(tmax, d);
+        }
+        const float cx[4] = { x0, x1, x0, x1 }, cy[4] = { y0, y0, y1, y1 };
+        for (int k = 0; k < 4; k++)
+        {
+            float d = nx * cx[k] + ny * cy[k];
+            bmin = fminf(bmin, d); bmax = fmaxf(bmax, d);
+        }
+        if (tmax < bmin || bmax < tmin)
+            return false;
+    }
+    return true;
+}
+
+// Conservative rasterization tier 1 (12_1): every pixel a triangle touches is covered, and none it
+// misses by more than the uncertainty. Vertex buffer + root constants feed the vertex shader; both
+// DrawInstanced and DrawIndexedInstanced (reversed winding).
+static bool test_conservative()
+{
+    static const char *src = R"(
+float2 offset : register(b0);
+float4 vs(float2 pos : POSITION) : SV_Position { return float4(pos + offset, 0.5, 1); }
+float4 ps() : SV_Target { return 1; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 2;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+
+    D3D12_INPUT_ELEMENT_DESC ie = { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.InputLayout = { &ie, 1 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    static const float tris[][3][2] = {
+        { { 3.3f, 4.2f }, { 9.7f, 5.1f }, { 5.4f, 11.6f } },
+        { { 1.2f, 1.5f }, { 30.6f, 3.1f }, { 1.4f, 2.0f } },
+        { { 16.5f, 2.2f }, { 17.1f, 29.8f }, { 16.6f, 29.9f } },
+        { { 20.2f, 20.3f }, { 20.6f, 20.5f }, { 20.4f, 20.9f } },
+        { { 5.0f, 25.0f }, { 28.0f, 30.0f }, { 6.0f, 25.2f } },
+    };
+    const UINT W = 32, TRIS = sizeof(tris) / sizeof(tris[0]);
+    const float offset[2] = { 0.125f, -0.25f };
+    ID3D12Resource *vb = create_buffer(TRIS * 3 * 8, D3D12_HEAP_TYPE_UPLOAD), *ib = create_buffer(16, D3D12_HEAP_TYPE_UPLOAD);
+    float *v = nullptr;
+    vb->Map(0, nullptr, (void **)&v);
+    for (UINT t = 0; t < TRIS; t++)
+        for (UINT k = 0; k < 3; k++)
+        {
+            v[(t * 3 + k) * 2 + 0] = tris[t][k][0] / 16.0f - 1.0f - offset[0];
+            v[(t * 3 + k) * 2 + 1] = 1.0f - tris[t][k][1] / 16.0f - offset[1];
+        }
+    uint16_t *idx = nullptr;
+    ib->Map(0, nullptr, (void **)&idx);
+    idx[0] = 0; idx[1] = 2; idx[2] = 1;
+
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = W; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *rb = create_buffer(W * W * 4, D3D12_HEAP_TYPE_READBACK);
+
+    for (UINT t = 0; t < TRIS; t++)
+        for (int indexed = 0; indexed < 2; indexed++)
+        {
+            float clear[4] = { 0, 0, 0, 0 };
+            g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)W, 0, 1 };
+            D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)W };
+            g.list->RSSetViewports(1, &vp);
+            g.list->RSSetScissorRects(1, &sc);
+            g.list->SetGraphicsRootSignature(rs);
+            g.list->SetPipelineState(pso);
+            g.list->SetGraphicsRoot32BitConstants(0, 2, offset, 0);
+            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress() + t * 3 * 8, 3 * 8, 8 };
+            g.list->IASetVertexBuffers(0, 1, &vbv);
+            if (indexed)
+            {
+                D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), 6, DXGI_FORMAT_R16_UINT };
+                g.list->IASetIndexBuffer(&ibv);
+                g.list->DrawIndexedInstanced(3, 1, 0, 0, 0);
+            }
+            else
+                g.list->DrawInstanced(3, 1, 0, 0);
+            transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+            dst.pResource = rb;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, W, 1, W * 4 };
+            srcl.pResource = rt;
+            srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+            transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (!execute_and_wait())
+                return false;
+            const uint32_t *px = nullptr;
+            D3D12_RANGE range = { 0, W * W * 4 };
+            rb->Map(0, &range, (void **)&px);
+            int missing = 0, extra = 0;
+            for (UINT y = 0; y < W; y++)
+                for (UINT x = 0; x < W; x++)
+                {
+                    bool got = px[y * W + x] != 0;
+                    missing += tri_box(tris[t], x, y, x + 1, y + 1) && !got;
+                    extra += got && !tri_box(tris[t], x - 0.02f, y - 0.02f, x + 1.02f, y + 1.02f);
+                }
+            D3D12_RANGE none = { 0, 0 };
+            rb->Unmap(0, &none);
+            EXPECT(!missing && !extra, "triangle %u %s: %d missing, %d extra pixels", t, indexed ? "indexed" : "direct", missing, extra);
+        }
+    rb->Release(); rtv_heap->Release(); rt->Release(); ib->Release(); vb->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -681,6 +840,7 @@ static const Test tests[] = {
     { "compute_dxbc", test_compute_dxbc },
     { "sm67", test_sm67 },
     { "draw", test_draw },
+    { "conservative", test_conservative },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };
