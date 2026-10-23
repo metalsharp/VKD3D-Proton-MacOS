@@ -16430,10 +16430,10 @@ index 93c14daf..e3a1fe69 100644
  	// Volatile implicit buffers
  	// These buffers are updated per draw call, and are therefore always considered dirty
 diff --git a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
-index 99460bef..a0ac76c8 100644
+index 99460bef..cbde2434 100644
 --- a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
 +++ b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
-@@ -27,6 +27,18 @@
+@@ -27,6 +27,26 @@
  class MVKBaseObject;
  class MVKPixelFormats;
  
@@ -16445,6 +16445,14 @@ index 99460bef..a0ac76c8 100644
 +		case VK_FORMAT_R16G16B16A16_SFLOAT: return MTLAttributeFormatHalf4;
 +		case VK_FORMAT_R16G16_SNORM: return MTLAttributeFormatShort2Normalized;
 +		case VK_FORMAT_R16G16B16A16_SNORM: return MTLAttributeFormatShort4Normalized;
++		// DXR 1.1 formats; verified against Metal triangle intersection (the 4th component is ignored).
++		case VK_FORMAT_R16G16_UNORM: return MTLAttributeFormatUShort2Normalized;
++		case VK_FORMAT_R16G16B16A16_UNORM: return MTLAttributeFormatUShort4Normalized;
++		case VK_FORMAT_R8G8_UNORM: return MTLAttributeFormatUChar2Normalized;
++		case VK_FORMAT_R8G8B8A8_UNORM: return MTLAttributeFormatUChar4Normalized;
++		case VK_FORMAT_R8G8_SNORM: return MTLAttributeFormatChar2Normalized;
++		case VK_FORMAT_R8G8B8A8_SNORM: return MTLAttributeFormatChar4Normalized;
++		case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return MTLAttributeFormatUInt1010102Normalized;
 +		default: return MTLAttributeFormatInvalid;
 +	}
 +}
@@ -16452,7 +16460,7 @@ index 99460bef..a0ac76c8 100644
  /*
   * This header file should be used internally within MoltenVK in place of mvk_datatypes.h,
   * which is part of the public external MoltenVK C API.
-@@ -77,6 +89,8 @@ MTLMultisampleStencilResolveFilter mvkMTLMultisampleStencilResolveFilterFromVkRe
+@@ -77,6 +97,8 @@ MTLMultisampleStencilResolveFilter mvkMTLMultisampleStencilResolveFilterFromVkRe
  MVKShaderStage mvkShaderStageFromVkShaderStageFlagBitsInObj(VkShaderStageFlagBits vkStage, MVKBaseObject* mvkObj);
  #define mvkShaderStageFromVkShaderStageFlagBits(vkStage) mvkShaderStageFromVkShaderStageFlagBitsInObj(vkStage, this)
  

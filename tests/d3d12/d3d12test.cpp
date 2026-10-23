@@ -299,6 +299,13 @@ static bool test_caps()
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
     printf("  depthbounds %d raytracing %d vrs %d mesh %d samplerfeedback %d\n", o2.DepthBoundsTestSupported, o5.RaytracingTier,
            o6.VariableShadingRateTier, o7.MeshShaderTier, o7.SamplerFeedbackTier);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3));
+    printf("  vprt-without-gs %d waveops %d int64 %d copy-queue-timestamps %d casting-fully-typed %d\n",
+           o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation, o1.WaveOps, o1.Int64ShaderOps,
+           o3.CopyQueueTimestampQueriesSupported, o3.CastingFullyTypedFormatSupported);
     return true;
 }
 
@@ -636,6 +643,137 @@ float4 ps() : SV_Target { return 1; }
     return true;
 }
 
+// DXR 1.1 inline ray tracing: a bottom-level structure from an RGBA8_UNORM vertex buffer (a 1.1
+// format), one top-level instance, and RayQuery in a compute shader.
+static bool test_rayquery()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+    if (o5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1)
+    {
+        printf("  skipped: raytracing tier %d\n", o5.RaytracingTier);
+        return true;
+    }
+    ID3D12Device5 *dev5 = nullptr;
+    ID3D12GraphicsCommandList4 *list4 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev5)));
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list4)));
+
+    // Triangle (0,0) (1,0) (0,1) at z = 0.5, as RGBA8_UNORM.
+    const uint8_t verts[3][4] = { { 0, 0, 128, 255 }, { 255, 0, 128, 255 }, { 0, 255, 128, 255 } };
+    ID3D12Resource *vb = create_buffer(sizeof(verts), D3D12_HEAP_TYPE_UPLOAD);
+    void *map = nullptr;
+    vb->Map(0, nullptr, &map);
+    memcpy(map, verts, sizeof(verts));
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geom = {};
+    geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom.Triangles.VertexFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    geom.Triangles.VertexCount = 3;
+    geom.Triangles.VertexBuffer = { vb->GetGPUVirtualAddress(), 4 };
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blas_in = {};
+    blas_in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    blas_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    blas_in.NumDescs = 1;
+    blas_in.pGeometryDescs = &geom;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blas_info = {};
+    dev5->GetRaytracingAccelerationStructurePrebuildInfo(&blas_in, &blas_info);
+
+    D3D12_RAYTRACING_INSTANCE_DESC inst = {};
+    inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
+    inst.InstanceMask = 0xff;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_in = {};
+    tlas_in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    tlas_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    tlas_in.NumDescs = 1;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_info = {};
+    dev5->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_in, &tlas_info);
+
+    const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *blas = create_buffer(blas_info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, uav,
+                                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    ID3D12Resource *tlas = create_buffer(tlas_info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, uav,
+                                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    UINT64 scratch_size = blas_info.ScratchDataSizeInBytes > tlas_info.ScratchDataSizeInBytes
+            ? blas_info.ScratchDataSizeInBytes : tlas_info.ScratchDataSizeInBytes;
+    ID3D12Resource *scratch = create_buffer(scratch_size, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    inst.AccelerationStructure = blas->GetGPUVirtualAddress();
+    ID3D12Resource *inst_buf = create_buffer(sizeof(inst), D3D12_HEAP_TYPE_UPLOAD);
+    inst_buf->Map(0, nullptr, &map);
+    memcpy(map, &inst, sizeof(inst));
+    tlas_in.InstanceDescs = inst_buf->GetGPUVirtualAddress();
+    if (!blas || !tlas || !scratch)
+        return false;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build = {};
+    build.Inputs = blas_in;
+    build.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = blas;
+    list4->ResourceBarrier(1, &b);
+    build.Inputs = tlas_in;
+    build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+    list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    b.UAV.pResource = tlas;
+    list4->ResourceBarrier(1, &b);
+
+    static const char *src = R"(
+RaytracingAccelerationStructure scene : register(t0);
+RWByteAddressBuffer o : register(u0);
+[numthreads(4, 1, 1)]
+void main(uint tid : SV_DispatchThreadID)
+{
+    static const float2 xy[4] = { float2(0.25, 0.25), float2(0.9, 0.9), float2(0.1, 0.1), float2(0.5, 0.4) };
+    RayDesc r;
+    r.Origin = float3(xy[tid], -1.0);
+    r.Direction = float3(0, 0, 1);
+    r.TMin = 0.0;
+    r.TMax = 10.0;
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(scene, 0, 0xff, r);
+    q.Proceed();
+    o.Store2(tid * 8, uint2(q.CommittedStatus(), asuint(q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0)));
+}
+)";
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_5"));
+    if (!rs || !ps)
+        return false;
+    ID3D12Resource *out = create_buffer(32, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootShaderResourceView(0, tlas->GetGPUVirtualAddress());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 32, &rb);
+    if (!v)
+        return false;
+    static const bool hit[4] = { true, false, true, true };
+    for (int i = 0; i < 4; i++)
+    {
+        float t;
+        memcpy(&t, &v[i * 2 + 1], 4);
+        if (hit[i])
+            EXPECT(v[i * 2] == 1 && fabsf(t - 1.502f) < 0.01f, "ray %d: status %u t %f, want a hit at 1.5", i, v[i * 2], t);
+        else
+            EXPECT(v[i * 2] == 0, "ray %d: status %u t %f, want a miss", i, v[i * 2], t);
+    }
+    rb->Release(); out->Release(); ps->Release(); rs->Release(); inst_buf->Release(); scratch->Release();
+    tlas->Release(); blas->Release(); vb->Release(); list4->Release(); dev5->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -841,6 +979,7 @@ static const Test tests[] = {
     { "sm67", test_sm67 },
     { "draw", test_draw },
     { "conservative", test_conservative },
+    { "rayquery", test_rayquery },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };
