@@ -103,4 +103,81 @@ static void vkctx_submit(struct vkctx *c, VkCommandBuffer cb)
 
 static int failures;
 #define EXPECT_EQ(what, got, want) do { unsigned long long g_ = (got), w_ = (want); \
-    if (g_ != w_) { if (failures++ < 20) printf("FAIL %s: got 0x%llx want 0x%llx\n", what, g_, w_); } } while (0)
+    if (g_ != w_) { if (failures++ < 200) printf("FAIL %s: got 0x%llx want 0x%llx\n", what, g_, w_); } } while (0)
+
+struct vkimg { VkImage image; VkDeviceMemory memory; VkImageView view; VkFormat format; uint32_t width, height; };
+
+static struct vkimg vkctx_image(struct vkctx *c, VkFormat format, uint32_t width, uint32_t height, VkImageUsageFlags usage)
+{
+    struct vkimg i = { 0 };
+    i.format = format; i.width = width; i.height = height;
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, format, { width, height, 1 }, 1, 1,
+                              VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                              VK_IMAGE_LAYOUT_UNDEFINED };
+    CHECK(vkCreateImage(c->device, &ici, NULL, &i.image));
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(c->device, i.image, &req);
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
+                                 vkctx_memory_type(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    CHECK(vkAllocateMemory(c->device, &mai, NULL, &i.memory));
+    CHECK(vkBindImageMemory(c->device, i.image, i.memory, 0));
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, i.image, VK_IMAGE_VIEW_TYPE_2D, format, { 0 },
+                                  { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    CHECK(vkCreateImageView(c->device, &vci, NULL, &i.view));
+    return i;
+}
+
+static void vkctx_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to)
+{
+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, from, to,
+                               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* Copies a color image (in TRANSFER_SRC_OPTIMAL) into a new host buffer. */
+static struct vkbuf vkctx_readback(struct vkctx *c, VkCommandBuffer cb, struct vkimg *img, uint32_t texel_size)
+{
+    struct vkbuf b = vkctx_buffer(c, (VkDeviceSize)img->width * img->height * texel_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkBufferImageCopy r = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { img->width, img->height, 1 } };
+    vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b.buffer, 1, &r);
+    return b;
+}
+
+/* A graphics pipeline for dynamic rendering into one color attachment, no vertex input. */
+static VkPipeline vkctx_graphics_pipeline(struct vkctx *c, VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, VkFormat format,
+                                          const VkPipelineColorBlendStateCreateInfo *blend, const void *rasterization_next)
+{
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL },
+    };
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, rasterization_next };
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn };
+    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &format };
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, 2, stages, &vi, &ia, NULL, &vp, &rs, &ms, &ds,
+                                         blend, &dy, layout };
+    VkPipeline p;
+    CHECK(vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gpi, NULL, &p));
+    return p;
+}
+
+/* Begins dynamic rendering into one color attachment (loaded, not cleared) with a full viewport. */
+static void vkctx_begin_rendering(VkCommandBuffer cb, struct vkimg *img)
+{
+    VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, img->view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { img->width, img->height } }, 1, 0, 1, &att };
+    vkCmdBeginRendering(cb, &ri);
+    VkViewport v = { 0, 0, (float)img->width, (float)img->height, 0, 1 };
+    VkRect2D s = { { 0, 0 }, { img->width, img->height } };
+    vkCmdSetViewport(cb, 0, 1, &v);
+    vkCmdSetScissor(cb, 0, 1, &s);
+}
