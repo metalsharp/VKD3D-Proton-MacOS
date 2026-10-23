@@ -1,0 +1,184 @@
+From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 14:37:47 -0600
+Subject: [PATCH] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
+ texel alignment, Metal-safe decompression shaders.
+
+- Without VK_EXT_transform_feedback, stream output is disabled instead of failing
+  device creation; SO statistics queries resolve to zero.
+- VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT accepts the custom MoltenVK's emulated
+  unaligned texel buffer views.
+- The NV memory decompression shaders keep their dispatch size as three scalars:
+  MSL has no atomics on a vector component.
+---
+ libs/vkd3d/command.c                          | 42 +++++++++++++++++++
+ libs/vkd3d/device.c                           | 23 ++++++++--
+ ..._emit_nv_memory_decompression_regions.comp |  8 +++-
+ ...it_nv_memory_decompression_workgroups.comp | 10 ++++-
+ 4 files changed, 75 insertions(+), 8 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8a632d2d..fc696f7e 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -5031,6 +5031,39 @@ static void d3d12_command_list_reset_active_query(struct d3d12_command_list *lis
+     query->state = VKD3D_ACTIVE_QUERY_RESET;
+ }
+ 
++static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type);
++
++/* Without VK_EXT_transform_feedback (MoltenVK) stream output is disabled, so SO statistics
++ * queries never reach Vulkan: ending one stores zero primitives written and needed. */
++static bool d3d12_query_type_needs_missing_xfb(struct d3d12_command_list *list, D3D12_QUERY_TYPE type)
++{
++    return d3d12_query_type_is_indexed(type) && !list->device->vk_info.EXT_transform_feedback;
++}
++
++static void d3d12_command_list_write_zero_query(struct d3d12_command_list *list,
++        struct d3d12_query_heap *heap, uint32_t index)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    size_t stride = get_query_heap_stride(heap->desc.Type);
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++
++    d3d12_command_list_end_current_render_pass(list, true);
++    VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, heap->vk_buffer, index * stride, stride, 0));
++
++    memset(&vk_barrier, 0, sizeof(vk_barrier));
++    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &vk_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++}
++
+ static bool d3d12_command_list_enable_query(struct d3d12_command_list *list,
+         struct d3d12_query_heap *heap, uint32_t index, D3D12_QUERY_TYPE type)
+ {
+@@ -17418,6 +17451,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
++    if (d3d12_query_type_needs_missing_xfb(list, type))
++        return;
++
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (d3d12_command_list_is_query_resolve_pending(list, query_heap, index))
+@@ -17463,6 +17499,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
++    if (d3d12_query_type_needs_missing_xfb(list, type))
++    {
++        d3d12_command_list_write_zero_query(list, query_heap, index);
++        return;
++    }
++
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 817f8a80..8334e3b1 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2501,8 +2501,13 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        /* Metal (MoltenVK) has no transform feedback. Everything else in D3D12 works without it:
++         * stream output and its queries are turned off instead of failing device creation. */
++        WARN("Lacking transform-feedback behavior; stream output is disabled (VKMT).\n");
++        vulkan_info->EXT_transform_feedback = false;
++        memset(&physical_device_info->xfb_features, 0, sizeof(physical_device_info->xfb_features));
++        memset(&physical_device_info->xfb_properties, 0, sizeof(physical_device_info->xfb_properties));
++        vulkan_info->rasterization_stream = false;
+     }
+ 
+     single_storage_texel =
+@@ -2516,8 +2521,18 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment; the custom VKMT
++         * MoltenVK emulates unaligned views, which VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT vouches for. */
++        char allow[8];
++        if (vkd3d_get_env_var("VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT", allow, sizeof(allow)) && strcmp(allow, "0"))
++        {
++            WARN("Allowing non-single texel alignment (VKMT).\n");
++        }
++        else
++        {
++            ERR("Lacking support for single texel alignment.\n");
++            return E_INVALIDARG;
++        }
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+index 2978f0bb..8af6c20a 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+@@ -43,7 +43,11 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ buffer memory_regions_t {
+-  uvec3 region_count;
++  /* the indirect dispatch size, as three scalars (the same scalar layout as a uvec3): MSL has
++   * no atomics on a vector component, so SPIR-V's access chain into a uvec3 fails there */
++  uint  region_count_x;
++  uint  region_count_y;
++  uint  region_count_z;
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -102,7 +106,7 @@ void main() {
+ 
+   // Allocate an output region structure from the scratch buffer
+   memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-  uint out_index = atomicAdd(region_buffer.region_count.x, 1);
++  uint out_index = atomicAdd(region_buffer.region_count_x, 1);
+ 
+   // Compute absolute VAs for vkCmdDecompressMemoryIndirectCountNV
+   region_buffer.memory_regions[out_index] = memory_region_t(
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+index aea1124c..3863eb42 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+@@ -48,7 +48,11 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ writeonly buffer memory_regions_t {
+-  uvec3 region_count;
++  /* the indirect dispatch size, as three scalars (the same scalar layout as a uvec3): MSL has
++   * no atomics on a vector component, so SPIR-V's access chain into a uvec3 fails there */
++  uint  region_count_x;
++  uint  region_count_y;
++  uint  region_count_z;
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -70,7 +74,9 @@ void main() {
+   // Reset memory region count that is later passed the decompression command.
+   if (stream_index == 0u) {
+     memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-    region_buffer.region_count = uvec3(0u, 1u, 1u);
++    region_buffer.region_count_x = 0u;
++    region_buffer.region_count_y = 1u;
++    region_buffer.region_count_z = 1u;
+   }
+ 
+   if (stream_index >= stream_count)
+-- 
+2.54.0 (Apple Git-157)
+
