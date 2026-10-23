@@ -1,5 +1,6 @@
 /* GPU test: VK_EXT_conservative_rasterization overestimation against a CPU triangle/pixel-square
- * intersection reference, for direct and indexed draws (both windings). */
+ * intersection reference, for direct and indexed draws (both windings), including degenerate
+ * triangles, and FullyCoveredEXT (inner coverage) against a pixel-inside-triangle reference. */
 #include "vkcommon.h"
 #include <math.h>
 
@@ -30,6 +31,23 @@ static int tri_box(const float t[3][2], float x0, float y0, float x1, float y1)
         }
         if (tmax < bmin || bmax < tmin)
             return 0;
+    }
+    return 1;
+}
+
+/* Is the square [x0,x1]x[y0,y1] inside triangle t (never for degenerate triangles)? */
+static int box_in_tri(const float t[3][2], float x0, float y0, float x1, float y1)
+{
+    float area = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]);
+    if (fabsf(area) < 1e-6f)
+        return 0;
+    float cx[4] = { x0, x1, x0, x1 }, cy[4] = { y0, y0, y1, y1 };
+    for (int e = 0; e < 3; e++)
+    {
+        const float *a = t[e], *b = t[(e + 1) % 3];
+        for (int k = 0; k < 4; k++)
+            if (((b[0] - a[0]) * (cy[k] - a[1]) - (b[1] - a[1]) * (cx[k] - a[0])) * area < 0)
+                return 0;
     }
     return 1;
 }
@@ -111,6 +129,9 @@ int main(int argc, char **argv)
         { { 16.5f, 2.2f }, { 17.1f, 29.8f }, { 16.6f, 29.9f } },
         { { 20.2f, 20.3f }, { 20.6f, 20.5f }, { 20.4f, 20.9f } },
         { { 5.0f, 25.0f }, { 28.0f, 30.0f }, { 6.0f, 25.2f } },
+        { { 2.2f, 10.3f }, { 8.7f, 13.1f }, { 5.45f, 11.7f } },     /* degenerate: a segment */
+        { { 25.5f, 12.25f }, { 25.5f, 12.25f }, { 25.5f, 12.25f } }, /* degenerate: a point */
+        { { 2.0f, 14.0f }, { 30.0f, 15.0f }, { 12.0f, 31.0f } },    /* large, for inner coverage */
     };
     enum { TRIS = sizeof(tris) / sizeof(tris[0]) };
     struct vkbuf vbuf = vkctx_buffer(&c, TRIS * 3 * 8, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -162,7 +183,7 @@ int main(int argc, char **argv)
             vkctx_submit(&c, cb);
 
             const uint8_t *px = rb.map;
-            int missing = 0, extra = 0, covered = 0, ref_count = 0;
+            int missing = 0, extra = 0, covered = 0, ref_count = 0, inner = 0, inner_missing = 0, inner_extra = 0;
             for (int y = 0; y < W; y++)
                 for (int x = 0; x < W; x++)
                 {
@@ -179,12 +200,18 @@ int main(int argc, char **argv)
                     }
                     if (mode && got && !near)
                         extra++;
+                    int got_inner = px[(y * W + x) * 4 + 1] > 127;
+                    inner += got_inner;
+                    if (mode && !got_inner && box_in_tri(tris[t], x - 0.02f, y - 0.02f, x + 1.02f, y + 1.02f))
+                        inner_missing++;
+                    if (got_inner && !box_in_tri(tris[t], x + 0.02f, y + 0.02f, x + 0.98f, y + 0.98f))
+                        inner_extra++;
                 }
-            char what[96];
-            snprintf(what, sizeof(what), "triangle %d mode %d: %d covered, %d reference, %d missing, %d extra", t, mode, covered,
-                     ref_count, missing, extra);
+            char what[160];
+            snprintf(what, sizeof(what), "triangle %d mode %d: %d covered, %d reference, %d missing, %d extra; inner %d (%d missing, %d extra)",
+                     t, mode, covered, ref_count, missing, extra, inner, inner_missing, inner_extra);
             printf("%s\n", what);
-            EXPECT_EQ(what, missing + extra, 0);
+            EXPECT_EQ(what, missing + extra + inner_missing + inner_extra, 0);
         }
     }
     printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);

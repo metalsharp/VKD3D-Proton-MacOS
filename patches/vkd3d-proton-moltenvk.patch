@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 1/3] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
+Subject: [PATCH 1/4] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
  texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 2/3] Keep the transform feedback structures linked when stream
+Subject: [PATCH 2/4] Keep the transform feedback structures linked when stream
  output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 3/3] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 3/4] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -245,6 +245,51 @@ index 836a7441..e4eecfcf 100644
              }
          }
  
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 17:51:33 -0600
+Subject: [PATCH 4/4] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
+ 16-pixel shading rate tile
+
+---
+ libs/vkd3d/device.c             | 3 +++
+ libs/vkd3d/device_workarounds.c | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index e4eecfcf..8ae68956 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9433,6 +9433,9 @@ static void d3d12_device_caps_init_feature_options6(struct d3d12_device *device)
+     if (options6->VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2)
+     {
+         options6->ShadingRateImageTileSize = d3d12_determine_shading_rate_image_tile_size(device);
++        /* Emulated tier 2 ignores shading rate images; report a valid tile size so apps can size them. */
++        if (!options6->ShadingRateImageTileSize && !d3d12_device_supports_variable_shading_rate_tier_2(device))
++            options6->ShadingRateImageTileSize = 16;
+ 
+         options6->PerPrimitiveShadingRateSupportedWithViewportIndexing =
+                 device->device_info.fragment_shading_rate_properties.primitiveFragmentShadingRateWithMultipleViewports;
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+index 55e17c26..5a7f58e7 100644
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -1173,6 +1173,11 @@ bool vkd3d_driver_id_wraps_ssbo_32bit_before_robustness(VkDriverId driver_id)
+ 
+ bool d3d12_device_allow_emulated_vrs_tier_2(struct d3d12_device *device)
+ {
++    /* MoltenVK: Metal has no per-draw or per-tile shading rates. Shade at full rate, as the
++     * RDNA1 compatibility path does: shading rate state is ignored, which only costs performance. */
++    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++        return true;
++
+     return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) &&
+             device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_AMD &&
+             device->device_info.vulkan_1_3_properties.minSubgroupSize == 32;
 -- 
 2.54.0 (Apple Git-157)
 
