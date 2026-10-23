@@ -895,6 +895,118 @@ void main()
     return true;
 }
 
+// Variable rate shading tier 2: per-draw rate, per-primitive SV_ShadingRate and a shading rate image
+// are all accepted; on MoltenVK the draw shades at full rate (the finest rate is always valid output).
+static bool test_vrs()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6));
+    if (o6.VariableShadingRateTier < D3D12_VARIABLE_SHADING_RATE_TIER_2)
+    {
+        printf("  skipped: VRS tier %d\n", o6.VariableShadingRateTier);
+        return true;
+    }
+    EXPECT(o6.ShadingRateImageTileSize >= 8 && o6.ShadingRateImageTileSize <= 32, "tile size %u", o6.ShadingRateImageTileSize);
+    ID3D12GraphicsCommandList5 *list5 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list5)));
+    static const char *src = R"(
+struct V { float4 pos : SV_Position; uint rate : SV_ShadingRate; };
+V vs(uint id : SV_VertexID)
+{
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.rate = 0x5; // D3D12_SHADING_RATE_2X2
+    return o;
+}
+float4 ps(float4 pos : SV_Position) : SV_Target { return float4(pos.x / 64.0, pos.y / 64.0, 0, 1); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_4"), ps = compile_dxc(src, "ps", "ps_6_4");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT W = 64;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = W; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    UINT tiles = (W + o6.ShadingRateImageTileSize - 1) / o6.ShadingRateImageTileSize;
+    td.Width = tiles; td.Height = tiles;
+    td.Format = DXGI_FORMAT_R8_UINT;
+    td.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource *sri = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, nullptr,
+                                               IID_PPV_ARGS(&sri)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)W, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)W };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    D3D12_SHADING_RATE_COMBINER combiners[2] = { D3D12_SHADING_RATE_COMBINER_MAX, D3D12_SHADING_RATE_COMBINER_MAX };
+    list5->RSSetShadingRate(D3D12_SHADING_RATE_2X2, combiners);
+    list5->RSSetShadingRateImage(sri);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    list5->RSSetShadingRateImage(nullptr);
+    list5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
+
+    ID3D12Resource *rb = create_buffer(W * W * 4, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, W, 1, W * 4 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE range = { 0, W * W * 4 };
+    rb->Map(0, &range, (void **)&px);
+    int wrong = 0;
+    for (UINT y = 0; y < W; y++)
+        for (UINT x = 0; x < W; x++)
+        {
+            // Full rate: the shader ran at each pixel center. A 2x2 coarse pixel would share one value.
+            int r = px[(y * W + x) * 4], g8 = px[(y * W + x) * 4 + 1];
+            int wr = (int)((x + 0.5f) / 64.0f * 255.0f + 0.5f), wg = (int)((y + 0.5f) / 64.0f * 255.0f + 0.5f);
+            wrong += abs(r - wr) > 1 || abs(g8 - wg) > 1;
+        }
+    EXPECT(!wrong, "%d pixels not shaded at their own center", wrong);
+    rb->Release(); rtv_heap->Release(); sri->Release(); rt->Release(); pso->Release(); rs->Release(); list5->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -1102,6 +1214,7 @@ static const Test tests[] = {
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
     { "samplerfeedback", test_samplerfeedback },
+    { "vrs", test_vrs },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };
