@@ -7435,7 +7435,7 @@ index a00c09bd..9ea56253 100644
  #pragma mark -
  #pragma mark MVKBufferView
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h
-index d6c738aa..9b644251 100644
+index d6c738aa..55b897c4 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h
 @@ -30,6 +30,7 @@ class MVKDescriptorPool;
@@ -7463,7 +7463,15 @@ index d6c738aa..9b644251 100644
  	uint8_t sampler : 1;
  	uint8_t dynamicOffset : 1;
  
-@@ -304,10 +306,13 @@ public:
+@@ -229,6 +231,7 @@ struct MVKDescriptorBinding {
+ 		uint32_t gpuOffset; /**< The byte offset of the first descriptor of this binding in the descriptor set's GPU storage, if using direct descriptor writes. */
+ 		uint32_t argBufID;  /**< The argument buffer of the first descriptor of this binding in the descriptor set's GPU storage, if using argument encoders. */
+ 	};
++	uint32_t sizeIndex;               /**< The index of this binding's first resource in the descriptor set's size buffer (which also holds emulated sampler reduction modes). */
+ 	union {
+ 		uint32_t auxIndex;        /**< The index into the descriptor set's metadata for auxiliary buffers (used by BufferAuxSize and OutlinedData). */
+ 		uint32_t immSamplerIndex; /**< The index into the descriptor set layout's immutable sampler list. */
+@@ -304,10 +307,13 @@ public:
  	VkDebugReportObjectTypeEXT getVkDebugReportObjectType() override { return VK_DEBUG_REPORT_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT_EXT; }
  
  	/** Creates a new descriptor set layout. */
@@ -7478,7 +7486,16 @@ index d6c738aa..9b644251 100644
  
  	/** Returns the argument encoder.  Returns null if you should be using direct writes. */
  	MVKMTLArgumentEncoder* mtlArgumentEncoder() { return _mtlArgumentEncoder.get(); }
-@@ -390,6 +395,7 @@ private:
+@@ -324,7 +330,7 @@ public:
+ 	/** Returns the number of aux offsets.  Note that for variable descriptor sets, `auxOffsets` will be null even though this is nonzero. */
+ 	uint32_t numAuxOffsets() const { return _numAuxOffsets; }
+ 	/** Returns the number of uint32s needed in the buffer size aux buffer. */
+-	uint32_t sizeBufSize(uint32_t numVariable) const { return _sizeBufSize + (_flags.has(Flag::IsSizeBufVariable) ? numVariable : 0); }
++	uint32_t sizeBufSize(uint32_t numVariable) const { return _sizeBufSize + (_flags.has(Flag::IsSizeBufVariable) ? numVariable * _variableSizeBufStride : 0); }
+ 	/** Returns whether a size buffer is needed. */
+ 	bool needsSizeBuf() const { return _sizeBufSize || _flags.has(Flag::IsSizeBufVariable); }
+ 
+@@ -390,6 +396,7 @@ private:
  		IsVariable,                   /**< Whether the descriptor set is variable length. */
  		IsSizeBufVariable,            /**< Whether the size buf is variable length. */
  		IsDynamicOffsetCountVariable, /**< Whether the dynamic offset buffer is variable length. */
@@ -7486,7 +7503,15 @@ index d6c738aa..9b644251 100644
  		Count
  	};
  	/** A list of bindings sorted by binding number. */
-@@ -440,7 +446,7 @@ private:
+@@ -408,6 +415,7 @@ private:
+ 	uint32_t _numLinearBindings = 0;
+ 	/** The maximum index of a buffer that needs a buffer size entry. */
+ 	uint32_t _sizeBufSize = 0;
++	uint32_t _variableSizeBufStride = 1;	/**< The size buffer entries of each variable descriptor. */
+ 	/** The required size of cpu buffer minus any variable descriptors. */
+ 	uint32_t _cpuSize = 0;
+ 	/** If using variable descriptors, the size of each variable element in the cpu buffer. */
+@@ -440,7 +448,7 @@ private:
  /** Represents a Vulkan descriptor set. */
  struct MVKDescriptorSet {
  	/** The layout this descriptor set uses. */
@@ -7495,7 +7520,7 @@ index d6c738aa..9b644251 100644
  	/** The argument encoder, if needed. */
  	MVKMTLArgumentEncoder* argEnc;
  	/** The host-side descriptor buffer. */
-@@ -459,6 +465,8 @@ struct MVKDescriptorSet {
+@@ -459,6 +467,8 @@ struct MVKDescriptorSet {
  	uint32_t cpuBufferSize;
  	/** The number of variable descriptors. */
  	uint32_t variableDescriptorCount;
@@ -7504,7 +7529,7 @@ index d6c738aa..9b644251 100644
  
  	void setGPUBuffer(id<MTLBuffer> buffer, void* contents, size_t offset, size_t size) {
  		gpuBufferObject = buffer;
-@@ -473,18 +481,47 @@ struct MVKDescriptorSet {
+@@ -473,18 +483,47 @@ struct MVKDescriptorSet {
  	}
  };
  
@@ -7556,7 +7581,7 @@ index d6c738aa..9b644251 100644
  };
  
  /**
-@@ -555,7 +592,6 @@ private:
+@@ -555,7 +594,6 @@ private:
  	MVKInlineArray<char> _cpuBuffer;
  	MVKArrayRef<char> _gpuBuffer;
  	id<MTLBuffer> _gpuBufferObject = nullptr;
@@ -7564,7 +7589,7 @@ index d6c738aa..9b644251 100644
  	MVKDescriptorSetListItem* _firstFreeDescriptorSet = nullptr;
  	MVKDescriptorPoolFreeList _cpuBufferFreeList;
  	MVKDescriptorPoolFreeList _gpuBufferFreeList;
-@@ -623,10 +659,15 @@ void mvkUpdateDescriptorSetWithTemplate(VkDescriptorSet descriptorSet,
+@@ -623,10 +661,15 @@ void mvkUpdateDescriptorSetWithTemplate(VkDescriptorSet descriptorSet,
  										VkDescriptorUpdateTemplate updateTemplate,
  										const void* pData);
  
@@ -7585,7 +7610,7 @@ index d6c738aa..9b644251 100644
 +	                                               MVKDescriptorSet* set,
 +	                                               MVKDescriptorSetSnapshot* current);
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
-index 3cdc6234..9d844b81 100644
+index 3cdc6234..a8eddf37 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
 @@ -17,6 +17,7 @@
@@ -7637,7 +7662,57 @@ index 3cdc6234..9d844b81 100644
  		case MVKDescriptorGPULayout::InlineData:    return 1;
  		case MVKDescriptorGPULayout::TexBufSoA:     return 1;
  		case MVKDescriptorGPULayout::TexSampSoA:    return 1;
-@@ -188,7 +195,7 @@ static MVKArgumentBufferMode pickArgumentBufferMode(MVKDevice* dev, const VkDesc
+@@ -158,8 +165,47 @@ static bool needsAuxOffset(MVKDescriptorGPULayout layout) {
+ 	}
+ }
+ 
+-static bool needsAuxBuf(MVKDescriptorGPULayout layout) {
+-	return layout == MVKDescriptorGPULayout::BufferAuxSize;
++static bool hasSampler(MVKDescriptorGPULayout layout) {
++	switch (layout) {
++		case MVKDescriptorGPULayout::Sampler:
++		case MVKDescriptorGPULayout::TexSampSoA:
++		case MVKDescriptorGPULayout::Tex2SampSoA:
++		case MVKDescriptorGPULayout::Tex3SampSoA:
++			return true;
++		default:
++			return false;
++	}
++}
++
++/** Returns whether the layout has entries in the size buffer: buffer sizes, and the emulated reduction modes of samplers. */
++static bool needsAuxBuf(MVKDescriptorGPULayout layout, MVKDevice* device) {
++	return layout == MVKDescriptorGPULayout::BufferAuxSize ||
++	       (hasSampler(layout) && device->getPhysicalDevice()->emulatesSamplerReduction());
++}
++
++/** Returns the emulated sampler reduction modes of the set (in its size buffer), or null if it has none. */
++static uint32_t* getSamplerReductionModes(const MVKDescriptorSet* set) {
++	const MVKDescriptorSetLayout* layout = set->layout;
++	if ( !set->gpuBuffer || layout->argBufMode() != MVKArgumentBufferMode::Metal3 || !layout->needsSizeBuf() ||
++		 !layout->getDevice()->getPhysicalDevice()->emulatesSamplerReduction() ) {
++		return nullptr;
++	}
++	return reinterpret_cast<uint32_t*>(set->gpuBuffer + layout->gpuAuxBase(set->variableDescriptorCount));
++}
++
++/** Copies the emulated reduction modes of copied samplers; the sampler entries start srcTextures and dstTextures resources into their bindings. */
++static void copySamplerReductionModes(const MVKDescriptorSet* srcSet, const MVKDescriptorBinding* srcBinding, uint32_t srcElement,
++									  const MVKDescriptorSet* dstSet, const MVKDescriptorBinding* dstBinding, uint32_t dstElement,
++									  uint32_t count, uint32_t srcTextures, uint32_t dstTextures) {
++	uint32_t* dst = getSamplerReductionModes(dstSet);
++	if ( !dst ) { return; }
++	dst += dstBinding->sizeIndex + dstTextures + dstElement;
++	// Metal 3 sets, host-only ones included, all have their device-side layout.
++	if (const uint32_t* src = getSamplerReductionModes(srcSet)) {
++		memcpy(dst, src + srcBinding->sizeIndex + srcTextures + srcElement, count * sizeof(uint32_t));
++	} else {
++		memset(dst, 0, count * sizeof(uint32_t));
++	}
+ }
+ 
+ /** Selects an argument buffer mode for the given device.  Descriptor sets on the device may use this mode or Off, but not any others. */
+@@ -188,7 +234,7 @@ static MVKArgumentBufferMode pickArgumentBufferMode(MVKDevice* dev, const VkDesc
  	MVKArgumentBufferMode mode = pickArgumentBufferMode(dev);
  	if (mode == MVKArgumentBufferMode::Off) // The following checks only switch argument buffers off, so we can skip them if they're already off.
  		return mode;
@@ -7646,7 +7721,7 @@ index 3cdc6234..9d844b81 100644
  	if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT))
  		return MVKArgumentBufferMode::Off;
  	auto* metalFeatures = dev->getPhysicalDevice()->getMetalFeatures();
-@@ -293,6 +300,9 @@ static MVKDescriptorResourceCount perDescriptorResourceCount(VkDescriptorType ty
+@@ -293,6 +339,9 @@ static MVKDescriptorResourceCount perDescriptorResourceCount(VkDescriptorType ty
  			case MVKDescriptorGPULayout::OutlinedData:
  				count.buffer = 1;
  				break;
@@ -7656,7 +7731,7 @@ index 3cdc6234..9d844b81 100644
  			case MVKDescriptorGPULayout::TexBufSoA:
  				count.buffer = 1;
  				count.texture = 1;
-@@ -337,6 +347,9 @@ static MVKDescriptorResourceCount perDescriptorResourceCount(VkDescriptorType ty
+@@ -337,6 +386,9 @@ static MVKDescriptorResourceCount perDescriptorResourceCount(VkDescriptorType ty
  			case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  				count.buffer = 1;
  				break;
@@ -7666,7 +7741,7 @@ index 3cdc6234..9d844b81 100644
  			default:
  				assert(0);
  				break;
-@@ -376,6 +389,7 @@ static MVKDescriptorCPULayout pickCPULayout(
+@@ -376,6 +428,7 @@ static MVKDescriptorCPULayout pickCPULayout(
  		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return MVKDescriptorCPULayout::OneID2Meta;
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return MVKDescriptorCPULayout::OneID2Meta;
  		case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:       return MVKDescriptorCPULayout::OneID;
@@ -7674,7 +7749,7 @@ index 3cdc6234..9d844b81 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:   return argBuf == MVKArgumentBufferMode::Off ? MVKDescriptorCPULayout::InlineData : MVKDescriptorCPULayout::None;
  		default:                                        return MVKDescriptorCPULayout::None;
  	}
-@@ -408,6 +422,7 @@ static MVKDescriptorGPULayout pickGPULayout(
+@@ -408,6 +461,7 @@ static MVKDescriptorGPULayout pickGPULayout(
  		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return MVKDescriptorGPULayout::BufferAuxSize;
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return MVKDescriptorGPULayout::BufferAuxSize;
  		case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:       return MVKDescriptorGPULayout::Texture;
@@ -7682,7 +7757,7 @@ index 3cdc6234..9d844b81 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:   return MVKDescriptorGPULayout::OutlinedData;
  		default:                                        return MVKDescriptorGPULayout::None;
  	}
-@@ -476,11 +491,17 @@ static int bindingCompare(const void* a, const void* b) {
+@@ -476,11 +530,17 @@ static int bindingCompare(const void* a, const void* b) {
  				case MVKDescriptorGPULayout::Texture:
  				case MVKDescriptorGPULayout::BufferAuxSize: {
  					MTLDataType type = layout == MVKDescriptorGPULayout::Sampler ? MTLDataTypeSampler :
@@ -7702,7 +7777,7 @@ index 3cdc6234..9d844b81 100644
  
  				case MVKDescriptorGPULayout::OutlinedData:
  					[list addObject:argumentDescriptor(index, access, MTLDataTypePointer)];
-@@ -551,7 +572,9 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -551,7 +611,9 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
  
  MVKDescriptorSetLayout::MVKDescriptorSetLayout(MVKDevice* device): MVKVulkanAPIDeviceObject(device) {}
  
@@ -7713,7 +7788,7 @@ index 3cdc6234..9d844b81 100644
  	using Constructor = MVKInlineObjectConstructor<MVKDescriptorSetLayout>;
  	const VkDescriptorBindingFlags* flagList = getBindingFlags(pCreateInfo);
  	uint32_t numBindings = pCreateInfo->bindingCount;
-@@ -560,8 +583,10 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -560,8 +622,10 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
  	const VkDescriptorSetLayoutBinding* variableDesc = nullptr;
  	bool needsSizeBuf = false;
  	bool hasAnyBindings = false;
@@ -7725,7 +7800,13 @@ index 3cdc6234..9d844b81 100644
  
  	for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
  		const VkDescriptorSetLayoutBinding& bind = pCreateInfo->pBindings[i];
-@@ -575,6 +600,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -570,11 +634,12 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+ 		auto layout = pickGPULayout(bind.descriptorType, bind.descriptorCount, argBufMode, device);
+ 		if (needsAuxOffset(layout))
+ 			numAuxOffsets++;
+-		needsSizeBuf |= needsAuxBuf(layout);
++		needsSizeBuf |= needsAuxBuf(layout, device);
+ 		if (bind.descriptorCount > 0) {
  			if (flagList && mvkIsAnyFlagEnabled(flagList[i], VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT))
  				variableDesc = &bind;
  			hasAnyBindings = true;
@@ -7733,7 +7814,7 @@ index 3cdc6234..9d844b81 100644
  		}
  	}
  
-@@ -601,6 +627,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -601,6 +666,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
  	ret->_argBufMode = argBufMode;
  	ret->_flags |= MVKFlagList<Flag>(Flag::IsPushDescriptorSetLayout, isPush);
  	ret->_flags |= MVKFlagList<Flag>(Flag::IsVariable,                isVariable);
@@ -7741,7 +7822,7 @@ index 3cdc6234..9d844b81 100644
  
  
  	for (uint32_t i = 0; i < numBindings; i++) {
-@@ -662,7 +689,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -662,7 +728,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
  		MVKShaderStageResourceBinding resourceCount = binding.totalResourceCount();
  		for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
  			auto stage = static_cast<MVKShaderStage>(i);
@@ -7750,7 +7831,39 @@ index 3cdc6234..9d844b81 100644
  				ret->_totalResourceCount.stages[stage] += resourceCount;
  		}
  		if (!binding.isVariable())
-@@ -779,7 +806,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+@@ -685,8 +751,9 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+ 			binding.gpuOffset = gpuOffset;
+ 			gpuOffset += descriptorGPUSizeMetal3(gpu, count);
+ 		}
++		binding.sizeIndex = bindingCount;
+ 		bindingCount += binding.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? 1 : descriptorGPUBindingCount(gpu) * count;
+-		if (needsAuxBuf(binding.gpuLayout))
++		if (needsAuxBuf(binding.gpuLayout, device))
+ 			sizeBufSize = bindingCount;
+ 		if (needsAuxOffset(binding.gpuLayout))
+ 			binding.auxIndex = auxOffset++;
+@@ -707,7 +774,8 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+ 	if (isVariable) {
+ 		MVKDescriptorBinding& variable = ret->_bindings.back();
+ 		assert(variable.isVariable());
+-		ret->_flags |= MVKFlagList<Flag>(Flag::IsSizeBufVariable,            needsAuxBuf(variable.gpuLayout));
++		ret->_flags |= MVKFlagList<Flag>(Flag::IsSizeBufVariable,            needsAuxBuf(variable.gpuLayout, device));
++		ret->_variableSizeBufStride = descriptorGPUBindingCount(variable.gpuLayout);
+ 		ret->_flags |= MVKFlagList<Flag>(Flag::IsDynamicOffsetCountVariable, needsDynamicOffset(variable.descriptorType));
+ 		ret->_cpuVariableElementSize = descriptorCPUSize(variable.cpuLayout);
+ 		ret->_gpuAlignment = gpuAlign;
+@@ -715,8 +783,8 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
+ 			ret->_gpuAuxBase = gpuOffset;
+ 			ret->_gpuSize = gpuOffset;
+ 			ret->_gpuVariableElementSize = descriptorGPUSizeMetal3(variable.gpuLayout);
+-			if (needsAuxBuf(variable.gpuLayout))
+-				ret->_gpuVariableElementSize += sizeof(uint32_t);
++			if (needsAuxBuf(variable.gpuLayout, device))
++				ret->_gpuVariableElementSize += sizeof(uint32_t) * descriptorGPUBindingCount(variable.gpuLayout);
+ 		}
+ 	} else {
+ 		if (argBufMode == MVKArgumentBufferMode::ArgEncoder) {
+@@ -779,7 +847,7 @@ static uint32_t writeAuxOffsets(uint32_t* write, MVKArrayRef<const MVKDescriptor
  #pragma mark Descriptor Set Updates
  
  /** The type of data being supplied from a Vulkan descriptor update */
@@ -7759,7 +7872,7 @@ index 3cdc6234..9d844b81 100644
  
  static MVKDescriptorUpdateSourceType getDescriptorUpdateSourceType(VkDescriptorType type) {
  	switch (type) {
-@@ -807,8 +834,10 @@ static MVKDescriptorUpdateSourceType getDescriptorUpdateSourceType(VkDescriptorT
+@@ -807,8 +875,10 @@ static MVKDescriptorUpdateSourceType getDescriptorUpdateSourceType(VkDescriptorT
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			return MVKDescriptorUpdateSourceType::InlineUniform;
  
@@ -7771,7 +7884,7 @@ index 3cdc6234..9d844b81 100644
  		case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV:
  		case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
  		case VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM:
-@@ -833,6 +862,8 @@ static MVKDescriptorUpdateSourceType getDescriptorUpdateSourceType(VkDescriptorT
+@@ -833,6 +903,8 @@ static MVKDescriptorUpdateSourceType getDescriptorUpdateSourceType(VkDescriptorT
  			return write.pTexelBufferView;
  		case MVKDescriptorUpdateSourceType::InlineUniform:
  			return mvkFindStructInChain<VkWriteDescriptorSetInlineUniformBlock>(&write, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK)->pData;
@@ -7780,7 +7893,7 @@ index 3cdc6234..9d844b81 100644
  		case MVKDescriptorUpdateSourceType::Unsupported:
  			return nullptr;
  	}
-@@ -846,6 +877,7 @@ static uint32_t getDescriptorUpdateStride(MVKDescriptorUpdateSourceType type) {
+@@ -846,6 +918,7 @@ static uint32_t getDescriptorUpdateStride(MVKDescriptorUpdateSourceType type) {
  		case MVKDescriptorUpdateSourceType::Buffer:        return sizeof(VkDescriptorBufferInfo);
  		case MVKDescriptorUpdateSourceType::TexelBuffer:   return sizeof(VkBufferView);
  		case MVKDescriptorUpdateSourceType::InlineUniform: return 1;
@@ -7788,7 +7901,7 @@ index 3cdc6234..9d844b81 100644
  		case MVKDescriptorUpdateSourceType::Unsupported:   return 0;
  	}
  }
-@@ -863,6 +895,7 @@ static bool canUseFastPathUpdate(MVKDescriptorGPULayout layout, MVKArgumentBuffe
+@@ -863,6 +936,7 @@ static bool canUseFastPathUpdate(MVKDescriptorGPULayout layout, MVKArgumentBuffe
  		case MVKDescriptorGPULayout::InlineData:
  			return true;
  		case MVKDescriptorGPULayout::TexBufSoA:
@@ -7796,7 +7909,7 @@ index 3cdc6234..9d844b81 100644
  		case MVKDescriptorGPULayout::TexSampSoA:
  		case MVKDescriptorGPULayout::Tex2SampSoA:
  		case MVKDescriptorGPULayout::Tex3SampSoA:
-@@ -909,9 +942,13 @@ static bool canUseFastPathUpdate(MVKDescriptorGPULayout layout, MVKArgumentBuffe
+@@ -909,9 +983,13 @@ static bool canUseFastPathUpdate(MVKDescriptorGPULayout layout, MVKArgumentBuffe
  	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
  		dst[index].gpuAddress = buf.gpuAddress + offset;
  	}
@@ -7810,7 +7923,7 @@ index 3cdc6234..9d844b81 100644
  	void setTexture(MVKImageView* img, size_t index = 0) { setTexture(img ? img->getMTLTexture() : nil, index); }
  	void setSampler(MVKSampler* samp, size_t index = 0) { setSampler(samp ? samp->getMTLSamplerState() : nil, index); }
  	void setBuffer(const VkDescriptorBufferInfo* info, size_t index = 0) {
-@@ -934,9 +971,13 @@ void setBuffer(const VkDescriptorBufferInfo* info, size_t index = 0) {
+@@ -934,9 +1012,13 @@ void setBuffer(const VkDescriptorBufferInfo* info, size_t index = 0) {
  	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
  		[enc setBuffer:buf offset:static_cast<NSUInteger>(offset) atIndex:base + index];
  	}
@@ -7824,16 +7937,33 @@ index 3cdc6234..9d844b81 100644
  	void setTexture(MVKImageView* img, size_t index = 0) {
  		[enc setTexture:img ? img->getMTLTexture() : nil atIndex:base + index];
  	}
-@@ -967,7 +1008,7 @@ static void writeDescriptorSetGPUBuffer(
+@@ -965,9 +1047,9 @@ static constexpr size_t descriptorGPUStride(MVKArgumentBufferMode argBufMode, MV
+ template <MVKArgumentBufferMode ArgBufMode, MVKDescriptorGPULayout Layout>
+ static void writeDescriptorSetGPUBuffer(
  	const MVKDescriptorBinding& binding,
- 	id<MTLArgumentEncoder> enc_, char* base, const uint32_t* auxOffsets,
+-	id<MTLArgumentEncoder> enc_, char* base, const uint32_t* auxOffsets,
++	id<MTLArgumentEncoder> enc_, char* base, const uint32_t* auxOffsets, uint32_t* samplerModes,
  	const void* src, size_t srcStride, MVKDescriptorUpdateSourceType srcType,
 -	uint32_t start, uint32_t count)
 +	uint32_t bindingCount, uint32_t start, uint32_t count)
  {
  	constexpr size_t dstStride = descriptorGPUStride(ArgBufMode, Layout);
  	size_t startOffset = start * dstStride;
-@@ -1005,13 +1046,23 @@ static void writeDescriptorSetGPUBuffer(
+@@ -996,8 +1078,11 @@ static void writeDescriptorSetGPUBuffer(
+ 
+ 			case MVKDescriptorGPULayout::Sampler:
+ 				assert(srcType == MVKDescriptorUpdateSourceType::Sampler);
+-				if (!binding.hasImmutableSamplers())
+-					enc.setSampler(reinterpret_cast<MVKSampler*>(static_cast<const VkDescriptorImageInfo*>(src)->sampler));
++				if (!binding.hasImmutableSamplers()) {
++					auto* samp = reinterpret_cast<MVKSampler*>(static_cast<const VkDescriptorImageInfo*>(src)->sampler);
++					enc.setSampler(samp);
++					if (samplerModes) { samplerModes[binding.sizeIndex + start + i] = samp ? samp->getEmulatedReductionMode() : 0; }
++				}
+ 				break;
+ 
+ 			case MVKDescriptorGPULayout::Buffer:
+@@ -1005,13 +1090,23 @@ static void writeDescriptorSetGPUBuffer(
  				enc.setBuffer(static_cast<const VkDescriptorBufferInfo*>(src));
  				break;
  
@@ -7859,16 +7989,21 @@ index 3cdc6234..9d844b81 100644
  				}
  				break;
  
-@@ -1020,7 +1071,7 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1019,8 +1114,11 @@ static void writeDescriptorSetGPUBuffer(
+ 				assert(srcType == MVKDescriptorUpdateSourceType::ImageSampler);
  				auto* info = static_cast<const VkDescriptorImageInfo*>(src);
  				enc.setTexture(reinterpret_cast<MVKImageView*>(info->imageView));
- 				if (!binding.hasImmutableSamplers())
+-				if (!binding.hasImmutableSamplers())
 -					enc.setSampler(reinterpret_cast<MVKSampler*>(info->sampler), binding.descriptorCount);
-+					enc.setSampler(reinterpret_cast<MVKSampler*>(info->sampler), bindingCount);
++				if (!binding.hasImmutableSamplers()) {
++					auto* samp = reinterpret_cast<MVKSampler*>(info->sampler);
++					enc.setSampler(samp, bindingCount);
++					if (samplerModes) { samplerModes[binding.sizeIndex + bindingCount + start + i] = samp ? samp->getEmulatedReductionMode() : 0; }
++				}
  				break;
  			}
  
-@@ -1028,11 +1079,11 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1028,11 +1126,11 @@ static void writeDescriptorSetGPUBuffer(
  				assert(srcType == MVKDescriptorUpdateSourceType::ImageSampler);
  				assert(binding.hasImmutableSamplers());
  				if (auto* img = reinterpret_cast<MVKImageView*>(static_cast<const VkDescriptorImageInfo*>(src)->imageView)) {
@@ -7884,7 +8019,7 @@ index 3cdc6234..9d844b81 100644
  				}
  				break;
  
-@@ -1041,10 +1092,10 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1041,10 +1139,10 @@ static void writeDescriptorSetGPUBuffer(
  				assert(binding.hasImmutableSamplers());
  				if (auto* img = reinterpret_cast<MVKImageView*>(static_cast<const VkDescriptorImageInfo*>(src)->imageView)) {
  					for (size_t j = 0; j < 3; j++)
@@ -7897,7 +8032,7 @@ index 3cdc6234..9d844b81 100644
  				}
  				break;
  
-@@ -1055,10 +1106,10 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1055,10 +1153,10 @@ static void writeDescriptorSetGPUBuffer(
  				if (buf) {
  					enc.setBuffer(buf->getMTLBuffer(), buf->getMTLBufferOffset() + info->offset);
  					VkDeviceSize size = info->range == VK_WHOLE_SIZE ? buf->getByteCount() - info->offset : info->range;
@@ -7910,19 +8045,20 @@ index 3cdc6234..9d844b81 100644
  				}
  				break;
  			}
-@@ -1090,9 +1141,10 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1090,9 +1188,11 @@ static void writeDescriptorSetGPUBuffer(
  {
  	char* base = set->gpuBuffer;
  	const uint32_t* auxOffsets = set->auxIndices;
++	uint32_t* samplerModes = ArgBufMode == MVKArgumentBufferMode::Metal3 ? getSamplerReductionModes(set) : nullptr;
 +	uint32_t bindingCount = binding->getDescriptorCount(set->variableDescriptorCount);
  	if (canUseFastPathUpdate(binding->gpuLayout, ArgBufMode)) {
  		switch (binding->gpuLayout) {
 -#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, src, srcStride, srcType, start, count)
-+#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, src, srcStride, srcType, bindingCount, start, count)
++#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, samplerModes, src, srcStride, srcType, bindingCount, start, count)
  			case MVKDescriptorGPULayout::None:          break;
  			case MVKDescriptorGPULayout::Texture:       DISPATCH(Texture);       break;
  			case MVKDescriptorGPULayout::Sampler:       DISPATCH(Sampler);       break;
-@@ -1107,6 +1159,7 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1107,6 +1207,7 @@ static void writeDescriptorSetGPUBuffer(
  				break;
  
  			case MVKDescriptorGPULayout::TexBufSoA:
@@ -7930,7 +8066,7 @@ index 3cdc6234..9d844b81 100644
  			case MVKDescriptorGPULayout::TexSampSoA:
  			case MVKDescriptorGPULayout::Tex2SampSoA:
  			case MVKDescriptorGPULayout::Tex3SampSoA:
-@@ -1115,15 +1168,17 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1115,15 +1216,17 @@ static void writeDescriptorSetGPUBuffer(
  #undef DISPATCH
  		}
  	} else {
@@ -7946,13 +8082,13 @@ index 3cdc6234..9d844b81 100644
 +			uint32_t numWrite = std::min(count, bindingCount - start);
  			switch (binding->gpuLayout) {
 -#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, src, srcStride, srcType, start, numWrite)
-+#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, src, srcStride, srcType, bindingCount, start, numWrite)
++#define DISPATCH(x) writeDescriptorSetGPUBuffer<ArgBufMode, MVKDescriptorGPULayout::x>(*binding, enc, base, auxOffsets, samplerModes, src, srcStride, srcType, bindingCount, start, numWrite)
  				case MVKDescriptorGPULayout::TexBufSoA:     DISPATCH(TexBufSoA);    break;
 +				case MVKDescriptorGPULayout::AccelerationStructureAux: DISPATCH(AccelerationStructureAux); break;
  				case MVKDescriptorGPULayout::TexSampSoA:    DISPATCH(TexSampSoA);   break;
  				case MVKDescriptorGPULayout::Tex2SampSoA:   DISPATCH(Tex2SampSoA);  break;
  				case MVKDescriptorGPULayout::Tex3SampSoA:   DISPATCH(Tex3SampSoA);  break;
-@@ -1144,13 +1199,14 @@ static void writeDescriptorSetGPUBuffer(
+@@ -1144,13 +1247,14 @@ static void writeDescriptorSetGPUBuffer(
  					assert(0); // Fast path
  #undef DISPATCH
  			}
@@ -7968,7 +8104,7 @@ index 3cdc6234..9d844b81 100644
  		}
  	}
  }
-@@ -1178,6 +1234,14 @@ static void writeDescriptorSetCPUBuffer(
+@@ -1178,6 +1282,14 @@ static void writeDescriptorSetCPUBuffer(
  			case MVKDescriptorCPULayout::OneID: {
  				id* desc = reinterpret_cast<id*>(dst);
  				switch (srcType) {
@@ -7983,7 +8119,7 @@ index 3cdc6234..9d844b81 100644
  					case MVKDescriptorUpdateSourceType::Image:
  					case MVKDescriptorUpdateSourceType::ImageSampler: {
  						// OneID ImageSampler is image + constexpr sampler
-@@ -1362,10 +1426,18 @@ static void writeDescriptorSetCPUBufferDispatch(
+@@ -1362,10 +1474,18 @@ static void writeDescriptorSetCPUBufferDispatch(
  
  static void writeDescriptorSetBinding(
  	const MVKDescriptorSetLayout* layout,
@@ -8003,7 +8139,7 @@ index 3cdc6234..9d844b81 100644
  	char* cpuBuffer = set->cpuBuffer + binding->cpuOffset;
  	writeDescriptorSetCPUBufferDispatch(layout, *binding, cpuBuffer, src, stride, type, start, count);
  	switch (layout->argBufMode()) {
-@@ -1378,6 +1450,9 @@ static void writeDescriptorSetBinding(
+@@ -1378,6 +1498,9 @@ static void writeDescriptorSetBinding(
  			writeDescriptorSetGPUBuffer<MVKArgumentBufferMode::Metal3    >(binding, set, src, stride, type, enc, start, count);
  			break;
  	}
@@ -8013,7 +8149,7 @@ index 3cdc6234..9d844b81 100644
  }
  
  /**
-@@ -1389,20 +1464,21 @@ static void writeDescriptorSetBinding(
+@@ -1389,20 +1512,21 @@ static void writeDescriptorSetBinding(
  static void copyArgBuf(MVKDevice* device, id<MTLArgumentEncoder> enc,
                         const char* src, size_t srcStride,
                         uint32_t start, uint32_t count,
@@ -8039,7 +8175,7 @@ index 3cdc6234..9d844b81 100644
  				[enc setBuffer:live ? buf : nil offset:live ? offset : 0 atIndex:start + i];
  			} else {
  				[enc setBuffer:nil offset:0 atIndex:start + i];
-@@ -1416,20 +1492,67 @@ static void copyArgBuf(MVKDevice* device, id<MTLArgumentEncoder> enc,
+@@ -1416,20 +1540,67 @@ static void copyArgBuf(MVKDevice* device, id<MTLArgumentEncoder> enc,
  static void copyDescriptorSetBinding(
  	const MVKDescriptorSetLayout* dstLayout,
  	const MVKDescriptorBinding* srcBinding, const MVKDescriptorSet* srcSet, id<MTLArgumentEncoder> srcEnc,
@@ -8111,7 +8247,7 @@ index 3cdc6234..9d844b81 100644
  	if (gpu != MVKDescriptorGPULayout::None) {
  		if (canUseFastPathUpdate(gpu, argBufMode)) {
  			if (argBufMode != MVKArgumentBufferMode::ArgEncoder) {
-@@ -1451,13 +1574,13 @@ static void copyDescriptorSetBinding(
+@@ -1451,13 +1622,13 @@ static void copyDescriptorSetBinding(
  
  					case MVKDescriptorGPULayout::Texture:
  						// Texture always comes first, so layout doesn't matter
@@ -8127,7 +8263,7 @@ index 3cdc6234..9d844b81 100644
  						break;
  
  					case MVKDescriptorGPULayout::Buffer:
-@@ -1470,12 +1593,13 @@ static void copyDescriptorSetBinding(
+@@ -1470,12 +1641,13 @@ static void copyDescriptorSetBinding(
  							assert(cpu == MVKDescriptorCPULayout::OneID2Meta);
  							offsetOffset = offsetof(MVKCPUDescriptorOneID2Meta, offset);
  						}
@@ -8142,9 +8278,15 @@ index 3cdc6234..9d844b81 100644
  					case MVKDescriptorGPULayout::TexSampSoA:
  					case MVKDescriptorGPULayout::Tex2SampSoA:
  					case MVKDescriptorGPULayout::Tex3SampSoA:
-@@ -1485,9 +1609,17 @@ static void copyDescriptorSetBinding(
+@@ -1483,11 +1655,22 @@ static void copyDescriptorSetBinding(
+ 						assert(0); // Not fast path
+ 				}
  			}
- 			if (needsAuxBuf(gpu)) {
+-			if (needsAuxBuf(gpu)) {
++			if (gpu == MVKDescriptorGPULayout::Sampler && !dstBinding->hasImmutableSamplers()) {
++				copySamplerReductionModes(srcSet, srcBinding, srcArrayElement, dstSet, dstBinding, dstArrayElement, count, 0, 0);
++			}
++			if (gpu == MVKDescriptorGPULayout::BufferAuxSize) {
  				// Copy aux buffer data
 -				char* src = srcSet->gpuBuffer + srcSet->auxIndices[srcBinding->auxIndex] + srcArrayElement * sizeof(uint32_t);
  				char* dst = dstSet->gpuBuffer + dstSet->auxIndices[dstBinding->auxIndex] + dstArrayElement * sizeof(uint32_t);
@@ -8162,7 +8304,7 @@ index 3cdc6234..9d844b81 100644
  			}
  		} else {
  			uint32_t srcStart = srcArrayElement;
-@@ -1506,14 +1638,18 @@ static void copyDescriptorSetBinding(
+@@ -1506,14 +1689,18 @@ static void copyDescriptorSetBinding(
  				uint32_t copyCount = std::min(count, std::min(srcRemaining, dstRemaining));
  
  				if (gpu == MVKDescriptorGPULayout::OutlinedData) {
@@ -8183,7 +8325,7 @@ index 3cdc6234..9d844b81 100644
  						src = [dstEnc constantDataAtIndex:srcBinding->argBufID];
  					} else if (srcEnc == dstEnc) {
  						// Both encoders are the same, so we need to swap the argument buffer out
-@@ -1529,6 +1665,7 @@ static void copyDescriptorSetBinding(
+@@ -1529,6 +1716,7 @@ static void copyDescriptorSetBinding(
  					size_t elemSize = sizeof(uint64_t);
  					uint32_t elems = 0;
  					switch (gpu) {
@@ -8191,7 +8333,16 @@ index 3cdc6234..9d844b81 100644
  						case MVKDescriptorGPULayout::TexBufSoA:   elems = 2; break;
  						case MVKDescriptorGPULayout::TexSampSoA:  elems = 2; break;
  						case MVKDescriptorGPULayout::Tex2SampSoA: elems = 3; break;
-@@ -1555,6 +1692,7 @@ static void copyDescriptorSetBinding(
+@@ -1551,10 +1739,16 @@ static void copyDescriptorSetBinding(
+ 					size_t dstAdvance = dstBinding->descriptorCount * elemSize;
+ 					for (uint32_t i = 0; i < elems; i++, src += srcAdvance, dst += dstAdvance)
+ 						memcpy(dst, src, copyCount * elemSize);
++					if (hasSampler(gpu) && !dstBinding->hasImmutableSamplers()) {
++						uint32_t ntex = elems - 1;
++						copySamplerReductionModes(srcSet, srcBinding, srcStart, dstSet, dstBinding, dstStart, copyCount,
++												  ntex * srcBinding->descriptorCount, ntex * dstBinding->descriptorCount);
++					}
+ 				} else {
  					// All these are SoA with textures as the first element
  					uint32_t ntex = 0;
  					switch (gpu) {
@@ -8199,7 +8350,7 @@ index 3cdc6234..9d844b81 100644
  						case MVKDescriptorGPULayout::TexBufSoA:   ntex = 1; break;
  						case MVKDescriptorGPULayout::TexSampSoA:  ntex = 1; break;
  						case MVKDescriptorGPULayout::Tex2SampSoA: ntex = 2; break;
-@@ -1575,15 +1713,15 @@ static void copyDescriptorSetBinding(
+@@ -1575,15 +1769,15 @@ static void copyDescriptorSetBinding(
  					char* src = srcSet->cpuBuffer + srcBinding->cpuOffset + srcStart * cpuStride;
  					uint32_t dst = dstBinding->argBufID + dstStart;
  					for (uint32_t i = 0; i < ntex; i++, dst += dstBinding->descriptorCount)
@@ -8218,7 +8369,7 @@ index 3cdc6234..9d844b81 100644
  						}
  					}
  				}
-@@ -1817,8 +1955,9 @@ void mvkUpdateDescriptorSetWithTemplate(VkDescriptorSet set, VkDescriptorUpdateT
+@@ -1817,8 +2011,9 @@ void mvkUpdateDescriptorSetWithTemplate(VkDescriptorSet set, VkDescriptorUpdateT
  	}
  }
  
@@ -8230,7 +8381,7 @@ index 3cdc6234..9d844b81 100644
  	for (uint32_t i = 0; i < writeCount; i++) {
  		const VkWriteDescriptorSet& write = pDescriptorWrites[i];
  		MVKDescriptorUpdateSourceType type = getDescriptorUpdateSourceType(write.descriptorType);
-@@ -1828,13 +1967,13 @@ void mvkPushDescriptorSet(void* dst, MVKDescriptorSetLayout* layout, uint32_t wr
+@@ -1828,13 +2023,13 @@ void mvkPushDescriptorSet(void* dst, MVKDescriptorSetLayout* layout, uint32_t wr
  			continue;
  
  		const MVKDescriptorBinding* binding = layout->getBinding(write.dstBinding);
@@ -8248,7 +8399,7 @@ index 3cdc6234..9d844b81 100644
  
  	for (uint32_t i = 0; i < updateTemplate->getNumberOfEntries(); i++) {
  		const VkDescriptorUpdateTemplateEntry* pEntry = updateTemplate->getEntry(i);
-@@ -1842,8 +1981,318 @@ void mvkPushDescriptorSetTemplate(void* dst, MVKDescriptorSetLayout* layout, MVK
+@@ -1842,8 +2037,323 @@ void mvkPushDescriptorSetTemplate(void* dst, MVKDescriptorSetLayout* layout, MVK
  
  		const MVKDescriptorBinding* binding = layout->getBinding(pEntry->dstBinding);
  		MVKDescriptorUpdateSourceType type = getDescriptorUpdateSourceType(pEntry->descriptorType);
@@ -8560,6 +8711,11 @@ index 3cdc6234..9d844b81 100644
 +					MVKSampler*const* samplers = &layout->immutableSamplers()[binding.immSamplerIndex];
 +					for (uint32_t i = 0; i < count; i++)
 +						write[i] = samplers[i]->getMTLSamplerState().gpuResourceID;
++					if (uint32_t* modes = getSamplerReductionModes(set)) {
++						modes += binding.sizeIndex + descriptorTextureCount(binding.gpuLayout) * count;
++						for (uint32_t i = 0; i < count; i++)
++							modes[i] = samplers[i]->getEmulatedReductionMode();
++					}
 +				}
 +			}
 +			break;
@@ -8569,7 +8725,7 @@ index 3cdc6234..9d844b81 100644
  	}
  }
  
-@@ -1890,6 +2339,7 @@ static uint32_t maxGPUSize(MVKDescriptorGPULayout layout, const MVKPhysicalDevic
+@@ -1890,6 +2400,7 @@ static uint32_t maxGPUSize(MVKDescriptorGPULayout layout, const MVKPhysicalDevic
  		case MVKDescriptorGPULayout::Texture:       return sizes.texture.size;
  		case MVKDescriptorGPULayout::Sampler:       return sizes.sampler.size;
  		case MVKDescriptorGPULayout::Buffer:        return sizes.pointer.size;
@@ -8577,7 +8733,7 @@ index 3cdc6234..9d844b81 100644
  		case MVKDescriptorGPULayout::TexBufSoA:     return sizes.texture.size + sizes.pointer.size;
  		case MVKDescriptorGPULayout::TexSampSoA:    return sizes.texture.size + sizes.sampler.size;
  		case MVKDescriptorGPULayout::Tex2SampSoA:   return sizes.texture.size * 2 + sizes.sampler.size;
-@@ -2008,8 +2458,6 @@ static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_
+@@ -2008,8 +2519,6 @@ static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_
  		} else @autoreleasepool {
  			ret->_gpuBufferObject = [device->getPhysicalDevice()->getMTLDevice() newBufferWithLength:gpuSize options:MTLResourceStorageModeShared];
  			ret->_gpuBuffer = { static_cast<char*>([ret->_gpuBufferObject contents]), gpuSize };
@@ -8586,7 +8742,7 @@ index 3cdc6234..9d844b81 100644
  			ret->setMetalObjectLabel(ret->_gpuBufferObject, @"Descriptor set buffer");
  		}
  	}
-@@ -2018,6 +2466,11 @@ static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_
+@@ -2018,6 +2527,11 @@ static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_
  }
  
  MVKDescriptorPool::~MVKDescriptorPool() {
@@ -8598,7 +8754,7 @@ index 3cdc6234..9d844b81 100644
  	[_gpuBufferObject release];
  }
  
-@@ -2082,9 +2535,12 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2082,9 +2596,12 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  		static_assert(offsetof(MVKDescriptorSetListItem, freed) == 0);
  		MVKDescriptorSetListItem* set = _firstFreeDescriptorSet;
  		_firstFreeDescriptorSet = set->freed.next;
@@ -8612,7 +8768,7 @@ index 3cdc6234..9d844b81 100644
  	} else {
  		return nullptr;
  	}
-@@ -2112,14 +2568,17 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2112,14 +2629,17 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  
  	memset(set, 0, sizeof(*set));
  	set->layout = mvkDSL;
@@ -8632,7 +8788,7 @@ index 3cdc6234..9d844b81 100644
  	}
  
  	if (mvkDSL->numAuxOffsets()) {
-@@ -2140,62 +2599,11 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2140,62 +2660,11 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  			return pickOOMError(_gpuBufferFreeList, _gpuBuffer, _gpuBufferUsed, gpuAllocSize);
  	}
  
@@ -8697,7 +8853,7 @@ index 3cdc6234..9d844b81 100644
  
  	return VK_SUCCESS;
  }
-@@ -2211,6 +2619,9 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2211,6 +2680,9 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  				_cpuBufferFreeList.add(set->cpuBuffer - _cpuBuffer.data(), set->cpuBufferSize);
  			if (set->gpuBufferSize)
  				_gpuBufferFreeList.add(set->gpuBufferOffset, set->gpuBufferSize);
@@ -8707,7 +8863,7 @@ index 3cdc6234..9d844b81 100644
  			setItem->freed.next = _firstFreeDescriptorSet;
  			_firstFreeDescriptorSet = setItem;
  		}
-@@ -2220,6 +2631,8 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2220,6 +2692,8 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  		for (uint32_t i = 0; i < count; i++) {
  			MVKDescriptorSet* set = reinterpret_cast<MVKDescriptorSet*>(pDescriptorSets[i]);
  			assert(set == &_descriptorSets[_numAllocatedDescriptorSets - count + i].allocated);
@@ -8716,7 +8872,7 @@ index 3cdc6234..9d844b81 100644
  			_gpuBufferUsed -= set->gpuBufferSize;
  			_cpuBufferUsed -= set->cpuBufferSize;
  		}
-@@ -2229,6 +2642,12 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2229,6 +2703,12 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  }
  
  VkResult MVKDescriptorPool::reset(VkDescriptorPoolResetFlags flags) {
@@ -8729,7 +8885,7 @@ index 3cdc6234..9d844b81 100644
  	if (_freeAllowed) {
  		_firstFreeDescriptorSet = nullptr;
  		_cpuBufferFreeList.reset();
-@@ -2291,6 +2710,10 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
+@@ -2291,6 +2771,10 @@ static VkResult pickOOMError(const MVKDescriptorPoolFreeList& free, MVKArrayRef<
  					entryEnd += sizeof(VkBufferView);
  					break;
  
@@ -8741,7 +8897,7 @@ index 3cdc6234..9d844b81 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..6a3b1ffa 100644
+index 534a414f..7b7fe8c1 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,10 @@
@@ -8787,7 +8943,15 @@ index 534a414f..6a3b1ffa 100644
  static constexpr uint32_t   kMVKMaxSamplerCount = 16;
  static constexpr uint32_t   kMVKMaxSampleCount = 8;
  static constexpr uint32_t   kMVKSampleLocationCoordinateGridSize = 16;
-@@ -426,6 +440,23 @@ public:
+@@ -124,6 +138,7 @@ typedef struct MVKMTLDeviceCapabilities {
+ 	bool supports32BitMSAA;
+ 	bool supportsRenderLinearTextures;
+ 	bool supportsSamplerReduction;
++	bool emulatesSamplerReduction;	/**< Min/max sampler reduction in the shader (SPIRV-Cross emulate_sampler_reduction), where samplers lack it. */
+ 
+ 	uint8_t getHighestAppleGPU() const;
+ 	uint8_t getHighestMacGPU() const;
+@@ -426,6 +441,28 @@ public:
  	/** Returns whether argument buffers are in use. */
  	bool isUsingMetalArgumentBuffers() const { return _isUsingMetalArgumentBuffers; }
  
@@ -8796,6 +8960,11 @@ index 534a414f..6a3b1ffa 100644
 +	 * (64 KiB pages), mapped through MTL4CommandQueue (macOS 26, Apple GPUs).
 +	 */
 +	bool supportsSparseResources() const { return _supportsSparseResources; }
++
++	/** Returns whether min/max sampler reduction is emulated in shaders, from modes the descriptor sets hold. */
++	bool emulatesSamplerReduction() const {
++		return _gpuCapabilities.emulatesSamplerReduction && _isUsingMetalArgumentBuffers && !_metalFeatures.needsArgumentBufferEncoders;
++	}
 +
 +	/** The Vulkan sparse block size: one Metal 64 KiB sparse page. */
 +	static constexpr VkDeviceSize kSparseBlockSize = 64 * 1024;
@@ -8811,7 +8980,7 @@ index 534a414f..6a3b1ffa 100644
  	/** Returns whether or not vertex instancing can be used to implement multiview. */
  	bool canUseInstancingForMultiview() { return _metalFeatures.layeredRendering; }
  
-@@ -437,6 +468,7 @@ public:
+@@ -437,6 +474,7 @@ public:
  
  	/** Returns the MTLDevice capabilities. */
  	const MVKMTLDeviceCapabilities getMTLDeviceCapabilities() { return _gpuCapabilities; }
@@ -8819,7 +8988,7 @@ index 534a414f..6a3b1ffa 100644
  
  	/** Returns info on the sizes of argument buffers. */
  	const MVKPhysicalDeviceArgumentBufferSizes& getArgumentBufferSizes() const { return _argumentBufferSizes; }
-@@ -486,6 +518,7 @@ protected:
+@@ -486,6 +524,7 @@ protected:
  	uint32_t getMaxPerSetDescriptorCount();
  	void initExternalMemoryProperties();
  	void initExtensions();
@@ -8827,7 +8996,7 @@ index 534a414f..6a3b1ffa 100644
  	void initCounterSets();
  	bool needsCounterSetRetained();
  	void updateTimestampPeriod();
-@@ -498,6 +531,7 @@ protected:
+@@ -498,6 +537,7 @@ protected:
  	template<typename HostImageCopyProps> void populateHostImageCopyProperties(HostImageCopyProps* pHostImageCopyProps);
  	bool isTier2MetalArgumentBuffers();
  	void logGPUInfo();
@@ -8835,7 +9004,7 @@ index 534a414f..6a3b1ffa 100644
  
  	MVKInstance* _mvkInstance;
  	id<MTLDevice> _mtlDevice;
-@@ -528,7 +562,10 @@ protected:
+@@ -528,7 +568,10 @@ protected:
  	uint32_t _lazilyAllocatedMemoryTypes;
  	MVKPhysicalDeviceArgumentBufferSizes _argumentBufferSizes;
  	bool _hasUnifiedMemory = true;
@@ -8846,7 +9015,7 @@ index 534a414f..6a3b1ffa 100644
  };
  
  
-@@ -792,6 +829,14 @@ public:
+@@ -792,6 +835,14 @@ public:
  	void destroyPipelineLayout(MVKPipelineLayout* mvkPLL,
  							   const VkAllocationCallbacks* pAllocator);
  
@@ -8861,7 +9030,7 @@ index 534a414f..6a3b1ffa 100644
      /**
       * Template function that creates count number of pipelines of type PipelineType,
       * using a collection of configuration information of type PipelineInfoType,
-@@ -868,7 +913,32 @@ public:
+@@ -868,7 +919,32 @@ public:
  #pragma mark Operations
  
  	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
@@ -8895,7 +9064,7 @@ index 534a414f..6a3b1ffa 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -943,6 +1013,12 @@ public:
+@@ -943,6 +1019,12 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -8908,7 +9077,7 @@ index 534a414f..6a3b1ffa 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -1050,12 +1126,21 @@ public:
+@@ -1050,12 +1132,21 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -8930,7 +9099,7 @@ index 534a414f..6a3b1ffa 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1097,7 +1182,16 @@ protected:
+@@ -1097,7 +1188,16 @@ protected:
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
  	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
  	MVKSmallVector<MVKResource*> _resources;
@@ -8947,7 +9116,7 @@ index 534a414f..6a3b1ffa 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1199,20 @@ protected:
+@@ -1105,16 +1205,20 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -8968,7 +9137,11 @@ index 534a414f..6a3b1ffa 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1168,9 +1266,11 @@ public:
+@@ -1165,12 +1269,15 @@ public:
+ 
+ 	/** Device features available and enabled. */
+ 	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
++	const MVKPhysicalDeviceVulkan12NoExtFeatures& getEnabledVulkan12NoExtFeatures() const { return _device->_enabledVulkan12NoExtFeatures; }
  
  	// List of extended device feature enabling structures, as getEnabledXXXFeatures() functions.
  #define MVK_DEVICE_FEATURE(structName, enumName, flagCount) \
@@ -8983,7 +9156,7 @@ index 534a414f..6a3b1ffa 100644
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..cbe2cb0f 100644
+index 359f8a2b..4138a7c9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -9002,7 +9175,16 @@ index 359f8a2b..cbe2cb0f 100644
  #include <cmath>
  
  using namespace std;
-@@ -572,6 +574,25 @@
+@@ -133,6 +135,8 @@
+ #if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
+ 	supportsSamplerReduction = supportsApple10 && mvkOSVersionIsAtLeast(26.0);
+ #endif
++	// Shader emulation reads each sampler's reduction mode from its descriptor set (Metal 3 argument buffers).
++	emulatesSamplerReduction = !supportsSamplerReduction && isAppleGPU && supportsMetal3;
+ }
+ 
+ 
+@@ -572,6 +576,25 @@
  				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
  				break;
  			}
@@ -9028,7 +9210,7 @@ index 359f8a2b..cbe2cb0f 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
  				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
  				barycentricFeatures->fragmentShaderBarycentric = true;
-@@ -631,11 +652,26 @@
+@@ -631,11 +654,26 @@
  				presentWait2Features->presentWait2 = true;
  				break;
  			}
@@ -9057,7 +9239,7 @@ index 359f8a2b..cbe2cb0f 100644
  				break;
  			}
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR: {
-@@ -752,6 +788,16 @@
+@@ -752,6 +790,16 @@
  				legacyDitheringFeatures->legacyDithering = getMVKConfig().useMetalPrivateAPI;
  				break;
  			}
@@ -9074,7 +9256,18 @@ index 359f8a2b..cbe2cb0f 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT: {
  				auto* multiDrawFeatures = (VkPhysicalDeviceMultiDrawFeaturesEXT*)next;
  				multiDrawFeatures->multiDraw = true;
-@@ -1284,6 +1330,31 @@
+@@ -906,8 +954,8 @@
+ 	supportedProps12.supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;	// Metal allows you to set the stencil resolve filter to either Sample0 or the same sample used for depth resolve. This is impossible to express in Vulkan.
+ 	supportedProps12.independentResolveNone = true;
+ 	supportedProps12.independentResolve = true;
+-	supportedProps12.filterMinmaxSingleComponentFormats = _gpuCapabilities.supportsSamplerReduction;
+-	supportedProps12.filterMinmaxImageComponentMapping = _gpuCapabilities.supportsSamplerReduction;
++	supportedProps12.filterMinmaxSingleComponentFormats = _gpuCapabilities.supportsSamplerReduction || emulatesSamplerReduction();
++	supportedProps12.filterMinmaxImageComponentMapping = _gpuCapabilities.supportsSamplerReduction || emulatesSamplerReduction();
+ 	supportedProps12.maxTimelineSemaphoreValueDifference = std::numeric_limits<uint64_t>::max();
+ 	supportedProps12.framebufferIntegerColorSampleCounts = _metalFeatures.supportedSampleCounts;
+ 
+@@ -1284,6 +1332,31 @@
  				shaderIntDotProperties->integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = supportedProps13.integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated;
  				break;
  			}
@@ -9106,7 +9299,7 @@ index 359f8a2b..cbe2cb0f 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES: {
  				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorProperties*)next;
  				divisorProps->maxVertexAttribDivisor = supportedProps14.maxVertexAttribDivisor;
-@@ -1311,6 +1382,43 @@
+@@ -1311,6 +1384,43 @@
  				nestedCmdBuffProps->maxCommandBufferNestingLevel = std::numeric_limits<uint32_t>::max();
  				break;
  			}
@@ -9150,7 +9343,7 @@ index 359f8a2b..cbe2cb0f 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
  				auto* multiDrawProps = (VkPhysicalDeviceMultiDrawPropertiesEXT*)next;
  				// Each draw is encoded as a separate command, so no limit is imposed.
-@@ -1588,6 +1696,13 @@
+@@ -1588,6 +1698,13 @@
  	const auto placementHeapFlags = VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT |
  	                                VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
  	                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
@@ -9164,7 +9357,7 @@ index 359f8a2b..cbe2cb0f 100644
  	if (!_metalFeatures.placementHeaps && mvkIsAnyFlagEnabled(flags, placementHeapFlags)) {
  		return VK_ERROR_FORMAT_NOT_SUPPORTED;
  	}
-@@ -1742,7 +1857,7 @@
+@@ -1742,7 +1859,7 @@
  	pImageFormatProperties->maxExtent = maxExt;
  	pImageFormatProperties->maxMipLevels = maxLevels;
  	pImageFormatProperties->maxArrayLayers = maxLayers;
@@ -9173,7 +9366,7 @@ index 359f8a2b..cbe2cb0f 100644
  	pImageFormatProperties->maxResourceSize = kMVKUndefinedLargeUInt64;
  
  	return VK_SUCCESS;
-@@ -2242,24 +2357,26 @@
+@@ -2242,24 +2359,26 @@
  		qfProps.queueCount = kMVKQueueCountPerQueueFamily;
  		qfProps.timestampValidBits = 64;
  		qfProps.minImageTransferGranularity = { 1, 1, 1};
@@ -9204,7 +9397,7 @@ index 359f8a2b..cbe2cb0f 100644
  			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
  		}
  
-@@ -2668,6 +2785,15 @@
+@@ -2668,6 +2787,15 @@
  	_metalFeatures.programmableSamplePositions = _mtlDevice.areProgrammableSamplePositionsSupported;
  	_metalFeatures.rasterOrderGroups = _mtlDevice.areRasterOrderGroupsSupported;
  	_metalFeatures.pullModelInterpolation = _mtlDevice.supportsPullModelInterpolation;
@@ -9220,7 +9413,7 @@ index 359f8a2b..cbe2cb0f 100644
  
  	// Both current and deprecated properties are retrieved and OR'd together, due to a
  	// Metal bug that, in some environments, returned true for one and false for the other.
-@@ -2726,6 +2852,9 @@
+@@ -2726,6 +2854,9 @@
  
  	// Argument buffers
  	_metalFeatures.argumentBuffersTier = _mtlDevice.argumentBuffersSupport;
@@ -9230,7 +9423,7 @@ index 359f8a2b..cbe2cb0f 100644
  
  	// Metal argument buffer support for descriptor sets is supported on macOS 11.0 or later,
  	// or on older versions of macOS using an Intel GPU, or on iOS & tvOS 16.0 or later (Metal 3).
-@@ -2738,6 +2867,8 @@
+@@ -2738,6 +2869,8 @@
  													_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  
  	_isUsingMetalArgumentBuffers = _metalFeatures.descriptorSetArgumentBuffers && getMVKConfig().useMetalArgumentBuffers;
@@ -9239,7 +9432,7 @@ index 359f8a2b..cbe2cb0f 100644
  
  #define checkSupportsMTLCounterSamplingPoint(mtlSP, mvkSP)  \
  	if ([_mtlDevice supportsCounterSampling: MTLCounterSamplingPointAt ##mtlSP ##Boundary]) {  \
-@@ -2787,6 +2918,71 @@
+@@ -2787,6 +2920,71 @@
  	_metalFeatures.renderWithoutAttachments = true;
  }
  
@@ -9311,7 +9504,7 @@ index 359f8a2b..cbe2cb0f 100644
  bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
  	return _isUsingMetalArgumentBuffers && (_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  }
-@@ -2794,12 +2990,13 @@
+@@ -2794,12 +2992,13 @@
  // Initializes the physical device features of this instance.
  void MVKPhysicalDevice::initFeatures() {
  	mvkClear(&_features);	// Start with everything cleared
@@ -9326,7 +9519,7 @@ index 359f8a2b..cbe2cb0f 100644
      _features.depthBiasClamp = true;
      _features.fillModeNonSolid = true;
      _features.largePoints = true;
-@@ -2808,6 +3005,14 @@
+@@ -2808,6 +3007,14 @@
      _features.samplerAnisotropy = true;
      _features.shaderImageGatherExtended = true;
      _features.shaderStorageImageExtendedFormats = true;
@@ -9341,7 +9534,16 @@ index 359f8a2b..cbe2cb0f 100644
      _features.shaderStorageImageReadWithoutFormat = true;
      _features.shaderStorageImageWriteWithoutFormat = true;
      _features.shaderUniformBufferArrayDynamicIndexing = true;
-@@ -2931,6 +3136,14 @@
+@@ -2869,7 +3076,7 @@
+ 	_vulkan12NoExtFeatures.samplerMirrorClampToEdge = _metalFeatures.samplerMirrorClampToEdge;
+ 	_vulkan12NoExtFeatures.drawIndirectCount = _metalFeatures.indirectDrawing;
+ 	_vulkan12NoExtFeatures.descriptorIndexing = _metalFeatures.arrayOfTextures && _metalFeatures.arrayOfSamplers;
+-	_vulkan12NoExtFeatures.samplerFilterMinmax = _gpuCapabilities.supportsSamplerReduction;
++	_vulkan12NoExtFeatures.samplerFilterMinmax = _gpuCapabilities.supportsSamplerReduction || emulatesSamplerReduction();
+ 	_vulkan12NoExtFeatures.shaderOutputViewportIndex = _features.multiViewport;
+ 	_vulkan12NoExtFeatures.shaderOutputLayer = _metalFeatures.layeredRendering;
+ 	_vulkan12NoExtFeatures.subgroupBroadcastDynamicId = _metalFeatures.simdPermute || _metalFeatures.quadPermute;
+@@ -2931,6 +3138,14 @@
  	_properties.limits.maxPerStageDescriptorStorageImages = _metalFeatures.maxPerStageStorageTextureCount;
  	_properties.limits.maxPerStageDescriptorInputAttachments = _metalFeatures.maxPerStageTextureCount;
  
@@ -9356,7 +9558,7 @@ index 359f8a2b..cbe2cb0f 100644
      _properties.limits.maxPerStageResources = (_metalFeatures.maxPerStageBufferCount + _metalFeatures.maxPerStageTextureCount);
      _properties.limits.maxFragmentCombinedOutputResources = _properties.limits.maxPerStageResources;
  
-@@ -3143,7 +3356,12 @@
+@@ -3143,7 +3358,12 @@
  
      // Unsupported features - set to zeros generally
  
@@ -9370,7 +9572,7 @@ index 359f8a2b..cbe2cb0f 100644
  
      _properties.limits.maxGeometryShaderInvocations = 0;
      _properties.limits.maxGeometryInputComponents = 0;
-@@ -3313,6 +3531,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3313,6 +3533,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// might affect the contents of the pipeline cache (mostly MSL content).
  	uint32_t mtlFeatures = 0;
  	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
@@ -9378,7 +9580,7 @@ index 359f8a2b..cbe2cb0f 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mtlFeatures);
  	uuidComponentOffset += sizeof(mtlFeatures);
  }
-@@ -3545,6 +3764,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3545,6 +3766,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -9401,8 +9603,12 @@ index 359f8a2b..cbe2cb0f 100644
  void MVKPhysicalDevice::initExtensions() {
  	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
  	pWritableExtns->disableAllButEnabledDeviceExtensions();
-@@ -3595,12 +3830,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
- 	if (!_gpuCapabilities.supportsSamplerReduction) {
+@@ -3592,15 +3829,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	if (!_metalFeatures.placementHeaps) {
+ 		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
+ 	}
+-	if (!_gpuCapabilities.supportsSamplerReduction) {
++	if (!_gpuCapabilities.supportsSamplerReduction && !emulatesSamplerReduction()) {
  		pWritableExtns->vk_EXT_sampler_filter_minmax.enabled = false;
  	}
 +	if (!_gpuCapabilities.supportsApple7) {
@@ -9429,7 +9635,7 @@ index 359f8a2b..cbe2cb0f 100644
  
  	if (!_gpuCapabilities.isAppleGPU) {
  		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
-@@ -4034,6 +4284,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4034,6 +4286,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  			maxVarDescCount = mtlFeats.maxPerStageBufferCount - mtlBuffCnt;
  			break;
@@ -9439,7 +9645,7 @@ index 359f8a2b..cbe2cb0f 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			maxVarDescCount = (uint32_t)min<VkDeviceSize>(mtlFeats.maxMTLBufferSize, numeric_limits<uint32_t>::max());
  			break;
-@@ -4045,7 +4298,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4045,7 +4300,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
  		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
  				maxVarDescCount = min(mtlFeats.maxPerStageTextureCount - mtlTexCnt,
@@ -9448,7 +9654,7 @@ index 359f8a2b..cbe2cb0f 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4355,6 +4608,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,6 +4610,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -9460,7 +9666,7 @@ index 359f8a2b..cbe2cb0f 100644
  			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
  				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
  			default:
-@@ -4398,6 +4656,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4398,6 +4658,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -9506,7 +9712,7 @@ index 359f8a2b..cbe2cb0f 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +4761,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +4763,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -9519,7 +9725,7 @@ index 359f8a2b..cbe2cb0f 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4629,6 +4932,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +4934,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -9529,7 +9735,7 @@ index 359f8a2b..cbe2cb0f 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +4946,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +4948,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -9855,7 +10061,7 @@ index 359f8a2b..cbe2cb0f 100644
  	}
  }
  
-@@ -4967,6 +5581,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +5583,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -9875,7 +10081,7 @@ index 359f8a2b..cbe2cb0f 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -5016,7 +5643,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5016,7 +5645,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Can't use prefilled Metal command buffers if any of the resource descriptors can be updated after binding.
  bool MVKDevice::shouldPrefillMTLCommandBuffers() {
@@ -9888,7 +10094,7 @@ index 359f8a2b..cbe2cb0f 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5267,7 +5898,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +5900,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -9901,7 +10107,7 @@ index 359f8a2b..cbe2cb0f 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5601,6 +6236,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5601,6 +6238,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  #endif
  	[_defaultMTLSamplerState release];
  	[_dummyBlitMTLBuffer release];
@@ -10096,7 +10302,7 @@ index 00b182b8..c1f3dc3b 100644
  	_mtlHeap = nil;
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-index 45ddd3a4..1d50d42d 100644
+index 45ddd3a4..4453aff9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 @@ -152,6 +152,19 @@ protected:
@@ -10162,8 +10368,28 @@ index 45ddd3a4..1d50d42d 100644
  	bool _hasExtendedUsage;
  	bool _hasMutableFormat;
  	bool _shouldSupportAtomics;
+@@ -733,6 +768,12 @@ public:
+ 	/** Returns whether this sampler must be implemented as a hardcoded constant sampler in the shader MSL code. */
+ 	inline 	bool getRequiresConstExprSampler() { return _requiresConstExprSampler; }
+ 
++	/**
++	 * Returns the reduction mode that shaders emulate for this sampler (SPIRV-Cross emulate_sampler_reduction):
++	 * the reduction (0: weighted average, 1: min, 2: max) and its linear mag, min and mip filters, or zero.
++	 */
++	uint32_t getEmulatedReductionMode() const { return _emulatedReductionMode; }
++
+ 	/** Returns the Metal MTLSamplerAddressMode corresponding to the specified Vulkan VkSamplerAddressMode. */
+ 	MTLSamplerAddressMode getMTLSamplerAddressMode(VkSamplerAddressMode vkMode);
+ 
+@@ -751,5 +792,6 @@ protected:
+ 	id<MTLSamplerState> _mtlSamplerState;
+ 	SPIRV_CROSS_NAMESPACE::MSLConstexprSampler _constExprSampler;
+ 	MVKSamplerYcbcrConversion* _ycbcrConversion;
++	uint32_t _emulatedReductionMode = 0;
+ 	bool _requiresConstExprSampler;
+ };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..83708e1f 100644
+index 2b394922..48ff75c6 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -10375,6 +10601,27 @@ index 2b394922..83708e1f 100644
  	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
  
  	// Setting Metal objects directly will override Vulkan settings.
+@@ -2570,6 +2741,20 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+ 
+ 	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
+ 
++	if (getPhysicalDevice()->emulatesSamplerReduction() && !pCreateInfo->unnormalizedCoordinates) {
++		for (const auto* next = (const VkBaseInStructure*)pCreateInfo->pNext; next; next = next->pNext) {
++			if (next->sType != VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO) { continue; }
++			auto mode = ((const VkSamplerReductionModeCreateInfo*)next)->reductionMode;
++			uint32_t reduction = mode == VK_SAMPLER_REDUCTION_MODE_MIN ? 1 : mode == VK_SAMPLER_REDUCTION_MODE_MAX ? 2 : 0;
++			if (reduction) {
++				_emulatedReductionMode = reduction |
++					(pCreateInfo->magFilter == VK_FILTER_LINEAR ? 4u : 0u) |
++					(pCreateInfo->minFilter == VK_FILTER_LINEAR ? 8u : 0u) |
++					(pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? 16u : 0u);
++			}
++		}
++	}
++
+ 	@autoreleasepool {
+ 		auto mtlDev = getMTLDevice();
+ 		@synchronized (mtlDev) {
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
 index ef69994a..6fa84475 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
@@ -10747,7 +10994,7 @@ index e385e9bd..d71dcc03 100644
  #pragma mark Construction
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 47bbd4fc..7206e985 100644
+index 47bbd4fc..43bf3b19 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -36,6 +36,7 @@
@@ -10951,7 +11198,7 @@ index 47bbd4fc..7206e985 100644
  
  	for (uint32_t stage = 0; stage < kMVKShaderStageCount; stage++) {
  		ret->_pushConstantResourceIndices[stage] = static_cast<uint8_t>(ret->_mtlResourceCounts.stages[stage].bufferIndex);
-@@ -396,12 +466,68 @@ static bool isWriteable(VkDescriptorType type) {
+@@ -396,12 +466,72 @@ static bool isWriteable(VkDescriptorType type) {
  }
  
  MVKPipelineLayout::~MVKPipelineLayout() {
@@ -11015,12 +11262,16 @@ index 47bbd4fc..7206e985 100644
 +			hasInlineUniformBlocks |= binding.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
 +	shaderConfig.options.mslOptions.robust_storage_buffer_access = robust;
 +	shaderConfig.options.mslOptions.robust_uniform_buffer_access = robust && !hasInlineUniformBlocks;
++
++	// Min/max sampler reduction, emulated from the sampler modes the descriptor sets hold.
++	shaderConfig.options.mslOptions.emulate_sampler_reduction = getPhysicalDevice()->emulatesSamplerReduction() &&
++		getEnabledVulkan12NoExtFeatures().samplerFilterMinmax;
 +}
 +
  MVKPipeline::MVKPipeline(MVKDevice* device, MVKPipelineCache* pipelineCache, MVKPipelineLayout* layout,
  						 VkPipelineCreateFlags2 flags, MVKPipeline* parent) :
  	MVKVulkanAPIDeviceObject(device),
-@@ -429,7 +555,7 @@ static bool isWriteable(VkDescriptorType type) {
+@@ -429,7 +559,7 @@ static bool isWriteable(VkDescriptorType type) {
  
  /** Populate a MVKStageResourceBits based on the resources used by the given shader info. */
  static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLConversionConfiguration& src, SPIRVToMSLConversionResultInfo& results, spv::ExecutionModel stage) {
@@ -11029,7 +11280,7 @@ index 47bbd4fc..7206e985 100644
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Swizzle,       results.needsSwizzleBuffer);
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Output,        results.needsOutputBuffer);
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::PatchOutput,   results.needsPatchOutputBuffer);
-@@ -439,14 +565,16 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
+@@ -439,14 +569,16 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::ViewRange,     results.needsViewRangeBuffer);
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::DrawId,        results.needsDrawId);
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::DepthClip,     results.needsDepthClipStateBuffer);
@@ -11050,7 +11301,7 @@ index 47bbd4fc..7206e985 100644
  	}
  	for (const auto& binding : src.resourceBindings) {
  		if (!binding.outIsUsedByShader)
-@@ -458,8 +586,8 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
+@@ -458,8 +590,8 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
  			continue;
  		}
  		assert(binding.resourceBinding.desc_set < kMVKMaxDescriptorSetCount);
@@ -11061,7 +11312,7 @@ index 47bbd4fc..7206e985 100644
  			continue;
  		uint32_t count = binding.resourceBinding.count;
  		switch (binding.resourceBinding.basetype) {
-@@ -477,14 +605,18 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
+@@ -477,14 +609,18 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
  						dst.resources.textures.setRange(binding.resourceBinding.msl_texture, binding.resourceBinding.msl_texture + count);
  				}
  				break;
@@ -11082,7 +11333,7 @@ index 47bbd4fc..7206e985 100644
  			dst.resources.buffers.set(i);
  			dst.resources.descriptorSetData.set(i);
  		}
-@@ -707,6 +839,18 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -707,6 +843,18 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  										 const VkGraphicsPipelineCreateInfo* pCreateInfo) :
  	MVKPipeline(device, pipelineCache, (MVKPipelineLayout*)pCreateInfo->layout, getPipelineCreateFlags(pCreateInfo), parent)
  {
@@ -11101,7 +11352,7 @@ index 47bbd4fc..7206e985 100644
  	// Extract dynamic state first, as it can affect many configurations.
  	initDynamicState(pCreateInfo);
  
-@@ -763,12 +907,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -763,12 +911,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  		const auto* pSS = &pCreateInfo->pStages[i];
  		switch (pSS->stage) {
  			case VK_SHADER_STAGE_VERTEX_BIT:
@@ -11116,7 +11367,7 @@ index 47bbd4fc..7206e985 100644
  				pTessCtlSS = pSS;
  				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
  					pTessCtlFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
-@@ -999,7 +1145,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -999,7 +1149,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  }
  
  // Either returns an existing pipeline state or compiles a new one.
@@ -11126,7 +11377,7 @@ index 47bbd4fc..7206e985 100644
  																	 id<MTLRenderPipelineState>& plState) {
  	if ( !plState ) {
  		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
-@@ -1100,7 +1247,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1100,7 +1251,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  		}
  	}
  
@@ -11143,7 +11394,7 @@ index 47bbd4fc..7206e985 100644
  		MTLRenderPipelineDescriptor* plDesc = newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pFragmentSS, pFragmentFB);	// temp retain
  		if (plDesc) {
  			auto viewMask = getRenderingCreateInfo(pCreateInfo)->viewMask;
-@@ -1176,7 +1331,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1176,7 +1335,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  																				 const VkPipelineShaderStageCreateInfo* pVertexSS,
  																				 VkPipelineCreationFeedback* pVertexFB,
  																				 const VkPipelineShaderStageCreateInfo* pFragmentSS,
@@ -11153,7 +11404,7 @@ index 47bbd4fc..7206e985 100644
  	SPIRVToMSLConversionConfiguration shaderConfig;
  	initShaderConversionConfig(shaderConfig, pCreateInfo, reflectData);
  
-@@ -1184,13 +1340,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1184,13 +1344,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  
  	SPIRVShaderOutputs vtxOutputs;
  	std::string errorLog;
@@ -11170,7 +11421,7 @@ index 47bbd4fc..7206e985 100644
  
  	// Vertex input
  	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
-@@ -1394,6 +1551,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
+@@ -1394,6 +1555,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
  		case MVKImplicitBuffer::ViewRange:      return "view range";
  		case MVKImplicitBuffer::EmulatedReversedDepthViewport: return "emulated reversed-depth viewport";
  		case MVKImplicitBuffer::DepthClip:      return "depth clip state";
@@ -11178,7 +11429,7 @@ index 47bbd4fc..7206e985 100644
  		case MVKImplicitBuffer::IndirectParams: return "indirect parameter";
  		case MVKImplicitBuffer::Output:         return "per-vertex output";
  		case MVKImplicitBuffer::PatchOutput:    return "per-patch output";
-@@ -1418,10 +1576,91 @@ static bool verifyImplicitBuffers(MVKImplicitBufferBindings& buffers, const char
+@@ -1418,10 +1580,91 @@ static bool verifyImplicitBuffers(MVKImplicitBufferBindings& buffers, const char
  	return true;
  }
  
@@ -11271,7 +11522,7 @@ index 47bbd4fc..7206e985 100644
  }
  
  static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable) {
-@@ -1458,17 +1697,79 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1458,17 +1701,79 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	return ::verifyImplicitBuffers(_stageResources[stage].implicitBuffers, stageNames[stage], _descriptorBufferCounts.stages[stage], this);
  }
  
@@ -11354,7 +11605,7 @@ index 47bbd4fc..7206e985 100644
  	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
  	shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
  	shaderConfig.options.mslOptions.draw_id_buffer_index = implicit[MVKImplicitBuffer::DrawId];
-@@ -1478,18 +1779,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1478,18 +1783,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	setDepthClipConfig(shaderConfig, implicit, _isRasterizing && isPossibleBothDepthClipClamp(_dynamicStateFlags, _staticStateData, false));
  	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
  
@@ -11385,7 +11636,7 @@ index 47bbd4fc..7206e985 100644
  		pFragmentSS = nullptr;
  	}
  
-@@ -1507,7 +1814,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1507,7 +1818,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
  	shaderConfig.options.entryPointName = pVertexSS->pName;
@@ -11395,7 +11646,7 @@ index 47bbd4fc..7206e985 100644
  	shaderConfig.options.mslOptions.shader_index_buffer_index = implicit[MVKImplicitBuffer::Index];
  	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
  	shaderConfig.options.mslOptions.draw_id_buffer_index = implicit[MVKImplicitBuffer::DrawId];
-@@ -1553,7 +1861,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1553,7 +1865,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageTessCtl].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationControl;
  	shaderConfig.options.entryPointName = pTessCtlSS->pName;
@@ -11405,7 +11656,7 @@ index 47bbd4fc..7206e985 100644
  	shaderConfig.options.mslOptions.indirect_params_buffer_index = implicit[MVKImplicitBuffer::IndirectParams];
  	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
-@@ -1593,7 +1902,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1593,7 +1906,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageTessEval].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationEvaluation;
  	shaderConfig.options.entryPointName = pTessEvalSS->pName;
@@ -11415,7 +11666,7 @@ index 47bbd4fc..7206e985 100644
  	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_patch_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_tess_factor_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding);
-@@ -1632,7 +1942,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1632,7 +1946,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	auto& mtlFeats = getMetalFeatures();
  	if (pFragmentSS) {
  		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
@@ -11425,7 +11676,7 @@ index 47bbd4fc..7206e985 100644
  		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
  		shaderConfig.options.entryPointName = pFragmentSS->pName;
  		shaderConfig.options.mslOptions.capture_output_to_buffer = false;
-@@ -1953,19 +2264,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1953,19 +2268,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
              // bits, but some applications will not bother to check. We can just
              // skip and log a warning in this case to avoid crashing.
              if (mtlPixFmt && supportsBlend) {
@@ -11447,7 +11698,7 @@ index 47bbd4fc..7206e985 100644
              } else if (mtlPixFmt && !supportsBlend && pCA->blendEnable) {
                  reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "Blending is enabled for attachment with format %s, which does not support it.", getPixelFormats()->getName(attachFmt));
              }
-@@ -2043,12 +2349,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2043,12 +2353,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  
  	MVKPipelineLayout* layout = (MVKPipelineLayout*)pCreateInfo->layout;
  	layout->populateShaderConversionConfig(shaderConfig);
@@ -11472,7 +11723,7 @@ index 47bbd4fc..7206e985 100644
  	for (uint32_t i = 0; i < std::size(_stageResources); i++) {
  		MVKShaderStage stage = (MVKShaderStage)i;
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::DynamicOffset]  = getImplicitBufferIndex(stage, 0);
-@@ -2057,6 +2375,10 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2057,6 +2379,10 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::Output]         = getImplicitBufferIndex(stage, 4);
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::EmulatedReversedDepthViewport] = getImplicitBufferIndex(stage, 7);
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::DepthClip]       = getImplicitBufferIndex(stage, 8);
@@ -11483,7 +11734,7 @@ index 47bbd4fc..7206e985 100644
  		uint32_t extra = getImplicitBufferIndex(stage, 3);
  		switch (stage) {
  			case kMVKShaderStageVertex:
-@@ -2093,11 +2415,18 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2093,11 +2419,18 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	// Must ignore allowed bad pMultisampleState pointer if rasterization disabled
  	bool hasA2C = _isRasterizing && pCreateInfo->pMultisampleState && pCreateInfo->pMultisampleState->alphaToCoverageEnable;
  	shaderConfig.options.mslOptions.enable_frag_output_mask = hasA2C ? 1 : 0;
@@ -11502,7 +11753,7 @@ index 47bbd4fc..7206e985 100644
  		}
  	}
  
-@@ -2343,12 +2672,43 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2343,12 +2676,43 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  									   MVKPipelineCache* pipelineCache,
  									   MVKPipeline* parent,
  									   const VkComputePipelineCreateInfo* pCreateInfo) :
@@ -11549,7 +11800,7 @@ index 47bbd4fc..7206e985 100644
  		switch (next->sType) {
  			case VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO:
  				pFeedbackInfo = (VkPipelineCreationFeedbackCreateInfo*)next;
-@@ -2358,8 +2718,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2358,8 +2722,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		}
  	}
  
@@ -11558,7 +11809,7 @@ index 47bbd4fc..7206e985 100644
  	// Initialize feedback. The VALID bit must be initialized, either set or cleared.
  	// We'll set the VALID bit on the stage feedback when we compile it.
  	VkPipelineCreationFeedback* pPipelineFB = nullptr;
-@@ -2374,12 +2732,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2374,12 +2736,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].flags = 0;
  			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].duration = 0;
  		}
@@ -11576,7 +11827,7 @@ index 47bbd4fc..7206e985 100644
  	_mtlPipelineState = nil;
  
  	id<MTLFunction> mtlFunc = func.getMTLFunction();
-@@ -2387,12 +2747,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2387,12 +2751,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];	// temp retain
  		plDesc.computeFunction = mtlFunc;
  		plDesc.maxTotalThreadsPerThreadgroup = _mtlThreadgroupSize.width * _mtlThreadgroupSize.height * _mtlThreadgroupSize.depth;
@@ -11591,7 +11842,7 @@ index 47bbd4fc..7206e985 100644
  
  		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
  		_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
-@@ -2413,11 +2773,27 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2413,11 +2777,27 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  }
  
  // Returns a MTLFunction to use when creating the MTLComputePipelineState.
@@ -11624,7 +11875,7 @@ index 47bbd4fc..7206e985 100644
  
  	_module = getOrCreateShaderModule(_device, pSS, _ownsModule);
  
-@@ -2426,8 +2802,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2426,8 +2806,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	auto& mtlFeats = getMetalFeatures();
  	auto& mvkCfg = getMVKConfig();
      SPIRVToMSLConversionConfiguration shaderConfig;
@@ -11635,7 +11886,7 @@ index 47bbd4fc..7206e985 100644
      shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
      shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
      shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
-@@ -2450,8 +2826,21 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2450,8 +2830,21 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
      shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
  #endif
  
@@ -11659,7 +11910,7 @@ index 47bbd4fc..7206e985 100644
  
  	// Set implicit buffer indices
  	// FIXME: Many of these are optional. We shouldn't set the ones that aren't
-@@ -2461,9 +2850,50 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2461,9 +2854,50 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::BufferSize]    = getImplicitBufferIndex(1);
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::Swizzle]       = getImplicitBufferIndex(2);
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::DispatchBase]  = getImplicitBufferIndex(3);
@@ -11711,7 +11962,7 @@ index 47bbd4fc..7206e985 100644
  	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
  
      MVKMTLFunction func = _module->getMTLFunction(&shaderConfig, pSS->pSpecializationInfo, this, pStageFB);
-@@ -2475,13 +2905,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2475,13 +2909,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		}
  	}
  	auto& funcRslts = func.shaderConversionResults;
@@ -11749,7 +12000,7 @@ index 47bbd4fc..7206e985 100644
  	return getMetalFeatures().maxPerStageBufferCount - (bufferIndexOffset + 1);
  }
  
-@@ -2493,6 +2944,685 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2493,6 +2948,685 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  }
  
  
@@ -12435,7 +12686,7 @@ index 47bbd4fc..7206e985 100644
  #pragma mark -
  #pragma mark MVKPipelineCache
  
-@@ -2780,6 +3910,26 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2780,6 +3914,26 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.swizzle_buffer_index,
  				opt.indirect_params_buffer_index,
  				opt.shader_output_buffer_index,
@@ -12462,7 +12713,7 @@ index 47bbd4fc..7206e985 100644
  				opt.shader_patch_output_buffer_index,
  				opt.shader_tess_factor_buffer_index,
  				opt.buffer_size_buffer_index,
-@@ -2814,6 +3964,10 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2814,6 +3968,11 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.argument_buffers,
  				opt.argument_buffers_tier,
  				opt.runtime_array_rich_descriptor,
@@ -12470,10 +12721,11 @@ index 47bbd4fc..7206e985 100644
 +				opt.robust_uniform_buffer_access,
 +				opt.logic_op,
 +				opt.logic_op_attachment_kinds,
++				opt.emulate_sampler_reduction,
  				opt.enable_base_index_zero,
  				opt.pad_fragment_output_components,
  				opt.ios_support_base_vertex_instance,
-@@ -2921,8 +4075,15 @@ void serialize(Archive & archive, SPIRVEntryPoint& ep) {
+@@ -2921,8 +4080,15 @@ void serialize(Archive & archive, SPIRVEntryPoint& ep) {
  	template<class Archive>
  	void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
  		archive(opt.mslOptions,
@@ -12489,7 +12741,7 @@ index 47bbd4fc..7206e985 100644
  				opt.tessPatchKind,
  				opt.numTessControlPoints,
  				opt.shouldFlipVertexY,
-@@ -2959,7 +4120,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
+@@ -2959,7 +4125,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
  				cfg.shaderOutputs,
  				cfg.resourceBindings,
  				cfg.discreteDescriptorSets,
@@ -12499,7 +12751,7 @@ index 47bbd4fc..7206e985 100644
  	}
  
  	template<class Archive>
-@@ -2978,6 +4140,7 @@ void serialize(Archive & archive, SPIRVToMSLConversionResultInfo& scr) {
+@@ -2978,6 +4145,7 @@ void serialize(Archive & archive, SPIRVToMSLConversionResultInfo& scr) {
  				scr.needsViewRangeBuffer,
  				scr.needsDrawId,
  				scr.needsDepthClipStateBuffer,
@@ -12507,7 +12759,7 @@ index 47bbd4fc..7206e985 100644
  				scr.usesPhysicalStorageBufferAddressesCapability);
  	}
  
-@@ -3042,6 +4205,24 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3042,6 +4210,24 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  	return [_mtlRenderPipelineState retain];
  }
  
@@ -12532,12 +12784,12 @@ index 47bbd4fc..7206e985 100644
  bool MVKRenderPipelineCompiler::compileComplete(id<MTLRenderPipelineState> mtlRenderPipelineState, NSError* compileError) {
  	lock_guard<mutex> lock(_completionLock);
  
-@@ -3124,18 +4305,36 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+@@ -3124,18 +4310,36 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
  
  void mvkValidateCeralArchiveDefinitions() {
  	[[maybe_unused]] size_t missingBytes = 0;
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(8);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(7);
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
  	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
 +#else
@@ -12550,7 +12802,7 @@ index 47bbd4fc..7206e985 100644
  	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(40);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(39);			// Contains string
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
 +	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(32);			// Contains string
 +#else
@@ -12562,7 +12814,7 @@ index 47bbd4fc..7206e985 100644
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(136);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(135);	// Contains collection
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
 +	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(112);	// Contains collection
 +#else
@@ -12573,7 +12825,7 @@ index 47bbd4fc..7206e985 100644
  	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
  	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
-index 51bd5412..b2fe8039 100644
+index 51bd5412..283edff9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
 @@ -19,6 +19,7 @@
@@ -12584,6 +12836,15 @@ index 51bd5412..b2fe8039 100644
  #include <string>
  
  using namespace std;
+@@ -1587,7 +1588,7 @@
+ 	// Optimal tiling features
+ 	enableFormatFeatures(Read, Tex, mtlPixFmtCaps, vkProps.optimalTilingFeatures);
+ #if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
+-	if (gpuCaps.supportsSamplerReduction && chromaSubsamplingComponentBits == 0 &&
++	if ((gpuCaps.supportsSamplerReduction || gpuCaps.emulatesSamplerReduction) && chromaSubsamplingComponentBits == 0 &&
+ 		mvkIsAnyFlagEnabled(vkProps.optimalTilingFeatures, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
+ 		vkProps.optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+ 	}
 @@ -1641,5 +1642,8 @@
  		enableFormatFeatures(Write, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
  		enableFormatFeatures(Atomic, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);

@@ -1,0 +1,317 @@
+From 02351021517a71c8dd6816ffb0f0b54dfa4aeb26 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 23 Oct 2026 16:23:02 -0600
+Subject: [PATCH 5/5] MSL: Emulate min/max sampler reduction
+
+Options::emulate_sampler_reduction: each sampler in an argument buffer has its reduction mode
+and filters in its set's spvBufferSizeConstants. 2D and 2D array samples through a min or max
+sampler reduce the texels of their footprint (each sampled at its center, so the sampler's
+addressing applies) on one or both mips; other samples are unchanged.
+---
+ main.cpp      |   3 +
+ spirv_msl.cpp | 193 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ spirv_msl.hpp |  14 ++++
+ 3 files changed, 210 insertions(+)
+
+diff --git a/main.cpp b/main.cpp
+index 58f859b1..5253871a 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -687,6 +687,7 @@ struct CLIArguments
+ 	bool msl_robust_storage_buffer_access = false;
+ 	bool msl_robust_uniform_buffer_access = false;
+ 	uint32_t msl_logic_op = 0;
++	bool msl_emulate_sampler_reduction = false;
+ 	uint32_t msl_logic_op_attachment_kinds = 0;
+ 	bool msl_replace_recursive_inputs = false;
+ 	bool msl_readwrite_texture_fences = true;
+@@ -1326,6 +1327,7 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t>
+ 		msl_opts.robust_storage_buffer_access = args.msl_robust_storage_buffer_access;
+ 		msl_opts.robust_uniform_buffer_access = args.msl_robust_uniform_buffer_access;
+ 		msl_opts.logic_op = args.msl_logic_op;
++		msl_opts.emulate_sampler_reduction = args.msl_emulate_sampler_reduction;
+ 		msl_opts.logic_op_attachment_kinds = args.msl_logic_op_attachment_kinds;
+ 		msl_opts.replace_recursive_inputs = args.msl_replace_recursive_inputs;
+ 		msl_opts.input_attachment_is_ds_attachment = args.msl_input_attachment_is_ds_attachment;
+@@ -1942,6 +1944,7 @@ static int main_inner(int argc, char *argv[])
+ 	});
+ 	cbs.add("--msl-robust-storage-buffer-access",
+ 	        [&args](CLIParser &) { args.msl_robust_storage_buffer_access = true; });
++	cbs.add("--msl-emulate-sampler-reduction", [&args](CLIParser &) { args.msl_emulate_sampler_reduction = true; });
+ 	cbs.add("--msl-logic-op", [&args](CLIParser &parser) {
+ 		args.msl_logic_op = parser.next_uint() + 1;
+ 		args.msl_logic_op_attachment_kinds = parser.next_hex_uint();
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 23ca3722..0cd29d2a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -8519,6 +8519,60 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplSampleReduce:
++			statement("// Min/max sampler reduction: each texel of the footprint, sampled at its center, reduced per channel.");
++			statement("template <typename T>");
++			statement("static inline vec<T, 4> spvReduceTexels(vec<T, 4> a, vec<T, 4> b, uint mode)");
++			begin_scope();
++			statement("return (mode & 3u) == 1u ? min(a, b) : max(a, b);");
++			end_scope();
++			statement("");
++			for (int arrayed = 0; arrayed < 2; arrayed++)
++			{
++				const char *tex = arrayed ? "texture2d_array<T>" : "texture2d<T>";
++				const char *layer_param = arrayed ? ", uint layer" : "";
++				const char *layer_arg = arrayed ? ", layer" : "";
++				statement("template <typename T>");
++				statement("static inline vec<T, 4> spvSampleReduceLevel(", tex, " t, sampler s, float2 uv", layer_param,
++				          ", uint lvl, bool linear_filter, uint mode, int2 off)");
++				begin_scope();
++				statement("float2 size = float2(t.get_width(lvl), t.get_height(lvl));");
++				statement("float2 p = uv * size - (linear_filter ? 0.5 : 0.0);");
++				statement("float2 i = floor(p);");
++				statement("float2 f = p - i;");
++				statement("float2 c = (i + 0.5) / size;");
++				statement("vec<T, 4> r = t.sample(s, c", layer_arg, ", level(float(lvl)), off);");
++				statement("if (!linear_filter)");
++				statement("    return r;");
++				statement("float2 dx = float2(1.0 / size.x, 0.0), dy = float2(0.0, 1.0 / size.y);");
++				statement("if (f.x > 0.0)");
++				statement("    r = spvReduceTexels(r, t.sample(s, c + dx", layer_arg, ", level(float(lvl)), off), mode);");
++				statement("if (f.y > 0.0)");
++				statement("    r = spvReduceTexels(r, t.sample(s, c + dy", layer_arg, ", level(float(lvl)), off), mode);");
++				statement("if (f.x > 0.0 && f.y > 0.0)");
++				statement("    r = spvReduceTexels(r, t.sample(s, c + dx + dy", layer_arg, ", level(float(lvl)), off), mode);");
++				statement("return r;");
++				end_scope();
++				statement("");
++				statement("template <typename T>");
++				statement("static inline vec<T, 4> spvSampleReduce(", tex, " t, sampler s, float2 uv", layer_param,
++				          ", float lod, uint mode, int2 off)");
++				begin_scope();
++				statement("uint levels = t.get_num_mip_levels();");
++				statement("bool linear_filter = (mode & (lod <= 0.0 ? 4u : 8u)) != 0u;");
++				statement("float l = clamp(lod, 0.0, float(levels - 1u));");
++				statement("if ((mode & 16u) == 0u)");
++				statement("    return spvSampleReduceLevel(t, s, uv", layer_arg, ", uint(max(ceil(l + 0.5) - 1.0, 0.0)), linear_filter, mode, off);");
++				statement("uint l0 = uint(floor(l));");
++				statement("vec<T, 4> r = spvSampleReduceLevel(t, s, uv", layer_arg, ", l0, linear_filter, mode, off);");
++				statement("if (l > float(l0) && l0 + 1u < levels)");
++				statement("    r = spvReduceTexels(r, spvSampleReduceLevel(t, s, uv", layer_arg, ", l0 + 1u, linear_filter, mode, off), mode);");
++				statement("return r;");
++				end_scope();
++				statement("");
++			}
++			break;
++
+ 		case SPVFuncImplSparseValue:
+ 			statement("// Splits a sparse texture result into its value and a residency code (0: all texels resident).");
+ 			statement("template <typename T>");
+@@ -11573,6 +11627,9 @@ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
+ 		return;
+ 	}
+ 
++	if (emit_sampler_reduction_texture_op(i))
++		return;
++
+ 	if (msl_options.use_framebuffer_fetch_subpasses)
+ 	{
+ 		auto *ops = stream(i);
+@@ -14323,6 +14380,125 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
+ 		return img_expr.substr(0, index) + sampler_name_suffix + img_expr.substr(index);
+ }
+ 
++bool CompilerMSL::is_sampler_reduction_variable(const SPIRVariable &var)
++{
++	if (!msl_options.emulate_sampler_reduction || var.storage != StorageClassUniformConstant || is_hidden_variable(var))
++		return false;
++	auto &type = get_variable_data_type(var);
++	bool sampler = type.basetype == SPIRType::Sampler ||
++	               (type.basetype == SPIRType::SampledImage && type.image.dim != DimBuffer);
++	if (!sampler || type.array.size() > 1 || !descriptor_set_is_argument_buffer(get_decoration(var.self, DecorationDescriptorSet)))
++		return false;
++	if (find_constexpr_sampler(var.basevariable ? var.basevariable : VariableID(var.self)))
++		return false;
++	return interface_variable_exists_in_entry_point(var.self);
++}
++
++// The reduction mode of the sampler expression: name + suffix, keeping any array index
++// (or the name alone, for its declaration).
++string CompilerMSL::to_sampler_reduction_expression(const string &sampler_expr, bool declaration)
++{
++	auto expr = sampler_expr;
++	if (expr.size() >= 3 && expr[0] == '(' && expr[1] == '*')
++		expr = expr.substr(2, expr.size() - 3);
++	auto index = expr.find_first_of('[');
++	string base = index == string::npos ? expr : expr.substr(0, index);
++	for (auto &c : base)
++		if (c == '.')
++			c = '_';
++	string reduction = base + sampler_reduction_name_suffix;
++	if (declaration)
++		return reduction;
++	return index == string::npos ? reduction + "[0]" : reduction + expr.substr(index);
++}
++
++// Samples through a min/max sampler reduce their footprint (see Options::emulate_sampler_reduction).
++// Returns false if the operation is emitted normally.
++bool CompilerMSL::emit_sampler_reduction_texture_op(const Instruction &i)
++{
++	if (!msl_options.emulate_sampler_reduction)
++		return false;
++	auto *ops = stream(i);
++	auto op = static_cast<Op>(i.op);
++	if (op != OpImageSampleImplicitLod && op != OpImageSampleExplicitLod)
++		return false;
++
++	uint32_t result_type_id = ops[0];
++	uint32_t id = ops[1];
++	uint32_t img = ops[2];
++	uint32_t coord = ops[3];
++	auto &imgtype = expression_type(img);
++	if (imgtype.image.dim != Dim2D || imgtype.image.ms || imgtype.image.depth)
++		return false;
++
++	// The sampler must be one whose reduction mode is in its set's constants.
++	auto *combined = maybe_get<SPIRCombinedImageSampler>(img);
++	auto *sampler_var = maybe_get_backing_variable(combined && combined->sampler ? uint32_t(combined->sampler) : img);
++	if (!sampler_var || !is_sampler_reduction_variable(*sampler_var))
++		return false;
++
++	uint32_t bias = 0, lod = 0, grad_x = 0, grad_y = 0, offset = 0, min_lod = 0;
++	if (i.length > 4)
++	{
++		uint32_t flags = ops[4];
++		uint32_t k = 5;
++		auto next = [&]() { return k < i.length ? ops[k++] : 0u; };
++		if (flags & ImageOperandsBiasMask)
++			bias = next();
++		if (flags & ImageOperandsLodMask)
++			lod = next();
++		if (flags & ImageOperandsGradMask)
++		{
++			grad_x = next();
++			grad_y = next();
++		}
++		if (flags & ImageOperandsConstOffsetMask)
++			offset = next();
++		if (flags & ImageOperandsOffsetMask)
++			offset = next();
++		if (flags & (ImageOperandsConstOffsetsMask | ImageOperandsSampleMask))
++			return false;
++		if (flags & ImageOperandsMinLodMask)
++			min_lod = next();
++	}
++
++	bool forward = false;
++	SmallVector<uint32_t> inherited_expressions;
++	string sample_expr = to_texture_op(i, false, &forward, inherited_expressions);
++
++	string tex_expr = to_expression(combined ? combined->image : VariableID(img));
++	string smp_expr = to_sampler_expression(img);
++	string coord_expr = to_enclosed_expression(coord);
++	bool arrayed = imgtype.image.arrayed;
++	string uv = join(coord_expr, ".xy");
++	string layer = arrayed ? join(", uint(max(rint(", coord_expr, ".z), 0.0))") : "";
++
++	string lod_expr;
++	if (lod)
++		lod_expr = join("float(", to_expression(lod), ")");
++	else if (grad_x)
++		lod_expr = join("log2(max(length(float2(", to_expression(grad_x), ") * float2(", tex_expr, ".get_width(), ", tex_expr,
++		                ".get_height())), length(float2(", to_expression(grad_y), ") * float2(", tex_expr, ".get_width(), ", tex_expr,
++		                ".get_height()))))");
++	else if (get_execution_model() == ExecutionModelFragment)
++		lod_expr = join(tex_expr, ".calculate_unclamped_lod(", smp_expr, ", ", uv, ")");
++	else
++		lod_expr = "0.0";
++	if (bias)
++		lod_expr = join("(", lod_expr, " + float(", to_expression(bias), "))");
++	if (min_lod)
++		lod_expr = join("max(", lod_expr, ", float(", to_expression(min_lod), "))");
++	string offset_expr = offset ? join(", int2(", to_expression(offset), ")") : ", int2(0)";
++
++	add_spv_func_and_recompile(SPVFuncImplSampleReduce);
++	string mode = join("(", to_sampler_reduction_expression(smp_expr), ")");
++	string reduced = join("spvSampleReduce(", tex_expr, ", ", smp_expr, ", ", uv, layer, ", ", lod_expr, ", ", mode, offset_expr, ")");
++	emit_op(result_type_id, id, join("((", mode, " & 3u) != 0u ? ", reduced, " : ", sample_expr, ")"), false);
++	for (auto &inherit : inherited_expressions)
++		inherit_expression_dependencies(id, inherit);
++	return true;
++}
++
+ string CompilerMSL::to_swizzle_expression(uint32_t id)
+ {
+ 	auto *combined = maybe_get<SPIRCombinedImageSampler>(id);
+@@ -16451,6 +16627,17 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 		uint32_t var_id = var.self;
+ 		bool ssbo = has_decoration(type.self, DecorationBufferBlock);
+ 
++		if (var.storage == StorageClassUniformConstant && !is_hidden_variable(var) && is_sampler_reduction_variable(var))
++		{
++			entry_func.fixup_hooks_in.push_back([this, &type, &var, var_id]() {
++				uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
++				string sampler_expr = type.basetype == SPIRType::Sampler ? to_expression(var_id) : to_sampler_expression(var_id);
++				statement("constant uint* ", to_sampler_reduction_expression(sampler_expr, true), " = &",
++				          to_name(argument_buffer_ids[desc_set]), ".spvBufferSizeConstants[",
++				          convert_to_string(get_metal_resource_index(var, SPIRType::Sampler)), "];");
++			});
++		}
++
+ 		if (var.storage == StorageClassUniformConstant && !is_hidden_variable(var))
+ 		{
+ 			if (msl_options.swizzle_texture_samples && has_sampled_images && is_sampled_image_type(type))
+@@ -21246,6 +21433,12 @@ void CompilerMSL::analyze_argument_buffers()
+ 				set_needs_buffer_sizes[desc_set] = true;
+ 				needs_buffer_sizes = true;
+ 			}
++			// Sampler reduction modes live in the same constants as buffer sizes.
++			if (is_sampler_reduction_variable(var))
++			{
++				set_needs_buffer_sizes[desc_set] = true;
++				needs_buffer_sizes = true;
++			}
+ 		}
+ 	});
+ 
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index b2be39e8..3465aba3 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -404,6 +404,13 @@ public:
+ 		uint32_t logic_op = 0;
+ 		uint32_t logic_op_attachment_kinds = 0;
+ 
++		// Min/max sampler reduction (VK_SAMPLER_REDUCTION_MODE_MIN/MAX) on GPUs whose samplers lack it.
++		// Each sampler in an argument buffer has a uint in its set's spvBufferSizeConstants, at the sampler's
++		// index: bits 0-1 the reduction (0: weighted average, 1: min, 2: max), bit 2 a linear mag filter,
++		// bit 3 a linear min filter, bit 4 a linear mip filter. 2D and 2D array samples with a min or max
++		// sampler reduce the texels of their footprint, each sampled at its center.
++		bool emulate_sampler_reduction = false;
++
+ 		// Ensures vertex and instance indices start at zero. This reflects the behavior of HLSL with SV_VertexID and SV_InstanceID.
+ 		bool enable_base_index_zero = false;
+ 
+@@ -955,6 +962,7 @@ protected:
+ 		SPVFuncImplTextureCast,
+ 		SPVFuncImplDepthCast,
+ 		SPVFuncImplSparseValue,
++		SPVFuncImplSampleReduce,
+ 		SPVFuncImplMulExtended,
+ 		SPVFuncImplSetMeshOutputsEXT,
+ 		SPVFuncImplAssume,
+@@ -1429,6 +1437,12 @@ protected:
+ 
+ 	// Sparse residency: the residency code temporary of the texture operation being emitted.
+ 	uint32_t sparse_feedback_code_id = 0;
++
++	// Sampler reduction emulation.
++	std::string sampler_reduction_name_suffix = "Reduction";
++	bool is_sampler_reduction_variable(const SPIRVariable &var);
++	std::string to_sampler_reduction_expression(const std::string &sampler_expr, bool declaration = false);
++	bool emit_sampler_reduction_texture_op(const Instruction &i);
+ 	void emit_logic_op(const SPIRVariable &var, uint32_t location, uint32_t kind);
+ 	bool is_robust_buffer_variable(const SPIRVariable &var) const;
+ 	void track_robust_access_chain(const uint32_t *ops, uint32_t length, bool ptr_chain);
+-- 
+2.54.0 (Apple Git-157)
+

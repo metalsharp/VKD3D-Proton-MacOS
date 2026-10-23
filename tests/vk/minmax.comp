@@ -1,0 +1,14 @@
+#version 460
+// Min/max sampler reduction through a separate sampler array (the vkd3d-proton sampler heap).
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform texture2D tex;
+layout(set = 0, binding = 1) uniform sampler samplers[3];
+layout(set = 0, binding = 2) buffer Out { float v[]; } o;
+layout(set = 0, binding = 3) buffer In { vec4 q[]; } queries;   // xy uv, z lod
+layout(push_constant) uniform P { uint count; } p;
+void main()
+{
+    for (uint i = 0u; i < p.count; i++)
+        for (uint s = 0u; s < 3u; s++)
+            o.v[i * 3u + s] = textureLod(sampler2D(tex, samplers[s]), queries.q[i].xy, queries.q[i].z).x;
+}
