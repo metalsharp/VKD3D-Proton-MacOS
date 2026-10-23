@@ -16,6 +16,6 @@ for src in "$HERE"/*.c; do
 done
 for shader in "$HERE"/*.comp "$HERE"/*.vert "$HERE"/*.frag; do
     [ -e "$shader" ] || continue
-    glslangValidator -V --target-env vulkan1.2 "$shader" -o "$OUT/$(basename "$shader" | tr . _).spv" >/dev/null
+    glslangValidator -V --target-env vulkan1.3 "$shader" -o "$OUT/$(basename "$shader" | tr . _).spv" >/dev/null
 done
 ls "$OUT"

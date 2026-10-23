@@ -1,0 +1,21 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_subgroup_extended_types_int64 : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer O { uint64_t o[]; };
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    uint64_t v = (uint64_t(i) << 33) | i;
+    o[i * 8 + 0] = subgroupOr(v);
+    o[i * 8 + 1] = subgroupAdd(v);
+    o[i * 8 + 2] = subgroupInclusiveAdd(v);
+    o[i * 8 + 3] = subgroupExclusiveAdd(v);
+    o[i * 8 + 4] = subgroupMax(v);
+    o[i * 8 + 5] = subgroupBroadcastFirst(v);
+    o[i * 8 + 6] = subgroupShuffleXor(v, 1u);
+    o[i * 8 + 7] = uint64_t(subgroupMin(int64_t(v) - 100));
+}

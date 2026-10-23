@@ -774,6 +774,127 @@ void main(uint tid : SV_DispatchThreadID)
     return true;
 }
 
+// Sampler feedback 0.9: WriteSamplerFeedbackLevel into a MinMip map (16x16 mip regions of a 64x64
+// texture), decoded with ResolveSubresourceRegion. Feedback may be conservative (VKD3D-Proton records
+// mip N at regions 2^N times coarser), so check what must hold: every access is recorded, no region
+// reports a finer mip than was requested anywhere, and a mip 0 access marks exactly its region.
+static bool test_samplerfeedback()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+    if (o7.SamplerFeedbackTier < D3D12_SAMPLER_FEEDBACK_TIER_0_9)
+    {
+        printf("  skipped: sampler feedback tier %d\n", o7.SamplerFeedbackTier);
+        return true;
+    }
+    ID3D12Device8 *dev8 = nullptr;
+    ID3D12GraphicsCommandList1 *list1 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev8)));
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list1)));
+
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 64; td.Height = 64; td.DepthOrArraySize = 1; td.MipLevels = 7;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)));
+    D3D12_RESOURCE_DESC1 fd = {};
+    fd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    fd.Width = 64; fd.Height = 64; fd.DepthOrArraySize = 1; fd.MipLevels = 7;
+    fd.Format = (DXGI_FORMAT)189;   // DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE (missing from the mingw headers)
+    fd.SampleDesc.Count = 1;
+    fd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    fd.SamplerFeedbackMipRegion = { 16, 16, 1 };
+    ID3D12Resource *fb = nullptr;
+    CHECK_HR(dev8->CreateCommittedResource2(&hp, D3D12_HEAP_FLAG_NONE, &fd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, nullptr,
+                                            IID_PPV_ARGS(&fb)));
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateShaderResourceView(tex, nullptr, cpu);
+    cpu.ptr += inc;
+    dev8->CreateSamplerFeedbackUnorderedAccessView(tex, fb, cpu);
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 },
+    };
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable = { 2, ranges };
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    static const char *src = R"(
+Texture2D<float4> tex : register(t0);
+FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> fb : register(u0);
+SamplerState s : register(s0);
+[numthreads(1, 1, 1)]
+void main()
+{
+    fb.WriteSamplerFeedbackLevel(tex, s, float2(0.1, 0.1), 2.0);
+    fb.WriteSamplerFeedbackLevel(tex, s, float2(0.9, 0.6), 3.0);
+    fb.WriteSamplerFeedbackLevel(tex, s, float2(0.6, 0.1), 0.0);
+}
+)";
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_5"));
+    if (!rs || !ps)
+        return false;
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->Dispatch(1, 1, 1);
+
+    td.Width = 4; td.Height = 4; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8_UINT;
+    ID3D12Resource *decoded = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                               IID_PPV_ARGS(&decoded)));
+    transition(fb, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    list1->ResolveSubresourceRegion(decoded, 0, 0, 0, fb, 0, nullptr, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+    transition(decoded, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *rb = create_buffer(256 * 4, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8_UINT, 4, 4, 1, 256 };
+    srcl.pResource = decoded;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * 4 };
+    rb->Map(0, &range, (void **)&px);
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+        {
+            uint8_t v = px[y * 256 + x];
+            if (x == 2 && y == 0)
+                EXPECT(v == 0, "min mip of region (2,0) = %u, want 0", v);
+            else if (x == 0 && y == 0)
+                EXPECT(v == 2, "min mip of region (0,0) = %u, want 2", v);
+            else if (x == 3 && y == 2)
+                EXPECT(v == 2 || v == 3, "min mip of region (3,2) = %u, want 3 (or 2, conservatively)", v);
+            else
+                EXPECT(v == 0xff || v == 2 || v == 3, "min mip of region (%u,%u) = %u, want 255 (or 2/3, conservatively)", x, y, v);
+        }
+    rb->Release(); decoded->Release(); ps->Release(); rs->Release(); heap->Release(); fb->Release(); tex->Release();
+    list1->Release(); dev8->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -980,6 +1101,7 @@ static const Test tests[] = {
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
+    { "samplerfeedback", test_samplerfeedback },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };
