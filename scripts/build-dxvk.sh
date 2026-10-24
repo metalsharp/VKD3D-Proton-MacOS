@@ -29,5 +29,5 @@ CROSS
     -Db_ndebug=if-release "$OUT/x86_64" "$SRC" >/dev/null
 ninja -C "$OUT/x86_64" >/dev/null
 mkdir -p "$OUT/x86_64-windows"
-cp "$OUT/x86_64/src/dxgi/dxgi.dll" "$OUT/x86_64/src/d3d11/d3d11.dll" "$OUT/x86_64-windows/"
+cp "$OUT/x86_64/src/dxgi/dxgi.dll" "$OUT/x86_64/src/d3d11/d3d11.dll" "$OUT/x86_64/src/d3d10/d3d10core.dll" "$OUT/x86_64-windows/"
 ls -la "$OUT/x86_64-windows"
