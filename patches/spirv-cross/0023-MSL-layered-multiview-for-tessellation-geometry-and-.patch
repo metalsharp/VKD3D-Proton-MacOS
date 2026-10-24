@@ -1,0 +1,214 @@
+From c58749c6d688c3af76e76e5289f2590883b9c6b4 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 21:31:26 -0600
+Subject: [PATCH 23/23] MSL: layered multiview for tessellation, geometry and
+ mesh shaders
+
+Stages other than the vertex and fragment functions (vertex shaders run as kernels or object stages, tessellation
+control and evaluation, geometry and task and mesh shaders) take the view index from the view mask buffer, which
+the API sets to { view, 1, the Metal pass's first view } for each view's draw; the last pre-rasterization stage
+renders into the view's layer of the pass (a Layer output added where the shader has none: for mesh shaders, a
+per-primitive one). A vertex shader run as a kernel gets no Layer output, which changed the layout of its outputs
+that the tessellation control stage reads, and the view index is declared with its variable's type, not const,
+for the functions that take it by reference.
+---
+ spirv_msl.cpp | 89 +++++++++++++++++++++++++++++++++++++++++++++++----
+ spirv_msl.hpp | 20 ++++++++++++
+ 2 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 26cf99fd..07e3d70b 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -277,10 +277,12 @@ void CompilerMSL::build_implicit_builtins()
+ 	    active_input_builtins.get(BuiltInSubgroupLtMask);
+ 	bool need_subgroup_ge_mask = !msl_options.is_ios() && (active_input_builtins.get(BuiltInSubgroupGeMask) ||
+ 	                                                       active_input_builtins.get(BuiltInSubgroupGtMask));
++	// Not for a vertex shader run as a kernel (tessellation, transform feedback), which doesn't rasterize: a Layer
++	// output would change the layout of its outputs that the next stage reads.
+ 	bool need_multiview = get_execution_model() == ExecutionModelVertex && !msl_options.view_index_from_device_index &&
+ 	                      msl_options.multiview_layered_rendering &&
+ 	                      (msl_options.multiview || active_input_builtins.get(BuiltInViewIndex)) &&
+-	                      !msl_options.for_mesh_pipeline;
++	                      !msl_options.for_mesh_pipeline && !vertex_shader_is_kernel();
+ 	bool need_dispatch_base =
+ 	    msl_options.dispatch_base && get_execution_model() == ExecutionModelGLCompute &&
+ 	    (active_input_builtins.get(BuiltInWorkgroupId) || active_input_builtins.get(BuiltInGlobalInvocationId));
+@@ -305,7 +307,7 @@ void CompilerMSL::build_implicit_builtins()
+ 	    need_tese_params || need_multiview || need_dispatch_base || need_vertex_base_params || need_grid_params ||
+ 	    needs_sample_id || needs_subgroup_invocation_id || needs_subgroup_size || needs_helper_invocation ||
+ 	    has_additional_fixed_sample_mask() || need_local_invocation_index || need_workgroup_size ||
+-	    force_frag_depth_passthrough || needs_point_size_output || is_mesh_shader())
++	    force_frag_depth_passthrough || needs_point_size_output || is_mesh_shader() || needs_multiview_layer_output())
+ 	{
+ 		bool has_frag_coord = false;
+ 		bool has_sample_id = false;
+@@ -736,6 +738,58 @@ void CompilerMSL::build_implicit_builtins()
+ 			mark_implicit_builtin(StorageClassOutput, BuiltInLayer, var_id);
+ 		}
+ 
++		if (needs_multiview_layer_output())
++		{
++			// The shader's own Layer output (a mesh shader's is a member of its per-primitive block, which the
++			// output of the primitives sets), or a new one: the view's layer replaces what the shader writes.
++			bool has_layer_block_member = false;
++			ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++				if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(var.self))
++					return;
++				if (has_decoration(var.self, DecorationBuiltIn) && get_decoration(var.self, DecorationBuiltIn) == BuiltInLayer)
++					multiview_layer_output_id = var.self;
++				auto &type = get_variable_data_type(var);
++				for (uint32_t i = 0; type.basetype == SPIRType::Struct && i < uint32_t(type.member_types.size()); i++)
++					if (has_member_decoration(type.self, i, DecorationBuiltIn) &&
++					    get_member_decoration(type.self, i, DecorationBuiltIn) == BuiltInLayer)
++						has_layer_block_member = true;
++			});
++			if (!multiview_layer_output_id && !has_layer_block_member)
++			{
++				uint32_t offset = ir.increase_bound_by(is_mesh_shader() ? 3 : 2);
++				uint32_t type_id = get_uint_type_id();
++				if (is_mesh_shader())
++				{
++					// One for each primitive.
++					SPIRType array_type = get_uint_type();
++					array_type.op = OpTypeArray;
++					array_type.array.push_back(get_entry_point().output_primitives);
++					array_type.array_size_literal.push_back(true);
++					array_type.parent_type = get_uint_type_id();
++					type_id = offset + 2;
++					auto &t = set<SPIRType>(type_id, array_type);
++					t.self = type_id;
++				}
++				SPIRType ptr_out = get<SPIRType>(type_id);
++				ptr_out.op = OpTypePointer;
++				ptr_out.pointer = true;
++				ptr_out.pointer_depth++;
++				ptr_out.parent_type = type_id;
++				ptr_out.storage = StorageClassOutput;
++				auto &ptr_type = set<SPIRType>(offset, ptr_out);
++				ptr_type.self = type_id;
++				uint32_t var_id = offset + 1;
++				set<SPIRVariable>(var_id, offset, StorageClassOutput);
++				set_decoration(var_id, DecorationBuiltIn, BuiltInLayer);
++				if (is_mesh_shader())
++					set_decoration(var_id, DecorationPerPrimitiveEXT);
++				multiview_layer_output_id = var_id;
++				mark_implicit_builtin(StorageClassOutput, BuiltInLayer, var_id);
++			}
++			if (multiview_layer_output_id && !is_mesh_shader())
++				builtin_layer_id = multiview_layer_output_id;
++		}
++
+ 		if ((need_tesc_params && (msl_options.multi_patch_workgroup || !has_invocation_id || !has_primitive_id)) ||
+ 		    (need_tese_params && !has_primitive_id) || need_grid_params)
+ 		{
+@@ -2349,6 +2403,9 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 				uint32_t builtin = get_decoration(var_id, DecorationBuiltIn);
+ 
+ 				switch (builtin) {
++				case BuiltInViewIndex:
++					// The vertex function derives it (from the view mask, or 0 without multiview).
++					break;
+ 				case BuiltInInstanceIndex: {
+ 					statement(need_semicolon ? ", " : "", "instanceIndex");
+ 					need_semicolon = true;
+@@ -13092,6 +13149,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpEmitVertex:
+ 	{
+ 		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		if (needs_multiview_layer_output())
++			statement(builtin_to_glsl(BuiltInLayer, StorageClassOutput), " = ", to_expression(view_mask_buffer_id), "[0] - ",
++			          to_expression(view_mask_buffer_id), "[2];");
+ 		if (!needs_geometry_transform_feedback())
+ 		{
+ 			statement("meshStream.EmitVertex();");
+@@ -18529,6 +18589,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 		});
+ 	}
+ 
++	// Multiview: a tessellation evaluation shader renders into the view's layer of the Metal pass.
++	if (needs_multiview_layer_output() && is_tese_shader() && multiview_layer_output_id)
++	{
++		entry_func.fixup_hooks_out.push_back([this]() {
++			statement(to_expression(multiview_layer_output_id), " = ", to_expression(view_mask_buffer_id), "[0] - ",
++			          to_expression(view_mask_buffer_id), "[2];");
++		});
++	}
++
+ 	// Depth bounds test against the stored depth, before the shader runs.
+ 	if (depth_bounds_texture_id && depth_bounds_buffer_id && builtin_frag_coord_id)
+ 	{
+@@ -19024,13 +19093,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 					// Since every physical device is rendering a different view,
+ 					// there's no need for layered rendering here.
+ 				}
+-				else if (!msl_options.multiview_layered_rendering)
++				else if (!msl_options.multiview_layered_rendering || multiview_view_from_mask())
+ 				{
+ 					// In this case, the views are rendered one at a time. The view index, then,
+-					// is just the first part of the "view mask".
++					// is just the first part of the "view mask". Declared with the variable's type,
++					// and not const, since functions that use it take it by reference.
+ 					entry_func.fixup_hooks_in.push_back([=]() {
+-						statement("const ", builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+-						          to_expression(view_mask_buffer_id), "[0];");
++						auto &vtype = get_variable_data_type(get<SPIRVariable>(var_id));
++						statement(type_to_glsl(vtype), " ", to_expression(var_id), " = ", type_to_glsl(vtype), "(",
++						          to_expression(view_mask_buffer_id), "[0]);");
+ 					});
+ 				}
+ 				else if (get_execution_model() == ExecutionModelFragment)
+@@ -24800,7 +24871,11 @@ void CompilerMSL::emit_mesh_outputs()
+ 						access = "." + to_member_name(orig_type, orig_id);
+ 					}
+ 				}
+-				statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[spvPI]", access, ";");
++				if (needs_multiview_layer_output() && (builtin == BuiltInLayer || orig_var == multiview_layer_output_id))
++					statement("spvP.", to_member_name(type_prim, index), " = ", to_expression(view_mask_buffer_id), "[0] - ",
++					          to_expression(view_mask_buffer_id), "[2];");
++				else
++					statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[spvPI]", access, ";");
+ 			}
+ 			statement("spvMesh.set_primitive(spvPI, spvP);");
+ 		}
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 9d67b4d6..de0dc5ef 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -812,6 +812,25 @@ public:
+ 		return msl_options.multiview && !msl_options.view_index_from_device_index;
+ 	}
+ 
++	// With layered multiview, stages other than the vertex and fragment functions run once for each view
++	// (the API draws once for each), so their view index is the view mask buffer's first entry, { view, 1, the
++	// Metal pass's first view }, and the last pre-rasterization stage (tessellation evaluation, geometry or mesh)
++	// renders into the view's layer of the pass.
++	bool multiview_view_from_mask() const
++	{
++		auto model = get_execution_model();
++		return msl_options.multiview && msl_options.multiview_layered_rendering && !msl_options.view_index_from_device_index &&
++		       model != spv::ExecutionModelFragment &&
++		       (model != spv::ExecutionModelVertex || vertex_shader_is_kernel() || msl_options.for_mesh_pipeline);
++	}
++	bool needs_multiview_layer_output() const
++	{
++		auto model = get_execution_model();
++		return multiview_view_from_mask() &&
++		       (model == spv::ExecutionModelTessellationEvaluation || model == spv::ExecutionModelGeometry ||
++		        model == spv::ExecutionModelMeshEXT);
++	}
++
+ 	// Provide feedback to calling API to allow it to pass depth clip
+ 	// emulation state.
+ 	bool needs_depth_clip_state_buffer() const
+@@ -1421,6 +1440,7 @@ protected:
+ 	uint32_t builtin_base_instance_id = 0;
+ 	uint32_t builtin_view_idx_id = 0;
+ 	uint32_t builtin_layer_id = 0;
++	uint32_t multiview_layer_output_id = 0;	// The Layer output a multiview tessellation evaluation, geometry or mesh shader writes.
+ 	uint32_t builtin_invocation_id_id = 0;
+ 	uint32_t builtin_primitive_id_id = 0;
+ 	uint32_t builtin_subgroup_invocation_id_id = 0;
+-- 
+2.54.0 (Apple Git-157)
+
