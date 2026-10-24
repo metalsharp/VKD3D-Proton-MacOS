@@ -11915,7 +11915,7 @@ index 534a414f..95e8b64e 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..17d751ad 100644
+index 359f8a2b..e7d47684 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -12565,15 +12565,43 @@ index 359f8a2b..17d751ad 100644
  
      _properties.limits.maxGeometryShaderInvocations = 0;
      _properties.limits.maxGeometryInputComponents = 0;
-@@ -3313,6 +3638,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3288,6 +3613,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 
+ #endif	//MVK_MACOS
+ 
++// The LC_UUID of the MoltenVK binary, which changes with every build, or null.
++static const uint8_t* mvkBuildUUID() {
++	Dl_info info;
++	if ( !dladdr((const void*)&mvkBuildUUID, &info) || !info.dli_fbase ) { return nullptr; }
++	auto* hdr = (const struct mach_header_64*)info.dli_fbase;
++	auto* cmd = (const struct load_command*)(hdr + 1);
++	for (uint32_t i = 0; i < hdr->ncmds; i++) {
++		if (cmd->cmd == LC_UUID) { return ((const struct uuid_command*)cmd)->uuid; }
++		cmd = (const struct load_command*)((const char*)cmd + cmd->cmdsize);
++	}
++	return nullptr;
++}
++
+ // Since this is a uint8_t array, use Big-Endian byte ordering,
+ // so a hex dump of the array is human readable in its parts.
+ void MVKPhysicalDevice::initPipelineCacheUUID() {
+@@ -3313,8 +3651,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// might affect the contents of the pipeline cache (mostly MSL content).
  	uint32_t mtlFeatures = 0;
  	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
 +	mtlFeatures |= MVK_SPIRV_CROSS_RT_PROFILE << 1;
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mtlFeatures);
  	uuidComponentOffset += sizeof(mtlFeatures);
++
++	// Last 4 bytes come from the binary's build UUID: the serialized shader conversion options change
++	// between builds of the same revision, and caches such as VKD3D-Proton's keep pipeline cache data.
++	if (const uint8_t* buildUUID = mvkBuildUUID()) {
++		memcpy(&_properties.pipelineCacheUUID[uuidComponentOffset], buildUUID, 4);
++	}
  }
-@@ -3545,6 +3871,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 
+ // Combine OS major (8 bits), OS minor (8 bits), Mac GPU family (8 bits), and
+@@ -3545,6 +3890,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -12596,7 +12624,7 @@ index 359f8a2b..17d751ad 100644
  void MVKPhysicalDevice::initExtensions() {
  	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
  	pWritableExtns->disableAllButEnabledDeviceExtensions();
-@@ -3555,6 +3897,18 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3555,6 +3916,18 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.maximalReconvergence) {
  		pWritableExtns->vk_KHR_shader_maximal_reconvergence.enabled = false;
  	}
@@ -12615,7 +12643,7 @@ index 359f8a2b..17d751ad 100644
  	if (!_metalFeatures.quadControlFlow || !_metalFeatures.quadPermute) {
  		pWritableExtns->vk_KHR_shader_quad_control.enabled = false;
  	}
-@@ -3592,15 +3946,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3592,15 +3965,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.placementHeaps) {
  		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
  	}
@@ -12647,7 +12675,7 @@ index 359f8a2b..17d751ad 100644
  
  	if (!_gpuCapabilities.isAppleGPU) {
  		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
-@@ -4034,6 +4403,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4034,6 +4422,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  			maxVarDescCount = mtlFeats.maxPerStageBufferCount - mtlBuffCnt;
  			break;
@@ -12657,7 +12685,7 @@ index 359f8a2b..17d751ad 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			maxVarDescCount = (uint32_t)min<VkDeviceSize>(mtlFeats.maxMTLBufferSize, numeric_limits<uint32_t>::max());
  			break;
-@@ -4045,7 +4417,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4045,7 +4436,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
  		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
  				maxVarDescCount = min(mtlFeats.maxPerStageTextureCount - mtlTexCnt,
@@ -12666,7 +12694,7 @@ index 359f8a2b..17d751ad 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4355,8 +4727,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,8 +4746,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -12682,7 +12710,7 @@ index 359f8a2b..17d751ad 100644
  			default:
  				return new MVKUnsupportedQueryPool(this, pCreateInfo);
  		}
-@@ -4398,6 +4777,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4398,6 +4796,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -12728,7 +12756,7 @@ index 359f8a2b..17d751ad 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +4882,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +4901,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -12741,7 +12769,7 @@ index 359f8a2b..17d751ad 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4577,6 +5001,51 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4577,6 +5020,51 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Look for an available pre-reserved private data slot and return its address if found.
  // Otherwise create a new instance and return it.
@@ -12793,7 +12821,7 @@ index 359f8a2b..17d751ad 100644
  VkResult MVKDevice::createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  										  const VkAllocationCallbacks* pAllocator,
  										  VkPrivateDataSlot* pPrivateDataSlot) {
-@@ -4629,6 +5098,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +5117,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -12803,7 +12831,7 @@ index 359f8a2b..17d751ad 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5112,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5131,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -13129,7 +13157,7 @@ index 359f8a2b..17d751ad 100644
  	}
  }
  
-@@ -4967,6 +5747,33 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +5766,33 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -13163,7 +13191,7 @@ index 359f8a2b..17d751ad 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +5795,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +5814,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -13192,7 +13220,7 @@ index 359f8a2b..17d751ad 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5010,13 +5821,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5010,13 +5840,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.optimizationLevel = MTLLibraryOptimizationLevelDefault;
  	}
  
@@ -13214,7 +13242,7 @@ index 359f8a2b..17d751ad 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6069,96 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6088,87 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -13229,20 +13257,11 @@ index 359f8a2b..17d751ad 100644
 +// SPIRV-Cross on every shader again (Metal caches the compiled libraries itself).
 +// MVK_CONFIG_PIPELINE_CACHE_PATH names the directory; set it to 0 to disable.
 +static std::string mvkPipelineCacheBuildID() {
-+	Dl_info info;
-+	if ( !dladdr((const void*)&mvkPipelineCacheBuildID, &info) || !info.dli_fbase ) { return "0"; }
-+	auto* hdr = (const struct mach_header_64*)info.dli_fbase;
-+	auto* cmd = (const struct load_command*)(hdr + 1);
-+	for (uint32_t i = 0; i < hdr->ncmds; i++) {
-+		if (cmd->cmd == LC_UUID) {
-+			auto* uuid = ((const struct uuid_command*)cmd)->uuid;
-+			char str[33];
-+			for (int j = 0; j < 16; j++) { snprintf(str + j * 2, 3, "%02x", uuid[j]); }
-+			return std::string(str, 16);
-+		}
-+		cmd = (const struct load_command*)((const char*)cmd + cmd->cmdsize);
-+	}
-+	return "0";
++	const uint8_t* uuid = mvkBuildUUID();
++	if ( !uuid ) { return "0"; }
++	char str[33];
++	for (int j = 0; j < 16; j++) { snprintf(str + j * 2, 3, "%02x", uuid[j]); }
++	return std::string(str, 16);
 +}
 +
 +void MVKDevice::initImplicitPipelineCache() {
@@ -13311,7 +13330,7 @@ index 359f8a2b..17d751ad 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6170,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6180,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -13324,7 +13343,7 @@ index 359f8a2b..17d751ad 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5592,6 +6499,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5592,6 +6509,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mvkDestroyContainerContents(queues);
  	}
  
@@ -13340,7 +13359,7 @@ index 359f8a2b..17d751ad 100644
  	if (_commandResourceFactory) { _commandResourceFactory->destroy(); }
  
  	for (auto &fences: _barrierFences) for (auto fence: fences) [fence release];
-@@ -5601,6 +6517,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5601,6 +6527,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  #endif
  	[_defaultMTLSamplerState release];
  	[_dummyBlitMTLBuffer release];
