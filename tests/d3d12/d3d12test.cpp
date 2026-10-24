@@ -1680,6 +1680,135 @@ static bool test_gs_streamoutput_dxbc()
                                compile_fxc(gs_so_src, "ps", "ps_5_0"));
 }
 
+// Predication (SetPredication): draws and dispatches skipped by the predicate buffer's value, with EQUAL_ZERO
+// and NOT_EQUAL_ZERO.
+static bool test_predication()
+{
+    static const char *src = R"(
+RWStructuredBuffer<uint> u : register(u0);
+[numthreads(1, 1, 1)] void cs() { InterlockedAdd(u[0], 1); }
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
+)";
+    std::vector<char> csb = compile_dxc(src, "cs", "cs_6_0"), vsb = compile_dxc(src, "vs", "vs_6_0"), psb = compile_dxc(src, "ps", "ps_6_0");
+    if (csb.empty() || vsb.empty() || psb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, csb);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *gps = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps)));
+    if (!cps)
+        return false;
+
+    // Predicates: [0] = 0, [1] = 1 (64-bit each).
+    ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint64_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    init[0] = 0;
+    init[1] = 1;
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *pred = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(pred, 0, upload, 0, 16);
+    transition(pred, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+    ID3D12Resource *counter = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const UINT W = 4, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt[4] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    UINT rtv_size = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
+    float clear[4] = { 0, 0, 0, 0 };
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    // Cases: predicate 0 / 1 with EQUAL_ZERO (skips when the value is 0) and NOT_EQUAL_ZERO.
+    struct { UINT64 offset; D3D12_PREDICATION_OP op; bool runs; } cases[4] = {
+        { 0, D3D12_PREDICATION_OP_EQUAL_ZERO, false },
+        { 8, D3D12_PREDICATION_OP_EQUAL_ZERO, true },
+        { 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true },
+        { 8, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, false },
+    };
+    for (UINT k = 0; k < 4; k++)
+    {
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt[k])));
+        rtv[k] = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv[k].ptr += k * rtv_size;
+        g.device->CreateRenderTargetView(rt[k], nullptr, rtv[k]);
+        g.list->ClearRenderTargetView(rtv[k], clear, 0, nullptr);
+        g.list->SetPredication(pred, cases[k].offset, cases[k].op);
+        g.list->SetComputeRootSignature(rs);
+        g.list->SetComputeRootUnorderedAccessView(0, counter->GetGPUVirtualAddress() + 4 * k);
+        g.list->SetPipelineState(cps);
+        g.list->Dispatch(1, 1, 1);
+        g.list->OMSetRenderTargets(1, &rtv[k], FALSE, nullptr);
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetPipelineState(gps);
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.list->DrawInstanced(3, 1, 0, 0);
+        g.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    }
+    ID3D12Resource *rb[4] = {};
+    for (UINT k = 0; k < 4; k++)
+    {
+        rb[k] = create_buffer(W * H * 4, D3D12_HEAP_TYPE_READBACK);
+        transition(rt[k], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb[k];
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+        srcl.pResource = rt[k];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    ID3D12Resource *crb = nullptr;
+    const uint32_t *c = read_buffer(counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 16, &crb);
+    if (!c)
+        return false;
+    for (UINT k = 0; k < 4; k++)
+    {
+        const uint32_t *px = nullptr;
+        D3D12_RANGE range = { 0, 4 };
+        rb[k]->Map(0, &range, (void **)&px);
+        EXPECT(c[k] == (cases[k].runs ? 1u : 0u), "case %u: dispatch ran %u times, want %u", k, c[k], cases[k].runs ? 1 : 0);
+        EXPECT(px[0] == (cases[k].runs ? 0xff00ff00u : 0u), "case %u: pixel 0x%08x, want 0x%08x", k, px[0], cases[k].runs ? 0xff00ff00u : 0u);
+        rb[k]->Release(); rt[k]->Release();
+    }
+    crb->Release(); counter->Release(); pred->Release(); upload->Release(); rtv_heap->Release();
+    gps->Release(); cps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1698,6 +1827,7 @@ static const Test tests[] = {
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
+    { "predication", test_predication },
 };
 
 int main(int argc, char **argv)
