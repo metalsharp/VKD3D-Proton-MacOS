@@ -3308,6 +3308,235 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+// View instancing (tier 2): two views, mapped to slices 1 and 0 of a render target array, through a vertex shader,
+// a geometry shader, tessellation and a mesh shader. Each pre-rasterization stage adds a multiple of SV_ViewID to
+// red (1x, then 2x and 4x by the next stages), the pixel shader writes its own view to green.
+static bool test_viewinstancing()
+{
+    static const char *src = R"(
+struct V { float4 pos : SV_Position; float r : RED; };
+V vs(uint v : SV_VertexID, uint view : SV_ViewID)
+{
+    V o;
+    float2 uv = float2((v << 1) & 2, v & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.r = view;
+    return o;
+}
+[maxvertexcount(3)]
+void gs(triangle V i[3], uint view : SV_ViewID, inout TriangleStream<V> s)
+{
+    for (uint k = 0; k < 3; k++)
+    {
+        V o = i[k];
+        o.r += 2 * view;
+        s.Append(o);
+    }
+}
+struct PC { float e[3] : SV_TessFactor; float in_ : SV_InsideTessFactor; };
+PC pc(uint view : SV_ViewID) { PC p; p.e[0] = p.e[1] = p.e[2] = 1; p.in_ = 1; return p; }
+[domain("tri")] [partitioning("integer")] [outputtopology("triangle_cw")] [outputcontrolpoints(3)] [patchconstantfunc("pc")]
+V hs(InputPatch<V, 3> p, uint i : SV_OutputControlPointID, uint view : SV_ViewID)
+{
+    V o = p[i];
+    o.r += 2 * view;
+    return o;
+}
+[domain("tri")]
+V ds(PC c, float3 b : SV_DomainLocation, const OutputPatch<V, 3> p, uint view : SV_ViewID)
+{
+    V o;
+    o.pos = p[0].pos * b.x + p[1].pos * b.y + p[2].pos * b.z;
+    o.r = p[0].r + 4 * view;
+    return o;
+}
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void ms(uint view : SV_ViewID, out vertices V v[3], out indices uint3 tri[1])
+{
+    SetMeshOutputCounts(3, 1);
+    for (uint k = 0; k < 3; k++)
+    {
+        float2 uv = float2((k << 1) & 2, k & 2);
+        v[k].pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+        v[k].r = view;
+    }
+    tri[0] = uint3(0, 1, 2);
+}
+float4 ps(V i, uint view : SV_ViewID) : SV_Target { return float4(i.r / 16.0, (view + 1) / 4.0, 0, 1); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_1"), gs = compile_dxc(src, "gs", "gs_6_1"),
+                      hs = compile_dxc(src, "hs", "hs_6_1"), ds = compile_dxc(src, "ds", "ds_6_1"),
+                      ms = compile_dxc(src, "ms", "ms_6_5"), ps = compile_dxc(src, "ps", "ps_6_1");
+    if (vs.empty() || gs.empty() || hs.empty() || ds.empty() || ms.empty() || ps.empty())
+        return false;
+    // After compiling, which fills the DXIL cache for the other lane.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3));
+    if (o3.ViewInstancingTier < D3D12_VIEW_INSTANCING_TIER_2)
+    {
+        printf("  skipped: view instancing tier %d\n", o3.ViewInstancingTier);
+        return true;
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12Device2 *dev2 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev2)));
+    ID3D12GraphicsCommandList6 *list6 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list6)));
+
+    D3D12_RASTERIZER_DESC rast = {};
+    rast.FillMode = D3D12_FILL_MODE_SOLID;
+    rast.CullMode = D3D12_CULL_MODE_NONE;
+    rast.DepthClipEnable = TRUE;
+    D3D12_BLEND_DESC blend = {};
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    D3D12_RT_FORMAT_ARRAY rtv_formats = {};
+    rtv_formats.NumRenderTargets = 1;
+    rtv_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const D3D12_VIEW_INSTANCE_LOCATION locations[2] = { { 0, 1 }, { 0, 0 } };   // View 0 to slice 1, view 1 to slice 0.
+    D3D12_VIEW_INSTANCING_DESC vid = { 2, locations, D3D12_VIEW_INSTANCING_FLAG_NONE };
+    struct
+    {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_SHADER_BYTECODE> hs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_SHADER_BYTECODE> ds;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_SHADER_BYTECODE> gs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
+    } stream;
+    struct
+    {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
+    } mesh_stream;
+
+    const UINT W = 4, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 2; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+
+    enum { VERTEX, GEOMETRY, TESSELLATION, MESH };
+    const char *names[4] = { "vertex", "geometry", "tessellation", "mesh" };
+    const float scale[4] = { 1, 3, 7, 1 };   // The multiple of the view the pre-rasterization stages add up to.
+    for (int kind = VERTEX; kind <= MESH; kind++)
+    {
+        if (kind == MESH && o7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1)
+            continue;
+        ID3D12PipelineState *pso = nullptr;
+        if (kind == MESH)
+        {
+            mesh_stream.rs.value = rs;
+            mesh_stream.ms.value = { ms.data(), ms.size() };
+            mesh_stream.ps.value = { ps.data(), ps.size() };
+            mesh_stream.rast.value = rast;
+            mesh_stream.blend.value = blend;
+            mesh_stream.mask.value = ~0u;
+            mesh_stream.rtvs.value = rtv_formats;
+            mesh_stream.sample.value = { 1, 0 };
+            mesh_stream.views.value = vid;
+            D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(mesh_stream), &mesh_stream };
+            CHECK_HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)));
+        }
+        else
+        {
+            stream.rs.value = rs;
+            stream.vs.value = { vs.data(), vs.size() };
+            stream.hs.value = kind == TESSELLATION ? D3D12_SHADER_BYTECODE{ hs.data(), hs.size() } : D3D12_SHADER_BYTECODE{};
+            stream.ds.value = kind == TESSELLATION ? D3D12_SHADER_BYTECODE{ ds.data(), ds.size() } : D3D12_SHADER_BYTECODE{};
+            stream.gs.value = kind == GEOMETRY ? D3D12_SHADER_BYTECODE{ gs.data(), gs.size() } : D3D12_SHADER_BYTECODE{};
+            stream.ps.value = { ps.data(), ps.size() };
+            stream.rast.value = rast;
+            stream.blend.value = blend;
+            stream.mask.value = ~0u;
+            stream.topology.value = kind == TESSELLATION ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            stream.rtvs.value = rtv_formats;
+            stream.sample.value = { 1, 0 };
+            stream.views.value = vid;
+            D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(stream), &stream };
+            CHECK_HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)));
+        }
+        ID3D12Resource *rt = nullptr;
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+        D3D12_RENDER_TARGET_VIEW_DESC rvd = {};
+        rvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        rvd.Texture2DArray.ArraySize = 2;
+        g.device->CreateRenderTargetView(rt, &rvd, rtv);
+        float clear[4] = { 0, 0, 0, 0 };
+        g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+        D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetPipelineState(pso);
+        if (kind == MESH)
+            list6->DispatchMesh(1, 1, 1);
+        else
+        {
+            g.list->IASetPrimitiveTopology(kind == TESSELLATION ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g.list->DrawInstanced(3, 1, 0, 0);
+        }
+        ID3D12Resource *rb = create_buffer(256 * H * 2, D3D12_HEAP_TYPE_READBACK);
+        transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (UINT slice = 0; slice < 2; slice++)
+        {
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+            dst.pResource = rb;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = slice * 256 * H;
+            dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+            srcl.pResource = rt;
+            srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            srcl.SubresourceIndex = slice;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        }
+        if (!execute_and_wait())
+            return false;
+        const uint8_t *px = nullptr;
+        D3D12_RANGE r = { 0, 256 * H * 2 };
+        rb->Map(0, &r, (void **)&px);
+        for (UINT view = 0; view < 2; view++)
+        {
+            const uint8_t *t = px + locations[view].RenderTargetArrayIndex * 256 * H + (H / 2) * 256 + (W / 2) * 4;
+            int want_r = (int)(scale[kind] * view / 16.0f * 255.0f + 0.5f), want_g = (int)((view + 1) / 4.0f * 255.0f + 0.5f);
+            EXPECT(abs(t[0] - want_r) <= 1 && abs(t[1] - want_g) <= 1 && t[3] == 255,
+                   "%s: view %u (slice %u) pixel %02x %02x %02x %02x, want %02x %02x 00 ff", names[kind], view,
+                   locations[view].RenderTargetArrayIndex, t[0], t[1], t[2], t[3], want_r, want_g);
+        }
+        rb->Unmap(0, nullptr);
+        rb->Release(); rt->Release(); pso->Release();
+    }
+    rtv_heap->Release(); list6->Release(); dev2->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3327,6 +3556,7 @@ static const Test tests[] = {
     { "queues", test_queues },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
+    { "viewinstancing", test_viewinstancing },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },

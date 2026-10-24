@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_multiview : require
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+struct Payload { uint view; };
+taskPayloadSharedEXT Payload payload;
+layout(location = 0) flat out uint oview[];
+void main()
+{
+    SetMeshOutputsEXT(3, 1);
+    for (int i = 0; i < 3; i++)
+    {
+        vec2 uv = vec2((i << 1) & 2, i & 2);
+        gl_MeshVerticesEXT[i].gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+        oview[i] = payload.view | (gl_ViewIndex << 2);
+    }
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+}
