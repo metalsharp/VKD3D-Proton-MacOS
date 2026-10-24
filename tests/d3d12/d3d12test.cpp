@@ -306,6 +306,37 @@ static bool test_caps()
     printf("  vprt-without-gs %d waveops %d int64 %d copy-queue-timestamps %d casting-fully-typed %d\n",
            o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation, o1.WaveOps, o1.Int64ShaderOps,
            o3.CopyQueueTimestampQueriesSupported, o3.CastingFullyTypedFormatSupported);
+    // The other options, for spotting what is not supported.
+#define CAPS(n, ...) do { D3D12_FEATURE_DATA_D3D12_OPTIONS##n d = {}; \
+        if (SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS##n, &d, sizeof(d)))) { printf("  options%s:", #n); __VA_ARGS__; printf("\n"); } \
+        else printf("  options%s: not available\n", #n); } while (0)
+#define F(field) printf(" " #field "=%d", (int)d.field)
+    CAPS(, F(DoublePrecisionFloatShaderOps), F(OutputMergerLogicOp), F(MinPrecisionSupport), F(PSSpecifiedStencilRefSupported),
+         F(TypedUAVLoadAdditionalFormats), F(ROVsSupported), F(StandardSwizzle64KBSupported), F(CrossNodeSharingTier),
+         F(ResourceHeapTier), F(MaxGPUVirtualAddressBitsPerResource));
+    CAPS(1, F(WaveLaneCountMin), F(WaveLaneCountMax), F(TotalLaneCount), F(ExpandedComputeResourceStates));
+    CAPS(2, F(ProgrammableSamplePositionsTier));
+    CAPS(3, F(WriteBufferImmediateSupportFlags), F(ViewInstancingTier), F(BarycentricsSupported));
+    CAPS(4, F(MSAA64KBAlignedTextureSupported), F(SharedResourceCompatibilityTier), F(Native16BitShaderOpsSupported));
+    CAPS(5, F(SRVOnlyTiledResourceTier3), F(RenderPassesTier));
+    CAPS(6, F(AdditionalShadingRatesSupported), F(PerPrimitiveShadingRateSupportedWithViewportIndexing), F(ShadingRateImageTileSize),
+         F(BackgroundProcessingSupported));
+    CAPS(8, F(UnalignedBlockTexturesSupported));
+    CAPS(9, F(MeshShaderPipelineStatsSupported), F(MeshShaderSupportsFullRangeRenderTargetArrayIndex), F(AtomicInt64OnTypedResourceSupported),
+         F(AtomicInt64OnGroupSharedSupported), F(DerivativesInMeshAndAmplificationShadersSupported), F(WaveMMATier));
+    CAPS(10, F(VariableRateShadingSumCombinerSupported), F(MeshShaderPerPrimitiveShadingRateSupported));
+    CAPS(11, F(AtomicInt64OnDescriptorHeapResourceSupported));
+    CAPS(12, F(MSPrimitivesPipelineStatisticIncludesCulledPrimitives), F(EnhancedBarriersSupported), F(RelaxedFormatCastingSupported));
+    CAPS(13, F(UnrestrictedBufferTextureCopyPitchSupported), F(UnrestrictedVertexElementAlignmentSupported),
+         F(InvertedViewportHeightFlipsYSupported), F(InvertedViewportDepthFlipsZSupported), F(TextureCopyBetweenDimensionsSupported),
+         F(AlphaBlendFactorSupported));
+    CAPS(14, F(AdvancedTextureOpsSupported), F(WriteableMSAATexturesSupported), F(IndependentFrontAndBackStencilRefMaskSupported));
+    CAPS(15, F(TriangleFanSupported), F(DynamicIndexBufferStripCutSupported));
+    CAPS(16, F(DynamicDepthBiasSupported), F(GPUUploadHeapSupported));
+    CAPS(17, F(NonNormalizedCoordinateSamplersSupported), F(ManualWriteTrackingResourceSupported));
+    CAPS(18, F(RenderPassesValid));
+#undef F
+#undef CAPS
     return true;
 }
 
@@ -1809,6 +1840,80 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
     return true;
 }
 
+// Native 16-bit shader operations (SM 6.2, -enable-16bit-types): half and 16-bit integer arithmetic, 16-bit loads
+// and stores of raw and structured buffers, and FP16 denormals (which D3D12 requires to be preserved).
+static const char *cs_16bit_src = R"(
+RWByteAddressBuffer raw : register(u0);
+struct S { half2 h; uint16_t2 u; };
+RWStructuredBuffer<S> st : register(u1);
+[numthreads(1, 1, 1)]
+void main()
+{
+    half a = raw.Load<half>(0);             // 1.5
+    half b = raw.Load<half>(2);             // 2^-14, the smallest normal
+    uint16_t c = raw.Load<uint16_t>(4);     // 0xfff0
+    raw.Store<half>(16, a * half(3.0));                  // 4.5
+    raw.Store<half>(18, b * half(0.0009765625));         // 2^-24, a denormal
+    raw.Store<uint16_t>(20, c + uint16_t(0x20));         // wraps to 0x0010
+    raw.Store<int16_t>(22, int16_t(-3) * int16_t(5));    // -15
+    S s = st[0];
+    s.h = s.h * half2(2.0, 0.5);
+    s.u = s.u >> uint16_t(1);
+    st[1] = s;
+}
+)";
+
+static bool test_native16bit()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4));
+    EXPECT(o4.Native16BitShaderOpsSupported, "Native16BitShaderOpsSupported is false");
+    static const wchar_t *const extra[] = { L"-enable-16bit-types" };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(cs_16bit_src, "main", "cs_6_2", extra, 1));
+    if (!rs || !ps)
+        return false;
+    ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint16_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    memset(init, 0, 256);
+    init[0] = 0x3e00;   // 1.5
+    init[1] = 0x0400;   // 2^-14
+    init[2] = 0xfff0;
+    init[64] = 0x4400;  // st[0].h = (4, 6)
+    init[65] = 0x4600;
+    init[66] = 0x1234;  // st[0].u = (0x1234, 0x8000)
+    init[67] = 0x8000;
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(buf, 0, upload, 0, 256);
+    transition(buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->SetComputeRootUnorderedAccessView(1, buf->GetGPUVirtualAddress() + 128);
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v32 = read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v32)
+        return false;
+    const uint16_t *v = (const uint16_t *)v32;
+    EXPECT(v[8] == 0x4480, "half multiply = %#x, want 0x4480 (4.5)", v[8]);
+    EXPECT(v[9] == 0x0001, "half denormal = %#x, want 0x0001 (2^-24)", v[9]);
+    EXPECT(v[10] == 0x0010, "uint16 wrapping add = %#x, want 0x10", v[10]);
+    EXPECT(v[11] == 0xfff1, "int16 multiply = %#x, want 0xfff1 (-15)", v[11]);
+    EXPECT(v[68] == 0x4800 && v[69] == 0x4200, "structured half2 = (%#x %#x), want (0x4800 0x4200)", v[68], v[69]);
+    EXPECT(v[70] == 0x091a && v[71] == 0x4000, "structured uint16_t2 = (%#x %#x), want (0x91a 0x4000)", v[70], v[71]);
+    rb->Release(); buf->Release(); upload->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1828,6 +1933,7 @@ static const Test tests[] = {
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
     { "predication", test_predication },
+    { "native16bit", test_native16bit },
 };
 
 int main(int argc, char **argv)
