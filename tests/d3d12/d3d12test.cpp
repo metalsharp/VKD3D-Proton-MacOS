@@ -1007,6 +1007,117 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return float4(pos.x / 64.0, po
     return true;
 }
 
+// Tiled resources tier 3: a reserved Texture3D with one tile mapped. A compute shader writes the whole
+// volume (unmapped tiles drop writes), another reads it back with residency feedback.
+static bool test_tiled3d()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+    if (o.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_3)
+    {
+        printf("  skipped: tiled resources tier %d\n", o.TiledResourcesTier);
+        return true;
+    }
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Width = 256; td.Height = 256; td.DepthOrArraySize = 4; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *vol = nullptr;
+    CHECK_HR(g.device->CreateReservedResource(&td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&vol)));
+    UINT tile_count = 0;
+    D3D12_TILE_SHAPE shape = {};
+    D3D12_SUBRESOURCE_TILING tiling = {};
+    UINT tiling_count = 1;
+    g.device->GetResourceTiling(vol, &tile_count, nullptr, &shape, &tiling_count, 0, &tiling);
+    printf("  %u tiles, shape %ux%ux%u, mip 0 %ux%ux%u tiles\n", tile_count, shape.WidthInTexels, shape.HeightInTexels,
+           shape.DepthInTexels, tiling.WidthInTiles, tiling.HeightInTiles, tiling.DepthInTiles);
+    EXPECT(shape.WidthInTexels * shape.HeightInTexels * shape.DepthInTexels * 4 == 65536, "tile is %u texels",
+           shape.WidthInTexels * shape.HeightInTexels * shape.DepthInTexels);
+
+    D3D12_HEAP_DESC hd = { 65536, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES };
+    ID3D12Heap *heap = nullptr;
+    CHECK_HR(g.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)));
+    // Map the tile covering texel (130, 5, 2).
+    D3D12_TILED_RESOURCE_COORDINATE coord = { 130 / shape.WidthInTexels, 5 / shape.HeightInTexels, 2 / shape.DepthInTexels, 0 };
+    D3D12_TILE_REGION_SIZE region = { 1, FALSE, 0, 0, 0 };
+    D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_start = 0, range_count = 1;
+    g.queue->UpdateTileMappings(vol, 1, &coord, &region, heap, 1, &range_flags, &heap_start, &range_count, D3D12_TILE_MAPPING_FLAG_NONE);
+
+    static const char *src = R"(
+RWTexture3D<float4> vol : register(u0);
+Texture3D<float4> vol_srv : register(t0);
+RWByteAddressBuffer o : register(u1);
+[numthreads(8, 8, 1)]
+void write(uint3 id : SV_DispatchThreadID) { vol[id] = float4(0.25, 0.5, 0.75, 1.0); }
+[numthreads(1, 1, 1)]
+void read()
+{
+    static const int3 at[3] = { int3(130, 5, 2), int3(130, 5, 1), int3(5, 5, 2) };
+    for (int i = 0; i < 3; i++)
+    {
+        uint status;
+        float4 v = vol_srv.Load(int4(at[i], 0), int3(0, 0, 0), status);
+        o.Store2(i * 8, uint2(CheckAccessFullyMapped(status) ? 1 : 0, asuint(v.x)));
+    }
+}
+)";
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1 },
+    };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 2, ranges };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *wps = create_compute_pipeline(rs, compile_dxc(src, "write", "cs_6_0"));
+    ID3D12PipelineState *rps = create_compute_pipeline(rs, compile_dxc(src, "read", "cs_6_0"));
+    if (!rs || !wps || !rps)
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *dheap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dheap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = dheap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateUnorderedAccessView(vol, nullptr, nullptr, cpu);
+    cpu.ptr += inc;
+    g.device->CreateShaderResourceView(vol, nullptr, cpu);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    g.list->SetDescriptorHeaps(1, &dheap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootDescriptorTable(0, dheap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(wps);
+    g.list->Dispatch(256 / 8, 256 / 8, 4);
+    D3D12_RESOURCE_BARRIER uavb = {};
+    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    g.list->ResourceBarrier(1, &uavb);
+    transition(vol, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g.list->SetPipelineState(rps);
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    static const char *names[3] = { "mapped tile", "unmapped slice", "unmapped tile" };
+    for (int i = 0; i < 3; i++)
+    {
+        float x;
+        memcpy(&x, &v[i * 2 + 1], 4);
+        bool mapped = i == 0;
+        EXPECT(v[i * 2] == (mapped ? 1u : 0u) && fabsf(x - (mapped ? 0.25f : 0.0f)) < 0.01f, "%s: mapped %u value %f", names[i], v[i * 2], x);
+    }
+    rb->Release(); out->Release(); dheap->Release(); rps->Release(); wps->Release(); rs->Release(); heap->Release(); vol->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -1215,6 +1326,7 @@ static const Test tests[] = {
     { "rayquery", test_rayquery },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
+    { "tiled3d", test_tiled3d },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };

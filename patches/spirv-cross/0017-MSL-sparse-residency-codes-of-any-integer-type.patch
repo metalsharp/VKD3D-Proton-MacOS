@@ -1,0 +1,27 @@
+From dd63f4e0709db9aa648c4c0fdfd34c0d2063b0f5 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 18:37:27 -0600
+Subject: [PATCH 17/17] MSL: sparse residency codes of any integer type
+
+---
+ spirv_msl.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a4bfc2ec..340cd6e0 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9755,8 +9755,8 @@ void CompilerMSL::emit_custom_functions()
+ 
+ 		case SPVFuncImplSparseValue:
+ 			statement("// Splits a sparse texture result into its value and a residency code (0: all texels resident).");
+-			statement("template <typename T>");
+-			statement("static inline T spvSparseValue(thread int &code, sparse_color<T> c)");
++			statement("template <typename T, typename C>");
++			statement("static inline T spvSparseValue(thread C &code, sparse_color<T> c)");
+ 			begin_scope();
+ 			statement("code = c.resident() ? 0 : 1;");
+ 			statement("return c.value();");
+-- 
+2.54.0 (Apple Git-157)
+
