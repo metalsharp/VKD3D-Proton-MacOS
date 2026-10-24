@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 1/5] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
+Subject: [PATCH 1/6] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
  texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 2/5] Keep the transform feedback structures linked when stream
+Subject: [PATCH 2/6] Keep the transform feedback structures linked when stream
  output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 3/5] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 3/6] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 4/5] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
+Subject: [PATCH 4/6] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
  16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 5/5] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 5/6] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -322,6 +322,69 @@ index 8ae68956..ea779aa9 100644
          return D3D12_TILED_RESOURCES_TIER_2;
  
      return D3D12_TILED_RESOURCES_TIER_4;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 18:43:10 -0600
+Subject: [PATCH 6/6] MoltenVK: typed buffer views start at aligned offsets via
+ the typed offset buffer (no env bypass)
+
+---
+ libs/vkd3d/device.c   | 14 ++++++++------
+ libs/vkd3d/resource.c | 12 ++++++++++++
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ea779aa9..9c6839ea 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2525,12 +2525,14 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment; the custom VKMT
+-         * MoltenVK emulates unaligned views, which VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT vouches for. */
+-        char allow[8];
+-        if (vkd3d_get_env_var("VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT", allow, sizeof(allow)) && strcmp(allow, "0"))
+-        {
+-            WARN("Allowing non-single texel alignment (VKMT).\n");
++        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment (16 bytes). Without
++         * descriptor buffers (which MoltenVK lacks), typed views go through the typed offset buffer:
++         * the view starts at an aligned offset and the shader adds the element offset
++         * (see vkd3d_buffer_view_get_aligned_view()). */
++        if (physical_device_info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
++                !vulkan_info->EXT_descriptor_buffer)
++        {
++            INFO("Typed buffer views are aligned through the typed offset buffer.\n");
+         }
+         else
+         {
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a8fc26b1..bf474e86 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -6372,6 +6372,18 @@ static bool vkd3d_buffer_view_get_aligned_view(
+             end_range = (first_element + num_elements + element_align - 1) & ~(element_align - 1);
+             end_range = min(end_range, max_resource_elements);
+ 
++            /* Without single texel alignment (MoltenVK: 16 bytes), the view must also start at an
++             * aligned byte offset; if quantizing did not get there, start the view at 0 instead. */
++            if (!device->device_info.vulkan_1_3_properties.storageTexelBufferOffsetSingleTexelAlignment ||
++                    !device->device_info.vulkan_1_3_properties.uniformTexelBufferOffsetSingleTexelAlignment)
++            {
++                VkDeviceSize byte_count = format ? vkd3d_get_format(device, format, false)->byte_count : sizeof(uint32_t);
++                VkDeviceSize align = max(device->device_info.vulkan_1_3_properties.storageTexelBufferOffsetAlignmentBytes,
++                        device->device_info.vulkan_1_3_properties.uniformTexelBufferOffsetAlignmentBytes);
++                if (align && (begin_range * byte_count) % align)
++                    begin_range = 0;
++            }
++
+             bound_range->element_offset = first_element - begin_range;
+             bound_range->element_count = num_elements;
+ 
 -- 
 2.54.0 (Apple Git-157)
 

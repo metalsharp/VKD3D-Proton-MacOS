@@ -1118,6 +1118,92 @@ void read()
     return true;
 }
 
+// Typed buffer views at element offsets that are not 16-byte aligned (D3D12 only requires element
+// alignment): an SRV from element 3 and a UAV from element 5 of R32_UINT buffers.
+static bool test_typedbuffer()
+{
+    static const char *src = R"(
+Buffer<uint> srv : register(t0);
+RWBuffer<uint> uav : register(u0);
+RWByteAddressBuffer o : register(u1);
+[numthreads(8, 1, 1)]
+void main(uint i : SV_DispatchThreadID)
+{
+    o.Store(i * 4, srv[i]);
+    uav[i] = 1000 + i;
+}
+)";
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 },
+    };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 2, ranges };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!rs || !ps)
+        return false;
+    ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (uint32_t i = 0; i < 64; i++)
+        u[i] = i;
+    ID3D12Resource *data = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(data, 0, upload, 0, 256);
+    transition(data, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource *target = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_UINT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Buffer.FirstElement = 3;
+    sd.Buffer.NumElements = 8;
+    g.device->CreateShaderResourceView(data, &sd, h);
+    h.ptr += inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_R32_UINT;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    ud.Buffer.FirstElement = 5;
+    ud.Buffer.NumElements = 8;
+    g.device->CreateUnorderedAccessView(target, nullptr, &ud, h);
+
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb, *rb2;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    for (uint32_t i = 0; i < 8; i++)
+        EXPECT(v[i] == 3 + i, "srv[%u] = %u, want %u", i, v[i], 3 + i);
+    const uint32_t *t = read_buffer(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb2);
+    if (!t)
+        return false;
+    for (uint32_t i = 0; i < 16; i++)
+    {
+        uint32_t want = i >= 5 && i < 13 ? 1000 + i - 5 : 0;
+        EXPECT(t[i] == want, "uav element %u = %u, want %u", i, t[i], want);
+    }
+    rb->Release(); rb2->Release(); heap->Release(); out->Release(); target->Release(); data->Release(); upload->Release();
+    ps->Release(); rs->Release();
+    return true;
+}
+
 // Output-merger logic operation (11_1): XOR into an integer render target.
 static bool test_logicop()
 {
@@ -1327,6 +1413,7 @@ static const Test tests[] = {
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
+    { "typedbuffer", test_typedbuffer },
     { "robust", test_robust },
     { "logicop", test_logicop },
 };

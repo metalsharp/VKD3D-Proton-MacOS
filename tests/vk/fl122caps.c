@@ -15,10 +15,17 @@ int main(void)
     VkPhysicalDeviceFeatures2 f = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &img64 };
     vkGetPhysicalDeviceFeatures2(pd, &f);
     VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsrp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR };
-    VkPhysicalDeviceProperties2 p = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &fsrp };
+    VkPhysicalDeviceTransformFeedbackPropertiesEXT xfbp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT, &fsrp };
+    VkPhysicalDeviceVulkan13Properties p13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &xfbp };
+    VkPhysicalDeviceProperties2 p = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13 };
     vkGetPhysicalDeviceProperties2(pd, &p);
 #define P(s, m) printf("%-44s %llu\n", #m, (unsigned long long)(s).m)
     P(f.features, depthBounds);
+    P(p13, storageTexelBufferOffsetAlignmentBytes); P(p13, storageTexelBufferOffsetSingleTexelAlignment);
+    P(p13, uniformTexelBufferOffsetAlignmentBytes); P(p13, uniformTexelBufferOffsetSingleTexelAlignment);
+    P(p.properties.limits, minTexelBufferOffsetAlignment);
+    P(xfbp, transformFeedbackQueries); P(xfbp, maxTransformFeedbackStreams); P(xfbp, maxTransformFeedbackBuffers);
+    P(xfbp, transformFeedbackStreamsLinesTriangles); P(xfbp, transformFeedbackRasterizationStreamSelect); P(xfbp, transformFeedbackDraw);
     P(rtp, rayTracingPipeline); P(rtp, rayTraversalPrimitiveCulling); P(rtp, rayTracingPipelineTraceRaysIndirect);
     P(rq, rayQuery); P(rtm, rayTracingMaintenance1); P(rtm, rayTracingPipelineTraceRaysIndirect2);
     P(fsr, pipelineFragmentShadingRate); P(fsr, primitiveFragmentShadingRate); P(fsr, attachmentFragmentShadingRate);
