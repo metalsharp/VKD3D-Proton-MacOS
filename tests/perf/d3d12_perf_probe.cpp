@@ -74,7 +74,7 @@ struct Probe
 static Probe p;
 
 static D3D12_CPU_DESCRIPTOR_HANDLE rtv(UINT i) { auto h = p.rtv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * p.rtv_size; return h; }
-static D3D12_CPU_DESCRIPTOR_HANDLE dsv() { return p.dsv_heap->GetCPUDescriptorHandleForHeapStart(); }
+static D3D12_CPU_DESCRIPTOR_HANDLE dsv(UINT i = 0) { auto h = p.dsv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV); return h; }
 static D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu(UINT i) { auto h = p.srv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * p.srv_size; return h; }
 static D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu(UINT i) { auto h = p.srv_heap->GetGPUDescriptorHandleForHeapStart(); h.ptr += (UINT64)i * p.srv_size; return h; }
 static D3D12_CPU_DESCRIPTOR_HANDLE staging_cpu(UINT i) { auto h = p.cpu_srv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * p.srv_size; return h; }
@@ -203,6 +203,74 @@ float4 ps_tex(V i) : SV_Target
 }
 struct VI { float3 pos : POSITION; float2 uv : TEXCOORD0; };
 V vs_input(VI v) { V o; o.pos = float4(v.pos.xy * rc.z + rc.xy, 0.5, 1); o.uv = v.uv; return o; }
+// Alpha test, as in Unity's cutout shaders (foliage, fences): discard defeats hidden-surface removal.
+float4 ps_alpha(V i) : SV_Target
+{
+    float4 c = tex[0].Sample(smp, i.uv * 3);
+    clip(c.g - 0.5);
+    return c * rc.w;
+}
+// Post-processing style: a few taps of the previous pass.
+float4 ps_post(V i) : SV_Target
+{
+    float2 d = float2(1.0 / 1920, 1.0 / 1080);
+    return (tex[0].Sample(smp, i.uv * 0.5) + tex[0].Sample(smp, i.uv * 0.5 + d) +
+            tex[0].Sample(smp, i.uv * 0.5 - d) + tex[0].Sample(smp, i.uv * 0.5 + d.yx)) * 0.25 + rc.w * 0.01;
+}
+float4 ps_sample1(V i) : SV_Target { return tex[0].Sample(smp, i.uv * 3) * rc.w; }
+// UI: textured, blended.
+float4 ps_ui(V i) : SV_Target { float4 c = tex[0].Sample(smp, i.uv); c.a = 0.5; return c; }
+// Instances spread over the screen.
+V vs_instanced(uint id : SV_VertexID, uint inst : SV_InstanceID)
+{
+    V o;
+    float2 q = float2((id << 1) & 2, id & 2);
+    float2 at = float2(inst % 400, inst / 400 % 400) / 200.0 - 1;
+    o.uv = q;
+    o.pos = float4(at + q * 0.004, 0.5, 1);
+    return o;
+}
+// Dense geometry: a grid of tiny triangles from the vertex index alone (vertex-bound).
+V vs_dense(uint id : SV_VertexID)
+{
+    V o;
+    uint tri = id / 3, corner = id % 3;
+    float2 at = float2(tri % 1024, tri / 1024 % 1024) / 512.0 - 1;
+    float2 q = float2(corner == 1, corner == 2) * (1.0 / 512);
+    o.uv = q;
+    o.pos = float4(at + q + sin(at.yx * 7 + rc.w) * 0.001, 0.5, 1);
+    return o;
+}
+)";
+
+// SM 5.1 dynamic indexing into a large table (bindless-style materials).
+static const char *bindless_hlsl = R"(
+cbuffer RC : register(b0) { float4 rc; uint4 idx; };
+Texture2D tex[1000] : register(t0, space1);
+SamplerState smp : register(s0);
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; nointerpolation uint index : INDEX; };
+V vs_quad(uint id : SV_VertexID)
+{
+    V o;
+    float2 q = float2((id << 1) & 2, id & 2);
+    o.uv = q;
+    o.pos = float4((q * 2 - 1) * rc.z + rc.xy, 0.5, 1);
+    o.index = idx.x;
+    return o;
+}
+float4 ps_bindless(V i) : SV_Target { return tex[NonUniformResourceIndex(i.index)].Sample(smp, i.uv); }
+)";
+
+// Compute post-processing writing a 1080p texture.
+static const char *compute_image_hlsl = R"(
+cbuffer RC : register(b0) { float4 rc; };
+RWTexture2D<float4> img : register(u0);
+Texture2D<float4> src : register(t0);
+[numthreads(8, 8, 1)] void cs_blur(uint3 t : SV_DispatchThreadID)
+{
+    float4 c = src.Load(int3(t.xy, 0)) + src.Load(int3(t.xy + uint2(1, 0), 0)) + src.Load(int3(t.xy + uint2(0, 1), 0));
+    img[t.xy] = c * 0.333 + rc;
+}
 )";
 
 static const char *compute_hlsl = R"(
@@ -222,22 +290,29 @@ static std::string salted(const char *src, unsigned salt)
 struct PsoDesc
 {
     const char *vs = "vs_quad", *ps = "ps_flat";
-    DXGI_FORMAT rt = BACKBUFFER_FORMAT;
-    bool depth = false, blend = false, input = false;
+    const char *hlsl = nullptr;              // shader source (default common_hlsl)
+    const char *ps_target = "ps_5_0", *vs_target = "vs_5_0";
+    DXGI_FORMAT rt = BACKBUFFER_FORMAT, dsv = DXGI_FORMAT_D32_FLOAT;
+    UINT num_rt = 1;                         // 0: depth-only
+    bool depth = false, depth_write = true, blend = false, input = false;
+    bool stencil_write = false, stencil_test = false;
     UINT samples = 1;
     unsigned salt = 0;
+    ID3D12RootSignature *rs = nullptr;      // default p.root_signature
 };
 
 static ID3D12PipelineState *create_pso(const PsoDesc &d, double *compile_ms = nullptr, double *create_ms = nullptr)
 {
     double t0 = qpc_ms();
-    std::string src = d.salt ? salted(common_hlsl, d.salt) : std::string(common_hlsl);
-    ID3DBlob *vs = compile(src, d.vs, "vs_5_0"), *ps = compile(src, d.ps, "ps_5_0");
+    const char *hlsl = d.hlsl ? d.hlsl : common_hlsl;
+    std::string src = d.salt ? salted(hlsl, d.salt) : std::string(hlsl);
+    ID3DBlob *vs = compile(src, d.vs, d.vs_target), *ps = d.ps ? compile(src, d.ps, d.ps_target) : nullptr;
     double t1 = qpc_ms();
     D3D12_GRAPHICS_PIPELINE_STATE_DESC g = {};
-    g.pRootSignature = p.root_signature;
+    g.pRootSignature = d.rs ? d.rs : p.root_signature;
     g.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-    g.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    if (ps)
+        g.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
     g.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     if (d.blend)
     {
@@ -250,12 +325,22 @@ static ID3D12PipelineState *create_pso(const PsoDesc &d, double *compile_ms = nu
     g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     g.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     g.RasterizerState.DepthClipEnable = TRUE;
-    if (d.depth)
+    if (d.depth || d.stencil_write || d.stencil_test)
     {
-        g.DepthStencilState.DepthEnable = TRUE;
-        g.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        g.DepthStencilState.DepthEnable = d.depth;
+        g.DepthStencilState.DepthWriteMask = d.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         g.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-        g.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        g.DSVFormat = d.dsv;
+        if (d.stencil_write || d.stencil_test)
+        {
+            auto &f = g.DepthStencilState.FrontFace;
+            g.DepthStencilState.StencilEnable = TRUE;
+            g.DepthStencilState.StencilReadMask = g.DepthStencilState.StencilWriteMask = 0xff;
+            f.StencilFailOp = f.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+            f.StencilPassOp = d.stencil_write ? D3D12_STENCIL_OP_REPLACE : D3D12_STENCIL_OP_KEEP;
+            f.StencilFunc = d.stencil_test ? D3D12_COMPARISON_FUNC_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+            g.DepthStencilState.BackFace = f;
+        }
     }
     static const D3D12_INPUT_ELEMENT_DESC elements[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -264,14 +349,16 @@ static ID3D12PipelineState *create_pso(const PsoDesc &d, double *compile_ms = nu
     if (d.input)
         g.InputLayout = { elements, 2 };
     g.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    g.NumRenderTargets = 1;
-    g.RTVFormats[0] = d.rt;
+    g.NumRenderTargets = d.num_rt;
+    if (d.num_rt)
+        g.RTVFormats[0] = d.rt;
     g.SampleDesc.Count = d.samples;
     ID3D12PipelineState *pso = nullptr;
     CHECK(p.device->CreateGraphicsPipelineState(&g, IID_PPV_ARGS(&pso)));
     double t2 = qpc_ms();
     vs->Release();
-    ps->Release();
+    if (ps)
+        ps->Release();
     if (compile_ms) *compile_ms += t1 - t0;
     if (create_ms) *create_ms += t2 - t1;
     return pso;
@@ -351,10 +438,10 @@ static void setup()
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = FRAMES_IN_FLIGHT + 8;
+    hd.NumDescriptors = FRAMES_IN_FLIGHT + 16;
     CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p.rtv_heap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = 1;
+    hd.NumDescriptors = 4;
     CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p.dsv_heap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = HEAP_SIZE;
@@ -468,7 +555,8 @@ struct Scene
     const char *name, *desc;
     std::function<void()> init;
     std::function<void(UINT frame)> frame;
-    bool present = false;   // Only the present scene paces by the swap chain; the rest run offscreen.
+    bool present = false;   // Only the present scenes pace by the swap chain; the rest run offscreen.
+    UINT sync_interval = 0;
 };
 
 static void set_quad_state(ID3D12GraphicsCommandList *l, ID3D12PipelineState *pso)
@@ -506,7 +594,7 @@ static void submit_and_wait(ID3D12GraphicsCommandList *l)
     wait_fence(signal_queue());
 }
 
-static std::vector<Scene> scenes()
+static std::vector<Scene> base_scenes()
 {
     static ID3D12PipelineState *flat, *heavy, *texd, *input, *flat_depth, *flat_hdr, *flat_msaa, *compute, *psos[16];
     static ID3D12Resource *vb, *ib, *buffers_default, *upload_texture_dst, *readback, *msaa_target, *resolve_target;
@@ -965,6 +1053,528 @@ static std::vector<Scene> scenes()
     };
 }
 
+// ---- scenes added for the typical shape of a Unity frame and the costs of tile-based GPUs ----
+
+// Records upload work on the first allocator outside the frame loop and waits for it (scene init).
+static void base_init_none() {}
+
+static void run_init_commands(const std::function<void(ID3D12GraphicsCommandList *)> &record)
+{
+    CHECK(p.allocators[0]->Reset());
+    CHECK(p.list->Reset(p.allocators[0], nullptr));
+    record(p.list);
+    submit_and_wait(p.list);
+}
+
+static void fullscreen(ID3D12GraphicsCommandList *l, float value)
+{
+    float rc[4] = { 0, 0, 1, value };
+    l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+    l->DrawInstanced(3, 1, 0, 0);
+}
+
+static ID3D12Resource *create_depth(UINT w, UINT h, DXGI_FORMAT typeless, DXGI_FORMAT dsv_format, D3D12_RESOURCE_STATES state, UINT dsv_slot)
+{
+    D3D12_CLEAR_VALUE cv = { dsv_format };
+    cv.DepthStencil.Depth = 1.0f;
+    ID3D12Resource *r = create_texture(w, h, typeless, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, state, 1, 1, &cv);
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
+    dd.Format = dsv_format;
+    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    p.device->CreateDepthStencilView(r, &dd, dsv(dsv_slot));
+    return r;
+}
+
+static std::vector<Scene> more_scenes()
+{
+    // Heap slots: 8-1007 texture copies (bindless/tables), 10000+ the resources below.
+    enum { SRV_SHADOW = 10000, UAV_IMAGE = 10001, SRV_HDR = 10010, SRV_BC7 = 10020, SRV_RGBA8 = 10030, CPU_UAV_IMAGE = 15001 };
+    static ID3D12PipelineState *flat, *shadow, *opaque, *post, *final_pso, *ui, *alpha, *sample1, *stencil_w, *stencil_t, *flat_hdr,
+        *cimg, *inst, *dense, *bindless, *rs_psos[2], *texd;
+    static ID3D12RootSignature *cimg_rs, *bindless_rs, *rs_pair[2];
+    static ID3D12Resource *shadow_map, *image, *depth_stencil, *atlas, *bc7, *rgba8, *count_buffer, *args, *dst_buffer;
+    static ID3D12DescriptorHeap *second_heap;
+    static ID3D12CommandSignature *draw_sig;
+
+    auto hdr_srvs = [] { for (int i = 0; i < 3; i++) p.device->CreateShaderResourceView(p.hdr_targets[i], nullptr, srv_cpu(SRV_HDR + i)); };
+    auto texture_copies = [] { for (UINT i = 8; i < 8 + 1000; i++) p.device->CreateShaderResourceView(p.textures[i % 8], nullptr, srv_cpu(i)); };
+    auto make_image = [] {
+        image = create_texture(W, H, HDR_FORMAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        p.device->CreateUnorderedAccessView(image, nullptr, nullptr, srv_cpu(UAV_IMAGE));
+        p.device->CreateUnorderedAccessView(image, nullptr, nullptr, staging_cpu(CPU_UAV_IMAGE));
+    };
+    auto make_cimg = [] {
+        D3D12_DESCRIPTOR_RANGE uav = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+        D3D12_DESCRIPTOR_RANGE srv = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER rp[3] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants = { 0, 0, 4 };
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable = { 1, &uav };
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[2].DescriptorTable = { 1, &srv };
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        cimg_rs = serialize_root_signature(rsd);
+        ID3DBlob *cs = compile(compute_image_hlsl, "cs_blur", "cs_5_0");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+        c.pRootSignature = cimg_rs;
+        c.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        CHECK(p.device->CreateComputePipelineState(&c, IID_PPV_ARGS(&cimg)));
+        cs->Release();
+    };
+    auto dispatch_image = [](ID3D12GraphicsCommandList *l, UINT count, UINT frame) {
+        l->SetComputeRootSignature(cimg_rs);
+        l->SetPipelineState(cimg);
+        l->SetComputeRootDescriptorTable(1, srv_gpu(UAV_IMAGE));
+        l->SetComputeRootDescriptorTable(2, srv_gpu(SRV_HDR));
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = image;
+        for (UINT i = 0; i < count; i++)
+        {
+            float rc[4] = { frame * 0.001f, 0, 0, 0 };
+            l->SetComputeRoot32BitConstants(0, 4, rc, 0);
+            l->Dispatch(W / 8, H / 8, 1);
+            l->ResourceBarrier(1, &b);
+        }
+    };
+    auto make_shadow = [] {
+        shadow_map = create_depth(2048, 2048, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        p.device->CreateShaderResourceView(shadow_map, &sd, srv_cpu(SRV_SHADOW));
+        PsoDesc d; d.ps = nullptr; d.num_rt = 0; d.depth = true; shadow = create_pso(d);
+    };
+    auto shadow_pass = [](ID3D12GraphicsCommandList *l, UINT draws, UINT frame) {
+        barrier(l, shadow_map, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        auto d = dsv(1);
+        l->OMSetRenderTargets(0, nullptr, FALSE, &d);
+        l->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        viewport(l, 2048, 2048);
+        set_quad_state(l, shadow);
+        for (UINT i = 0; i < draws; i++)
+        {
+            float rc[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.04f, frame * 0.01f };
+            l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+            l->DrawInstanced(3, 1, 0, 0);
+        }
+        barrier(l, shadow_map, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        viewport(l);
+    };
+    auto back_to_backbuffer = [](ID3D12GraphicsCommandList *l) {
+        auto bb = rtv(p.frame_index);
+        l->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+        viewport(l);
+    };
+    // One full-screen pass from target src (or the backbuffer if dst < 0) into hdr target dst.
+    auto post_pass = [back_to_backbuffer](ID3D12GraphicsCommandList *l, ID3D12PipelineState *pso, int src, int dst, float value) {
+        if (dst >= 0)
+        {
+            barrier(l, p.hdr_targets[dst], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto h = rtv(FRAMES_IN_FLIGHT + dst);
+            l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+        }
+        else
+            back_to_backbuffer(l);
+        set_quad_state(l, pso);
+        l->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_HDR + src));
+        fullscreen(l, value);
+        if (dst >= 0)
+            barrier(l, p.hdr_targets[dst], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    auto make_bc = [] {
+        // BC7 and RGBA8 1024x1024 textures with the same footprint in texels, 8 SRVs each.
+        bc7 = create_texture(1024, 1024, DXGI_FORMAT_BC7_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        rgba8 = create_texture(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        run_init_commands([](ID3D12GraphicsCommandList *l) {
+            void *cpu;
+            D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc(1024 * 1024 * 4, &cpu);
+            uint32_t *w = (uint32_t *)cpu;
+            for (UINT i = 0; i < 1024 * 1024; i++) w[i] = i * 2654435761u;
+            D3D12_TEXTURE_COPY_LOCATION src = { p.upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            src.PlacedFootprint.Offset = va - p.upload_ring->GetGPUVirtualAddress();
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_BC7_UNORM, 1024, 1024, 1, 4096 };
+            D3D12_TEXTURE_COPY_LOCATION dst = { bc7, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024, 1, 4096 };
+            dst.pResource = rgba8;
+            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            barrier(l, bc7, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier(l, rgba8, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        });
+        for (UINT i = 0; i < 8; i++)
+        {
+            p.device->CreateShaderResourceView(bc7, nullptr, srv_cpu(SRV_BC7 + i));
+            p.device->CreateShaderResourceView(rgba8, nullptr, srv_cpu(SRV_RGBA8 + i));
+        }
+        PsoDesc d; d.ps = "ps_tex"; texd = create_pso(d);
+    };
+    auto sample_frame = [](UINT base, UINT f) {
+        set_quad_state(p.list, texd);
+        p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(base));
+        for (UINT i = 0; i < 20; i++) fullscreen(p.list, f * 0.01f);
+    };
+
+    return {
+        { "unity_frame", "a Unity-shaped frame: 400-draw shadow map, 800 opaque draws with a root CBV each, 4 post passes, "
+                         "3 compute passes with UAV barriers, composite and 300 UI quads", [make_shadow, hdr_srvs, make_image, make_cimg, texture_copies] {
+            make_shadow(); hdr_srvs(); make_image(); make_cimg(); texture_copies();
+            PsoDesc d; d.rt = HDR_FORMAT; d.depth = true; d.ps = "ps_tex"; opaque = create_pso(d);
+            d = {}; d.rt = HDR_FORMAT; d.ps = "ps_post"; post = create_pso(d);
+            d = {}; d.ps = "ps_post"; final_pso = create_pso(d);
+            d = {}; d.ps = "ps_ui"; d.blend = true; ui = create_pso(d);
+        }, [shadow_pass, post_pass, dispatch_image, back_to_backbuffer](UINT f) {
+            double t = qpc_ms();
+            ID3D12GraphicsCommandList *l = p.list;
+            shadow_pass(l, 400, f);
+            // Opaque pass into hdr target 0 with depth; a fresh root CBV per draw, as Unity binds per-object data.
+            barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto h = rtv(FRAMES_IN_FLIGHT);
+            auto d = dsv(0);
+            l->OMSetRenderTargets(1, &h, FALSE, &d);
+            float c[4] = { 0, 0, 0, 0 };
+            l->ClearRenderTargetView(h, c, 0, nullptr);
+            l->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            set_quad_state(l, opaque);
+            for (UINT i = 0; i < 800; i++)
+            {
+                void *cpu;
+                D3D12_GPU_VIRTUAL_ADDRESS cb = upload_alloc(256, &cpu);
+                ((float *)cpu)[4] = (float)i;
+                l->SetGraphicsRootConstantBufferView(1, cb);
+                if (i % 16 == 0) l->SetGraphicsRootDescriptorTable(2, srv_gpu(8 + (i / 16) * 8 % 992));
+                small_quad(l, i, f * 0.01f);
+            }
+            barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            // Post chain: 0 -> 1 -> 2 -> 1 -> 2.
+            post_pass(l, post, 0, 1, f * 0.01f);
+            post_pass(l, post, 1, 2, f * 0.01f);
+            post_pass(l, post, 2, 1, f * 0.01f);
+            post_pass(l, post, 1, 2, f * 0.01f);
+            dispatch_image(l, 3, f);
+            // Composite into the backbuffer, then UI.
+            post_pass(l, final_pso, 2, -1, f * 0.01f);
+            set_quad_state(l, ui);
+            for (UINT i = 0; i < 300; i++)
+            {
+                if (i % 10 == 0) l->SetGraphicsRootDescriptorTable(2, srv_gpu(8 + i % 1000));
+                small_quad(l, i, 1.0f);
+            }
+            back_to_backbuffer(l);
+            extras.add("record_ms", qpc_ms() - t);
+        } },
+        { "depth_only", "2000 draws into a 2048x2048 shadow map with no pixel shader", make_shadow, [shadow_pass](UINT f) {
+            shadow_pass(p.list, 2000, f);
+        } },
+        { "overdraw_opaque", "50 full-screen depth-tested quads sampling a texture (baseline for alpha_test)", [] {
+            PsoDesc d; d.ps = "ps_sample1"; d.depth = true; d.depth_write = false; sample1 = create_pso(d);
+        }, [](UINT f) {
+            auto h = rtv(p.frame_index);
+            auto d = dsv(0);
+            p.list->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            p.list->OMSetRenderTargets(1, &h, FALSE, &d);
+            set_quad_state(p.list, sample1);
+            for (UINT i = 0; i < 50; i++) fullscreen(p.list, 1.0f);
+        } },
+        { "alpha_test", "50 full-screen depth-tested quads with discard (Unity cutout shaders)", [] {
+            PsoDesc d; d.ps = "ps_alpha"; d.depth = true; d.depth_write = false; alpha = create_pso(d);
+        }, [](UINT f) {
+            auto h = rtv(p.frame_index);
+            auto d = dsv(0);
+            p.list->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            p.list->OMSetRenderTargets(1, &h, FALSE, &d);
+            set_quad_state(p.list, alpha);
+            for (UINT i = 0; i < 50; i++) fullscreen(p.list, 1.0f);
+        } },
+        { "stencil", "200 quads writing stencil, then 20 full-screen quads tested against it (D24S8)", [] {
+            depth_stencil = create_depth(W, H, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_STATE_DEPTH_WRITE, 2);
+            PsoDesc d; d.stencil_write = true; d.dsv = DXGI_FORMAT_D24_UNORM_S8_UINT; stencil_w = create_pso(d);
+            d = {}; d.stencil_test = true; d.dsv = DXGI_FORMAT_D24_UNORM_S8_UINT; d.ps = "ps_heavy"; stencil_t = create_pso(d);
+        }, [](UINT f) {
+            auto h = rtv(p.frame_index);
+            auto d = dsv(2);
+            p.list->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+            p.list->OMSetRenderTargets(1, &h, FALSE, &d);
+            p.list->OMSetStencilRef(1);
+            set_quad_state(p.list, stencil_w);
+            for (UINT i = 0; i < 200; i++)
+            {
+                float rc[4] = { (float)(i % 16) / 8.0f - 0.9f, (float)(i / 16) / 8.0f - 0.9f, 0.05f, 0.2f };
+                p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                p.list->DrawInstanced(3, 1, 0, 0);
+            }
+            set_quad_state(p.list, stencil_t);
+            for (UINT i = 0; i < 20; i++) fullscreen(p.list, f * 0.01f);
+        } },
+        { "postfx_chain", "10 full-screen post passes ping-ponging two 1080p HDR targets", [hdr_srvs] {
+            hdr_srvs();
+            PsoDesc d; d.rt = HDR_FORMAT; d.ps = "ps_post"; post = create_pso(d);
+        }, [post_pass, back_to_backbuffer](UINT f) {
+            double t = qpc_ms();
+            for (int i = 0; i < 10; i++) post_pass(p.list, post, 1 + (i + 1) % 2, 1 + i % 2, f * 0.01f);
+            back_to_backbuffer(p.list);
+            extras.add("record_us_per_pass", (qpc_ms() - t) * 100.0);
+        } },
+        { "compute_image", "10 compute passes over a 1080p RWTexture2D with UAV barriers (compute post-processing)", [make_image, make_cimg, hdr_srvs] {
+            make_image(); make_cimg(); hdr_srvs();
+        }, [dispatch_image](UINT f) {
+            dispatch_image(p.list, 10, f);
+        } },
+        { "clear_uav", "10 ClearUnorderedAccessViewFloat calls on a 1080p texture", make_image, [](UINT f) {
+            float v[4] = { f * 0.001f, 0, 0, 1 };
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            b.UAV.pResource = image;
+            for (UINT i = 0; i < 10; i++)
+            {
+                p.list->ClearUnorderedAccessViewFloat(srv_gpu(UAV_IMAGE), staging_cpu(CPU_UAV_IMAGE), image, v, 0, nullptr);
+                p.list->ResourceBarrier(1, &b);
+            }
+        } },
+        { "render_pass_api", "50 D3D12 render passes (BeginRenderPass) of 6 draws, clear or discard on load, preserve on store", [] {
+            PsoDesc d; d.rt = HDR_FORMAT; flat_hdr = create_pso(d);
+        }, [back_to_backbuffer](UINT f) {
+            ID3D12GraphicsCommandList4 *l4 = nullptr;
+            CHECK(p.list->QueryInterface(IID_PPV_ARGS(&l4)));
+            for (UINT pass = 0; pass < 50; pass++)
+            {
+                ID3D12Resource *target = p.hdr_targets[pass % 3];
+                barrier(p.list, target, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                D3D12_RENDER_PASS_RENDER_TARGET_DESC rt = {};
+                rt.cpuDescriptor = rtv(FRAMES_IN_FLIGHT + pass % 3);
+                rt.BeginningAccess.Type = pass & 1 ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+                rt.BeginningAccess.Clear.ClearValue.Format = HDR_FORMAT;
+                rt.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+                l4->BeginRenderPass(1, &rt, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+                set_quad_state(p.list, flat_hdr);
+                for (UINT i = 0; i < 6; i++) small_quad(p.list, pass * 6 + i, f * 0.01f);
+                l4->EndRenderPass();
+                barrier(p.list, target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            l4->Release();
+            back_to_backbuffer(p.list);
+        } },
+        { "discard_resource", "50 passes, each preceded by DiscardResource on its target (should load nothing)", [] {
+            PsoDesc d; d.rt = HDR_FORMAT; flat_hdr = create_pso(d);
+        }, [back_to_backbuffer](UINT f) {
+            for (UINT pass = 0; pass < 50; pass++)
+            {
+                ID3D12Resource *target = p.hdr_targets[pass % 3];
+                barrier(p.list, target, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                p.list->DiscardResource(target, nullptr);
+                auto h = rtv(FRAMES_IN_FLIGHT + pass % 3);
+                p.list->OMSetRenderTargets(1, &h, FALSE, nullptr);
+                set_quad_state(p.list, flat_hdr);
+                for (UINT i = 0; i < 6; i++) small_quad(p.list, pass * 6 + i, f * 0.01f);
+                barrier(p.list, target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            back_to_backbuffer(p.list);
+        } },
+        { "bindless", "2000 draws indexing a 1000-texture unbounded table per draw (SM 5.1 dynamic indexing)", [texture_copies] {
+            texture_copies();
+            D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1, 0 };
+            D3D12_ROOT_PARAMETER rp[2] = {};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rp[0].Constants = { 0, 0, 8 };
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable = { 1, &range };
+            D3D12_STATIC_SAMPLER_DESC ss = {};
+            ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            ss.MaxLOD = D3D12_FLOAT32_MAX;
+            D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+            bindless_rs = serialize_root_signature(rsd);
+            PsoDesc d; d.hlsl = bindless_hlsl; d.ps = "ps_bindless"; d.vs_target = "vs_5_1"; d.ps_target = "ps_5_1"; d.rs = bindless_rs;
+            bindless = create_pso(d);
+        }, [](UINT f) {
+            p.list->SetGraphicsRootSignature(bindless_rs);
+            p.list->SetPipelineState(bindless);
+            p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            p.list->SetGraphicsRootDescriptorTable(1, srv_gpu(8));
+            double t = qpc_ms();
+            for (UINT i = 0; i < 2000; i++)
+            {
+                uint32_t rc[8];
+                float pos[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.02f, f * 0.01f };
+                memcpy(rc, pos, 16);
+                rc[4] = i % 1000; rc[5] = rc[6] = rc[7] = 0;
+                p.list->SetGraphicsRoot32BitConstants(0, 8, rc, 0);
+                p.list->DrawInstanced(3, 1, 0, 0);
+            }
+            extras.add("record_us_per_draw", (qpc_ms() - t) * 1000.0 / 2000);
+        } },
+        { "root_signature_switch", "3000 draws alternating two root signatures (and their pipelines), rebinding all parameters", [] {
+            D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0 };
+            for (int k = 0; k < 2; k++)
+            {
+                D3D12_ROOT_PARAMETER rp[3] = {};
+                rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                rp[0].Constants = { 0, 0, 4u + k * 4 };
+                rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+                rp[1].Descriptor = { 1, 0 };
+                rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                rp[2].DescriptorTable = { 1, &range };
+                D3D12_STATIC_SAMPLER_DESC ss = {};
+                ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                ss.MaxLOD = D3D12_FLOAT32_MAX;
+                D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+                rs_pair[k] = serialize_root_signature(rsd);
+                PsoDesc d; d.rs = rs_pair[k]; d.blend = k; rs_psos[k] = create_pso(d);
+            }
+        }, [](UINT f) {
+            p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            void *cpu;
+            D3D12_GPU_VIRTUAL_ADDRESS cb = upload_alloc(256, &cpu);
+            double t = qpc_ms();
+            for (UINT i = 0; i < 3000; i++)
+            {
+                int k = i & 1;
+                p.list->SetGraphicsRootSignature(rs_pair[k]);
+                p.list->SetPipelineState(rs_psos[k]);
+                p.list->SetGraphicsRootConstantBufferView(1, cb);
+                p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(0));
+                small_quad(p.list, i, f * 0.01f);
+            }
+            extras.add("record_us_per_draw", (qpc_ms() - t) * 1000.0 / 3000);
+        } },
+        { "heap_switch", "2000 draws alternating two shader-visible descriptor heaps", [] {
+            flat = nullptr;
+            D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+            CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&second_heap)));
+            auto h = second_heap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < 8; i++, h.ptr += p.srv_size) p.device->CreateShaderResourceView(p.textures[7 - i], nullptr, h);
+            PsoDesc d; d.ps = "ps_tex"; texd = create_pso(d);
+        }, [](UINT f) {
+            set_quad_state(p.list, texd);
+            double t = qpc_ms();
+            for (UINT i = 0; i < 2000; i++)
+            {
+                ID3D12DescriptorHeap *heap = (i & 1) ? second_heap : p.srv_heap;
+                p.list->SetDescriptorHeaps(1, &heap);
+                p.list->SetGraphicsRootDescriptorTable(2, heap->GetGPUDescriptorHandleForHeapStart());
+                small_quad(p.list, i, f * 0.01f);
+            }
+            ID3D12DescriptorHeap *heaps[] = { p.srv_heap };
+            p.list->SetDescriptorHeaps(1, heaps);
+            extras.add("record_us_per_draw", (qpc_ms() - t) * 1000.0 / 2000);
+        } },
+        { "ui_quads", "4000 small blended, textured quads, a texture change every 8", [texture_copies] {
+            texture_copies();
+            PsoDesc d; d.ps = "ps_ui"; d.blend = true; ui = create_pso(d);
+        }, [](UINT f) {
+            set_quad_state(p.list, ui);
+            double t = qpc_ms();
+            for (UINT i = 0; i < 4000; i++)
+            {
+                if (i % 8 == 0) p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(8 + (i / 8) % 992));
+                small_quad(p.list, i, 1.0f);
+            }
+            extras.add("record_us_per_draw", (qpc_ms() - t) * 1000.0 / 4000);
+        } },
+        { "small_copies", "1000 256-byte CopyBufferRegion uploads per frame (per-object constant uploads)", [] {
+            dst_buffer = create_buffer(1000 * 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        }, [](UINT f) {
+            double t = qpc_ms();
+            for (UINT i = 0; i < 1000; i++)
+            {
+                void *cpu;
+                D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc(256, &cpu);
+                ((uint32_t *)cpu)[0] = f + i;
+                p.list->CopyBufferRegion(dst_buffer, i * 256, p.upload_ring, va - p.upload_ring->GetGPUVirtualAddress(), 256);
+            }
+            extras.add("record_us_per_copy", (qpc_ms() - t));
+        } },
+        { "small_texture_updates", "200 64x64 CopyTextureRegion updates into a 1024x1024 atlas per frame (fonts, UI)", [] {
+            atlas = create_texture(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }, [](UINT f) {
+            barrier(p.list, atlas, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (UINT i = 0; i < 200; i++)
+            {
+                void *cpu;
+                D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc(64 * 64 * 4, &cpu);
+                memset(cpu, (f + i) & 0xff, 64 * 64 * 4);
+                D3D12_TEXTURE_COPY_LOCATION src = { p.upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                src.PlacedFootprint.Offset = va - p.upload_ring->GetGPUVirtualAddress();
+                src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 };
+                D3D12_TEXTURE_COPY_LOCATION dst = { atlas, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                p.list->CopyTextureRegion(&dst, (i % 16) * 64, (i / 16 % 16) * 64, 0, &src, nullptr);
+            }
+            barrier(p.list, atlas, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        } },
+        { "copy_resource", "10 CopyResource calls of a 1080p HDR target", base_init_none, [](UINT) {
+            barrier(p.list, p.hdr_targets[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(p.list, p.hdr_targets[2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (UINT i = 0; i < 10; i++) p.list->CopyResource(p.hdr_targets[2], p.hdr_targets[1]);
+            barrier(p.list, p.hdr_targets[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier(p.list, p.hdr_targets[2], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        } },
+        { "big_resources", "4 64 MiB textures (4096x4096 RGBA8) created and released per frame", base_init_none, [](UINT) {
+            double t = qpc_ms();
+            ID3D12Resource *r[4];
+            for (int i = 0; i < 4; i++)
+                r[i] = create_texture(4096, 4096, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            double t1 = qpc_ms();
+            for (int i = 0; i < 4; i++) r[i]->Release();
+            extras.add("create_ms_per_resource", (t1 - t) / 4);
+            extras.add("release_ms_per_resource", (qpc_ms() - t1) / 4);
+        } },
+        { "execute_indirect_count", "ExecuteIndirect with a count buffer: up to 4000 draws, 2000 executed", [] {
+            flat = create_pso({});
+            D3D12_INDIRECT_ARGUMENT_DESC a[2] = {};
+            a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+            a[0].Constant = { 0, 0, 4 };
+            a[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 2, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, p.root_signature, IID_PPV_ARGS(&draw_sig)));
+            args = create_buffer(4000 * 32, D3D12_HEAP_TYPE_UPLOAD);
+            float *v; CHECK(args->Map(0, nullptr, (void **)&v));
+            for (UINT i = 0; i < 4000; i++)
+            {
+                float rc[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.01f, 0.5f };
+                memcpy(v + i * 8, rc, 16);
+                uint32_t draw[4] = { 3, 1, 0, 0 };
+                memcpy(v + i * 8 + 4, draw, 16);
+            }
+            args->Unmap(0, nullptr);
+            count_buffer = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+            uint32_t *c; CHECK(count_buffer->Map(0, nullptr, (void **)&c));
+            *c = 2000;
+            count_buffer->Unmap(0, nullptr);
+        }, [](UINT) {
+            set_quad_state(p.list, flat);
+            p.list->ExecuteIndirect(draw_sig, 4000, args, 0, count_buffer, 0);
+        } },
+        { "instancing", "one draw of 160000 small instances (vertex/instance throughput)", [] {
+            PsoDesc d; d.vs = "vs_instanced"; inst = create_pso(d);
+        }, [](UINT) {
+            set_quad_state(p.list, inst);
+            p.list->DrawInstanced(3, 160000, 0, 0);
+        } },
+        { "vertex_heavy", "one draw of 1M tiny triangles (vertex-bound geometry)", [] {
+            PsoDesc d; d.vs = "vs_dense"; dense = create_pso(d);
+        }, [](UINT f) {
+            set_quad_state(p.list, dense);
+            float rc[4] = { 0, 0, 1, f * 0.01f };
+            p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+            p.list->DrawInstanced(3 * 1048576, 1, 0, 0);
+        } },
+        { "sample_bc7", "20 full-screen quads sampling 8 BC7 textures each (compressed bandwidth)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_BC7, f); } },
+        { "sample_rgba8", "the same with RGBA8 textures (baseline for sample_bc7)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_RGBA8, f); } },
+        { "present_vsync", "clear + Present(1): the display-locked frame", [] {}, [](UINT) {}, true, 1 },
+    };
+}
+
+static std::vector<Scene> scenes()
+{
+    std::vector<Scene> all = base_scenes(), more = more_scenes();
+    all.insert(all.end(), more.begin(), more.end());
+    return all;
+}
+
 // ---- main loop ----
 
 static double percentile(std::vector<double> v, double q)
@@ -1008,7 +1618,7 @@ int main(int argc, char **argv)
     double first = 0, last_present = 0;
     // Timed frames, then serialized frames: each is submitted and waited for, and its
     // submit-to-completion time is the "gpu" figure (independent of timestamp queries).
-    const UINT serialized = 20;
+    const UINT serialized = 60;
     for (UINT f = 0; f < warmup + frames + serialized; f++)
     {
         bool timed = f >= warmup && f < warmup + frames, sync = f >= warmup + frames;
@@ -1062,7 +1672,7 @@ int main(int argc, char **argv)
         if (timed)
             work.push_back(qpc_ms() - frame_start);
         if (scene->present)
-            CHECK(p.swapchain->Present(0, DXGI_PRESENT_ALLOW_TEARING));
+            CHECK(p.swapchain->Present(scene->sync_interval, scene->sync_interval ? 0 : DXGI_PRESENT_ALLOW_TEARING));
         double now = qpc_ms();
         if (f == 0) first = now - t;
         else if (timed) cpu.push_back(now - last_present);
