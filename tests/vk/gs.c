@@ -1,7 +1,7 @@
 /* GPU test: geometry shaders (run as Metal object and mesh stages): point to quad expansion, instancing,
  * triangle strip output winding (with front faces culled), the primitive ID and input vertex order for
  * triangle lists, strips and fans, indexed draws, line lists and strips with point output, and lines and
- * triangles with adjacency (lists and a triangle strip). */
+ * triangles with adjacency (lists and a triangle strip), and indirect (and indirect count) draws. */
 #include "vkcommon.h"
 
 #define W 16
@@ -41,6 +41,12 @@ static VkPipeline make_pipeline(struct gsctx *g, const char *geom, VkPrimitiveTo
 }
 
 /* Draws and returns the render target's texels (RGBA8 UINT). */
+enum { DIRECT, INDIRECT, INDIRECT_COUNT };
+
+/* Draws the indirect commands in args (indexed if indices), and returns the render target's texels. */
+static const uint8_t *draw_args(struct gsctx *g, VkPipeline p, uint32_t table, int mode, const void *args, uint32_t count,
+                                uint32_t drawn, const uint32_t *indices, uint32_t index_count);
+
 static const uint8_t *draw_indexed(struct gsctx *g, VkPipeline p, uint32_t table, uint32_t instanced, uint32_t vertices,
                                    const uint32_t *indices)
 {
@@ -80,6 +86,53 @@ static const uint8_t *draw_indexed(struct gsctx *g, VkPipeline p, uint32_t table
 static const uint8_t *draw(struct gsctx *g, VkPipeline p, uint32_t table, uint32_t instanced, uint32_t vertices)
 {
     return draw_indexed(g, p, table, instanced, vertices, NULL);
+}
+
+static const uint8_t *draw_args(struct gsctx *g, VkPipeline p, uint32_t table, int mode, const void *args, uint32_t count,
+                                uint32_t drawn, const uint32_t *indices, uint32_t index_count)
+{
+    PFN_vkCmdDrawIndirectCount draw_count = (void *)vkGetDeviceProcAddr(g->c.device, "vkCmdDrawIndirectCount");
+    PFN_vkCmdDrawIndexedIndirectCount draw_indexed_count = (void *)vkGetDeviceProcAddr(g->c.device, "vkCmdDrawIndexedIndirectCount");
+    uint32_t stride = indices ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    struct vkbuf ab = vkctx_buffer(&g->c, 256, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    memcpy(ab.map, args, count * stride);
+    ((uint32_t *)ab.map)[60] = drawn;
+    struct vkbuf ib = { 0 };
+    if (indices)
+    {
+        ib = vkctx_buffer(&g->c, index_count * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        memcpy(ib.map, indices, index_count * 4);
+    }
+    VkCommandBuffer cb = vkctx_begin(&g->c);
+    vkctx_barrier(cb, g->rt.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g->rt.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rinfo = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { W, H } }, 1, 0, 1, &att };
+    vkCmdBeginRendering(cb, &rinfo);
+    VkViewport v = { 0, 0, W, H, 0, 1 };
+    VkRect2D s = { { 0, 0 }, { W, H } };
+    vkCmdSetViewport(cb, 0, 1, &v);
+    vkCmdSetScissor(cb, 0, 1, &s);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    uint32_t pc[2] = { table, 0 };
+    vkCmdPushConstants(cb, g->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, sizeof(pc), pc);
+    if (indices)
+    {
+        vkCmdBindIndexBuffer(cb, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+        if (mode == INDIRECT_COUNT)
+            draw_indexed_count(cb, ab.buffer, 0, ab.buffer, 240, count, stride);
+        else
+            vkCmdDrawIndexedIndirect(cb, ab.buffer, 0, count, stride);
+    }
+    else if (mode == INDIRECT_COUNT)
+        draw_count(cb, ab.buffer, 0, ab.buffer, 240, count, stride);
+    else
+        vkCmdDrawIndirect(cb, ab.buffer, 0, count, stride);
+    vkCmdEndRendering(cb);
+    vkctx_barrier(cb, g->rt.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    struct vkbuf rb = vkctx_readback(&g->c, cb, &g->rt, 4);
+    vkctx_submit(&g->c, cb);
+    return rb.map;
 }
 
 static void expect_px(const char *what, const uint8_t *px, int x, int y, uint8_t r, uint8_t gg, uint8_t b, uint8_t a)
@@ -190,6 +243,23 @@ int main(int argc, char **argv)
     px = draw(&g, tsadj, 3, 0, 8);
     expect_px("triangle strip with adjacency", px, 2, 2, 1, 2, 7, 4);
     expect_px("triangle strip with adjacency", px, 13, 13, 5, 1, 6, 8);
+
+    /* Indirect: the right half's triangle (vertexes 3 to 5), then the left half's; primitive IDs restart per draw. */
+    VkDrawIndirectCommand dc[2] = { { 3, 1, 3, 0 }, { 3, 1, 0, 0 } };
+    px = draw_args(&g, tri, 1, INDIRECT, dc, 2, 2, NULL, 0);
+    expect_px("indirect", px, 9, 2, 1, 4, 5, 6);
+    expect_px("indirect", px, 1, 4, 1, 1, 2, 3);
+    px = draw_args(&g, tri, 1, INDIRECT_COUNT, dc, 2, 1, NULL, 0);
+    expect_px("indirect count (1 of 2)", px, 9, 2, 1, 4, 5, 6);
+    expect_px("indirect count (1 of 2)", px, 1, 4, 0, 0, 0, 0);
+    /* Indexed indirect: indexes 3 to 5 of { 3 4 5 0 1 2 } (the left half), then 0 to 2 (the right half). */
+    VkDrawIndexedIndirectCommand dic[2] = { { 3, 1, 3, 0, 0 }, { 3, 1, 0, 0, 0 } };
+    px = draw_args(&g, tri, 1, INDIRECT, dic, 2, 2, indices, 6);
+    expect_px("indexed indirect", px, 1, 4, 1, 1, 2, 3);
+    expect_px("indexed indirect", px, 9, 2, 1, 4, 5, 6);
+    px = draw_args(&g, tri, 1, INDIRECT_COUNT, dic, 2, 1, indices, 6);
+    expect_px("indexed indirect count (1 of 2)", px, 1, 4, 1, 1, 2, 3);
+    expect_px("indexed indirect count (1 of 2)", px, 9, 2, 0, 0, 0, 0);
 
     printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
