@@ -3965,11 +3965,119 @@ static bool test_special_values_dxbc()
     return true;
 }
 
+// A UAV barrier inside a render pass: MoltenVK keeps the pass open and defers the barrier (Apple GPUs have
+// no barriers inside render passes), so a later draw whose pixel shader uses UAVs must still see the
+// compute writes the barrier orders. Draw 1 uses no UAVs, then the barrier, then draw 2 reads the UAV.
+static bool test_uav_barrier_in_render_pass()
+{
+    static const char *src = R"(
+RWByteAddressBuffer b : register(u1);  // u0 shares its slot with SV_Target in SM 5
+[numthreads(1, 1, 1)] void cs() { b.Store(0, 0x3f000000); b.Store(4, 0x3e800000); } // 0.5, 0.25
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps_plain() : SV_Target { return float4(1, 0, 0, 1); }
+float4 ps_uav() : SV_Target { return float4(asfloat(b.Load(0)), asfloat(b.Load(4)), 0, 1); }
+)";
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.Descriptor.ShaderRegister = 1;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cs = create_compute_pipeline(rs, compile_fxc(src, "cs", "cs_5_0"));
+    std::vector<char> vs = compile_fxc(src, "vs", "vs_5_0"), ps_plain = compile_fxc(src, "ps_plain", "ps_5_0"),
+                      ps_uav = compile_fxc(src, "ps_uav", "ps_5_0");
+    if (!rs || !cs || vs.empty() || ps_plain.empty() || ps_uav.empty())
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *plain = nullptr, *uav = nullptr;
+    pd.PS = { ps_plain.data(), ps_plain.size() };
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&plain)));
+    pd.PS = { ps_uav.data(), ps_uav.size() };
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&uav)));
+
+    const UINT W = 16, H = 16;
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    D3D12_RESOURCE_BARRIER ub = {};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = buf;
+    float clear[4] = { 0, 0, 1, 1 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->SetPipelineState(plain);
+    g.list->DrawInstanced(3, 1, 0, 0);                 // opens the render pass
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->SetPipelineState(cs);
+    g.list->Dispatch(1, 1, 1);                         // ends the pass: compute writes the buffer
+    g.list->SetPipelineState(plain);
+    g.list->DrawInstanced(3, 1, 0, 0);                 // a new pass, drawn without UAVs
+    g.list->ResourceBarrier(1, &ub);                   // deferred inside the pass
+    g.list->DrawInstanced(3, 1, 0, 0);                 // still no UAVs
+    g.list->SetPipelineState(uav);
+    g.list->DrawInstanced(3, 1, 0, 0);                 // reads the UAV: must see the compute writes
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *rb = create_buffer(W * H * 4, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, W * 4 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, W * H * 4 };
+    rb->Map(0, &range, (void **)&px);
+    uint32_t got = px[4 * W + 4];
+    EXPECT(got == 0xff004080 || got == 0xff004081 || got == 0xff00407f, "pixel 0x%08x, want 0xff004080 (UAV values 0.5, 0.25)", got);
+    rb->Release(); rtv_heap->Release(); rt->Release(); buf->Release(); uav->Release(); plain->Release(); cs->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
     { "compute_dxil", test_compute_dxil },
     { "compute_dxbc", test_compute_dxbc },
+    { "uav_barrier_in_render_pass", test_uav_barrier_in_render_pass },
     { "special_values_dxbc", test_special_values_dxbc },
     { "sm67", test_sm67 },
     { "sm67_textures", test_sm67_textures },

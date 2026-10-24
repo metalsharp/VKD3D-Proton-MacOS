@@ -27,6 +27,9 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("error: %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); exit(3); } } while (0)
 
@@ -3471,13 +3474,147 @@ static std::vector<Scene> engine_scenes()
     return v;
 }
 
+// Submission-side costs below the game: many command lists recorded in parallel and executed together
+// (the driver encodes them on one queue thread), per-draw descriptor changes, and render target rebinds
+// split by unrelated barriers (each can end a render pass, and each pass is a Metal render encoder).
+static std::vector<Scene> submit_scenes()
+{
+    enum { THREADS = 8, MT_DRAWS = 500, BIND_DRAWS = 4000, REBIND_GROUPS = 64 };
+    static ID3D12PipelineState *tex_pso, *tex_pso2;
+    static ID3D12CommandAllocator *mt_alloc[THREADS][FRAMES_IN_FLIGHT];
+    static ID3D12GraphicsCommandList *mt_list[THREADS];
+    static ID3D12Resource *mt_upload[THREADS], *uav_dummy;
+    static uint8_t *mt_upload_ptr[THREADS];
+    static std::thread workers[THREADS];
+    static std::mutex lock;
+    static std::condition_variable start_cv, done_cv;
+    static UINT generation, done, work_frame;
+
+    // hdr target 0 stays a render target for these scenes; each thread has its own upload ring.
+    auto common_init = [] {
+        PsoDesc d; d.rt = HDR_FORMAT; d.ps = "ps_tex"; tex_pso = create_pso(d);
+        d = {}; d.rt = HDR_FORMAT; d.ps = "ps_ui"; d.blend = true; tex_pso2 = create_pso(d);
+        CHECK(p.allocators[0]->Reset());
+        CHECK(p.list->Reset(p.allocators[0], nullptr));
+        barrier(p.list, p.hdr_targets[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        submit_and_wait(p.list);
+    };
+    // Draws into hdr target 0 with a fresh root CBV per draw and a new descriptor table every `table_every` draws.
+    auto draws = [](ID3D12GraphicsCommandList *l, UINT n, UINT table_every, uint8_t *ring, D3D12_GPU_VIRTUAL_ADDRESS ring_va,
+                    UINT64 &offset, UINT seed, float value) {
+        for (UINT i = 0; i < n; i++)
+        {
+            if (offset + 256 > (4u << 20)) offset = 0;
+            ((float *)(ring + offset))[4] = (float)(seed + i);
+            l->SetGraphicsRootConstantBufferView(1, ring_va + offset);
+            offset += 256;
+            if (i % table_every == 0) l->SetGraphicsRootDescriptorTable(2, srv_gpu(8 + (seed + i) * 8 % 992));
+            small_quad(l, seed + i, value);
+        }
+    };
+    auto begin_hdr = [](ID3D12GraphicsCommandList *l, ID3D12PipelineState *pso) {
+        ID3D12DescriptorHeap *heaps[] = { p.srv_heap };
+        l->SetDescriptorHeaps(1, heaps);
+        auto h = rtv(FRAMES_IN_FLIGHT);
+        l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+        viewport(l);
+        l->SetGraphicsRootSignature(p.root_signature);
+        l->SetPipelineState(pso);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    };
+
+    return {
+        { "mt_submit", "8 command lists of 500 draws (root CBV per draw) recorded on 8 threads, executed together each frame",
+          [common_init, draws, begin_hdr] {
+            common_init();
+            for (UINT t = 0; t < THREADS; t++)
+            {
+                for (UINT i = 0; i < FRAMES_IN_FLIGHT; i++)
+                    CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&mt_alloc[t][i])));
+                CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, mt_alloc[t][0], nullptr, IID_PPV_ARGS(&mt_list[t])));
+                CHECK(mt_list[t]->Close());
+                mt_upload[t] = create_buffer(4u << 20, D3D12_HEAP_TYPE_UPLOAD);
+                CHECK(mt_upload[t]->Map(0, nullptr, (void **)&mt_upload_ptr[t]));
+                workers[t] = std::thread([t, draws, begin_hdr] {
+                    UINT seen = 0;
+                    UINT64 offset = 0;
+                    for (;;)
+                    {
+                        UINT f;
+                        {
+                            std::unique_lock<std::mutex> g(lock);
+                            start_cv.wait(g, [&] { return generation != seen; });
+                            seen = generation;
+                            f = work_frame;
+                        }
+                        ID3D12GraphicsCommandList *l = mt_list[t];
+                        CHECK(mt_alloc[t][p.frame_index]->Reset());
+                        CHECK(l->Reset(mt_alloc[t][p.frame_index], nullptr));
+                        begin_hdr(l, tex_pso);
+                        draws(l, MT_DRAWS, 16, mt_upload_ptr[t], mt_upload[t]->GetGPUVirtualAddress(), offset, t * 1000, f * 0.01f);
+                        CHECK(l->Close());
+                        std::lock_guard<std::mutex> g(lock);
+                        if (++done == THREADS) done_cv.notify_one();
+                    }
+                });
+                workers[t].detach();
+            }
+        }, [](UINT f) {
+            double t = qpc_ms();
+            {
+                std::unique_lock<std::mutex> g(lock);
+                done = 0;
+                work_frame = f;
+                generation++;
+                start_cv.notify_all();
+                done_cv.wait(g, [] { return done == THREADS; });
+            }
+            double recorded = qpc_ms();
+            ID3D12CommandList *lists[THREADS];
+            for (UINT i = 0; i < THREADS; i++) lists[i] = mt_list[i];
+            p.queue->ExecuteCommandLists(THREADS, lists);
+            extras.add("record_ms", recorded - t);
+            extras.add("execute_ms", qpc_ms() - recorded);
+        } },
+        { "draw_bindings", "4000 draws, each with its own root CBV and descriptor table (per-draw binding cost)",
+          [common_init] { common_init(); }, [draws, begin_hdr](UINT f) {
+            static UINT64 offset;
+            double t = qpc_ms();
+            begin_hdr(p.list, tex_pso);
+            draws(p.list, BIND_DRAWS, 1, p.upload_ptr, p.upload_ring->GetGPUVirtualAddress(), offset, 0, f * 0.01f);
+            extras.add("record_ms", qpc_ms() - t);
+        } },
+        { "rt_rebind", "64 groups of 6 draws, the same render target rebound each group after an unrelated UAV barrier",
+          [common_init] {
+            common_init();
+            uav_dummy = create_buffer(65536, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }, [draws, begin_hdr](UINT f) {
+            static UINT64 offset;
+            double t = qpc_ms();
+            for (UINT g = 0; g < REBIND_GROUPS; g++)
+            {
+                begin_hdr(p.list, g & 1 ? tex_pso2 : tex_pso);
+                draws(p.list, 6, 6, p.upload_ptr, p.upload_ring->GetGPUVirtualAddress(), offset, g * 6, f * 0.01f);
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                b.UAV.pResource = uav_dummy;
+                p.list->ResourceBarrier(1, &b);
+            }
+            extras.add("record_ms", qpc_ms() - t);
+        } },
+    };
+}
+
 static std::vector<Scene> scenes()
 {
-    std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes();
+    std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes(),
+                       sub = submit_scenes();
     all.insert(all.end(), more.begin(), more.end());
     all.insert(all.end(), sm6.begin(), sm6.end());
     all.insert(all.end(), feat.begin(), feat.end());
     all.insert(all.end(), eng.begin(), eng.end());
+    all.insert(all.end(), sub.begin(), sub.end());
     return all;
 }
 
