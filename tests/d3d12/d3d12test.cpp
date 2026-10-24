@@ -2369,6 +2369,170 @@ float4 ps(DSOut i) : SV_Target { return i.pid == 0 ? float4(1, 0, 0, 1) : float4
     return true;
 }
 
+// ExecuteIndirect: a command signature that changes a root constant and draws indexed (3 commands, the count
+// buffer allowing 2), one that dispatches, and one that also changes the root UAV; each command writes its root
+// constant into its own slot.
+static bool test_executeindirect()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint id; };
+RWByteAddressBuffer o : register(u0);
+float4 vs(uint v : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((v << 1) & 2, v & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+[earlydepthstencil]
+float4 ps(float4 pos : SV_Position) : SV_Target
+{
+    if (all(uint2(pos.xy) == 0))
+        o.InterlockedAdd(id * 4, 1);
+    return float4(0, 1, 0, 1);
+}
+[numthreads(4, 1, 1)]
+void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(64 + id * 4, 1); }
+)";
+    std::vector<char> vsb = compile_dxc(src, "vs", "vs_6_0"), psb = compile_dxc(src, "ps", "ps_6_0"), csb = compile_dxc(src, "cs", "cs_6_0");
+    if (vsb.empty() || psb.empty() || csb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *gps = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps)));
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, csb);
+    if (!cps)
+        return false;
+
+    // Draw signature: root constant, then DrawIndexed. Dispatch signature: root constant, then Dispatch.
+    D3D12_INDIRECT_ARGUMENT_DESC draw_args[2] = {}, dispatch_args[2] = {};
+    draw_args[0].Type = dispatch_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    draw_args[0].Constant.RootParameterIndex = dispatch_args[0].Constant.RootParameterIndex = 0;
+    draw_args[0].Constant.Num32BitValuesToSet = dispatch_args[0].Constant.Num32BitValuesToSet = 1;
+    draw_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    dispatch_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    struct DrawCmd { UINT id; D3D12_DRAW_INDEXED_ARGUMENTS draw; };
+    struct DispatchCmd { UINT id; D3D12_DISPATCH_ARGUMENTS dispatch; };
+    D3D12_COMMAND_SIGNATURE_DESC draw_sig_desc = { sizeof(DrawCmd), 2, draw_args, 0 };
+    D3D12_COMMAND_SIGNATURE_DESC dispatch_sig_desc = { sizeof(DispatchCmd), 2, dispatch_args, 0 };
+    ID3D12CommandSignature *draw_sig = nullptr, *dispatch_sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&draw_sig_desc, rs, IID_PPV_ARGS(&draw_sig)));
+    CHECK_HR(g.device->CreateCommandSignature(&dispatch_sig_desc, rs, IID_PPV_ARGS(&dispatch_sig)));
+
+    ID3D12Resource *args = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *a = nullptr;
+    args->Map(0, nullptr, (void **)&a);
+    memset(a, 0, 256);
+    DrawCmd *dc = (DrawCmd *)a;
+    for (UINT i = 0; i < 3; i++)
+        dc[i] = { 1 + i, { 3, 1, 0, 0, 0 } };
+    DispatchCmd *pc = (DispatchCmd *)(a + 128);
+    pc[0] = { 5, { 2, 1, 1 } };
+    pc[1] = { 6, { 1, 1, 1 } };
+    *(UINT *)(a + 192) = 2;  // The draw count.
+    args->Unmap(0, nullptr);
+    ID3D12Resource *ib = create_buffer(16, D3D12_HEAP_TYPE_UPLOAD);
+    uint16_t *idx = nullptr;
+    ib->Map(0, nullptr, (void **)&idx);
+    idx[0] = 0; idx[1] = 1; idx[2] = 2;
+    ib->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const UINT W = 4, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(gps);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), 16, DXGI_FORMAT_R16_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    g.list->ExecuteIndirect(draw_sig, 3, args, 0, args, 192);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(cps);
+    g.list->ExecuteIndirect(dispatch_sig, 2, args, 128, nullptr, 0);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    EXPECT(v[0] == 0, "slot 0 = %u, want 0", v[0]);
+    EXPECT(v[1] == 1 && v[2] == 1, "draws 1 and 2 = %u %u, want 1 1", v[1], v[2]);
+    EXPECT(v[3] == 0, "draw 3 (past the count) = %u, want 0", v[3]);
+    EXPECT(v[16 + 5] == 8 && v[16 + 6] == 4, "dispatches 5 and 6 = %u %u, want 8 4", v[16 + 5], v[16 + 6]);
+
+    // A signature that changes the root UAV per command: dispatches with id 7 write into their own buffers.
+    D3D12_INDIRECT_ARGUMENT_DESC uav_args[3] = {};
+    uav_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    uav_args[0].Constant.Num32BitValuesToSet = 1;
+    uav_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+    uav_args[1].UnorderedAccessView.RootParameterIndex = 1;
+    uav_args[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    // Command signature arguments are packed: the address follows the constant without padding.
+#pragma pack(push, 4)
+    struct UavCmd { UINT id; D3D12_GPU_VIRTUAL_ADDRESS uav; D3D12_DISPATCH_ARGUMENTS dispatch; };
+#pragma pack(pop)
+    D3D12_COMMAND_SIGNATURE_DESC uav_sig_desc = { sizeof(UavCmd), 3, uav_args, 0 };
+    ID3D12CommandSignature *uav_sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&uav_sig_desc, rs, IID_PPV_ARGS(&uav_sig)));
+    ID3D12Resource *outs[2] = { create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                                create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) };
+    ID3D12Resource *uav_argbuf = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    UavCmd *uc = nullptr;
+    uav_argbuf->Map(0, nullptr, (void **)&uc);
+    uc[0] = { 7, outs[0]->GetGPUVirtualAddress(), { 1, 1, 1 } };
+    uc[1] = { 7, outs[1]->GetGPUVirtualAddress(), { 3, 1, 1 } };
+    uav_argbuf->Unmap(0, nullptr);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(cps);
+    g.list->ExecuteIndirect(uav_sig, 2, uav_argbuf, 0, nullptr, 0);
+    ID3D12Resource *rb0, *rb1;
+    const uint32_t *v0 = read_buffer(outs[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb0);
+    const uint32_t *v1 = read_buffer(outs[1], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb1);
+    if (!v0 || !v1)
+        return false;
+    EXPECT(v0[16 + 7] == 4 && v1[16 + 7] == 12, "per-command root UAVs = %u %u, want 4 12", v0[16 + 7], v1[16 + 7]);
+    rb0->Release(); rb1->Release(); outs[0]->Release(); outs[1]->Release(); uav_argbuf->Release(); uav_sig->Release();
+    rb->Release(); out->Release(); ib->Release(); args->Release(); draw_sig->Release(); dispatch_sig->Release();
+    rtv_heap->Release(); rt->Release(); cps->Release(); gps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -2381,6 +2545,7 @@ static const Test tests[] = {
     { "dispatchrays", test_dispatchrays },
     { "mesh", test_mesh },
     { "tessellation", test_tessellation },
+    { "executeindirect", test_executeindirect },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
