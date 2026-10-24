@@ -3733,6 +3733,58 @@ void main(uint2 t : SV_GroupThreadID, uint gi : SV_GroupIndex)
     return true;
 }
 
+// Root CBVs (on MoltenVK, push descriptors: Metal constant buffers): two of them, at offsets into one buffer, with
+// a dynamically indexed array, read by a compute shader.
+static bool test_rootcbv()
+{
+    static const char *src = R"(
+cbuffer A : register(b0) { float4 a[4]; };
+cbuffer B : register(b1) { uint4 b; };
+RWStructuredBuffer<float4> o : register(u0);
+[numthreads(4, 1, 1)]
+void main(uint t : SV_DispatchThreadID) { o[t] = a[t] * b.x + float(b.y); }
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    for (auto &p : rp)
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+    ID3D12Resource *cb = create_buffer(1024, D3D12_HEAP_TYPE_UPLOAD);
+    float *f = nullptr;
+    cb->Map(0, nullptr, (void **)&f);
+    for (int i = 0; i < 16; i++)
+        f[64 + i] = float(i);                       // a at offset 256
+    uint32_t *u = (uint32_t *)(f + 128);            // b at offset 512
+    u[0] = 3; u[1] = 7; u[2] = 0; u[3] = 0;
+    cb->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress() + 256);
+    g.list->SetComputeRootConstantBufferView(1, cb->GetGPUVirtualAddress() + 512);
+    g.list->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const float *v = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64, &rb);
+    if (!v)
+        return false;
+    for (int i = 0; i < 16; i++)
+        EXPECT(v[i] == float(i) * 3 + 7, "o[%d].%c = %f, want %f", i / 4, "xyzw"[i % 4], v[i], float(i) * 3 + 7);
+    rb->Release(); out->Release(); cb->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3740,6 +3792,7 @@ static const Test tests[] = {
     { "compute_dxbc", test_compute_dxbc },
     { "sm67", test_sm67 },
     { "sm67_textures", test_sm67_textures },
+    { "rootcbv", test_rootcbv },
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
