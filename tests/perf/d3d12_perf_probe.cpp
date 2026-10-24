@@ -817,6 +817,35 @@ static std::vector<Scene> scenes()
             p.list->ResolveQueryData(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1000, readback, 0);
             p.list->ResolveQueryData(occlusion_heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 500, readback, 8000);
         } },
+        { "timestamps", "1000 timestamp queries between draws, resolved per frame", [] {
+            flat = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1000 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&ts_heap)));
+            readback = create_buffer(1000 * 8, D3D12_HEAP_TYPE_READBACK);
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 1000; i++)
+            {
+                p.list->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+                small_quad(p.list, i, f * 0.01f);
+            }
+            p.list->ResolveQueryData(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1000, readback, 0);
+        } },
+        { "occlusion", "500 binary occlusion queries, one per draw, resolved per frame", [] {
+            flat = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 500 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&occlusion_heap)));
+            readback = create_buffer(500 * 8, D3D12_HEAP_TYPE_READBACK);
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 500; i++)
+            {
+                p.list->BeginQuery(occlusion_heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+                small_quad(p.list, i, f * 0.01f);
+                p.list->EndQuery(occlusion_heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+            }
+            p.list->ResolveQueryData(occlusion_heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 500, readback, 0);
+        } },
         { "execute_indirect", "ExecuteIndirect of 2000 draws with root constants", [] {
             flat = create_pso({});
             D3D12_INDIRECT_ARGUMENT_DESC args[2] = {};
