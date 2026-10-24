@@ -3518,6 +3518,9 @@ static std::vector<Scene> submit_scenes()
         auto h = rtv(FRAMES_IN_FLIGHT);
         l->OMSetRenderTargets(1, &h, FALSE, nullptr);
         viewport(l);
+        // PROBE_TINY_SCISSOR: a 1x1 scissor leaves the GPU almost no work, so submission costs dominate.
+        static const bool tiny = getenv("PROBE_TINY_SCISSOR") != nullptr;
+        if (tiny) { D3D12_RECT sc = { 0, 0, 1, 1 }; l->RSSetScissorRects(1, &sc); }
         l->SetGraphicsRootSignature(p.root_signature);
         l->SetPipelineState(pso);
         l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3551,7 +3554,8 @@ static std::vector<Scene> submit_scenes()
                         CHECK(mt_alloc[t][p.frame_index]->Reset());
                         CHECK(l->Reset(mt_alloc[t][p.frame_index], nullptr));
                         begin_hdr(l, tex_pso);
-                        draws(l, MT_DRAWS, 16, mt_upload_ptr[t], mt_upload[t]->GetGPUVirtualAddress(), offset, t * 1000, f * 0.01f);
+                        static const UINT n = getenv("PROBE_MT_DRAWS") ? atoi(getenv("PROBE_MT_DRAWS")) : MT_DRAWS;
+                        draws(l, n, 16, mt_upload_ptr[t], mt_upload[t]->GetGPUVirtualAddress(), offset, t * 1000, f * 0.01f);
                         CHECK(l->Close());
                         std::lock_guard<std::mutex> g(lock);
                         if (++done == THREADS) done_cv.notify_one();
