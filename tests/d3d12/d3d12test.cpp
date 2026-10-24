@@ -102,7 +102,9 @@ static std::vector<char> compile_dxc_uncached(const char *source, const char *en
     wchar_t wentry[64], wtarget[32];
     MultiByteToWideChar(CP_UTF8, 0, entry, -1, wentry, 64);
     MultiByteToWideChar(CP_UTF8, 0, target, -1, wtarget, 32);
-    std::vector<LPCWSTR> args = { L"-E", wentry, L"-T", wtarget, L"-HV", L"2021" };
+    std::vector<LPCWSTR> args = { L"-T", wtarget, L"-HV", L"2021" };
+    if (*entry)  // Libraries (lib_6_x) have no entry point.
+        args.insert(args.begin(), { L"-E", wentry });
     for (int i = 0; i < extra_count; i++)
         args.push_back(extra[i]);
     DxcBuffer buffer = { source, strlen(source), DXC_CP_UTF8 };
@@ -676,21 +678,11 @@ float4 ps() : SV_Target { return 1; }
 
 // DXR 1.1 inline ray tracing: a bottom-level structure from an RGBA8_UNORM vertex buffer (a 1.1
 // format), one top-level instance, and RayQuery in a compute shader.
-static bool test_rayquery()
-{
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
-    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
-    if (o5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1)
-    {
-        printf("  skipped: raytracing tier %d\n", o5.RaytracingTier);
-        return true;
-    }
-    ID3D12Device5 *dev5 = nullptr;
-    ID3D12GraphicsCommandList4 *list4 = nullptr;
-    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev5)));
-    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list4)));
+// A one-triangle scene: (0,0) (1,0) (0,1) at z = 0.5 (RGBA8_UNORM vertexes), one instance; built into the list.
+struct RtScene { ID3D12Resource *vb = nullptr, *blas = nullptr, *tlas = nullptr, *scratch = nullptr, *inst_buf = nullptr; };
 
-    // Triangle (0,0) (1,0) (0,1) at z = 0.5, as RGBA8_UNORM.
+static bool build_rt_scene(ID3D12Device5 *dev5, ID3D12GraphicsCommandList4 *list4, RtScene &scene)
+{
     const uint8_t verts[3][4] = { { 0, 0, 128, 255 }, { 255, 0, 128, 255 }, { 0, 255, 128, 255 } };
     ID3D12Resource *vb = create_buffer(sizeof(verts), D3D12_HEAP_TYPE_UPLOAD);
     void *map = nullptr;
@@ -751,6 +743,33 @@ static bool test_rayquery()
     list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
     b.UAV.pResource = tlas;
     list4->ResourceBarrier(1, &b);
+    scene.vb = vb; scene.blas = blas; scene.tlas = tlas; scene.scratch = scratch; scene.inst_buf = inst_buf;
+    return true;
+}
+
+static void release_rt_scene(RtScene &scene)
+{
+    scene.inst_buf->Release(); scene.scratch->Release(); scene.tlas->Release(); scene.blas->Release(); scene.vb->Release();
+}
+
+static bool test_rayquery()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+    if (o5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1)
+    {
+        printf("  skipped: raytracing tier %d\n", o5.RaytracingTier);
+        return true;
+    }
+    ID3D12Device5 *dev5 = nullptr;
+    ID3D12GraphicsCommandList4 *list4 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev5)));
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list4)));
+
+    RtScene scene;
+    if (!build_rt_scene(dev5, list4, scene))
+        return false;
+    ID3D12Resource *tlas = scene.tlas;
 
     static const char *src = R"(
 RaytracingAccelerationStructure scene : register(t0);
@@ -780,7 +799,7 @@ void main(uint tid : SV_DispatchThreadID)
     ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_5"));
     if (!rs || !ps)
         return false;
-    ID3D12Resource *out = create_buffer(32, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *out = create_buffer(32, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g.list->SetComputeRootSignature(rs);
     g.list->SetPipelineState(ps);
     g.list->SetComputeRootShaderResourceView(0, tlas->GetGPUVirtualAddress());
@@ -800,8 +819,8 @@ void main(uint tid : SV_DispatchThreadID)
         else
             EXPECT(v[i * 2] == 0, "ray %d: status %u t %f, want a miss", i, v[i * 2], t);
     }
-    rb->Release(); out->Release(); ps->Release(); rs->Release(); inst_buf->Release(); scratch->Release();
-    tlas->Release(); blas->Release(); vb->Release(); list4->Release(); dev5->Release();
+    rb->Release(); out->Release(); ps->Release(); rs->Release();
+    release_rt_scene(scene); list4->Release(); dev5->Release();
     return true;
 }
 
@@ -1976,6 +1995,132 @@ static bool test_groupshared64()
     return true;
 }
 
+// Ray tracing pipelines (DXR 1.0): a state object with ray generation, miss and closest hit shaders, its shader
+// tables, and DispatchRays against the one-triangle scene (hits report RayTCurrent and the barycentrics).
+static bool test_dispatchrays()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+    if (o5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
+    {
+        printf("  skipped: raytracing tier %d\n", o5.RaytracingTier);
+        return true;
+    }
+    ID3D12Device5 *dev5 = nullptr;
+    ID3D12GraphicsCommandList4 *list4 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev5)));
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list4)));
+    RtScene scene;
+    if (!build_rt_scene(dev5, list4, scene))
+        return false;
+
+    static const char *src = R"(
+RaytracingAccelerationStructure scene : register(t0);
+RWByteAddressBuffer o : register(u0);
+struct Payload { uint hit; float t; float2 bary; };
+[shader("raygeneration")]
+void rg()
+{
+    static const float2 xy[4] = { float2(0.25, 0.25), float2(0.9, 0.9), float2(0.1, 0.1), float2(0.5, 0.4) };
+    uint id = DispatchRaysIndex().x;
+    RayDesc r;
+    r.Origin = float3(xy[id], -1.0);
+    r.Direction = float3(0, 0, 1);
+    r.TMin = 0.0;
+    r.TMax = 10.0;
+    Payload p = { 0, -1.0, float2(0, 0) };
+    TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, r, p);
+    o.Store4(id * 16, uint4(p.hit, asuint(p.t), asuint(p.bary)));
+}
+[shader("miss")]
+void ms(inout Payload p) { p.hit = 2; }
+[shader("closesthit")]
+void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p.t = RayTCurrent(); p.bary = a.barycentrics; }
+)";
+    std::vector<char> lib = compile_dxc(src, "", "lib_6_3");
+    if (lib.empty())
+        return false;
+
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+
+    D3D12_DXIL_LIBRARY_DESC lib_desc = {};
+    lib_desc.DXILLibrary = { lib.data(), lib.size() };
+    D3D12_HIT_GROUP_DESC hit_group = {};
+    hit_group.HitGroupExport = L"hg";
+    hit_group.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+    hit_group.ClosestHitShaderImport = L"ch";
+    D3D12_RAYTRACING_SHADER_CONFIG shader_config = { 16, 8 };
+    D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config = { 1 };
+    D3D12_GLOBAL_ROOT_SIGNATURE global_rs = { rs };
+    D3D12_STATE_SUBOBJECT subobjects[5] = {
+        { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc },
+        { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hit_group },
+        { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shader_config },
+        { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipeline_config },
+        { D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &global_rs },
+    };
+    D3D12_STATE_OBJECT_DESC so_desc = { D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 5, subobjects };
+    ID3D12StateObject *so = nullptr;
+    CHECK_HR(dev5->CreateStateObject(&so_desc, IID_PPV_ARGS(&so)));
+    ID3D12StateObjectProperties *props = nullptr;
+    CHECK_HR(so->QueryInterface(IID_PPV_ARGS(&props)));
+
+    // Shader table: ray generation at 0, miss at 64, hit group at 128.
+    ID3D12Resource *table = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *t = nullptr;
+    table->Map(0, nullptr, (void **)&t);
+    memset(t, 0, 256);
+    const wchar_t *names[3] = { L"rg", L"ms", L"hg" };
+    for (int i = 0; i < 3; i++)
+    {
+        void *id = props->GetShaderIdentifier(names[i]);
+        EXPECT(id, "no shader identifier for export %d", i);
+        if (id)
+            memcpy(t + 64 * i, id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    }
+    table->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_GPU_VIRTUAL_ADDRESS base = table->GetGPUVirtualAddress();
+    D3D12_DISPATCH_RAYS_DESC rays = {};
+    rays.RayGenerationShaderRecord = { base, 32 };
+    rays.MissShaderTable = { base + 64, 32, 32 };
+    rays.HitGroupTable = { base + 128, 32, 32 };
+    rays.Width = 4;
+    rays.Height = rays.Depth = 1;
+    list4->SetComputeRootSignature(rs);
+    list4->SetPipelineState1(so);
+    list4->SetComputeRootShaderResourceView(0, scene.tlas->GetGPUVirtualAddress());
+    list4->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    list4->DispatchRays(&rays);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64, &rb);
+    if (!v)
+        return false;
+    static const float xy[4][2] = { { 0.25f, 0.25f }, { 0.9f, 0.9f }, { 0.1f, 0.1f }, { 0.5f, 0.4f } };
+    for (int i = 0; i < 4; i++)
+    {
+        const uint32_t *r = v + 4 * i;
+        float tt, bu, bv;
+        memcpy(&tt, &r[1], 4); memcpy(&bu, &r[2], 4); memcpy(&bv, &r[3], 4);
+        bool inside = xy[i][0] + xy[i][1] < 1.0f;
+        if (inside)
+            EXPECT(r[0] == 1 && fabsf(tt - (1.0f + 128.0f / 255.0f)) < 1e-3f && fabsf(bu - xy[i][0]) < 1e-3f && fabsf(bv - xy[i][1]) < 1e-3f,
+                   "ray %d: hit %u t %f barycentrics (%f %f), want a hit at %f (%f %f)", i, r[0], tt, bu, bv,
+                   1.0f + 128.0f / 255.0f, xy[i][0], xy[i][1]);
+        else
+            EXPECT(r[0] == 2, "ray %d: hit %u, want a miss", i, r[0]);
+    }
+    rb->Release(); out->Release(); table->Release(); props->Release(); so->Release(); rs->Release();
+    release_rt_scene(scene); list4->Release(); dev5->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1985,6 +2130,7 @@ static const Test tests[] = {
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
+    { "dispatchrays", test_dispatchrays },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
