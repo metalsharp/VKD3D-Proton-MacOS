@@ -2812,6 +2812,308 @@ float4 ps() : SV_Target { return color; }
     return true;
 }
 
+// Textures: a BC1 texture (decoded colors), a 2-layer texture array with 2 mips sampled at explicit levels and
+// layers, and a copy of a texture region.
+static bool test_textures()
+{
+    static const char *src = R"(
+Texture2D<float4> bc : register(t0);
+Texture2DArray<float4> arr : register(t1);
+Texture2D<float4> copied : register(t2);
+SamplerState s : register(s0);
+RWStructuredBuffer<float4> o : register(u0);
+[numthreads(1, 1, 1)]
+void main()
+{
+    o[0] = bc.SampleLevel(s, float2(0.125, 0.125), 0);
+    o[1] = arr.SampleLevel(s, float3(0.5, 0.5, 0), 0);
+    o[2] = arr.SampleLevel(s, float3(0.5, 0.5, 1), 0);
+    o[3] = arr.SampleLevel(s, float3(0.5, 0.5, 1), 1);
+    o[4] = copied.Load(int3(1, 0, 0));
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+
+    ID3D12Resource *upload = create_buffer(65536, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 65536);
+    // BC1 4x4 block: color0 = pure red (RGB565 0xf800), color1 = pure blue (0x001f), all indexes 0 (color0).
+    uint16_t bc1[4] = { 0xf800, 0x001f, 0, 0 };
+    memcpy(u, bc1, 8);
+    // The array: layer 0 mip 0 (4x4) green, layer 1 mip 0 (4x4) blue, layer 1 mip 1 (2x2) white. RGBA8.
+    auto fill = [&](size_t offset, UINT w, UINT h, uint32_t v) {
+        for (UINT y = 0; y < h; y++)
+            for (UINT x = 0; x < w; x++)
+                memcpy(u + offset + 256 * y + 4 * x, &v, 4);
+    };
+    fill(4096, 4, 4, 0xff00ff00);
+    fill(8192, 4, 4, 0xffff0000);
+    fill(12288, 2, 2, 0xffffffff);
+    // The copy source: a 4x1 texture 0x11, 0x22, 0x33, 0x44 (in red).
+    uint32_t row[4] = { 0xff000011, 0xff000022, 0xff000033, 0xff000044 };
+    memcpy(u + 16384, row, 16);
+    upload->Unmap(0, nullptr);
+
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *bc = nullptr, *arr = nullptr, *src_tex = nullptr, *dst_tex = nullptr;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1; td.Format = DXGI_FORMAT_BC1_UNORM;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&bc)));
+    td.DepthOrArraySize = 2; td.MipLevels = 2; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&arr)));
+    td.Width = 4; td.Height = 1; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&src_tex)));
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dst_tex)));
+    auto upload_sub = [&](ID3D12Resource *t, UINT sub, UINT64 offset, DXGI_FORMAT f, UINT w, UINT h, UINT pitch) {
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = t;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = sub;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = offset;
+        srcl.PlacedFootprint.Footprint = { f, w, h, 1, pitch };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    };
+    upload_sub(bc, 0, 0, DXGI_FORMAT_BC1_UNORM, 4, 4, 256);
+    // Subresource = mip + layer * mip levels.
+    upload_sub(arr, 0, 4096, DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 256);
+    upload_sub(arr, 2, 8192, DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 256);
+    upload_sub(arr, 3, 12288, DXGI_FORMAT_R8G8B8A8_UNORM, 2, 2, 256);
+    upload_sub(src_tex, 0, 16384, DXGI_FORMAT_R8G8B8A8_UNORM, 4, 1, 256);
+    // Texture to texture: texels 2..3 of the source to 0..1 of the destination (texel 1 is checked: 0x44).
+    transition(src_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION tdst = {}, tsrc = {};
+    tdst.pResource = dst_tex; tdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    tsrc.pResource = src_tex; tsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box = { 2, 0, 0, 4, 1, 1 };
+    g.list->CopyTextureRegion(&tdst, 0, 0, 0, &tsrc, &box);
+    D3D12_RESOURCE_STATES srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    transition(bc, D3D12_RESOURCE_STATE_COPY_DEST, srv_state);
+    transition(arr, D3D12_RESOURCE_STATE_COPY_DEST, srv_state);
+    transition(dst_tex, D3D12_RESOURCE_STATE_COPY_DEST, srv_state);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateShaderResourceView(bc, nullptr, h);
+    h.ptr += inc;
+    g.device->CreateShaderResourceView(arr, nullptr, h);
+    h.ptr += inc;
+    g.device->CreateShaderResourceView(dst_tex, nullptr, h);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const float *v = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 80, &rb);
+    if (!v)
+        return false;
+    auto near_ = [](const float *c, float r, float gg, float b, float a) {
+        return fabsf(c[0] - r) < 0.01f && fabsf(c[1] - gg) < 0.01f && fabsf(c[2] - b) < 0.01f && fabsf(c[3] - a) < 0.01f; };
+    EXPECT(near_(v + 0, 1, 0, 0, 1), "BC1 texel (%f %f %f %f), want red", v[0], v[1], v[2], v[3]);
+    EXPECT(near_(v + 4, 0, 1, 0, 1), "layer 0 (%f %f %f %f), want green", v[4], v[5], v[6], v[7]);
+    EXPECT(near_(v + 8, 0, 0, 1, 1), "layer 1 (%f %f %f %f), want blue", v[8], v[9], v[10], v[11]);
+    EXPECT(near_(v + 12, 1, 1, 1, 1), "layer 1 mip 1 (%f %f %f %f), want white", v[12], v[13], v[14], v[15]);
+    EXPECT(fabsf(v[16] - 0x44 / 255.0f) < 0.002f, "copied texel %f, want %f", v[16], 0x44 / 255.0f);
+    rb->Release(); out->Release(); heap->Release(); dst_tex->Release(); src_tex->Release(); arr->Release(); bc->Release();
+    upload->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
+// Queues: a copy queue fills a buffer, a compute queue (waiting on the copy's fence) doubles it, and the direct
+// queue (waiting on the compute fence) reads it back.
+static bool test_queues()
+{
+    static const char *src = R"(
+RWStructuredBuffer<uint> b : register(u0);
+[numthreads(64, 1, 1)] void main(uint t : SV_DispatchThreadID) { b[t] *= 2; }
+)";
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!ps)
+        return false;
+    ID3D12CommandQueue *copy_q = nullptr, *compute_q = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    CHECK_HR(g.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&copy_q)));
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    CHECK_HR(g.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_q)));
+    ID3D12CommandAllocator *copy_a = nullptr, *compute_a = nullptr;
+    CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&copy_a)));
+    CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&compute_a)));
+    ID3D12GraphicsCommandList *copy_l = nullptr, *compute_l = nullptr;
+    CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, copy_a, nullptr, IID_PPV_ARGS(&copy_l)));
+    CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_a, nullptr, IID_PPV_ARGS(&compute_l)));
+    ID3D12Fence *f = nullptr;
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)));
+
+    const UINT n = 256;
+    ID3D12Resource *upload = create_buffer(n * 4, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT i = 0; i < n; i++)
+        u[i] = i;
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *buf = create_buffer(n * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_COMMON);
+    copy_l->CopyBufferRegion(buf, 0, upload, 0, n * 4);
+    CHECK_HR(copy_l->Close());
+    compute_l->SetComputeRootSignature(rs);
+    compute_l->SetPipelineState(ps);
+    compute_l->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    compute_l->Dispatch(n / 64, 1, 1);
+    CHECK_HR(compute_l->Close());
+    // Submit in the reverse order of execution: the waits order them.
+    CHECK_HR(compute_q->Wait(f, 1));
+    ID3D12CommandList *cl = compute_l;
+    compute_q->ExecuteCommandLists(1, &cl);
+    CHECK_HR(compute_q->Signal(f, 2));
+    cl = copy_l;
+    copy_q->ExecuteCommandLists(1, &cl);
+    CHECK_HR(copy_q->Signal(f, 1));
+    CHECK_HR(g.queue->Wait(f, 2));
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(buf, D3D12_RESOURCE_STATE_COMMON, n * 4, &rb);
+    if (!v)
+        return false;
+    UINT wrong = 0;
+    for (UINT i = 0; i < n; i++)
+        wrong += v[i] != 2 * i;
+    EXPECT(!wrong, "%u of %u values not doubled (v[1] = %u, v[255] = %u)", wrong, n, v[1], v[255]);
+    EXPECT(f->GetCompletedValue() == 2, "fence %llu, want 2", (unsigned long long)f->GetCompletedValue());
+    rb->Release(); buf->Release(); upload->Release(); f->Release(); copy_l->Release(); compute_l->Release();
+    copy_a->Release(); compute_a->Release(); copy_q->Release(); compute_q->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
+// Input layout: per-vertex positions and per-instance offsets (step rate 2), and colors from a second vertex buffer.
+static bool test_inputlayout()
+{
+    static const char *src = R"(
+struct VSIn { float2 pos : POSITION; float2 offset : OFFSET; float4 color : COLOR; };
+struct VSOut { float4 pos : SV_Position; float4 color : COLOR; };
+VSOut vs(VSIn i) { VSOut o; o.pos = float4(i.pos + i.offset, 0, 1); o.color = i.color; return o; }
+float4 ps(VSOut i) : SV_Target { return i.color; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_INPUT_ELEMENT_DESC ie[3] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2 },
+        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 8, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2 },
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.InputLayout = { ie, 3 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    // A quad over the left quarter (x in [-1, -0.5]); instances 0-1 use offset 0 (red), 2-3 offset 1 (green),
+    // which moves it to x in [0, 0.5].
+    ID3D12Resource *vb = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    float *f = nullptr;
+    vb->Map(0, nullptr, (void **)&f);
+    const float quad[12] = { -1, -1, -0.5f, -1, -1, 1, -0.5f, -1, -0.5f, 1, -1, 1 };
+    memcpy(f, quad, sizeof(quad));
+    float *inst = f + 32;
+    inst[0] = 0; inst[1] = 0; ((uint32_t *)inst)[2] = 0xff0000ff;
+    inst[3] = 1; inst[4] = 0; ((uint32_t *)inst)[5] = 0xff00ff00;
+    vb->Unmap(0, nullptr);
+    D3D12_VERTEX_BUFFER_VIEW vbv[2] = { { vb->GetGPUVirtualAddress(), 48, 8 }, { vb->GetGPUVirtualAddress() + 128, 24, 12 } };
+
+    const UINT W = 8, H = 2;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->IASetVertexBuffers(0, 2, vbv);
+    g.list->DrawInstanced(6, 4, 0, 0);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    EXPECT(px[0] == 0xff0000ff, "instances 0-1 pixel 0x%08x, want red", px[0]);
+    EXPECT(px[4] == 0xff00ff00, "instances 2-3 pixel 0x%08x, want green", px[4]);
+    EXPECT(px[2] == 0xff000000, "uncovered pixel 0x%08x, want black", px[2]);
+    rb->Release(); rtv_heap->Release(); rt->Release(); vb->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -2827,6 +3129,9 @@ static const Test tests[] = {
     { "executeindirect", test_executeindirect },
     { "dynamicresources", test_dynamicresources },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
+    { "textures", test_textures },
+    { "queues", test_queues },
+    { "inputlayout", test_inputlayout },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
