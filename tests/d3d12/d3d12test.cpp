@@ -12,6 +12,9 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <vector>
+#include <algorithm>
 
 static int g_failures, g_checks;
 #define CHECK_HR(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("  %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); return false; } } while (0)
@@ -3785,6 +3788,68 @@ void main(uint t : SV_DispatchThreadID) { o[t] = a[t] * b.x + float(b.y); }
     return true;
 }
 
+// How long a CPU waiter takes to see a queue signal: an empty Signal waited on through
+// SetEventOnCompletion (what engines do once per frame) and by polling GetCompletedValue.
+static bool test_fencelatency()
+{
+    ID3D12Fence *f = nullptr;
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)));
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    ID3D12Resource *src = create_buffer(65536, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    ID3D12Resource *dst = create_buffer(65536, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    std::vector<double> evt, poll;
+    UINT64 v = 0;
+    // Each signal follows a small copy, so it waits on real GPU completion.
+    auto submit = [&]() -> bool {
+        g.list->CopyBufferRegion(dst, 0, src, 0, 65536);
+        CHECK_HR(g.list->Close());
+        ID3D12CommandList *lists[] = { g.list };
+        g.queue->ExecuteCommandLists(1, lists);
+        return true;
+    };
+    auto reset = [&]() -> bool {
+        CHECK_HR(g.allocator->Reset());
+        CHECK_HR(g.list->Reset(g.allocator, nullptr));
+        return true;
+    };
+    for (int i = 0; i < 200; i++)
+    {
+        CHECK_HR(f->SetEventOnCompletion(++v, ev));
+        QueryPerformanceCounter(&t0);
+        if (!submit())
+            return false;
+        CHECK_HR(g.queue->Signal(f, v));
+        WaitForSingleObject(ev, 5000);
+        QueryPerformanceCounter(&t1);
+        evt.push_back(1000.0 * (t1.QuadPart - t0.QuadPart) / freq.QuadPart);
+        if (!reset())
+            return false;
+
+        QueryPerformanceCounter(&t0);
+        if (!submit())
+            return false;
+        CHECK_HR(g.queue->Signal(f, ++v));
+        while (f->GetCompletedValue() < v)
+            YieldProcessor();
+        QueryPerformanceCounter(&t1);
+        poll.push_back(1000.0 * (t1.QuadPart - t0.QuadPart) / freq.QuadPart);
+        if (!reset())
+            return false;
+    }
+    src->Release();
+    dst->Release();
+    std::sort(evt.begin(), evt.end());
+    std::sort(poll.begin(), poll.end());
+    printf("  submit + signal -> event wait: median %.3f ms, p90 %.3f ms, max %.3f ms\n", evt[100], evt[180], evt[199]);
+    printf("  submit + signal -> GetCompletedValue: median %.3f ms, p90 %.3f ms, max %.3f ms\n", poll[100], poll[180], poll[199]);
+    EXPECT(evt[100] < 5.0, "signal to event takes %.3f ms", evt[100]);
+    CloseHandle(ev);
+    f->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3793,6 +3858,7 @@ static const Test tests[] = {
     { "sm67", test_sm67 },
     { "sm67_textures", test_sm67_textures },
     { "rootcbv", test_rootcbv },
+    { "fencelatency", test_fencelatency },
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
