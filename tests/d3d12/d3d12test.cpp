@@ -3114,6 +3114,200 @@ float4 ps(VSOut i) : SV_Target { return i.color; }
     return true;
 }
 
+// ExecuteIndirect with vertex and index buffer views: three sequences, each with its root constants (color),
+// vertex buffer (with a different stride and base vertex in one) and index buffer (16 and 32 bit, and a start index),
+// then an ordinary draw to check that the state is bound again after them.
+static bool test_executeindirect_buffers()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { float4 color; };
+Texture2D<float4> tex : register(t0);
+StructuredBuffer<float4> sb : register(t1);
+float4 vs(float2 pos : POSITION) : SV_Position { return float4(pos, 0, 1); }
+float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 4;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable = { 1, &range };
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_INPUT_ELEMENT_DESC ie = { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.InputLayout = { &ie, 1 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    D3D12_INDIRECT_ARGUMENT_DESC ad[4] = {};
+    ad[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    ad[0].Constant = { 0, 0, 4 };
+    ad[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+    ad[1].VertexBuffer.Slot = 0;
+    ad[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+    ad[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+#pragma pack(push, 4)
+    struct Cmd { float color[4]; D3D12_VERTEX_BUFFER_VIEW vbv; D3D12_INDEX_BUFFER_VIEW ibv; D3D12_DRAW_INDEXED_ARGUMENTS draw; };
+#pragma pack(pop)
+    static_assert(sizeof(Cmd) == 68, "packed command");
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(Cmd), 4, ad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, rs, IID_PPV_ARGS(&sig)));
+
+    ID3D12Resource *buf = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    buf->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 4096);
+    D3D12_GPU_VIRTUAL_ADDRESS va = buf->GetGPUVirtualAddress();
+    // Quads over the column pairs [0,2), [2,4), [4,6) and [6,8) of an 8x2 target.
+    auto quad = [&](size_t offset, UINT stride, UINT first, float x0, float x1) {
+        const float v[4][2] = { { x0, -1 }, { x1, -1 }, { x1, 1 }, { x0, 1 } };
+        for (UINT i = 0; i < 4; i++)
+            memcpy(u + offset + (first + i) * stride, v[i], 8);
+    };
+    quad(0, 8, 0, -1.0f, -0.5f);
+    quad(256, 8, 0, -0.5f, 0.0f);
+    quad(512, 12, 2, 0.0f, 0.5f);       // Two vertices before it: base vertex 2.
+    quad(768, 8, 0, 0.5f, 1.0f);
+    const uint16_t i16[6] = { 0, 1, 2, 0, 2, 3 }, i16c[9] = { 9, 9, 9, 0, 1, 2, 0, 2, 3 };
+    const uint32_t i32[6] = { 0, 1, 2, 0, 2, 3 };
+    memcpy(u + 1024, i16, sizeof(i16));
+    memcpy(u + 1280, i16c, sizeof(i16c));
+    memcpy(u + 1536, i32, sizeof(i32));
+    Cmd cmds[3] = {
+        { { 1, 0, 0, 1 }, { va + 0, 32, 8 }, { va + 1024, 12, DXGI_FORMAT_R16_UINT }, { 6, 1, 0, 0, 0 } },
+        { { 0, 1, 0, 1 }, { va + 256, 32, 8 }, { va + 1536, 24, DXGI_FORMAT_R32_UINT }, { 6, 1, 0, 0, 0 } },
+        { { 0, 0, 1, 1 }, { va + 512, 72, 12 }, { va + 1280, 18, DXGI_FORMAT_R16_UINT }, { 6, 1, 3, 2, 0 } },
+    };
+    memcpy(u + 2048, cmds, sizeof(cmds));
+    const uint32_t one = 1;
+    memcpy(u + 2304, &one, 4);          // The count for the second ExecuteIndirect.
+    const float ones[4] = { 1, 1, 1, 1 };
+    memcpy(u + 2560, ones, 16);         // The structured buffer.
+    const uint32_t texel = 0xffffffff;
+    memcpy(u + 3072, &texel, 4);        // The texture's texel (512-aligned footprint).
+    buf->Unmap(0, nullptr);
+
+    const UINT W = 8, H = 2;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC xd = {};
+    xd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    xd.Width = 1; xd.Height = 1; xd.DepthOrArraySize = 1; xd.MipLevels = 1;
+    xd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    xd.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &xd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    {
+        D3D12_TEXTURE_COPY_LOCATION tdst = {}, tsrc = {};
+        tdst.pResource = tex;
+        tdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        tsrc.pResource = buf;
+        tsrc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        tsrc.PlacedFootprint.Offset = 3072;
+        tsrc.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256 };
+        g.list->CopyTextureRegion(&tdst, 0, 0, 0, &tsrc, nullptr);
+        transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *srv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&srv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE sh = srv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateShaderResourceView(tex, nullptr, sh);
+    sh.ptr += g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sbd = {};
+    sbd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sbd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sbd.Buffer.FirstElement = 2560 / 16;
+    sbd.Buffer.NumElements = 1;
+    sbd.Buffer.StructureByteStride = 16;
+    g.device->CreateShaderResourceView(buf, &sbd, sh);
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetDescriptorHeaps(1, &srv_heap);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootDescriptorTable(1, srv_heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Row 0: all three sequences. Row 1: the count buffer limits it to the first.
+    D3D12_RECT row0 = { 0, 0, (LONG)W, 1 }, row1 = { 0, 1, (LONG)W, 2 };
+    g.list->RSSetScissorRects(1, &row0);
+    g.list->ExecuteIndirect(sig, 3, buf, 2048, nullptr, 0);
+    g.list->RSSetScissorRects(1, &row1);
+    g.list->ExecuteIndirect(sig, 3, buf, 2048, buf, 2304);
+    g.list->RSSetScissorRects(1, &sc);
+    // The views and constants the signature set are undefined after it: set them for an ordinary draw.
+    const float white[4] = { 1, 1, 1, 1 };
+    D3D12_VERTEX_BUFFER_VIEW vbv = { va + 768, 32, 8 };
+    D3D12_INDEX_BUFFER_VIEW ibv = { va + 1024, 12, DXGI_FORMAT_R16_UINT };
+    g.list->SetGraphicsRoot32BitConstants(0, 4, white, 0);
+    g.list->IASetVertexBuffers(0, 1, &vbv);
+    g.list->IASetIndexBuffer(&ibv);
+    g.list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    const uint32_t want[4] = { 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff };
+    const char *what[4] = { "sequence 0 (16-bit indices)", "sequence 1 (32-bit indices)",
+                            "sequence 2 (stride 12, base vertex, start index)", "the draw after them" };
+    for (UINT i = 0; i < 4; i++)
+        for (UINT y = 0; y < H; y++)
+        {
+            uint32_t w = y == 1 && (i == 1 || i == 2) ? 0xff000000 : want[i];   // Not drawn with the count of 1.
+            EXPECT(px[y * 64 + 2 * i + 1] == w, "%s: pixel (%u, %u) 0x%08x, want 0x%08x", what[i], 2 * i + 1, y,
+                   px[y * 64 + 2 * i + 1], w);
+        }
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); rt->Release(); srv_heap->Release(); tex->Release(); buf->Release(); sig->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3132,6 +3326,7 @@ static const Test tests[] = {
     { "textures", test_textures },
     { "queues", test_queues },
     { "inputlayout", test_inputlayout },
+    { "executeindirect_buffers", test_executeindirect_buffers },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
