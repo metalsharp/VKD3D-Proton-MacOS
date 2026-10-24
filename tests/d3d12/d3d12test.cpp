@@ -3850,6 +3850,60 @@ static bool test_fencelatency()
     return true;
 }
 
+// A chain of dispatches, each reading what the previous one wrote, separated by UAV barriers.
+// MoltenVK keeps these barriers inside one compute encoder; a missing dependency shows up as a
+// wrong sum.
+static bool test_uavchain()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint step; };
+RWStructuredBuffer<uint> b : register(u0);
+[numthreads(64, 1, 1)] void main(uint t : SV_DispatchThreadID)
+{
+    // Element t takes its left neighbour's value from the previous step, plus one.
+    uint left = t == 0 ? 0 : b[t - 1];
+    GroupMemoryBarrierWithGroupSync();
+    if (t == step) b[t] = left + 1;
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants = { 0, 0, 1 };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    for (auto &p : rp)
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+    ID3D12Resource *buf = create_buffer(64 * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(1, buf->GetGPUVirtualAddress());
+    D3D12_RESOURCE_BARRIER uav = {};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = buf;
+    for (UINT step = 0; step < 64; step++)
+    {
+        g.list->SetComputeRoot32BitConstants(0, 1, &step, 0);
+        g.list->Dispatch(1, 1, 1);
+        g.list->ResourceBarrier(1, &uav);
+    }
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64 * 4, &rb);
+    if (!v)
+        return false;
+    for (UINT i = 0; i < 64; i++)
+        EXPECT(v[i] == i + 1, "b[%u] = %u, want %u", i, v[i], i + 1);
+    rb->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3859,6 +3913,7 @@ static const Test tests[] = {
     { "sm67_textures", test_sm67_textures },
     { "rootcbv", test_rootcbv },
     { "fencelatency", test_fencelatency },
+    { "uavchain", test_uavchain },
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
