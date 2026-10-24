@@ -1,0 +1,351 @@
+From cf5bfcaf2cb13ebc777e8ea97c165d9a36873582 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 19:13:01 -0600
+Subject: [PATCH 18/18] MSL: transform feedback capture for MoltenVK's compute
+ capture stage
+
+- Only the capture_output_to_buffer version of a vertex shader captures; the
+  rasterizing vertex function ignores the Xfb decorations (outputs are no longer
+  redirected to the capture locals there).
+- The capture writes a primitive to every buffer or none: the count that fits
+  in every buffer (from the offset and size in MoltenVK's capture state) is
+  written, and thread 0 records written/needed primitives and bytes per buffer
+  for a following dispatch that advances the offsets.
+- Captured outputs are thread-local, so component writes don't take the device
+  pointer cast.
+- gl_VertexIndex, gl_InstanceIndex, gl_BaseVertex and gl_BaseInstance in vertex
+  kernels include the stage-in grid origin (first vertex / vertex offset and
+  first instance).
+---
+ spirv_msl.cpp | 208 ++++++++++++++++++++++++--------------------------
+ spirv_msl.hpp |   4 +-
+ 2 files changed, 102 insertions(+), 110 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 340cd6e0..36360f47 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -18905,12 +18905,14 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 				if (!vertex_shader_is_kernel())
+ 					break;
+ 
++				// In a vertex kernel, spvDispatchBase is the stage-in grid origin: the first vertex
++				// (or vertex offset) and the first instance.
+ 				entry_func.fixup_hooks_in.push_back([=]() {
+ 					builtin_declaration = true;
+ 					switch (msl_options.vertex_index_type)
+ 					{
+ 					case Options::IndexType::None:
+-						if (msl_options.dispatch_base)
++						if (builtin_dispatch_base_id)
+ 							statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+ 							          to_expression(builtin_invocation_id_id), ".x + ",
+ 							          to_expression(builtin_dispatch_base_id), ".x;");
+@@ -18920,7 +18922,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 						break;
+ 					case Options::IndexType::UInt16:
+ 					case Options::IndexType::UInt32:
+-						if (msl_options.dispatch_base)
++						if (builtin_dispatch_base_id)
+ 							statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+ 							          index_buffer_var_name, "[", to_expression(builtin_invocation_id_id),
+ 							          ".x] + ", to_expression(builtin_dispatch_base_id), ".x;");
+@@ -18938,7 +18940,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 					break;
+ 
+ 				entry_func.fixup_hooks_in.push_back([=]() {
+-					if (msl_options.dispatch_base)
++					if (builtin_dispatch_base_id)
+ 						statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+ 						          to_expression(builtin_dispatch_base_id), ".x;");
+ 					else
+@@ -18953,7 +18955,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 
+ 				entry_func.fixup_hooks_in.push_back([=]() {
+ 					builtin_declaration = true;
+-					if (msl_options.dispatch_base)
++					if (builtin_dispatch_base_id)
+ 						statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+ 						          to_expression(builtin_invocation_id_id), ".y + ",
+ 						          to_expression(builtin_dispatch_base_id), ".y;");
+@@ -18969,7 +18971,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 					break;
+ 
+ 				entry_func.fixup_hooks_in.push_back([=]() {
+-					if (msl_options.dispatch_base)
++					if (builtin_dispatch_base_id)
+ 						statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+ 						          to_expression(builtin_dispatch_base_id), ".y;");
+ 					else
+@@ -19174,144 +19176,124 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+ 				    SPIRV_CROSS_THROW("Primitive type not yet supported for transform feedback.");
+ 			    }
+ 			    statement("uint spvXfbIndex = ", index_expr, ";");
+-			    // First, write the data out.
++			    // The capture buffers' offsets and sizes come from MoltenVK's transform feedback state
++			    // (each counter points at its offset; the size is 4 words later). A primitive is written
++			    // only if it fits in every buffer, and nothing here updates the offsets: thread 0 records
++			    // the draw's written / needed primitives and bytes per buffer, which a following dispatch
++			    // adds to the offsets once every thread is done.
++			    uint32_t vpp = 0;
++			    string total;
++			    string sx = to_expression(builtin_stage_input_size_id);
++			    switch (msl_options.xfb_primitive_type)
++			    {
++			    case Options::PrimitiveType::PointList: vpp = 1; total = join(sx, ".x * ", sx, ".y"); break;
++			    case Options::PrimitiveType::LineList: vpp = 2; total = join("(", sx, ".x / 2u) * ", sx, ".y"); break;
++			    case Options::PrimitiveType::LineStrip: vpp = 2; total = join("subsat(", sx, ".x, 1u) * ", sx, ".y"); break;
++			    case Options::PrimitiveType::TriangleList: vpp = 3; total = join("(", sx, ".x / 3u) * ", sx, ".y"); break;
++			    case Options::PrimitiveType::TriangleStrip:
++			    case Options::PrimitiveType::TriangleFan: vpp = 3; total = join("subsat(", sx, ".x, 2u) * ", sx, ".y"); break;
++			    default:
++				    SPIRV_CROSS_THROW("Primitive type not yet supported for transform feedback.");
++			    }
++			    uint32_t first_buffer = kMaxXfbBuffers;
++			    statement("uint spvXfbCap = 0xffffffffu;");
+ 			    for (uint32_t i = 0; i < kMaxXfbBuffers; ++i)
+ 			    {
+ 				    if (xfb_buffers[i] == 0)
+ 					    continue;
++				    if (first_buffer == kMaxXfbBuffers)
++					    first_buffer = i;
+ 				    statement("uint spvInitOffset", i, " = atomic_load_explicit(", to_name(xfb_counters[i]),
+ 				              ", memory_order_relaxed);");
++				    statement("uint spvXfbSize", i, " = reinterpret_cast<device uint*>(", to_name(xfb_counters[i]), ")[4];");
++				    statement("spvXfbCap = min(spvXfbCap, spvXfbSize", i, " > spvInitOffset", i, " ? (spvXfbSize", i,
++				              " - spvInitOffset", i, ") / uint(sizeof(*", to_name(xfb_buffers[i]), ") * ", vpp, "u) : 0u);");
++			    }
++			    statement("uint spvXfbTotal = ", total, ";");
++			    statement("uint spvXfbWritten = min(spvXfbTotal, spvXfbCap);");
++			    // First, write the data out.
++			    for (uint32_t i = 0; i < kMaxXfbBuffers; ++i)
++			    {
++				    if (xfb_buffers[i] == 0)
++					    continue;
+ 				    statement(to_name(xfb_buffers[i]), " = reinterpret_cast<",
+ 				              type_to_glsl(get_type_from_variable(xfb_buffers[i])), ">(reinterpret_cast<device char*>(",
+ 				              to_name(xfb_buffers[i]), ") + spvInitOffset", i, ");");
++				    auto write = [&](const string &slot, const string &value) {
++					    return join("if ((", slot, ") / ", vpp, "u < spvXfbWritten) ", to_name(xfb_buffers[i]), "[", slot,
++					                "] = ", value, ";");
++				    };
++				    string val = to_expression(xfb_locals[i]);
++				    string inv = to_expression(builtin_invocation_id_id);
+ 				    switch (msl_options.xfb_primitive_type)
+ 				    {
+ 				    case Options::PrimitiveType::PointList:
+-					    // This is straightforward enough. Just make sure we don't overstep the data buffer (FIXME).
+-					    statement(to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]), ";");
++					    statement(write("spvXfbIndex", val));
+ 					    break;
+ 				    case Options::PrimitiveType::LineList:
+-					    // This is a little trickier, because we don't want to write an incomplete primitive.
+-					    // Therefore, we must write only if we're an odd vertex, or we're not the last one.
+-					    // FIXME: Bounds check the buffer, too.
+-					    statement("if ((", to_expression(builtin_invocation_id_id), ".x & 1) || ",
+-					              to_expression(builtin_invocation_id_id), ".x < ",
+-					              to_expression(builtin_stage_input_size_id), ".x - 1u)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]),
+-					              ";");
++					    // Don't write an incomplete primitive: only odd vertices, or ones before the last.
++					    statement("if ((", inv, ".x & 1) || ", inv, ".x < ", sx, ".x - 1u)");
++					    statement("    ", write("spvXfbIndex", val));
+ 					    break;
+ 				    case Options::PrimitiveType::TriangleList:
+-					    // Capture every vertex belonging to a complete triangle and
+-					    // discard only a trailing one- or two-vertex fragment.
+-					    // FIXME: Bounds check the buffer, too.
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x < ",
+-					              to_expression(builtin_stage_input_size_id), ".x - ",
+-					              to_expression(builtin_stage_input_size_id), ".x % 3u)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]),
+-					              ";");
++					    // Every vertex of a complete triangle; drop a trailing one- or two-vertex fragment.
++					    statement("if (", inv, ".x < ", sx, ".x - ", sx, ".x % 3u)");
++					    statement("    ", write("spvXfbIndex", val));
+ 					    break;
+ 				    case Options::PrimitiveType::LineStrip:
+-					    // This is more complicated. We have to write out each individual line segment.
+-					    // So if we're not the first or the last, we have to write twice.
+-					    // On top of that, we also have to handle primitive restart. (FIXME)
+-					    // FIXME: Bounds check the buffer, too.
+-					    statement("if (", to_expression(builtin_invocation_id_id),
+-					              ".x != ", to_expression(builtin_stage_input_size_id), ".x - 1u)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]),
+-					              ";");
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x != 0)");
+-					    statement("    ", to_name(xfb_buffers[i]),
+-					              "[spvXfbIndex - 1u] = ", to_expression(xfb_locals[i]), ";");
++					    // Each line segment separately: vertices other than the first and last write twice.
++					    // FIXME: primitive restart.
++					    statement("if (", inv, ".x != ", sx, ".x - 1u)");
++					    statement("    ", write("spvXfbIndex", val));
++					    statement("if (", inv, ".x != 0)");
++					    statement("    ", write("spvXfbIndex - 1u", val));
+ 					    break;
+ 				    case Options::PrimitiveType::TriangleStrip:
+-					    // This is even worse. We have to write three times if we're not first or last,
+-					    // and now if there's fewer than two vertices in this strip, we can't write at all.
+-					    // Again, primitive restart is a factor here. (FIXME)
+-					    // FIXME: Bounds check the buffer, too.
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x + 2 < ",
+-					              to_expression(builtin_stage_input_size_id), ".x)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]),
+-					              ";");
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x != 0 && ",
+-					              to_expression(builtin_invocation_id_id),
+-					              ".x != ", to_expression(builtin_stage_input_size_id), ".x - 1u)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex - 1u - (",
+-					              to_expression(builtin_invocation_id_id), ".x & 1u)] = ", to_expression(xfb_locals[i]),
+-					              ";");
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x > 1)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex - 4u - (",
+-					              to_expression(builtin_invocation_id_id), ".x & 1u)] = ", to_expression(xfb_locals[i]),
+-					              ";");
++					    // Up to three times per vertex, and nothing if there are fewer than three vertices.
++					    // FIXME: primitive restart.
++					    statement("if (", inv, ".x + 2 < ", sx, ".x)");
++					    statement("    ", write("spvXfbIndex", val));
++					    statement("if (", inv, ".x != 0 && ", inv, ".x != ", sx, ".x - 1u)");
++					    statement("    ", write(join("spvXfbIndex - 1u - (", inv, ".x & 1u)"), val));
++					    statement("if (", inv, ".x > 1)");
++					    statement("    ", write(join("spvXfbIndex - 4u - (", inv, ".x & 1u)"), val));
+ 					    break;
+ 				    case Options::PrimitiveType::TriangleFan:
+-					    // This is the worst case of all. It's similar to the strip case, except now
+-					    // we have to write the fan base vertex for *every* triangle.
+-					    // Again, primitive restart is a factor here. (FIXME)
+-					    // FIXME: Bounds check the buffer, too.
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x == 0)");
++					    // Like a strip, but the base vertex is written for every triangle. FIXME: primitive restart.
++					    statement("if (", inv, ".x == 0)");
+ 					    begin_scope();
+-					    statement("for (uint i = 0; i < subsat(", to_expression(builtin_stage_input_size_id),
+-					              ".x, 2u); ++i)");
+-					    statement("    ", to_name(xfb_buffers[i]),
+-					              "[spvXfbBaseIndex + 3 * i] = ", to_name(xfb_locals[i]), ";");
++					    statement("for (uint i = 0; i < subsat(", sx, ".x, 2u); ++i)");
++					    statement("    ", write("spvXfbBaseIndex + 3 * i", to_name(xfb_locals[i])));
+ 					    end_scope();
+ 					    statement("else");
+ 					    begin_scope();
+-					    statement("if (", to_expression(builtin_invocation_id_id),
+-					              ".x != ", to_expression(builtin_stage_input_size_id), ".x - 1u)");
+-					    statement("    ", to_name(xfb_buffers[i]), "[spvXfbIndex] = ", to_expression(xfb_locals[i]),
+-					              ";");
+-					    statement("if (", to_expression(builtin_invocation_id_id), ".x != 1)");
+-					    statement("    ", to_name(xfb_buffers[i]),
+-					              "[spvXfbIndex - 2u] = ", to_expression(xfb_locals[i]), ";");
++					    statement("if (", inv, ".x != ", sx, ".x - 1u)");
++					    statement("    ", write("spvXfbIndex", val));
++					    statement("if (", inv, ".x != 1)");
++					    statement("    ", write("spvXfbIndex - 2u", val));
+ 					    end_scope();
+ 					    break;
+-				    case Options::PrimitiveType::Dynamic:
+ 				    default:
+ 					    SPIRV_CROSS_THROW("Primitive type not yet supported for transform feedback.");
+ 				    }
+ 			    }
+-			    statement("threadgroup_barrier(mem_flags::mem_device);");
+-			    // Now update the amount of data written to the buffer.
+-			    statement("if (all(", to_expression(builtin_invocation_id_id), ".xy == 0))");
+-			    begin_scope();
+-			    switch (msl_options.xfb_primitive_type)
+-			    {
+-			    case Options::PrimitiveType::PointList:
+-				    statement("uint spvWritten = ", to_expression(builtin_stage_input_size_id), ".x * ",
+-				              to_expression(builtin_stage_input_size_id), ".y;");
+-				    break;
+-			    case Options::PrimitiveType::LineList:
+-				    statement("uint spvWritten = (", to_expression(builtin_stage_input_size_id), ".x & ~1u) * ",
+-				              to_expression(builtin_stage_input_size_id), ".y;");
+-				    break;
+-			    case Options::PrimitiveType::LineStrip:
+-				    statement("uint spvWritten = 2 * (", to_expression(builtin_stage_input_size_id), ".x - 1u) * ",
+-				              to_expression(builtin_stage_input_size_id), ".y;");
+-				    break;
+-			    case Options::PrimitiveType::TriangleList:
+-				    statement("uint spvWritten = (", to_expression(builtin_stage_input_size_id), ".x - ",
+-				              to_expression(builtin_stage_input_size_id), ".x % 3u) * ",
+-				              to_expression(builtin_stage_input_size_id), ".y;");
+-				    break;
+-			    case Options::PrimitiveType::TriangleStrip:
+-			    case Options::PrimitiveType::TriangleFan:
+-				    statement("uint spvWritten = 3 * subsat(", to_expression(builtin_stage_input_size_id), ".x, 2u) * ",
+-				              to_expression(builtin_stage_input_size_id), ".y;");
+-				    break;
+-			    case Options::PrimitiveType::Dynamic:
+-			    default:
+-				    SPIRV_CROSS_THROW("Primitive type not yet supported for transform feedback.");
+-				    break;
+-			    }
+-			    for (uint32_t i = 0; i < kMaxXfbBuffers; ++i)
++			    // Record the draw's results: { written, needed, bytes[4] } at word 8 of the state.
++			    if (first_buffer < kMaxXfbBuffers)
+ 			    {
+-				    if (xfb_buffers[i] == 0)
+-					    continue;
+-				    statement("atomic_store_explicit(", to_name(xfb_counters[i]), ", spvInitOffset", i, " + sizeof(*",
+-				              to_name(xfb_buffers[i]), ") * spvWritten, memory_order_relaxed);");
++				    statement("if (all(", to_expression(builtin_invocation_id_id), ".xy == 0))");
++				    begin_scope();
++				    statement("device uint* spvXfbState = reinterpret_cast<device uint*>(", to_name(xfb_counters[first_buffer]), ") - ",
++				              first_buffer, "u;");
++				    statement("spvXfbState[8] = spvXfbWritten;");
++				    statement("spvXfbState[9] = spvXfbTotal;");
++				    for (uint32_t i = 0; i < kMaxXfbBuffers; ++i)
++				    {
++					    if (xfb_buffers[i] == 0)
++						    continue;
++					    statement("spvXfbState[", 10 + i, "] = spvXfbWritten * ", vpp, "u * uint(sizeof(*", to_name(xfb_buffers[i]), "));");
++				    }
++				    end_scope();
+ 			    }
+-			    end_scope();
+ 		    });
+ 	}
+ }
+@@ -20622,6 +20604,10 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
+ 		if (is_tese_shader() && is_builtin_variable(variable) && (builtin == BuiltInTessCoord || builtin == BuiltInPrimitiveId))
+ 			return false;
+ 
++		// Transform feedback captures go to thread-local copies, written out to the buffers at the end.
++		if (variable.storage == StorageClassOutput && needs_transform_feedback() && xfb_captured_outputs.count(variable.self))
++			return false;
++
+ 		// We won't be able to catch writes to control point outputs here since variable
+ 		// refers to a function local pointer.
+ 		// This is fine, as there cannot be concurrent writers to that memory anyways,
+@@ -24068,6 +24054,10 @@ void CompilerMSL::analyze_xfb_buffers()
+ 		xfb_strides[i] = 0;
+ 	}
+ 
++	// Only the capturing compute version of the shader redirects its outputs.
++	if (!needs_transform_feedback())
++		return;
++
+ 	ir.for_each_typed_id<SPIRVariable>(
+ 	    [&](uint32_t self, SPIRVariable &var)
+ 	    {
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 0274a85b..b56142f5 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -723,10 +723,12 @@ public:
+ 
+ 	// Provide feedback to calling API to allow runtime to bind buffers
+ 	// for transform feedback if a vertex pipeline shader requires it.
++	// Transform feedback is captured by a compute version of the shader (capture_output_to_buffer);
++	// a regular vertex function of the same shader rasterizes and ignores the Xfb decorations.
+ 	bool needs_transform_feedback() const
+ 	{
+ 		auto &execution = get_entry_point();
+-		return execution.flags.get(spv::ExecutionModeXfb) &&
++		return execution.flags.get(spv::ExecutionModeXfb) && msl_options.capture_output_to_buffer &&
+ 		       (execution.model == spv::ExecutionModelVertex ||
+ 		        execution.model == spv::ExecutionModelTessellationEvaluation);
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

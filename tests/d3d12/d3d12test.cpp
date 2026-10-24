@@ -1401,6 +1401,169 @@ void main(uint tid : SV_DispatchThreadID)
     return true;
 }
 
+// Stream output from the vertex shader (DXIL and DXBC): two targets, a primitive goes to every target or none
+// (the second target overflows), the SO statistics and overflow queries, appending from the filled size, and
+// rasterization while streaming out.
+static bool run_streamoutput(const char *what, const std::vector<char> &vs, const std::vector<char> &ps)
+{
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+
+    D3D12_SO_DECLARATION_ENTRY decl[2] = {
+        { 0, "TEXCOORD", 0, 0, 4, 0 },
+        { 0, "SV_Position", 0, 0, 4, 1 },
+    };
+    UINT strides[2] = { 16, 16 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.StreamOutput = { decl, 2, strides, 2, 0 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT W = 8, H = 8;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+
+    // One buffer: filled sizes at 0, 8 and 16; slot 0 data at 256, slot 1 at 1024 (room for one triangle),
+    // then at 2048. Everything else holds a sentinel.
+    const UINT64 size = 4096;
+    ID3D12Resource *upload = create_buffer(size, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    for (UINT i = 0; i < size / 4; i++)
+        init[i] = 0xdeadbeef;
+    memset(init, 0, 32);
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *so = create_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(so, 0, upload, 0, size);
+    transition(so, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+
+    D3D12_QUERY_HEAP_DESC qhd = { D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 2 };
+    ID3D12QueryHeap *qh = nullptr;
+    CHECK_HR(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)));
+    ID3D12Resource *qres = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+
+    D3D12_GPU_VIRTUAL_ADDRESS base = so->GetGPUVirtualAddress();
+    float clear[4] = { 0, 0, 0, 0 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW views[2] = {
+        { base + 256, 512, base + 0 },
+        { base + 1024, 48, base + 8 },
+    };
+    g.list->SOSetTargets(0, 2, views);
+    g.list->BeginQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    g.list->DrawInstanced(6, 1, 0, 0);
+    g.list->EndQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    // Append to slot 0 from its filled size, with slot 1 moved to a new range.
+    views[1] = { base + 2048, 512, base + 16 };
+    g.list->SOSetTargets(0, 2, views);
+    g.list->BeginQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    g.list->EndQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+    g.list->SOSetTargets(0, 0, nullptr);
+    g.list->ResolveQueryData(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 2, qres, 0);
+
+    ID3D12Resource *rb = create_buffer(W * H * 4, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, W * 4 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    ID3D12Resource *sorb = nullptr;
+    const uint32_t *d = read_buffer(so, D3D12_RESOURCE_STATE_STREAM_OUT, size, &sorb);
+    if (!d)
+        return false;
+
+    EXPECT(d[0] == 96, "%s: slot 0 filled size %u, want 96", what, d[0]);
+    EXPECT(d[2] == 48, "%s: slot 1 filled size %u, want 48", what, d[2]);
+    EXPECT(d[4] == 48, "%s: moved slot 1 filled size %u, want 48", what, d[4]);
+    // Slot 0: the first draw's first triangle, then the second draw's.
+    for (UINT k = 0; k < 6; k++)
+    {
+        UINT id = k % 3;
+        const float *t = (const float *)&d[(256 + 16 * k) / 4];
+        EXPECT(t[0] == id && t[1] == 2.0f * id && t[2] == 3.0f * id && t[3] == 7.0f,
+               "%s: slot 0 vertex %u = (%g %g %g %g), want (%u %u %u 7)", what, k, t[0], t[1], t[2], t[3], id, 2 * id, 3 * id);
+    }
+    EXPECT(d[(256 + 96) / 4] == 0xdeadbeef, "%s: slot 0 written past its filled size", what);
+    for (UINT k = 0; k < 3; k++)
+    {
+        const float *p0 = (const float *)&d[(1024 + 16 * k) / 4], *p1 = (const float *)&d[(2048 + 16 * k) / 4];
+        EXPECT(p0[3] == 1.0f && p1[3] == 1.0f, "%s: slot 1 vertex %u w = %g / %g, want 1", what, k, p0[3], p1[3]);
+    }
+    EXPECT(d[(1024 + 48) / 4] == 0xdeadbeef, "%s: slot 1 written past its size", what);
+
+    const UINT64 *q = nullptr;
+    D3D12_RANGE qr = { 0, 32 };
+    qres->Map(0, &qr, (void **)&q);
+    EXPECT(q[0] == 1 && q[1] == 2, "%s: first draw's SO statistics %llu written / %llu needed, want 1 / 2", what,
+           (unsigned long long)q[0], (unsigned long long)q[1]);
+    EXPECT(q[2] == 1 && q[3] == 1, "%s: second draw's SO statistics %llu written / %llu needed, want 1 / 1", what,
+           (unsigned long long)q[2], (unsigned long long)q[3]);
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, W * H * 4 };
+    rb->Map(0, &range, (void **)&px);
+    EXPECT(px[1 * W + 1] == 0xff00ff00, "%s: drawn pixel 0x%08x, want 0xff00ff00", what, px[1 * W + 1]);
+
+    qres->Release(); qh->Release(); sorb->Release(); so->Release(); upload->Release();
+    rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_streamoutput()
+{
+    static const char *src = R"(
+struct O { float4 pos : SV_Position; float4 t : TEXCOORD0; };
+O vs(uint id : SV_VertexID)
+{
+    O o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.t = float4(id, 2 * id, 3 * id, 7);
+    return o;
+}
+float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
+)";
+    bool ok = run_streamoutput("DXIL", compile_dxc(src, "vs", "vs_6_0"), compile_dxc(src, "ps", "ps_6_0"));
+    return run_streamoutput("DXBC", compile_fxc(src, "vs", "vs_5_0"), compile_fxc(src, "ps", "ps_5_0")) && ok;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1416,6 +1579,7 @@ static const Test tests[] = {
     { "typedbuffer", test_typedbuffer },
     { "robust", test_robust },
     { "logicop", test_logicop },
+    { "streamoutput", test_streamoutput },
 };
 
 int main(int argc, char **argv)

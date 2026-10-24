@@ -2854,10 +2854,10 @@ index 2a7eff45..1a3b50b5 100644
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
-index 9afc3ed8..60a4f430 100644
+index 9afc3ed8..915ef788 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
-@@ -218,3 +218,155 @@ protected:
+@@ -218,3 +218,165 @@ protected:
  	id<MTLBuffer> _mtlCountBuffer;
  	VkDeviceSize _mtlCountBufferOffset;
  };
@@ -2935,7 +2935,9 @@ index 9afc3ed8..60a4f430 100644
 +protected:
 +    MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 +
-+    MVKSmallVector<MVKMTLBufferBinding, N> _counterBuffers;
++    MVKSmallVector<uint64_t, N> _counterBuffers;	// GPU addresses, 0 for none.
++    MVKSmallVector<id<MTLBuffer>, N> _counterMTLBuffers;
++    uint32_t _firstCounterBuffer = 0;
 +};
 +
 +// Concrete template class implementations.
@@ -2966,6 +2968,7 @@ index 9afc3ed8..60a4f430 100644
 +    MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 +
 +    MVKSmallVector<MVKMTLBufferBinding, N> _bindings;
++    uint32_t _firstBinding = 0;
 +};
 +
 +// Concrete template class implementations.
@@ -3007,14 +3010,21 @@ index 9afc3ed8..60a4f430 100644
 +
 +class MVKCmdEndTransformFeedback : public MVKCommand {
 +public:
-+    VkResult setContent(MVKCommandBuffer* cmdBuffer);
++    VkResult setContent(MVKCommandBuffer* cmdBuffer,
++                        uint32_t firstCounterBuffer,
++                        uint32_t counterBufferCount,
++                        const VkBuffer* counterBuffers,
++                        const VkDeviceSize* counterBufferOffsets);
 +    void encode(MVKCommandEncoder* cmdEncoder) override;
 +
 +protected:
 +    MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
++
++    uint64_t _counterBuffers[4] = {};	// GPU addresses, 0 for none.
++    id<MTLBuffer> _counterMTLBuffers[4] = {};
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
-index d0452973..34e670ce 100644
+index d0452973..10ddc3e8 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 @@ -19,10 +19,7 @@
@@ -3048,7 +3058,7 @@ index d0452973..34e670ce 100644
  		b.stride = pStrides ? (uint32_t)pStrides[bindIdx] : 0;
          _bindings.push_back(b);
      }
-@@ -106,6 +110,68 @@
+@@ -106,6 +110,111 @@
      cmdEncoder->getState().bindIndexBuffer(_binding);
  }
  
@@ -3114,10 +3124,53 @@ index d0452973..34e670ce 100644
 +	}
 +}
 +#endif
++
++// Runs the transform feedback capture stage of a draw on the vertex stage compute encoder,
++// then restarts the render pass that running it ended.
++static void mvkEncodeTransformFeedbackCapture(MVKCommandEncoder* cmdEncoder,
++											  id<MTLComputeCommandEncoder> mtlEncoder,
++											  MVKGraphicsPipeline* pipeline,
++											  const MVKMTLBufferAllocation* drawIDBuff,
++											  const MVKIndexMTLBufferBinding* ibb,
++											  VkDeviceSize idxBuffOffset,
++											  uint32_t firstVertex, uint32_t vertexCount,
++											  uint32_t firstInstance, uint32_t instanceCount) {
++	const auto& implicit = pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids;
++	cmdEncoder->encodeTransformFeedbackCaptureBindings(mtlEncoder, pipeline);
++	if (pipeline->needsVertexOutputBuffer()) {
++		auto* vtxOutBuff = cmdEncoder->getTempMTLBuffer(vertexCount * instanceCount * 4 * cmdEncoder->getDeviceProperties().limits.maxVertexOutputComponents, true);
++		[mtlEncoder setBuffer: vtxOutBuff->_mtlBuffer offset: vtxOutBuff->_offset atIndex: implicit[MVKImplicitBuffer::Output]];
++	}
++	if (drawIDBuff) {
++		[mtlEncoder setBuffer: drawIDBuff->_mtlBuffer offset: drawIDBuff->_offset atIndex: implicit[MVKImplicitBuffer::DrawId]];
++	}
++	if (ibb) {
++		[mtlEncoder setBuffer: ibb->mtlBuffer offset: idxBuffOffset atIndex: implicit[MVKImplicitBuffer::Index]];
++	}
++	[mtlEncoder setStageInRegion: MTLRegionMake2D(firstVertex, firstInstance, vertexCount, instanceCount)];
++	cmdEncoder->getState().offsetZeroDivisorVertexBuffers(*cmdEncoder, kMVKGraphicsStageVertex, pipeline, firstInstance);
++	id<MTLComputePipelineState> vtxState = (!ibb ? pipeline->getVertexStageState()
++											: ibb->mtlIndexType == MTLIndexTypeUInt16 ? pipeline->getVertexStageIndex16State()
++											: pipeline->getVertexStageIndex32State());
++	if (cmdEncoder->getMetalFeatures().nonUniformThreadgroups) {
++		[mtlEncoder dispatchThreads: MTLSizeMake(vertexCount, instanceCount, 1)
++			  threadsPerThreadgroup: MTLSizeMake(vtxState.threadExecutionWidth, 1, 1)];
++	} else {
++		[mtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(vertexCount, vtxState.threadExecutionWidth), instanceCount, 1)
++				   threadsPerThreadgroup: MTLSizeMake(vtxState.threadExecutionWidth, 1, 1)];
++	}
++	cmdEncoder->encodeTransformFeedbackCaptureEnd(mtlEncoder);
++	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++}
++
++// The vertex stage of a transform feedback pipeline is its capture stage, which runs only while transform feedback is active.
++static bool mvkSkipsStage(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline, MVKGraphicsStage stage) {
++	return stage == kMVKGraphicsStageVertex && pipeline->isTransformFeedbackPipeline() && !cmdEncoder->_transformFeedbackRunning;
++}
  
  #pragma mark -
  #pragma mark MVKCmdDraw
-@@ -199,11 +265,14 @@
+@@ -199,11 +308,14 @@
  		uint32_t inControlPointCount = 0;
  		uint32_t patchCount = 0;
  	} tessParams;
@@ -3133,27 +3186,27 @@ index d0452973..34e670ce 100644
      }
      if (pipeline->needsDrawIdBuffer()) {
          tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
-@@ -222,6 +291,19 @@
+@@ -213,6 +325,7 @@
+     }
+     for (uint32_t s : stages) {
+         auto stage = MVKGraphicsStage(s);
++        if (mvkSkipsStage(cmdEncoder, pipeline, stage)) { continue; }
+         cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+ 
+ 		if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
+@@ -222,6 +335,11 @@
  		switch (stage) {
              case kMVKGraphicsStageVertex: {
                  mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-+                if (cmdEncoder->_transformFeedbackRunning) {
-+                    auto& counterBufferBinding =
-+                        cmdEncoder->_graphicsResourcesState._transformFeedbackCounterBufferBinding;
-+                    [mtlTessCtlEncoder setBuffer:counterBufferBinding.mtlBuffer
-+                                          offset:counterBufferBinding.offset
-+                                         atIndex:counterBufferBinding.index];
-+                    for (auto& xfbBufferBinding :
-+                         cmdEncoder->_graphicsResourcesState._transformFeedbackBufferBindings) {
-+                        [mtlTessCtlEncoder setBuffer:xfbBufferBinding.mtlBuffer
-+                                              offset:xfbBufferBinding.offset
-+                                             atIndex:xfbBufferBinding.index];
-+                    }
++                if (pipeline->isTransformFeedbackPipeline()) {
++                    mvkEncodeTransformFeedbackCapture(cmdEncoder, mtlTessCtlEncoder, pipeline, tempDrawIDBuff, nullptr, 0,
++                                                      _firstVertex, _vertexCount, _firstInstance, _instanceCount);
++                    break;
 +                }
                  if (pipeline->needsVertexOutputBuffer()) {
                      vtxOutBuff = cmdEncoder->getTempMTLBuffer(_vertexCount * _instanceCount * 4 * dvcLimits.maxVertexOutputComponents, true);
                      [mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
-@@ -233,16 +315,16 @@
+@@ -233,16 +351,16 @@
                                            offset: tempDrawIDBuff->_offset
                                           atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::DrawId]];
                  }
@@ -3174,7 +3227,7 @@ index d0452973..34e670ce 100644
                                        threadsPerThreadgroup: MTLSizeMake(vtxState.threadExecutionWidth, 1, 1)];
  				}
                  break;
-@@ -318,6 +400,13 @@
+@@ -318,6 +436,13 @@
                                          patchIndexBufferOffset: 0
                                                   instanceCount: 1
                                                    baseInstance: 0];
@@ -3188,7 +3241,7 @@ index d0452973..34e670ce 100644
                  } else {
                      MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                      uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
-@@ -469,6 +558,7 @@
+@@ -469,6 +594,7 @@
          auto* converted = convertUint8IndexBuffer(cmdEncoder, ibb);
          ibb.mtlBuffer = converted->_mtlBuffer;
          ibb.offset = converted->_offset;
@@ -3196,7 +3249,7 @@ index d0452973..34e670ce 100644
      }
  
      size_t idxSize = mvkMTLIndexTypeSizeInBytes((MTLIndexType)ibb.mtlIndexType);
-@@ -483,11 +573,14 @@
+@@ -483,11 +609,14 @@
  		uint32_t inControlPointCount = 0;
  		uint32_t patchCount = 0;
  	} tessParams;
@@ -3212,7 +3265,27 @@ index d0452973..34e670ce 100644
      }
      if (pipeline->needsDrawIdBuffer()) {
          tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
-@@ -519,16 +612,16 @@
+@@ -498,6 +627,7 @@
+     for (uint32_t s : stages) {
+         auto stage = MVKGraphicsStage(s);
+         id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
++        if (mvkSkipsStage(cmdEncoder, pipeline, stage)) { continue; }
+         cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+ 
+ 		if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
+@@ -505,6 +635,11 @@
+         switch (stage) {
+             case kMVKGraphicsStageVertex: {
+                 mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
++                if (pipeline->isTransformFeedbackPipeline()) {
++                    mvkEncodeTransformFeedbackCapture(cmdEncoder, mtlTessCtlEncoder, pipeline, tempDrawIDBuff, &ibb, idxBuffOffset,
++                                                      _vertexOffset, _indexCount, _firstInstance, _instanceCount);
++                    break;
++                }
+                 if (pipeline->needsVertexOutputBuffer()) {
+                     vtxOutBuff = cmdEncoder->getTempMTLBuffer(_indexCount * _instanceCount * 4 * dvcLimits.maxVertexOutputComponents, true);
+                     [mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
+@@ -519,16 +654,16 @@
  				[mtlTessCtlEncoder setBuffer: ibb.mtlBuffer
                                        offset: idxBuffOffset
                                       atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Index]];
@@ -3233,7 +3306,7 @@ index d0452973..34e670ce 100644
                                        threadsPerThreadgroup: MTLSizeMake(vtxState.threadExecutionWidth, 1, 1)];
  				}
                  break;
-@@ -607,6 +700,18 @@
+@@ -607,6 +742,18 @@
                                          patchIndexBufferOffset: 0
                                                   instanceCount: 1
                                                    baseInstance: 0];
@@ -3252,7 +3325,7 @@ index d0452973..34e670ce 100644
                  } else {
                      MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                      uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
-@@ -655,14 +760,16 @@
+@@ -655,14 +802,16 @@
  		id<MTLBuffer> countBuffer,
  		VkDeviceSize countBufferOffset,
  		uint32_t drawCount,
@@ -3272,7 +3345,7 @@ index d0452973..34e670ce 100644
  	state.bindPipeline(computeEncoder, pipeline);
  	state.bindBuffer(computeEncoder, indirectBuffer, indirectBufferOffset, 0);
  	state.bindBuffer(computeEncoder, convertedBuffer->_mtlBuffer, convertedBuffer->_offset, 1);
-@@ -778,7 +885,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -778,7 +927,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
  										VkDeviceSize offset,
  										uint32_t drawCount,
  										uint32_t stride) {
@@ -3281,7 +3354,7 @@ index d0452973..34e670ce 100644
  	_mtlIndirectBuffer = mvkBuffer->getMTLBuffer();
  	_mtlIndirectBufferOffset = mvkBuffer->getMTLBufferOffset() + offset;
  	_mtlIndirectBufferStride = stride;
-@@ -888,6 +995,14 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -888,6 +1037,14 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
  	auto* pipeline = cmdEncoder->getGraphicsPipeline();
  	auto& mtlFeats = cmdEncoder->getMetalFeatures();
  	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
@@ -3296,7 +3369,7 @@ index d0452973..34e670ce 100644
  	// Metal doesn't support triangle fans, so encode it as indexed indirect triangles instead.
  	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
  		encodeIndexedIndirect(cmdEncoder, indirectBuffer, indirectBufferOffset, indirectBufferStride);
-@@ -937,7 +1052,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -937,7 +1094,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          vertexCount = kMVKMaxDrawIndirectVertexCount;
          patchCount = mvkCeilingDivide(vertexCount, inControlPointCount);
          VkDeviceSize indirectSize = (2 * sizeof(MTLDispatchThreadgroupsIndirectArguments) + sizeof(MTLDrawPatchIndirectArguments) + sizeof(MTLStageInRegionIndirectArguments)) * _drawCount;
@@ -3305,7 +3378,7 @@ index d0452973..34e670ce 100644
  		VkDeviceSize paramsSize = paramsIncr * _drawCount;
          tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectSize, true);
          mtlIndBuff = tempIndirectBuff->_mtlBuffer;
-@@ -955,7 +1070,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -955,7 +1112,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          }
          tcLevelBuff = cmdEncoder->getTempMTLBuffer(patchCount * sizeof(MTLQuadTessellationFactorsHalf), true);
  
@@ -3314,7 +3387,16 @@ index d0452973..34e670ce 100644
          NSUInteger sgSize = pipeline->getTessControlStageState().threadExecutionWidth;
          tcWorkgroupSize = mvkLeastCommonMultiple(outControlPointCount, sgSize);
          while (tcWorkgroupSize > dvcLimits.maxComputeWorkGroupSize[0]) {
-@@ -1044,6 +1159,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -985,6 +1142,8 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+         for (uint32_t s : stages) {
+             auto stage = MVKGraphicsStage(s);
+             id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
++            // TODO: transform feedback capture of indirect draws.
++            if (stage == kMVKGraphicsStageVertex && pipeline->isTransformFeedbackPipeline()) { continue; }
+             if (drawIdx == 0 && stage == kMVKGraphicsStageVertex && pipeline->isTessellationPipeline()) {
+                 // We need the indirect buffers now. This must be done before finalizing
+                 // draw state, or the pipeline will get overridden. This is a good time
+@@ -1044,6 +1203,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
  			if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
  
              switch (stage) {
@@ -3322,7 +3404,7 @@ index d0452973..34e670ce 100644
                  case kMVKGraphicsStageVertex:
                      mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
  					bindIndirectZeroDivisorVertexBuffers(cmdEncoder, stage, zeroDivisorBuffers, drawIdx);
-@@ -1219,6 +1335,12 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1219,6 +1379,12 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
  }
  
  void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig) {
@@ -3335,7 +3417,7 @@ index d0452973..34e670ce 100644
  
  	id<MTLBuffer> indirectBuffer = _mtlIndirectBuffer;
  	VkDeviceSize indirectBufferOffset = _mtlIndirectBufferOffset;
-@@ -1244,6 +1366,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1244,6 +1410,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          auto* converted = convertUint8IndexBuffer(cmdEncoder, ibb);
          ibb.mtlBuffer = converted->_mtlBuffer;
          ibb.offset = converted->_offset;
@@ -3343,7 +3425,7 @@ index d0452973..34e670ce 100644
      }
  
  	MVKIndexMTLBufferBinding ibbTriFan = ibb;
-@@ -1302,8 +1425,8 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1302,8 +1469,8 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          outControlPointCount = pipeline->getOutputControlPointCount();
          vertexCount = kMVKMaxDrawIndirectVertexCount;
          patchCount = mvkCeilingDivide(vertexCount, inControlPointCount);
@@ -3354,7 +3436,7 @@ index d0452973..34e670ce 100644
  		VkDeviceSize paramsSize = paramsIncr * _drawCount;
          tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectSize, true);
          mtlIndBuff = tempIndirectBuff->_mtlBuffer;
-@@ -1323,7 +1446,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1323,7 +1490,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          vtxIndexBuff = cmdEncoder->getTempMTLBuffer(ibb.size, true);
  
          id<MTLComputePipelineState> vtxState;
@@ -3363,7 +3445,16 @@ index d0452973..34e670ce 100644
          vtxThreadExecWidth = vtxState.threadExecutionWidth;
  
          NSUInteger sgSize = pipeline->getTessControlStageState().threadExecutionWidth;
-@@ -1393,7 +1516,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1360,6 +1527,8 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+         for (uint32_t s : stages) {
+             auto stage = MVKGraphicsStage(s);
+             id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
++            // TODO: transform feedback capture of indirect draws.
++            if (stage == kMVKGraphicsStageVertex && pipeline->isTransformFeedbackPipeline()) { continue; }
+             if (stage == kMVKGraphicsStageVertex && pipeline->isTessellationPipeline()) {
+ 				cmdEncoder->encodeStoreActions(true);
+ 				MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
+@@ -1393,7 +1562,7 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
                  [mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
  													 indirectBufferOffset: mtlTempIndBuffOfst + sizeof(MTLStageInRegionIndirectArguments)
                                                      threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
@@ -3372,7 +3463,7 @@ index d0452973..34e670ce 100644
              } else if (drawIdx == 0 && vtxAdjmts.needsAdjustment()) {
                  // Similarly, for multiview, we need to adjust the instance count now.
                  // Unfortunately, this requires switching to compute. Luckily, we don't also
-@@ -1535,3 +1658,219 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1535,3 +1704,232 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          }
      }
  }
@@ -3488,16 +3579,16 @@ index d0452973..34e670ce 100644
 +                                                     uint32_t counterBufferCount,
 +                                                     const VkBuffer* pCounterBuffers,
 +                                                     const VkDeviceSize* pCounterBufferOffsets) {
-+    MVKDevice* mvkDvc = cmdBuff->getDevice();
++    _firstCounterBuffer = firstCounterBuffer;
 +    _counterBuffers.clear();    // Clear for reuse
 +    _counterBuffers.reserve(counterBufferCount);
-+    MVKMTLBufferBinding b;
++    _counterMTLBuffers.clear();
++    _counterMTLBuffers.reserve(counterBufferCount);
 +    for (uint32_t bindIdx = 0; bindIdx < counterBufferCount; bindIdx++) {
-+        auto* mvkBuffer = (MVKBuffer*)pCounterBuffers[bindIdx];
-+        b.index = mvkDvc->getMetalBufferIndexForTransformFeedbackCounterBinding(kMVKShaderStageVertex, firstCounterBuffer + bindIdx);
-+        b.mtlBuffer = mvkBuffer->getMTLBuffer();
-+        b.offset = mvkBuffer->getMTLBufferOffset() + pCounterBufferOffsets[bindIdx];
-+        _counterBuffers.push_back(b);
++        // A null counter buffer starts capturing at offset zero.
++        auto* mvkBuffer = pCounterBuffers ? (MVKBuffer*)pCounterBuffers[bindIdx] : nullptr;
++        _counterBuffers.push_back(mvkBuffer ? mvkBuffer->getMTLBufferGPUAddress() + pCounterBufferOffsets[bindIdx] : 0);
++        _counterMTLBuffers.push_back(mvkBuffer ? mvkBuffer->getMTLBuffer() : nil);
 +    }
 +
 +    return VK_SUCCESS;
@@ -3509,8 +3600,15 @@ index d0452973..34e670ce 100644
 +        return;
 +    }
 +
-+    cmdEncoder->_graphicsResourcesState._transformFeedbackCounterBufferBinding = _counterBuffers[0];
-+    cmdEncoder->_transformFeedbackRunning = true;
++    auto& counters = cmdEncoder->_graphicsResourcesState._transformFeedbackCounterAddresses;
++    auto& counterMTLBuffers = cmdEncoder->_graphicsResourcesState._transformFeedbackCounterBuffers;
++    mvkClear(counters, kMVKMaxTransformFeedbackBufferCount);
++    mvkClear(counterMTLBuffers, kMVKMaxTransformFeedbackBufferCount);
++    for (uint32_t i = 0; i < _counterBuffers.size() && _firstCounterBuffer + i < kMVKMaxTransformFeedbackBufferCount; i++) {
++        counters[_firstCounterBuffer + i] = _counterBuffers[i];
++        counterMTLBuffers[_firstCounterBuffer + i] = _counterMTLBuffers[i];
++    }
++    cmdEncoder->beginTransformFeedback();
 +}
 +
 +template class MVKCmdBeginTransformFeedback<1>;
@@ -3527,24 +3625,18 @@ index d0452973..34e670ce 100644
 +                                                        const VkBuffer *pBuffers,
 +                                                        const VkDeviceSize *pOffsets,
 +                                                       const VkDeviceSize *pSizes) {
-+    MVKDevice* mvkDvc = cmdBuffer->getDevice();
++    _firstBinding = firstBinding;
 +    _bindings.clear();	// Clear for reuse
 +    _bindings.reserve(bindingCount);
 +    MVKMTLBufferBinding b;
 +    for (uint32_t bindIdx = 0; bindIdx < bindingCount; bindIdx++) {
 +        auto* mvkBuffer = (MVKBuffer*)pBuffers[bindIdx];
-+        b.index = mvkDvc->getMetalBufferIndexForTransformFeedbackBinding(kMVKShaderStageVertex, firstBinding + bindIdx);
++        b.index = firstBinding + bindIdx;
 +        b.mtlBuffer = mvkBuffer->getMTLBuffer();
 +        b.offset = mvkBuffer->getMTLBufferOffset() + pOffsets[bindIdx];
-+        if (pSizes != nullptr) {
-+            if (pSizes[bindIdx] == VK_WHOLE_SIZE) {
-+                b.size = b.mtlBuffer.allocatedSize - b.offset;
-+            } else {
-+                b.size = pSizes[bindIdx];
-+            }
-+        } else {
-+            b.size = b.mtlBuffer.allocatedSize - b.offset;
-+        }
++        VkDeviceSize remaining = mvkBuffer->getByteCount() - pOffsets[bindIdx];
++        VkDeviceSize size = (pSizes && pSizes[bindIdx] != VK_WHOLE_SIZE) ? std::min(pSizes[bindIdx], remaining) : remaining;
++        b.size = (uint32_t)std::min<VkDeviceSize>(size, UINT32_MAX);
 +        _bindings.push_back(b);
 +    }
 +
@@ -3553,8 +3645,9 @@ index d0452973..34e670ce 100644
 +
 +template <size_t N>
 +void MVKCmdBindTransformFeedbackBuffers<N>::encode(MVKCommandEncoder *cmdEncoder) {
-+    cmdEncoder->_graphicsResourcesState._transformFeedbackBufferBindings.clear();
-+    for (auto& b : _bindings) { cmdEncoder->_graphicsResourcesState._transformFeedbackBufferBindings.push_back(b); }
++    for (auto& b : _bindings) {
++        if (b.index < kMVKMaxTransformFeedbackBufferCount) { cmdEncoder->_graphicsResourcesState._transformFeedbackBufferBindings[b.index] = b; }
++    }
 +}
 +
 +template class MVKCmdBindTransformFeedbackBuffers<1>;
@@ -3585,12 +3678,23 @@ index d0452973..34e670ce 100644
 +#pragma mark -
 +#pragma mark MVKCmdEndTransformFeedback
 +
-+VkResult MVKCmdEndTransformFeedback::setContent(MVKCommandBuffer *) {
++VkResult MVKCmdEndTransformFeedback::setContent(MVKCommandBuffer *,
++                                                uint32_t firstCounterBuffer,
++                                                uint32_t counterBufferCount,
++                                                const VkBuffer* pCounterBuffers,
++                                                const VkDeviceSize* pCounterBufferOffsets) {
++    mvkClear(_counterBuffers, kMVKMaxTransformFeedbackBufferCount);
++    mvkClear(_counterMTLBuffers, kMVKMaxTransformFeedbackBufferCount);
++    for (uint32_t i = 0; i < counterBufferCount && firstCounterBuffer + i < kMVKMaxTransformFeedbackBufferCount; i++) {
++        auto* mvkBuffer = pCounterBuffers ? (MVKBuffer*)pCounterBuffers[i] : nullptr;
++        _counterBuffers[firstCounterBuffer + i] = mvkBuffer ? mvkBuffer->getMTLBufferGPUAddress() + pCounterBufferOffsets[i] : 0;
++        _counterMTLBuffers[firstCounterBuffer + i] = mvkBuffer ? mvkBuffer->getMTLBuffer() : nil;
++    }
 +    return VK_SUCCESS;
 +}
 +
 +void MVKCmdEndTransformFeedback::encode(MVKCommandEncoder *cmdEncoder) {
-+    cmdEncoder->_transformFeedbackRunning = false;
++    if (cmdEncoder->_transformFeedbackRunning) { cmdEncoder->endTransformFeedback(_counterBuffers, _counterMTLBuffers); }
 +}
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
 index 5119f856..e496b965 100644
@@ -4013,7 +4117,7 @@ index ab318c57..cec229c0 100644
  	simd::float4 vertices[vtxCnt];
  	simd::float4 clearColors[kMVKClearAttachmentCount];
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
-index f6c94625..16bee2a1 100644
+index f6c94625..bf506470 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 @@ -26,7 +26,6 @@
@@ -4187,7 +4291,7 @@ index f6c94625..16bee2a1 100644
      /** Reset a range of queries. */
      void resetQueries(MVKQueryPool* pQueryPool, uint32_t firstQuery, uint32_t queryCount);
  
-@@ -508,10 +564,27 @@ public:
+@@ -508,10 +564,59 @@ public:
  	/** Indicates whether the current draw is an indexed draw. */
  	bool _isIndexedDraw;
  
@@ -4198,13 +4302,45 @@ index f6c94625..16bee2a1 100644
 +    /** If true, transform feedback is currently running. */
 +    VkBool32 _transformFeedbackRunning = false;
 +
-+    /** VK_EXT_transform_feedback (PR #1943). The PR was written against the old
-+        _graphicsResourcesState encoder-state object, which no longer exists; this
-+        carries just the SO buffer bindings the TF code tracks through it. */
++    /**
++     * VK_EXT_transform_feedback: the capture buffers by binding (nil if unbound) and the GPU addresses of
++     * the counter buffers given to vkCmdBeginTransformFeedbackEXT (0 if none).
++     */
 +    struct {
-+        MVKMTLBufferBinding _transformFeedbackCounterBufferBinding;
-+        MVKSmallVector<MVKMTLBufferBinding, 4> _transformFeedbackBufferBindings;
++        MVKMTLBufferBinding _transformFeedbackBufferBindings[kMVKMaxTransformFeedbackBufferCount];
++        uint64_t _transformFeedbackCounterAddresses[kMVKMaxTransformFeedbackBufferCount] = {};
++        id<MTLBuffer> _transformFeedbackCounterBuffers[kMVKMaxTransformFeedbackBufferCount] = {};
 +    } _graphicsResourcesState;
++
++    /** The capture state of the active transform feedback (see TransformFeedbackState in the shader source). */
++    const MVKMTLBufferAllocation* _transformFeedbackState = nullptr;
++
++    /** Whether the capture offsets still have to be loaded from the counter buffers. */
++    bool _transformFeedbackNeedsLoad = false;
++
++    /** The GPU addresses of the results of the active transform feedback queries, and their buffers. */
++    MVKSmallVector<uint64_t, 4> _transformFeedbackQueries;
++    MVKSmallVector<id<MTLBuffer>, 4> _transformFeedbackQueryBuffers;
++
++    /** Starts the transform feedback state of vkCmdBeginTransformFeedbackEXT. */
++    void beginTransformFeedback();
++
++    /** Adds and removes an active transform feedback query, by the GPU address of its results. */
++    void beginTransformFeedbackQuery(id<MTLBuffer> resultBuffer, uint64_t resultAddress);
++    void endTransformFeedbackQuery(uint64_t resultAddress);
++
++    /** Ends transform feedback, storing the capture offsets to the given counter buffer GPU addresses (0 for none). */
++    void endTransformFeedback(const uint64_t* counterAddresses, const id<MTLBuffer>* counterBuffers);
++
++    /** On the vertex stage compute encoder, before the capture's own resources: loads the capture offsets if needed. */
++    void encodeTransformFeedbackLoad();
++    void encodeTransformFeedbackLoad(id<MTLComputeCommandEncoder> mtlEncoder);
++
++    /** Binds the capture state and buffers of a transform feedback capture. */
++    void encodeTransformFeedbackCaptureBindings(id<MTLComputeCommandEncoder> mtlEncoder, MVKGraphicsPipeline* pipeline);
++
++    /** After a capture: advances the offsets, stores them to the counter buffers, and updates the queries. */
++    void encodeTransformFeedbackCaptureEnd(id<MTLComputeCommandEncoder> mtlEncoder, bool updateQueries = true);
 +
 +
  #pragma mark Construction
@@ -4216,7 +4352,7 @@ index f6c94625..16bee2a1 100644
  
  	~MVKCommandEncoder() override;
  
-@@ -530,6 +603,7 @@ protected:
+@@ -530,6 +635,7 @@ protected:
  	template<typename T> void retainIfImmediatelyEncoding(T& mtlEnc);
  	template<typename T> void endMetalEncoding(T& mtlEnc);
  	id<MTLFence> getBarrierStageFence(MVKBarrierStage stage);
@@ -4224,7 +4360,7 @@ index f6c94625..16bee2a1 100644
  
  	typedef struct GPUCounterQuery {
  		MVKGPUCounterQueryPool* queryPool = nullptr;
-@@ -542,9 +616,12 @@ protected:
+@@ -542,9 +648,12 @@ protected:
  	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
  	MVKSmallVector<VkClearValue, kMVKDefaultAttachmentCount> _clearValues;
  	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
@@ -4237,7 +4373,7 @@ index f6c94625..16bee2a1 100644
  	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
  	VkSubpassContents _subpassContents;
  	uint32_t _renderSubpassIndex;
-@@ -553,6 +630,7 @@ protected:
+@@ -553,6 +662,7 @@ protected:
  	MVKCommandUse _mtlComputeEncoderUse;
  	uint32_t _mtlComputeEncoderStages;
  	MVKCommandUse _mtlBlitEncoderUse;
@@ -4245,7 +4381,7 @@ index f6c94625..16bee2a1 100644
  	bool _isRenderingEntireAttachment;
  	bool _hasMTLRenderEncoderVisibilityResultBuffer;
  };
-@@ -569,3 +647,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
+@@ -569,3 +679,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
  
  /** Returns a name, suitable for use as a MTLComputeCommandEncoder label, based on the MVKCommandUse. */
  NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse);
@@ -4253,7 +4389,7 @@ index f6c94625..16bee2a1 100644
 +/** Returns a name, suitable for use as a MTLAccelerationStructureCommandEncoder label, based on the MVKCommandUse. */
 +NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse);
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-index de39c961..58e065c7 100644
+index de39c961..c1a3f906 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 @@ -21,6 +21,7 @@
@@ -4504,7 +4640,7 @@ index de39c961..58e065c7 100644
          default:
              break;
      }
-@@ -968,14 +1053,67 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -968,14 +1053,176 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
          encodeStoreActions(true);
      }
  	if (stage == kMVKGraphicsStageRasterization) {
@@ -4515,10 +4651,119 @@ index de39c961..58e065c7 100644
 +		if (getMtlGraphics()._depthStencil.depthWriteEnabled) { _depthBoundsSnapshotValid = false; }
  	} else {
  		getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
++		if (stage == kMVKGraphicsStageVertex) { encodeTransformFeedbackLoad(); }
  		prepareRenderDispatch(stage);
  	}
  }
  
++void MVKCommandEncoder::beginTransformFeedback() {
++	// TransformFeedbackState: offset[4], size[4], written, needed, bytes[4].
++	_transformFeedbackState = getTempMTLBuffer(16 * sizeof(uint32_t));
++	auto* state = (uint32_t*)_transformFeedbackState->getContents();
++	mvkClear(state, 16);
++	_transformFeedbackNeedsLoad = false;
++	for (uint32_t i = 0; i < kMVKMaxTransformFeedbackBufferCount; i++) {
++		auto& b = _graphicsResourcesState._transformFeedbackBufferBindings[i];
++		state[4 + i] = b.mtlBuffer ? (uint32_t)std::min<VkDeviceSize>(b.size, UINT32_MAX) : 0;
++		if (_graphicsResourcesState._transformFeedbackCounterAddresses[i]) { _transformFeedbackNeedsLoad = true; }
++	}
++	_transformFeedbackRunning = true;
++}
++
++void MVKCommandEncoder::encodeTransformFeedbackLoad() {
++	auto* pipeline = getGraphicsPipeline();
++	if ( !_transformFeedbackRunning || !_transformFeedbackNeedsLoad || !pipeline || !pipeline->isTransformFeedbackPipeline() ) { return; }
++	encodeTransformFeedbackLoad(getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl));
++}
++
++void MVKCommandEncoder::beginTransformFeedbackQuery(id<MTLBuffer> resultBuffer, uint64_t resultAddress) {
++	_transformFeedbackQueries.push_back(resultAddress);
++	_transformFeedbackQueryBuffers.push_back(resultBuffer);
++}
++
++void MVKCommandEncoder::endTransformFeedbackQuery(uint64_t resultAddress) {
++	for (size_t i = 0; i < _transformFeedbackQueries.size(); i++) {
++		if (_transformFeedbackQueries[i] == resultAddress) {
++			_transformFeedbackQueries.erase(_transformFeedbackQueries.begin() + i);
++			_transformFeedbackQueryBuffers.erase(_transformFeedbackQueryBuffers.begin() + i);
++			break;
++		}
++	}
++}
++
++// The kernels reach the counter and query buffers through their GPU addresses; tell Metal about the accesses,
++// so they are ordered with the other commands that use these buffers (such as query pool resets and copies).
++static void mvkUseTransformFeedbackBuffers(id<MTLComputeCommandEncoder> mtlEncoder, const id<MTLBuffer>* buffers, size_t count) {
++	for (size_t i = 0; i < count; i++) {
++		if (buffers[i]) { [mtlEncoder useResource: buffers[i] usage: MTLResourceUsageRead | MTLResourceUsageWrite]; }
++	}
++}
++
++void MVKCommandEncoder::encodeTransformFeedbackLoad(id<MTLComputeCommandEncoder> mtlEncoder) {
++	auto& mtlCompute = getMtlCompute();
++	mvkUseTransformFeedbackBuffers(mtlEncoder, _graphicsResourcesState._transformFeedbackCounterBuffers, kMVKMaxTransformFeedbackBufferCount);
++	mtlCompute.bindPipeline(mtlEncoder, getCommandEncodingPool()->getCmdTransformFeedbackLoadMTLComputePipelineState());
++	mtlCompute.bindBuffer(mtlEncoder, _transformFeedbackState->_mtlBuffer, _transformFeedbackState->_offset, 0);
++	mtlCompute.bindBytes(mtlEncoder, _graphicsResourcesState._transformFeedbackCounterAddresses,
++						 sizeof(_graphicsResourcesState._transformFeedbackCounterAddresses), 1);
++	[mtlEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
++	_transformFeedbackNeedsLoad = false;
++}
++
++void MVKCommandEncoder::endTransformFeedback(const uint64_t* counterAddresses, const id<MTLBuffer>* counterBuffers) {
++	_transformFeedbackRunning = false;
++	if ( !_transformFeedbackState ) { return; }
++	auto& counters = _graphicsResourcesState._transformFeedbackCounterAddresses;
++	bool hasCounters = false;
++	for (uint32_t i = 0; i < kMVKMaxTransformFeedbackBufferCount; i++) { hasCounters |= counterAddresses[i] != 0; }
++	if (hasCounters) {
++		// Store the offsets to the counter buffers given to End (if nothing was drawn, from those given to Begin).
++		bool isRendering = _mtlRenderEncoder != nil;
++		if (isRendering) { encodeStoreActions(true); }	// Must happen before switching encoders.
++		id<MTLComputeCommandEncoder> mtlEncoder = getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
++		if (_transformFeedbackNeedsLoad) { encodeTransformFeedbackLoad(mtlEncoder); }
++		mvkCopy(counters, counterAddresses, kMVKMaxTransformFeedbackBufferCount);
++		mvkCopy(_graphicsResourcesState._transformFeedbackCounterBuffers, counterBuffers, kMVKMaxTransformFeedbackBufferCount);
++		encodeTransformFeedbackCaptureEnd(mtlEncoder, false);
++		if (isRendering) { beginMetalRenderPass(kMVKCommandUseRestartSubpass); }
++	}
++	mvkClear(counters, kMVKMaxTransformFeedbackBufferCount);
++	mvkClear(_graphicsResourcesState._transformFeedbackCounterBuffers, kMVKMaxTransformFeedbackBufferCount);
++	_transformFeedbackState = nullptr;
++}
++
++void MVKCommandEncoder::encodeTransformFeedbackCaptureBindings(id<MTLComputeCommandEncoder> mtlEncoder, MVKGraphicsPipeline* pipeline) {
++	uint32_t bufferBase = pipeline->getTransformFeedbackBufferIndex(kMVKShaderStageVertex);
++	uint32_t counterBase = pipeline->getTransformFeedbackCounterBufferIndex(kMVKShaderStageVertex);
++	for (uint32_t i = 0; i < kMVKMaxTransformFeedbackBufferCount; i++) {
++		// Each counter points at its buffer's offset in the state; the size follows 4 words later.
++		auto& b = _graphicsResourcesState._transformFeedbackBufferBindings[i];
++		[mtlEncoder setBuffer: _transformFeedbackState->_mtlBuffer offset: _transformFeedbackState->_offset + i * sizeof(uint32_t) atIndex: counterBase + i];
++		if (b.mtlBuffer) {
++			[mtlEncoder setBuffer: b.mtlBuffer offset: b.offset atIndex: bufferBase + i];
++		} else {
++			// Unbound: size 0, nothing is written.
++			[mtlEncoder setBuffer: _transformFeedbackState->_mtlBuffer offset: _transformFeedbackState->_offset atIndex: bufferBase + i];
++		}
++	}
++}
++
++void MVKCommandEncoder::encodeTransformFeedbackCaptureEnd(id<MTLComputeCommandEncoder> mtlEncoder, bool updateQueries) {
++	auto& mtlCompute = getMtlCompute();
++	mvkUseTransformFeedbackBuffers(mtlEncoder, _graphicsResourcesState._transformFeedbackCounterBuffers, kMVKMaxTransformFeedbackBufferCount);
++	if (updateQueries) { mvkUseTransformFeedbackBuffers(mtlEncoder, _transformFeedbackQueryBuffers.data(), _transformFeedbackQueryBuffers.size()); }
++	mtlCompute.bindPipeline(mtlEncoder, getCommandEncodingPool()->getCmdTransformFeedbackAdvanceMTLComputePipelineState());
++	mtlCompute.bindBuffer(mtlEncoder, _transformFeedbackState->_mtlBuffer, _transformFeedbackState->_offset, 0);
++	mtlCompute.bindBytes(mtlEncoder, _graphicsResourcesState._transformFeedbackCounterAddresses,
++						 sizeof(_graphicsResourcesState._transformFeedbackCounterAddresses), 1);
++	uint64_t noQuery = 0;
++	uint32_t queryCount = updateQueries ? (uint32_t)_transformFeedbackQueries.size() : 0;
++	mtlCompute.bindBytes(mtlEncoder, queryCount ? _transformFeedbackQueries.data() : &noQuery,
++						 std::max<size_t>(queryCount, 1) * sizeof(uint64_t), 2);
++	mtlCompute.bindBytes(mtlEncoder, &queryCount, sizeof(queryCount), 3);
++	[mtlEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
++}
++
 +void MVKCommandEncoder::finalizeMeshDrawState() {
 +	auto* pipeline = getGraphicsPipeline();
 +	if (pipeline && pipeline->usesEmulatedDepthBounds()) { ensureDepthBoundsSnapshot(); }
@@ -4572,7 +4817,7 @@ index de39c961..58e065c7 100644
  // Clears the render area of the framebuffer attachments.
  void MVKCommandEncoder::clearRenderArea(MVKCommandUse cmdUse) {
  
-@@ -1027,6 +1165,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1027,6 +1274,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	prepareComputeDispatch();
  }
  
@@ -4584,7 +4829,7 @@ index de39c961..58e065c7 100644
  void MVKCommandEncoder::endRendering() {
  	endRenderpass();
  }
-@@ -1074,9 +1217,29 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1074,9 +1326,29 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	endMetalEncoding(_mtlBlitEncoder);
      _mtlBlitEncoderUse = kMVKCommandUseNone;
  
@@ -4614,7 +4859,7 @@ index de39c961..58e065c7 100644
  static MTLDispatchType getDispatchType(MVKCommandUse use) {
  	switch (use) {
  		case kMVKCommandUseAccumOcclusionQuery:
-@@ -1146,10 +1309,30 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1146,10 +1418,30 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	return _mtlBlitEncoder;
  }
  
@@ -4645,7 +4890,7 @@ index de39c961..58e065c7 100644
  	return nil;
  }
  
-@@ -1206,10 +1389,121 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1206,10 +1498,121 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // Copies the specified bytes into a temporary allocation within a pooled MTLBuffer, and returns the MTLBuffer allocation.
  const MVKMTLBufferAllocation* MVKCommandEncoder::copyToTempMTLBufferAllocation(const void* bytes, NSUInteger length, bool isDedicated) {
  	const MVKMTLBufferAllocation* mtlBuffAlloc = getTempMTLBuffer(length, false, isDedicated);
@@ -4770,7 +5015,7 @@ index de39c961..58e065c7 100644
  }
  
  
-@@ -1264,6 +1558,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1264,6 +1667,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	}
  }
  
@@ -4781,7 +5026,7 @@ index de39c961..58e065c7 100644
  // Metal stage GPU counters need to be configured in a Metal render, compute, or BLIT encoder, meaning that the
  // Metal encoder needs to know about any Vulkan timestamp commands that will be executed during the execution
  // of a renderpass, or set of Vulkan dispatch or BLIT commands. In addition, there are a very small number of
-@@ -1358,9 +1656,12 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1358,9 +1765,12 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  
  #pragma mark Construction
  
@@ -4795,7 +5040,7 @@ index de39c961..58e065c7 100644
  	, _prefillStyle(prefillStyle) {
  	_pActivatedQueries = nullptr;
  	_mtlCmdBuffer = nil;
-@@ -1371,15 +1672,20 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1371,15 +1781,20 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	_mtlComputeEncoderStages = 0;
  	_mtlBlitEncoder = nil;
  	_mtlBlitEncoderUse = kMVKCommandUseNone;
@@ -4816,7 +5061,7 @@ index de39c961..58e065c7 100644
  	// _stageCountersMTLFence is released after Metal command buffer completion
  }
  
-@@ -1415,6 +1721,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1415,6 +1830,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseUpdateBuffer:                    return @"vkCmdUpdateBuffer BlitEncoder";
          case kMVKCommandUseResetQueryPool:                  return @"vkCmdResetQueryPool BlitEncoder";
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
@@ -4826,7 +5071,7 @@ index de39c961..58e065c7 100644
  		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
          default:                                            return @"Unknown Use BlitEncoder";
      }
-@@ -1423,6 +1732,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1423,6 +1841,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
      switch (cmdUse) {
          case kMVKCommandUseDispatch:                        return @"vkCmdDispatch ComputeEncoder";
@@ -4834,7 +5079,7 @@ index de39c961..58e065c7 100644
          case kMVKCommandUseCopyBuffer:                      return @"vkCmdCopyBuffer ComputeEncoder";
          case kMVKCommandUseCopyBufferToImage:               return @"vkCmdCopyBufferToImage ComputeEncoder";
          case kMVKCommandUseCopyImageToBuffer:               return @"vkCmdCopyImageToBuffer ComputeEncoder";
-@@ -1434,6 +1744,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1434,6 +1853,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults ComputeEncoder";
          case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
          case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
@@ -5793,7 +6038,7 @@ index 199172a0..4abe2f01 100644
  		case CommandEncoderClass::Graphics:
  			if (bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE)
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
-index e8b7f3e1..50d6f1d6 100644
+index e8b7f3e1..8ea7dec8 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
 @@ -127,6 +127,9 @@ public:
@@ -5806,10 +6051,16 @@ index e8b7f3e1..50d6f1d6 100644
  	/** Returns a MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
  	id<MTLComputePipelineState> getCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed);
  
-@@ -142,6 +145,12 @@ public:
+@@ -142,6 +145,18 @@ public:
  	/** Returns a MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
  	id<MTLComputePipelineState> getConvertUint8IndicesMTLComputePipelineState();
  
++	/** Returns a MTLComputePipelineState that loads transform feedback offsets from counter buffers. */
++	id<MTLComputePipelineState> getCmdTransformFeedbackLoadMTLComputePipelineState();
++
++	/** Returns a MTLComputePipelineState that advances transform feedback offsets and queries after a capture. */
++	id<MTLComputePipelineState> getCmdTransformFeedbackAdvanceMTLComputePipelineState();
++
 +	id<MTLComputePipelineState> getCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdSerializeAccelerationStructureGatherMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState();
@@ -5819,7 +6070,7 @@ index e8b7f3e1..50d6f1d6 100644
  	/** Deletes all the internal resources. */
  	void clear();
  
-@@ -179,9 +188,15 @@ protected:
+@@ -179,9 +194,17 @@ protected:
  	id<MTLComputePipelineState> _mtlDrawIndirectConvertBuffersComputePipelineState[2] = {nil, nil};
  	id<MTLComputePipelineState> _mtlDrawIndirectCountConvertBuffersComputePipelineState[2] = {nil, nil};
  	id<MTLComputePipelineState> _mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState = nil;
@@ -5829,6 +6080,8 @@ index e8b7f3e1..50d6f1d6 100644
  	id<MTLComputePipelineState> _mtlCopyQueryPoolResultsComputePipelineState = nil;
  	id<MTLComputePipelineState> _mtlAccumOcclusionQueryResultsComputePipelineState = nil;
  	id<MTLComputePipelineState> _mtlConvertUint8IndicesComputePipelineState = nil;
++	id<MTLComputePipelineState> _mtlTransformFeedbackLoadComputePipelineState = nil;
++	id<MTLComputePipelineState> _mtlTransformFeedbackAdvanceComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlBuildAccStructConvertComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlSerializeAccStructGatherComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlBuildAccStructConvertTransformComputePipelineState = nil;
@@ -5836,7 +6089,7 @@ index e8b7f3e1..50d6f1d6 100644
 +	id<MTLComputePipelineState> _mtlTraceRaysIndirectConvertComputePipelineState = nil;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
-index d7fa57c3..c4ebace3 100644
+index d7fa57c3..dc31169f 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
 @@ -148,6 +148,10 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
@@ -5850,10 +6103,18 @@ index d7fa57c3..c4ebace3 100644
  id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdDrawIndirectCopyZeroDivisorVertexBuffersMTLComputePipelineState() {
  	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState, newCmdDrawIndirectCopyZeroDivisorVertexBuffersMTLComputePipelineState(_commandPool));
  }
-@@ -172,6 +176,26 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -172,6 +176,34 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
  	MVK_ENC_REZ_ACCESS(_mtlConvertUint8IndicesComputePipelineState, newConvertUint8IndicesMTLComputePipelineState(_commandPool));
  }
  
++id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdTransformFeedbackLoadMTLComputePipelineState() {
++	MVK_ENC_REZ_ACCESS(_mtlTransformFeedbackLoadComputePipelineState, newCmdTransformFeedbackLoadMTLComputePipelineState(_commandPool));
++}
++
++id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdTransformFeedbackAdvanceMTLComputePipelineState() {
++	MVK_ENC_REZ_ACCESS(_mtlTransformFeedbackAdvanceComputePipelineState, newCmdTransformFeedbackAdvanceMTLComputePipelineState(_commandPool));
++}
++
 +id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState() {
 +	MVK_ENC_REZ_ACCESS(_mtlBuildAccStructConvertComputePipelineState, newCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState(_commandPool));
 +}
@@ -5877,7 +6138,7 @@ index d7fa57c3..c4ebace3 100644
  void MVKCommandEncodingPool::clear() {
  	lock_guard<mutex> lock(_lock);
  	destroyMetalResources();
-@@ -254,6 +278,9 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -254,6 +286,9 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
      [_mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState release];
      _mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState = nil;
  
@@ -5887,10 +6148,14 @@ index d7fa57c3..c4ebace3 100644
      [_mtlDrawIndirectTessConvertBuffersComputePipelineState[0] release];
      [_mtlDrawIndirectTessConvertBuffersComputePipelineState[1] release];
      _mtlDrawIndirectTessConvertBuffersComputePipelineState[0] = nil;
-@@ -272,4 +299,19 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -272,4 +307,23 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
  
      [_mtlConvertUint8IndicesComputePipelineState release];
      _mtlConvertUint8IndicesComputePipelineState = nil;
++    [_mtlTransformFeedbackLoadComputePipelineState release];
++    _mtlTransformFeedbackLoadComputePipelineState = nil;
++    [_mtlTransformFeedbackAdvanceComputePipelineState release];
++    _mtlTransformFeedbackAdvanceComputePipelineState = nil;
 +
 +	[_mtlBuildAccStructConvertComputePipelineState release];
 +	_mtlBuildAccStructConvertComputePipelineState = nil;
@@ -5908,7 +6173,7 @@ index d7fa57c3..c4ebace3 100644
 +	_mtlTraceRaysIndirectConvertComputePipelineState = nil;
  }
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
-index 9a72cc2a..f7bed02e 100644
+index 9a72cc2a..ddb4956a 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 @@ -359,6 +359,30 @@ kernel void cmdDrawIndexedIndirectCountConvertBuffers(const device char* srcBuff
@@ -6009,7 +6274,79 @@ index 9a72cc2a..f7bed02e 100644
  	destBuff[i] = srcBuff[params.indexStart + i];
  }
  
-@@ -547,4 +577,246 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
+@@ -503,21 +533,63 @@ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [
+                                             constant uint& numQueries [[buffer(3)]],
+                                             constant uint& flags [[buffer(4)]],
+                                             constant QueryStatus* availability [[buffer(5)]],
++                                            constant uint& numElements [[buffer(6)]],
+                                             uint query [[thread_position_in_grid]]) {
+ 	if (query >= numQueries) { return; }
+ 	device uint32_t* destCount = (device uint32_t*)(dest + stride * query);
++	uint words = (flags & VK_QUERY_RESULT_64_BIT) ? 2 : 1;
+ 	if (availability[query] != Initial || flags & VK_QUERY_RESULT_PARTIAL_BIT) {
+-		destCount[0] = src[query].count;
+-		if (flags & VK_QUERY_RESULT_64_BIT) { destCount[1] = src[query].countHigh; }
++		for (uint e = 0; e < numElements; e++) {
++			destCount[e * words] = src[query * numElements + e].count;
++			if (flags & VK_QUERY_RESULT_64_BIT) { destCount[e * words + 1] = src[query * numElements + e].countHigh; }
++		}
+ 	}
+ 	if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+-		if (flags & VK_QUERY_RESULT_64_BIT) {
+-			destCount[2] = availability[query] != Initial ? 1 : 0;
+-			destCount[3] = 0;
+-		} else {
+-			destCount[1] = availability[query] != Initial ? 1 : 0;
+-		}
++		destCount[numElements * words] = availability[query] != Initial ? 1 : 0;
++		if (flags & VK_QUERY_RESULT_64_BIT) { destCount[numElements * words + 1] = 0; }
++	}
++}
++
++// Transform feedback: the capture buffers' byte offsets and sizes, and a capture's results
++// (written and needed primitives, bytes per buffer), which the capture shader records.
++typedef struct {
++	uint offset[4];
++	uint size[4];
++	uint written;
++	uint needed;
++	uint bytes[4];
++} TransformFeedbackState;
++
++// Loads the capture offsets from the counter buffers (GPU addresses; 0 for none).
++kernel void cmdTransformFeedbackLoad(device TransformFeedbackState& state [[buffer(0)]],
++                                     constant ulong4& counters [[buffer(1)]],
++                                     uint pos [[thread_position_in_grid]]) {
++	if (pos != 0) { return; }
++	for (uint i = 0; i < 4; i++) {
++		state.offset[i] = counters[i] ? *reinterpret_cast<device uint*>(counters[i]) : 0u;
++	}
++}
++
++// After a capture: advances the offsets, stores them to the counter buffers, and adds the
++// written and needed primitives to the active transform feedback queries.
++kernel void cmdTransformFeedbackAdvance(device TransformFeedbackState& state [[buffer(0)]],
++                                        constant ulong4& counters [[buffer(1)]],
++                                        constant ulong* queries [[buffer(2)]],
++                                        constant uint& queryCount [[buffer(3)]],
++                                        uint pos [[thread_position_in_grid]]) {
++	if (pos != 0) { return; }
++	for (uint i = 0; i < 4; i++) {
++		state.offset[i] += state.bytes[i];
++		state.bytes[i] = 0;
++		if (counters[i]) { *reinterpret_cast<device uint*>(counters[i]) = state.offset[i]; }
++	}
++	for (uint q = 0; q < queryCount; q++) {
++		device ulong* result = reinterpret_cast<device ulong*>(queries[q]);
++		result[0] += state.written;
++		result[1] += state.needed;
+ 	}
++	state.written = 0;
++	state.needed = 0;
+ }
+ 
+ kernel void accumulateOcclusionQueryResults(uint pos [[thread_position_in_grid]],
+@@ -547,4 +619,246 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
  	uint8_t idx = src[pos];
  	dst[pos] = idx;
  }
@@ -6383,7 +6720,7 @@ index 3aeed65b..10e52654 100644
 -
 -
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
-index fef56feb..f0bd3f7c 100644
+index fef56feb..c8d2e058 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
 @@ -368,6 +368,12 @@ public:
@@ -6399,10 +6736,15 @@ index fef56feb..f0bd3f7c 100644
  	/** Returns a new MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
  	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
  																				 MVKVulkanAPIDeviceObject* owner);
-@@ -384,6 +390,14 @@ public:
- 
+@@ -385,6 +391,20 @@ public:
  	/** Returns a new MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
  	id<MTLComputePipelineState> newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+ 
++	/** Returns a new MTLComputePipelineState that loads transform feedback offsets from counter buffers. */
++	id<MTLComputePipelineState> newCmdTransformFeedbackLoadMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
++
++	/** Returns a new MTLComputePipelineState that advances transform feedback offsets and queries after a capture. */
++	id<MTLComputePipelineState> newCmdTransformFeedbackAdvanceMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdSerializeAccelerationStructureGatherMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
@@ -6411,10 +6753,11 @@ index fef56feb..f0bd3f7c 100644
 +	id<MTLLibrary> newRayTracingDispatcherMTLLibrary(NSString* source,
 +														 bool usesIFB,
 +														 MVKVulkanAPIDeviceObject* owner);
- 
++
  
  #pragma mark Construction
-@@ -394,18 +408,22 @@ public:
+ 
+@@ -394,18 +414,22 @@ public:
  
  protected:
  	void initMTLLibrary();
@@ -6440,7 +6783,7 @@ index fef56feb..f0bd3f7c 100644
  	MVKDeviceMemory* _transferImageMemory;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
-index 48fc9879..ea01e055 100644
+index 48fc9879..31746e82 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
 @@ -593,6 +593,10 @@
@@ -6454,7 +6797,22 @@ index 48fc9879..ea01e055 100644
  id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectCopyZeroDivisorVertexBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
  	return newMTLComputePipelineState("cmdDrawIndirectCopyZeroDivisorVertexBuffers", owner);
  }
-@@ -633,15 +637,41 @@
+@@ -623,6 +627,14 @@
+ 	return newMTLComputePipelineState("accumulateOcclusionQueryResults", owner);
+ }
+ 
++id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdTransformFeedbackLoadMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
++	return newMTLComputePipelineState("cmdTransformFeedbackLoad", owner);
++}
++
++id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdTransformFeedbackAdvanceMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
++	return newMTLComputePipelineState("cmdTransformFeedbackAdvance", owner);
++}
++
+ id<MTLComputePipelineState> MVKCommandResourceFactory::newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+ #if MVK_USE_METAL_PRIVATE_API
+ 	if (getMVKConfig().useMetalPrivateAPI) {
+@@ -633,15 +645,41 @@
  	return newMTLComputePipelineState("convertUint8Indices", owner);
  }
  
@@ -6498,7 +6856,7 @@ index 48fc9879..ea01e055 100644
  	[nsFuncName release];														// temp release
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
  	return mtlFunc;
-@@ -683,8 +713,9 @@
+@@ -683,8 +721,9 @@
  }
  
  id<MTLComputePipelineState> MVKCommandResourceFactory::newMTLComputePipelineState(const char* funcName,
@@ -6510,7 +6868,7 @@ index 48fc9879..ea01e055 100644
  	// Providing a function directly may cause issues with Metal shader validation layer object
  	// management for some reason, so create a temporary pipeline descriptor to provide instead.
  	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];		// temp retain
-@@ -702,9 +733,46 @@
+@@ -702,9 +741,46 @@
  
  MVKCommandResourceFactory::MVKCommandResourceFactory(MVKDevice* device) : MVKBaseDeviceObject(device) {
  	initMTLLibrary();
@@ -6557,7 +6915,7 @@ index 48fc9879..ea01e055 100644
  // Initializes the Metal shaders used for command activity.
  void MVKCommandResourceFactory::initMTLLibrary() {
      @autoreleasepool {
-@@ -730,6 +798,9 @@
+@@ -730,6 +806,9 @@
  }
  
  MVKCommandResourceFactory::~MVKCommandResourceFactory() {
@@ -9566,7 +9924,7 @@ index 3cdc6234..a8eddf37 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..333f5baf 100644
+index 534a414f..3ae28a07 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,10 @@
@@ -9616,7 +9974,7 @@ index 534a414f..333f5baf 100644
  static constexpr float      kMVKMaxSampleLocationCoordinate = (float)(kMVKSampleLocationCoordinateGridSize - 1) / (float)kMVKSampleLocationCoordinateGridSize;
  static constexpr VkExtent2D kMVKSampleLocationPixelGridSize = { 1, 1 };
  static constexpr VkExtent2D kMVKSampleLocationPixelGridSizeNotSupported = { 0, 0 };
-+static constexpr uint32_t   kMVKMaxTransformFeedbackBufferCount = 1;	// TODO: Increase to 4.
++static constexpr uint32_t   kMVKMaxTransformFeedbackBufferCount = 4;
  
  
  
@@ -9742,20 +10100,7 @@ index 534a414f..333f5baf 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -919,6 +997,12 @@ public:
- 	/** Returns the Metal vertex buffer index to use for the specified vertex attribute binding number.  */
- 	uint32_t getMetalBufferIndexForVertexAttributeBinding(uint32_t binding);
- 
-+	/** Returns the Metal vertex buffer index to use for the specified transform feedback binding number.  */
-+	uint32_t getMetalBufferIndexForTransformFeedbackBinding(MVKShaderStage stage, uint32_t binding);
-+
-+	/** Returns the Metal vertex buffer index to use for the specified transform feedback counter binding number.  */
-+	uint32_t getMetalBufferIndexForTransformFeedbackCounterBinding(MVKShaderStage stage, uint32_t binding);
-+
- 	/** Returns the memory alignment required for the format when used in a texel buffer. */
- 	VkDeviceSize getVkFormatTexelBufferAlignment(VkFormat format, MVKBaseObject* mvkObj);
- 
-@@ -943,6 +1027,15 @@ public:
+@@ -943,6 +1021,15 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -9771,7 +10116,7 @@ index 534a414f..333f5baf 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -1050,12 +1143,21 @@ public:
+@@ -1050,12 +1137,21 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -9793,7 +10138,7 @@ index 534a414f..333f5baf 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1097,7 +1199,16 @@ protected:
+@@ -1097,7 +1193,16 @@ protected:
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
  	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
  	MVKSmallVector<MVKResource*> _resources;
@@ -9810,7 +10155,7 @@ index 534a414f..333f5baf 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1216,21 @@ protected:
+@@ -1105,16 +1210,21 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -9832,7 +10177,7 @@ index 534a414f..333f5baf 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1281,15 @@ public:
+@@ -1165,12 +1275,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -9851,7 +10196,7 @@ index 534a414f..333f5baf 100644
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..63381171 100644
+index 359f8a2b..8fa944e1 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -10132,7 +10477,7 @@ index 359f8a2b..63381171 100644
 +				xfbProps->maxTransformFeedbackStreamDataSize = (_properties.limits.maxFragmentInputComponents + 4) * sizeof(float);	// +4 more for the position.
 +				xfbProps->maxTransformFeedbackBufferDataSize = xfbProps->maxTransformFeedbackStreamDataSize;
 +				xfbProps->maxTransformFeedbackBufferDataStride = _metalFeatures.maxMTLBufferSize - xfbProps->maxTransformFeedbackBufferDataSize;
-+				xfbProps->transformFeedbackQueries = VK_FALSE;
++				xfbProps->transformFeedbackQueries = VK_TRUE;
 +				xfbProps->transformFeedbackStreamsLinesTriangles = VK_FALSE;
 +				xfbProps->transformFeedbackRasterizationStreamSelect = VK_FALSE;
 +				xfbProps->transformFeedbackDraw = VK_FALSE;
@@ -10537,7 +10882,7 @@ index 359f8a2b..63381171 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4355,6 +4693,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,8 +4693,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -10548,8 +10893,12 @@ index 359f8a2b..63381171 100644
 +				return new MVKAccelerationStructureQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
  				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
++			case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++				return new MVKTransformFeedbackQueryPool(this, pCreateInfo);
  			default:
-@@ -4398,6 +4741,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 				return new MVKUnsupportedQueryPool(this, pCreateInfo);
+ 		}
+@@ -4398,6 +4743,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -10595,7 +10944,7 @@ index 359f8a2b..63381171 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +4846,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +4848,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -10608,7 +10957,7 @@ index 359f8a2b..63381171 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4629,6 +5017,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +5019,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -10618,7 +10967,7 @@ index 359f8a2b..63381171 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5031,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5033,322 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -10649,7 +10998,9 @@ index 359f8a2b..63381171 100644
 +											bool write,
 +											MVKSmallVector<id<MTLBuffer>, 16>* retainedBuffers) {
 +	if (hasResidencySet()) { return; }
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	for (auto* buffer : _gpuAddressableBuffers) {
 +		id<MTLBuffer> mtlBuffer = buffer->getMTLBuffer();
 +		if (!mtlBuffer) { continue; }
@@ -10885,9 +11236,7 @@ index 359f8a2b..63381171 100644
 +}
 +
 +MVKBuffer* MVKDevice::getBufferAtAddress(VkDeviceAddress address, VkDeviceSize& offset, VkDeviceSize requiredSize) {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	for (;;) {
 +		if (_gpuAddressableBufferIndexDirty) {
 +			_gpuAddressableBufferIndex.clear();
@@ -10944,30 +11293,7 @@ index 359f8a2b..63381171 100644
  	}
  }
  
-@@ -4906,6 +5605,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
- 	return ((_physicalDevice->_metalFeatures.maxPerStageBufferCount - 1) - binding);
- }
- 
-+uint32_t MVKDevice::getMetalBufferIndexForTransformFeedbackBinding(MVKShaderStage stage, uint32_t binding) {
-+    binding = ((_physicalDevice->_metalFeatures.maxPerStageBufferCount - 1) - binding);
-+	switch (stage) {
-+		case kMVKShaderStageVertex:
-+			binding -= _physicalDevice->_properties.limits.maxVertexInputBindings;
-+			break;
-+		default:
-+			break;
-+	}
-+	return binding;
-+}
-+
-+uint32_t MVKDevice::getMetalBufferIndexForTransformFeedbackCounterBinding(MVKShaderStage stage, uint32_t binding) {
-+	return (getMetalBufferIndexForTransformFeedbackBinding(stage, binding) - kMVKMaxTransformFeedbackBufferCount);
-+}
-+
- VkDeviceSize MVKDevice::getVkFormatTexelBufferAlignment(VkFormat format, MVKBaseObject* mvkObj) {
- 	VkDeviceSize deviceAlignment = 0;
- 	id<MTLDevice> mtlDev = _physicalDevice->_mtlDevice;
-@@ -4967,6 +5682,33 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +5668,33 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -11001,7 +11327,7 @@ index 359f8a2b..63381171 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -5016,7 +5758,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5016,7 +5744,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Can't use prefilled Metal command buffers if any of the resource descriptors can be updated after binding.
  bool MVKDevice::shouldPrefillMTLCommandBuffers() {
@@ -11014,7 +11340,7 @@ index 359f8a2b..63381171 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5267,7 +6013,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +5999,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -11027,7 +11353,7 @@ index 359f8a2b..63381171 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5601,6 +6351,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5601,6 +6337,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  #endif
  	[_defaultMTLSamplerState release];
  	[_dummyBlitMTLBuffer release];
@@ -11615,7 +11941,7 @@ index ef69994a..e0ee5563 100644
  }
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
-index e385e9bd..1384a8d5 100644
+index e385e9bd..0223eb13 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
 @@ -50,6 +50,7 @@ enum class MVKDescriptorBindOperationCode : uint8_t {
@@ -11723,7 +12049,7 @@ index e385e9bd..1384a8d5 100644
  };
  
  /** Represents an Vulkan graphics pipeline. */
-@@ -250,6 +272,16 @@ public:
+@@ -250,6 +272,20 @@ public:
  	/** Returns whether this pipeline has tessellation shaders. */
  	bool isTessellationPipeline() { return _isTessellationPipeline; }
  
@@ -11737,10 +12063,14 @@ index e385e9bd..1384a8d5 100644
 +    /** Returns whether this pipeline uses transform feedback. */
 +    bool isTransformFeedbackPipeline() { return _isTransformFeedback; }
 +
++	/** The Metal buffer indexes of transform feedback buffer 0 and its counter in the capture stage; the others follow. */
++	uint32_t getTransformFeedbackBufferIndex(MVKShaderStage stage);
++	uint32_t getTransformFeedbackCounterBufferIndex(MVKShaderStage stage);
++
  	/** Returns the number of output tessellation patch control points. */
  	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
  
-@@ -261,14 +293,14 @@ public:
+@@ -261,14 +297,14 @@ public:
  		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
  	}
  
@@ -11761,7 +12091,7 @@ index e385e9bd..1384a8d5 100644
  
  	/** Returns the MTLComputePipelineState object for the tessellation control stage of a tessellated draw. */
  	id<MTLComputePipelineState> getTessControlStageState() { return _mtlTessControlStageState; }
-@@ -285,6 +317,25 @@ public:
+@@ -285,6 +321,25 @@ public:
  	/** Returns true if the tessellation control shader needs a buffer to store its per-patch output. */
  	bool needsTessCtlPatchOutputBuffer() const { return _stageResources[kMVKShaderStageTessCtl].implicitBuffers.needed.has(MVKImplicitBuffer::PatchOutput); }
  
@@ -11787,7 +12117,7 @@ index e385e9bd..1384a8d5 100644
  	/** Returns the Vulkan primitive topology. */
  	VkPrimitiveTopology getVkPrimitiveTopology() { return _vkPrimitiveTopology; }
  
-@@ -305,6 +356,25 @@ public:
+@@ -305,6 +360,25 @@ public:
  
  	/** Returns info about the given stage's bindings. */
  	const MVKPipelineStageResourceInfo& getStageResources(MVKShaderStage stage) const { return _stageResources[stage]; }
@@ -11813,7 +12143,7 @@ index e385e9bd..1384a8d5 100644
  
  	/** Returns the list of state that is needed from the command encoder */
  	const MVKRenderStateFlags& getDynamicStateFlags() const { return _dynamicStateFlags; }
-@@ -333,43 +403,61 @@ protected:
+@@ -333,32 +407,45 @@ protected:
  	typedef MVKSmallVector<mvk::SPIRVShaderInterfaceVariable, 32> SPIRVShaderOutputs;
  	typedef MVKSmallVector<mvk::SPIRVShaderInterfaceVariable, 32> SPIRVShaderInputs;
  
@@ -11845,8 +12175,6 @@ index e385e9bd..1384a8d5 100644
      MTLComputePipelineDescriptor* newMTLTessVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pTessCtlSS, MVKMTLFunction* pVtxFunctions);
  	MTLComputePipelineDescriptor* newMTLTessControlStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pTessCtlSS, VkPipelineCreationFeedback* pTessCtlFB, const VkPipelineShaderStageCreateInfo* pVertexSS, const VkPipelineShaderStageCreateInfo* pTessEvalSS);
 +	MTLComputePipelineDescriptor* newMTLXFBVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, MVKMTLFunction* pVtxFunctions);
-+	MTLRenderPipelineDescriptor* newMTLXFBRasterStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB);
-+	bool addPassThruVertexShaderToPipeline(MTLRenderPipelineDescriptor* plDesc, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB);
  	MTLRenderPipelineDescriptor* newMTLTessRasterStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pTessEvalSS, VkPipelineCreationFeedback* pTessEvalFB, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB, const VkPipelineShaderStageCreateInfo* pTessCtlSS);
 -	bool addVertexShaderToPipeline(MTLRenderPipelineDescriptor* plDesc, const VkGraphicsPipelineCreateInfo* pCreateInfo, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo*& pFragmentSS);
 +	bool addVertexShaderToPipeline(MTLRenderPipelineDescriptor* plDesc, const VkGraphicsPipelineCreateInfo* pCreateInfo, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo*& pFragmentSS, MTLMeshRenderPipelineDescriptor* meshDesc);
@@ -11868,12 +12196,7 @@ index e385e9bd..1384a8d5 100644
      bool isRenderingPoints();
      bool isRasterizationDisabled(const VkGraphicsPipelineCreateInfo* pCreateInfo);
      bool isDepthClipNegativeOneToOne(const VkGraphicsPipelineCreateInfo* pCreateInfo);
- 	bool verifyImplicitBuffers(MVKShaderStage stage);
- 	uint32_t getTranslatedVertexBinding(uint32_t binding, uint32_t translationOffset, uint32_t maxBinding);
- 	uint32_t getImplicitBufferIndex(MVKShaderStage stage, uint32_t bufferIndexOffset);
-+	uint32_t getTransformFeedbackBufferIndex(MVKShaderStage stage);
-+	uint32_t getTransformFeedbackCounterBufferIndex(MVKShaderStage stage);
- 	MVKMTLFunction getMTLFunction(mvk::SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -369,7 +456,8 @@ protected:
  								  const VkPipelineShaderStageCreateInfo* pShaderStage,
  								  VkPipelineCreationFeedback* pStageFB,
  								  MVKShaderModule* pShaderModule,
@@ -11883,7 +12206,7 @@ index e385e9bd..1384a8d5 100644
  	void populateRenderingAttachmentInfo(const VkGraphicsPipelineCreateInfo* pCreateInfo);
  
  	MVKRenderStateFlags _dynamicStateFlags;
-@@ -388,31 +476,49 @@ protected:
+@@ -388,31 +476,50 @@ protected:
  	MVKStaticBitSet<kMVKMaxBufferCount> _mtlVertexBuffers;
  	MVKPipelineStageResourceInfo _stageResources[kMVKShaderStageFragment + 1] = {};
  
@@ -11933,10 +12256,11 @@ index e385e9bd..1384a8d5 100644
  	bool _inputAttachmentIsDSAttachment = false;
  	bool _hasRemappedAttachmentLocations = false;
 +	bool _isTransformFeedback = false;
++	uint32_t _xfbFirstBufferIndex = 0;
  };
  
  
-@@ -441,6 +547,11 @@ public:
+@@ -441,6 +548,11 @@ public:
  	/** Returns the threadgroup size */
  	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
  
@@ -11948,7 +12272,7 @@ index e385e9bd..1384a8d5 100644
  	/** Constructs an instance for the device and parent (which may be NULL). */
  	MVKComputePipeline(MVKDevice* device,
  					   MVKPipelineCache* pipelineCache,
-@@ -450,13 +561,33 @@ public:
+@@ -450,13 +562,33 @@ public:
  	~MVKComputePipeline() override;
  
  protected:
@@ -11987,7 +12311,7 @@ index e385e9bd..1384a8d5 100644
  	bool _allowsDispatchBase = false;
  
  	MVKShaderModule* _module = nullptr;
-@@ -464,6 +595,77 @@ protected:
+@@ -464,6 +596,77 @@ protected:
  };
  
  
@@ -12065,7 +12389,7 @@ index e385e9bd..1384a8d5 100644
  #pragma mark -
  #pragma mark MVKPipelineCache
  
-@@ -547,6 +749,9 @@ public:
+@@ -547,6 +750,9 @@ public:
  	 */
  	id<MTLRenderPipelineState> newMTLRenderPipelineState(MTLRenderPipelineDescriptor* mtlRPLDesc);
  
@@ -12076,7 +12400,7 @@ index e385e9bd..1384a8d5 100644
  #pragma mark Construction
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 47bbd4fc..9058de3c 100644
+index 47bbd4fc..a740fd12 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -21,7 +21,6 @@
@@ -12632,7 +12956,7 @@ index 47bbd4fc..9058de3c 100644
  	_mtlTessControlStageState = nil;
  	_mtlPipelineState = nil;
  
-@@ -1100,7 +1310,46 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1100,7 +1310,45 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  		}
  	}
  
@@ -12655,32 +12979,31 @@ index 47bbd4fc..9058de3c 100644
 +			_hasValidMTLPipelineStates = false;
 +		}
 +	} else if (isTransformFeedbackPipeline()) {
-+		// VK_EXT_transform_feedback: run the vertex shader as a compute stage that captures its outputs
-+		// into the transform feedback buffers, then (if rasterizing) draw with a generated pass-through
-+		// vertex function that reads them back.
++		// VK_EXT_transform_feedback: the vertex shader also runs as a compute stage that captures its
++		// outputs into the transform feedback buffers. Draws run it only while transform feedback is
++		// active, and rasterize with the ordinary render pipeline.
 +		SPIRVToMSLConversionConfiguration shaderConfig;
 +		initShaderConversionConfig(shaderConfig, pCreateInfo, reflectData);
 +
 +		MVKMTLFunction vtxFunctions[3] = {};
 +		MTLComputePipelineDescriptor* vtxPLDesc = newMTLXFBVertexStageDescriptor(pCreateInfo, reflectData, shaderConfig, pVertexSS, pVertexFB, vtxFunctions);	// temp retained
-+		MTLRenderPipelineDescriptor* rastPLDesc = nil;
-+		if (_isRasterizing) {
-+			rastPLDesc = newMTLXFBRasterStageDescriptor(pCreateInfo, reflectData, shaderConfig, pFragmentSS, pFragmentFB, pVertexSS, pVertexFB);	// temp retained
-+		}
-+		if (vtxPLDesc && (!_isRasterizing || rastPLDesc)) {
-+			if (compileVertexStageState(vtxPLDesc, vtxFunctions, pVertexFB) && _isRasterizing) {
-+				getOrCompilePipeline(rastPLDesc, _mtlPipelineState);
-+			}
-+		} else {
++		if ( !vtxPLDesc || !compileVertexStageState(vtxPLDesc, vtxFunctions, pVertexFB) ) {
 +			_hasValidMTLPipelineStates = false;
 +		}
 +		[vtxPLDesc release];	// temp release
-+		[rastPLDesc release];	// temp release
++
++		MTLRenderPipelineDescriptor* plDesc = _hasValidMTLPipelineStates ? newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pFragmentSS, pFragmentFB) : nil;	// temp retain
++		if (plDesc) {
++			getOrCompilePipeline(plDesc, _mtlPipelineState);
++			[plDesc release];	// temp release
++		} else {
++			_hasValidMTLPipelineStates = false;
++		}
 +	} else if (!isTessellationPipeline()) {
  		MTLRenderPipelineDescriptor* plDesc = newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pFragmentSS, pFragmentFB);	// temp retain
  		if (plDesc) {
  			auto viewMask = getRenderingCreateInfo(pCreateInfo)->viewMask;
-@@ -1136,29 +1385,6 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1136,29 +1384,6 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  		} else {
  			_hasValidMTLPipelineStates = false;
  		}
@@ -12710,7 +13033,7 @@ index 47bbd4fc..9058de3c 100644
  	}
  
  	if (pPipelineFB) {
-@@ -1176,7 +1402,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1176,7 +1401,8 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  																				 const VkPipelineShaderStageCreateInfo* pVertexSS,
  																				 VkPipelineCreationFeedback* pVertexFB,
  																				 const VkPipelineShaderStageCreateInfo* pFragmentSS,
@@ -12720,7 +13043,7 @@ index 47bbd4fc..9058de3c 100644
  	SPIRVToMSLConversionConfiguration shaderConfig;
  	initShaderConversionConfig(shaderConfig, pCreateInfo, reflectData);
  
-@@ -1184,13 +1411,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1184,13 +1410,14 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  
  	SPIRVShaderOutputs vtxOutputs;
  	std::string errorLog;
@@ -12737,7 +13060,7 @@ index 47bbd4fc..9058de3c 100644
  
  	// Vertex input
  	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
-@@ -1210,6 +1438,63 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1210,6 +1437,63 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  	return plDesc;
  }
  
@@ -12801,7 +13124,7 @@ index 47bbd4fc..9058de3c 100644
  // Returns a retained MTLComputePipelineDescriptor for the vertex stage of a tessellated draw constructed from this instance, or nil if an error occurs.
  // It is the responsibility of the caller to release the returned descriptor.
  MTLComputePipelineDescriptor* MVKGraphicsPipeline::newMTLTessVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo,
-@@ -1221,21 +1506,21 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1221,21 +1505,21 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  																				   MVKMTLFunction* pVtxFunctions) {
  	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];	// retained
  
@@ -12828,7 +13151,7 @@ index 47bbd4fc..9058de3c 100644
  
  	// Vertex input
  	plDesc.stageInputDescriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
-@@ -1252,6 +1537,30 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1252,6 +1536,30 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  	return plDesc;
  }
  
@@ -12859,7 +13182,7 @@ index 47bbd4fc..9058de3c 100644
  // Returns how wide a stage interface variable is, for matching the interface of an adjoining stage.
  // The width is taken from the base type rather than from a Vulkan format, because a format describes
  // how many bits a color component occupies, and so reports a 16-bit float as a float. An interface
-@@ -1394,6 +1703,8 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
+@@ -1394,6 +1702,8 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
  		case MVKImplicitBuffer::ViewRange:      return "view range";
  		case MVKImplicitBuffer::EmulatedReversedDepthViewport: return "emulated reversed-depth viewport";
  		case MVKImplicitBuffer::DepthClip:      return "depth clip state";
@@ -12868,7 +13191,7 @@ index 47bbd4fc..9058de3c 100644
  		case MVKImplicitBuffer::IndirectParams: return "indirect parameter";
  		case MVKImplicitBuffer::Output:         return "per-vertex output";
  		case MVKImplicitBuffer::PatchOutput:    return "per-patch output";
-@@ -1401,6 +1712,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
+@@ -1401,6 +1711,7 @@ static MTLVertexFormat mvkAdjustFormatVectorToSize(MTLVertexFormat format, uint3
  		case MVKImplicitBuffer::Index:          return "index";
  		case MVKImplicitBuffer::DispatchBase:   return "dispatch base";
  		case MVKImplicitBuffer::DrawId:         return "draw ID";
@@ -12876,7 +13199,7 @@ index 47bbd4fc..9058de3c 100644
  		case MVKImplicitBuffer::Count:          break;
  	}
  	assert(0);
-@@ -1418,10 +1730,92 @@ static bool verifyImplicitBuffers(MVKImplicitBufferBindings& buffers, const char
+@@ -1418,10 +1729,92 @@ static bool verifyImplicitBuffers(MVKImplicitBufferBindings& buffers, const char
  	return true;
  }
  
@@ -12970,7 +13293,7 @@ index 47bbd4fc..9058de3c 100644
  }
  
  static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable) {
-@@ -1458,44 +1852,346 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1458,44 +1851,313 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	return ::verifyImplicitBuffers(_stageResources[stage].implicitBuffers, stageNames[stage], _descriptorBufferCounts.stages[stage], this);
  }
  
@@ -13030,39 +13353,6 @@ index 47bbd4fc..9058de3c 100644
 +		plDesc.objectFunction = [factory->newFunctionNamed("objCmdDrawMeshTasks") autorelease];
 +		_hasMeshGridObject = true;
 +	}
-+	return plDesc;
-+}
-+
-+// Returns a retained MTLRenderPipelineDescriptor for the raster stage of a transform
-+// feedback draw, or nil on error. Caller releases. (PR #1943, ported.)
-+MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLXFBRasterStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo,
-+																				 const SPIRVTessReflectionData& reflectData,
-+																				 SPIRVToMSLConversionConfiguration& shaderConfig,
-+																				 const VkPipelineShaderStageCreateInfo* pFragmentSS,
-+																				 VkPipelineCreationFeedback* pFragmentFB,
-+																				 const VkPipelineShaderStageCreateInfo* pVertexSS,
-+																				 VkPipelineCreationFeedback* pVertexFB) {
-+	MTLRenderPipelineDescriptor* plDesc = [MTLRenderPipelineDescriptor new];	// retained
-+
-+	SPIRVShaderOutputs vtxOutputs;
-+	std::string errorLog;
-+	if (!getShaderOutputs(((MVKShaderModule*)pVertexSS->module)->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog) ) {
-+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str()));
-+		[plDesc release];
-+		return nil;
-+	}
-+
-+	if (!addPassThruVertexShaderToPipeline(plDesc, shaderConfig, pVertexSS, pVertexFB)) {
-+		[plDesc release];
-+		return nil;
-+	}
-+
-+	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) {
-+		[plDesc release];
-+		return nil;
-+	}
-+
-+	addFragmentOutputToPipeline(plDesc, pCreateInfo);
 +	return plDesc;
 +}
 +
@@ -13326,7 +13616,7 @@ index 47bbd4fc..9058de3c 100644
  // Adds a vertex shader compiled as a compute kernel to the pipeline description.
  bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLComputePipelineDescriptor* plDesc,
  													const VkGraphicsPipelineCreateInfo* pCreateInfo,
-@@ -1507,12 +2203,32 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1507,12 +2169,32 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
  	shaderConfig.options.entryPointName = pVertexSS->pName;
@@ -13361,7 +13651,7 @@ index 47bbd4fc..9058de3c 100644
  	shaderConfig.options.mslOptions.disable_rasterization = true;
  	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
  	setDepthClipConfig(shaderConfig, implicit, false);
-@@ -1553,7 +2269,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1553,7 +2235,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageTessCtl].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationControl;
  	shaderConfig.options.entryPointName = pTessCtlSS->pName;
@@ -13371,7 +13661,7 @@ index 47bbd4fc..9058de3c 100644
  	shaderConfig.options.mslOptions.indirect_params_buffer_index = implicit[MVKImplicitBuffer::IndirectParams];
  	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
-@@ -1593,7 +2310,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1593,7 +2276,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	const auto& implicit = _stageResources[kMVKShaderStageTessEval].implicitBuffers.ids;
  	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationEvaluation;
  	shaderConfig.options.entryPointName = pTessEvalSS->pName;
@@ -13381,7 +13671,7 @@ index 47bbd4fc..9058de3c 100644
  	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_patch_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding);
  	shaderConfig.options.mslOptions.shader_tess_factor_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding);
-@@ -1622,7 +2340,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1622,7 +2306,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	return verifyImplicitBuffers(kMVKShaderStageTessEval);
  }
  
@@ -13391,7 +13681,7 @@ index 47bbd4fc..9058de3c 100644
  													  const VkGraphicsPipelineCreateInfo* pCreateInfo,
  													  SPIRVToMSLConversionConfiguration& shaderConfig,
  													  SPIRVShaderOutputs& shaderOutputs,
-@@ -1632,7 +2351,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1632,7 +2317,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	auto& mtlFeats = getMetalFeatures();
  	if (pFragmentSS) {
  		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
@@ -13406,7 +13696,7 @@ index 47bbd4fc..9058de3c 100644
  		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
  		shaderConfig.options.entryPointName = pFragmentSS->pName;
  		shaderConfig.options.mslOptions.capture_output_to_buffer = false;
-@@ -1650,6 +2375,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1650,6 +2341,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		if (mtlFeats.needsSampleDrefLodArrayWorkaround) {
  			shaderConfig.options.mslOptions.sample_dref_lod_array_as_grad = true;
  		}
@@ -13414,38 +13704,25 @@ index 47bbd4fc..9058de3c 100644
  		if (_isRasterizing && pCreateInfo->pMultisampleState) {		// Must ignore allowed bad pMultisampleState pointer if rasterization disabled
  #if MVK_USE_METAL_PRIVATE_API
  			if (!getMVKConfig().useMetalPrivateAPI) {
-@@ -1679,6 +2405,20 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1679,6 +2371,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	return verifyImplicitBuffers(kMVKShaderStageFragment);
  }
  
 +
-+// Adds a generated pass-through vertex shader which reads the transform feedback
-+// buffers to the pipeline description. (PR #1943, ported.)
-+bool MVKGraphicsPipeline::addPassThruVertexShaderToPipeline(MTLRenderPipelineDescriptor* plDesc,
-+															SPIRVToMSLConversionConfiguration& shaderConfig,
-+															const VkPipelineShaderStageCreateInfo* pVertexSS,
-+															VkPipelineCreationFeedback* pVertexFB) {
-+	shaderConfig.options.entryPointName = pVertexSS->pName;
-+	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex (pass-through)", true);
-+	if ( !func.getMTLFunction() ) { return false; }
-+	plDesc.vertexFunction = func.getMTLFunction();
-+	return true;
-+}
-+
  template<class T>
  bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
  												   const VkPipelineVertexInputStateCreateInfo* pVI,
-@@ -1722,7 +2462,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1722,7 +2415,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  				vbDesc.stepRate = 0;
  			} else {
  				vbDesc.stride = isVtxStrideStatic ? pVKVB->stride : MTLBufferLayoutStrideDynamic;
 -				vbDesc.stepFunction = (decltype(vbDesc.stepFunction))mvkMTLStepFunctionFromVkVertexInputRate(pVKVB->inputRate, isTessellationPipeline());
 +				vbDesc.stepFunction = (decltype(vbDesc.stepFunction))mvkMTLStepFunctionFromVkVertexInputRate(
-+					pVKVB->inputRate, isTessellationPipeline() || isTransformFeedbackPipeline());
++					pVKVB->inputRate, std::is_same<T, MTLStageInputOutputDescriptor>::value);
  				vbDesc.stepRate = 1;
  			}
          }
-@@ -1914,11 +2655,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1914,11 +2608,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	plDesc.tessellationPartitionMode = mvkMTLTessellationPartitionModeFromSpvExecutionMode(reflectData.partitionMode);
  }
  
@@ -13465,7 +13742,7 @@ index 47bbd4fc..9058de3c 100644
  
  	const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo);
  
-@@ -1953,19 +2697,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -1953,19 +2650,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
              // bits, but some applications will not bother to check. We can just
              // skip and log a warning in this case to avoid crashing.
              if (mtlPixFmt && supportsBlend) {
@@ -13487,7 +13764,7 @@ index 47bbd4fc..9058de3c 100644
              } else if (mtlPixFmt && !supportsBlend && pCA->blendEnable) {
                  reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "Blending is enabled for attachment with format %s, which does not support it.", getPixelFormats()->getName(attachFmt));
              }
-@@ -2043,12 +2782,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2043,12 +2735,24 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  
  	MVKPipelineLayout* layout = (MVKPipelineLayout*)pCreateInfo->layout;
  	layout->populateShaderConversionConfig(shaderConfig);
@@ -13512,7 +13789,7 @@ index 47bbd4fc..9058de3c 100644
  	for (uint32_t i = 0; i < std::size(_stageResources); i++) {
  		MVKShaderStage stage = (MVKShaderStage)i;
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::DynamicOffset]  = getImplicitBufferIndex(stage, 0);
-@@ -2057,6 +2808,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2057,6 +2761,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::Output]         = getImplicitBufferIndex(stage, 4);
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::EmulatedReversedDepthViewport] = getImplicitBufferIndex(stage, 7);
  		_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::DepthClip]       = getImplicitBufferIndex(stage, 8);
@@ -13525,7 +13802,7 @@ index 47bbd4fc..9058de3c 100644
  		uint32_t extra = getImplicitBufferIndex(stage, 3);
  		switch (stage) {
  			case kMVKShaderStageVertex:
-@@ -2093,11 +2850,18 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2093,11 +2803,18 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	// Must ignore allowed bad pMultisampleState pointer if rasterization disabled
  	bool hasA2C = _isRasterizing && pCreateInfo->pMultisampleState && pCreateInfo->pMultisampleState->alphaToCoverageEnable;
  	shaderConfig.options.mslOptions.enable_frag_output_mask = hasA2C ? 1 : 0;
@@ -13544,31 +13821,38 @@ index 47bbd4fc..9058de3c 100644
  		}
  	}
  
-@@ -2130,6 +2894,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2130,6 +2847,16 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	return getMetalBufferIndexForVertexAttributeBinding(_reservedVertexAttributeBufferCount.stages[stage] + bufferIndexOffset);
  }
  
++// The capture stage's counters and buffers take the reserved Metal buffer indexes below the vertex
++// buffers, ascending by transform feedback buffer: the counters first, then the buffers.
 +uint32_t MVKGraphicsPipeline::getTransformFeedbackBufferIndex(MVKShaderStage stage) {
-+	return _device->getMetalBufferIndexForTransformFeedbackBinding(stage, 0);
++	return _xfbFirstBufferIndex + kMVKMaxTransformFeedbackBufferCount;
 +}
 +
 +uint32_t MVKGraphicsPipeline::getTransformFeedbackCounterBufferIndex(MVKShaderStage stage) {
-+	return _device->getMetalBufferIndexForTransformFeedbackCounterBinding(stage, 0);
++	return _xfbFirstBufferIndex;
 +}
 +
  // Set the number of vertex attribute buffers consumed by this pipeline at each stage.
  // Any implicit buffers needed by this pipeline will be assigned indexes below the range
  // defined by this count below the max number of Metal buffer bindings per stage.
-@@ -2166,7 +2938,7 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2166,7 +2893,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	// The number of reserved bindings we need for the vertex stage is determined from the largest vertex
  	// attribute binding number, plus any synthetic buffer bindings created to support translated offsets.
  	mvkClear<uint32_t>(_reservedVertexAttributeBufferCount.stages, kMVKShaderStageCount);
 -	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageVertex] = (maxBinding + 1) + xltdBuffCnt;
-+	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageVertex] = (maxBinding + 1) + xltdBuffCnt + (isTransformFeedbackPipeline() ? 2*kMVKMaxTransformFeedbackBufferCount : 0);
++	uint32_t vtxBuffCnt = (maxBinding + 1) + xltdBuffCnt;
++	if (isTransformFeedbackPipeline()) {
++		vtxBuffCnt += 2 * kMVKMaxTransformFeedbackBufferCount;
++		_xfbFirstBufferIndex = getMetalBufferIndexForVertexAttributeBinding(vtxBuffCnt - 1);
++	}
++	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageVertex] = vtxBuffCnt;
  	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessCtl] = kMVKTessCtlNumReservedBuffers;
  	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessEval] = kMVKTessEvalNumReservedBuffers;
  }
-@@ -2177,12 +2949,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2177,12 +2909,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
      // Set the shader conversion config vertex attribute information
      shaderConfig.shaderInputs.clear();
      uint32_t vaCnt = pCreateInfo->pVertexInputState->vertexAttributeDescriptionCount;
@@ -13603,7 +13887,7 @@ index 47bbd4fc..9058de3c 100644
          si.binding = pVKVA->binding;
  
          // Metal can't do signedness conversions on vertex buffers (rdar://45922847). If the shader
-@@ -2212,11 +3006,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2212,11 +2966,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
              default:
                  break;
              }
@@ -13615,7 +13899,7 @@ index 47bbd4fc..9058de3c 100644
          }
  
          shaderConfig.shaderInputs.push_back(si);
-@@ -2259,6 +3048,9 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2259,6 +3008,9 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		sisv.component = so.component;
          sisv.builtin = so.builtin;
          sisv.vecsize = so.vecWidth;
@@ -13625,7 +13909,7 @@ index 47bbd4fc..9058de3c 100644
  		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
  
  		sisv.format = mvkInterfaceFormatFromBaseType(so.baseType);
-@@ -2306,11 +3098,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2306,11 +3058,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  												   const VkPipelineShaderStageCreateInfo* pShaderStage,
  												   VkPipelineCreationFeedback* pStageFB,
  												   MVKShaderModule* pShaderModule,
@@ -13641,7 +13925,7 @@ index 47bbd4fc..9058de3c 100644
  	if ( !func.getMTLFunction() ) {
  		if (shouldFailOnPipelineCompileRequired()) {
  			setConfigurationResult(VK_PIPELINE_COMPILE_REQUIRED);
-@@ -2323,12 +3117,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2323,12 +3077,13 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  
  MVKGraphicsPipeline::~MVKGraphicsPipeline() {
  	@synchronized (getMTLDevice()) {
@@ -13658,7 +13942,7 @@ index 47bbd4fc..9058de3c 100644
  		if (_ownsTessCtlModule) delete _tessCtlModule;
  		if (_ownsTessEvalModule) delete _tessEvalModule;
  		if (_ownsFragmentModule) delete _fragmentModule;
-@@ -2343,12 +3138,43 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2343,12 +3098,43 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  									   MVKPipelineCache* pipelineCache,
  									   MVKPipeline* parent,
  									   const VkComputePipelineCreateInfo* pCreateInfo) :
@@ -13673,7 +13957,8 @@ index 47bbd4fc..9058de3c 100644
 +					   0,
 +					   spv::ExecutionModelGLCompute,
 +					   mvkAreAllFlagsEnabled(getPipelineCreateFlags(pCreateInfo), VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT)) {}
-+
+ 
+-	_allowsDispatchBase = mvkAreAllFlagsEnabled(_flags, VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT);
 +MVKComputePipeline::MVKComputePipeline(MVKDevice* device,
 +									   MVKPipelineCache* pipelineCache,
 +									   MVKPipeline* parent,
@@ -13684,8 +13969,7 @@ index 47bbd4fc..9058de3c 100644
 +	_mtlThreadgroupSize(MTLSizeMake(1, 1, 1)) {
 +	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::PushConstant] = _layout->getPushConstantResourceIndex(kMVKShaderStageCompute);
 +}
- 
--	_allowsDispatchBase = mvkAreAllFlagsEnabled(_flags, VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT);
++
 +MVKComputePipeline::MVKComputePipeline(MVKDevice* device,
 +									   MVKPipelineCache* pipelineCache,
 +									   MVKPipeline* parent,
@@ -13705,7 +13989,7 @@ index 47bbd4fc..9058de3c 100644
  		switch (next->sType) {
  			case VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO:
  				pFeedbackInfo = (VkPipelineCreationFeedbackCreateInfo*)next;
-@@ -2358,8 +3184,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2358,8 +3144,6 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		}
  	}
  
@@ -13714,7 +13998,7 @@ index 47bbd4fc..9058de3c 100644
  	// Initialize feedback. The VALID bit must be initialized, either set or cleared.
  	// We'll set the VALID bit on the stage feedback when we compile it.
  	VkPipelineCreationFeedback* pPipelineFB = nullptr;
-@@ -2374,12 +3198,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2374,12 +3158,14 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].flags = 0;
  			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].duration = 0;
  		}
@@ -13732,7 +14016,7 @@ index 47bbd4fc..9058de3c 100644
  	_mtlPipelineState = nil;
  
  	id<MTLFunction> mtlFunc = func.getMTLFunction();
-@@ -2387,12 +3213,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2387,12 +3173,12 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];	// temp retain
  		plDesc.computeFunction = mtlFunc;
  		plDesc.maxTotalThreadsPerThreadgroup = _mtlThreadgroupSize.width * _mtlThreadgroupSize.height * _mtlThreadgroupSize.depth;
@@ -13747,7 +14031,7 @@ index 47bbd4fc..9058de3c 100644
  
  		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
  		_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
-@@ -2413,11 +3239,27 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2413,11 +3199,27 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  }
  
  // Returns a MTLFunction to use when creating the MTLComputePipelineState.
@@ -13780,7 +14064,7 @@ index 47bbd4fc..9058de3c 100644
  
  	_module = getOrCreateShaderModule(_device, pSS, _ownsModule);
  
-@@ -2426,8 +3268,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2426,8 +3228,8 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	auto& mtlFeats = getMetalFeatures();
  	auto& mvkCfg = getMVKConfig();
      SPIRVToMSLConversionConfiguration shaderConfig;
@@ -13791,7 +14075,7 @@ index 47bbd4fc..9058de3c 100644
      shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
      shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
      shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
-@@ -2450,8 +3292,21 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2450,8 +3252,21 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
      shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
  #endif
  
@@ -13815,7 +14099,7 @@ index 47bbd4fc..9058de3c 100644
  
  	// Set implicit buffer indices
  	// FIXME: Many of these are optional. We shouldn't set the ones that aren't
-@@ -2461,12 +3316,54 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2461,12 +3276,54 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::BufferSize]    = getImplicitBufferIndex(1);
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::Swizzle]       = getImplicitBufferIndex(2);
  	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::DispatchBase]  = getImplicitBufferIndex(3);
@@ -13872,7 +14156,7 @@ index 47bbd4fc..9058de3c 100644
  	if ( !func.getMTLFunction() ) {
  		if (shouldFailOnPipelineCompileRequired()) {
  			setConfigurationResult(VK_PIPELINE_COMPILE_REQUIRED);
-@@ -2475,13 +3372,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2475,13 +3332,34 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  		}
  	}
  	auto& funcRslts = func.shaderConversionResults;
@@ -13910,7 +14194,7 @@ index 47bbd4fc..9058de3c 100644
  	return getMetalFeatures().maxPerStageBufferCount - (bufferIndexOffset + 1);
  }
  
-@@ -2493,6 +3411,685 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+@@ -2493,6 +3371,685 @@ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
  }
  
  
@@ -14596,7 +14880,7 @@ index 47bbd4fc..9058de3c 100644
  #pragma mark -
  #pragma mark MVKPipelineCache
  
-@@ -2780,6 +4377,26 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2780,6 +4337,26 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.swizzle_buffer_index,
  				opt.indirect_params_buffer_index,
  				opt.shader_output_buffer_index,
@@ -14623,7 +14907,7 @@ index 47bbd4fc..9058de3c 100644
  				opt.shader_patch_output_buffer_index,
  				opt.shader_tess_factor_buffer_index,
  				opt.buffer_size_buffer_index,
-@@ -2790,6 +4407,10 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2790,6 +4367,10 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.shader_patch_input_buffer_index,
  				opt.draw_id_buffer_index,
  				opt.reversed_depth_viewport_buffer_index,
@@ -14634,7 +14918,7 @@ index 47bbd4fc..9058de3c 100644
  				opt.depth_clip_state_buffer_index,
  				opt.shader_input_wg_index,
  				opt.device_index,
-@@ -2814,6 +4435,11 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2814,6 +4395,11 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.argument_buffers,
  				opt.argument_buffers_tier,
  				opt.runtime_array_rich_descriptor,
@@ -14646,7 +14930,7 @@ index 47bbd4fc..9058de3c 100644
  				opt.enable_base_index_zero,
  				opt.pad_fragment_output_components,
  				opt.ios_support_base_vertex_instance,
-@@ -2844,7 +4470,16 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2844,7 +4430,16 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.force_fragment_with_side_effects_execution,
  				opt.input_attachment_is_ds_attachment,
  				opt.auto_disable_rasterization,
@@ -14664,7 +14948,7 @@ index 47bbd4fc..9058de3c 100644
  	}
  
  	template<class Archive>
-@@ -2854,7 +4489,12 @@ void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
+@@ -2854,7 +4449,12 @@ void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
  				si.format,
  				si.builtin,
  				si.vecsize,
@@ -14678,7 +14962,7 @@ index 47bbd4fc..9058de3c 100644
  	}
  
  	template<class Archive>
-@@ -2921,8 +4561,15 @@ void serialize(Archive & archive, SPIRVEntryPoint& ep) {
+@@ -2921,8 +4521,15 @@ void serialize(Archive & archive, SPIRVEntryPoint& ep) {
  	template<class Archive>
  	void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
  		archive(opt.mslOptions,
@@ -14694,7 +14978,7 @@ index 47bbd4fc..9058de3c 100644
  				opt.tessPatchKind,
  				opt.numTessControlPoints,
  				opt.shouldFlipVertexY,
-@@ -2959,7 +4606,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
+@@ -2959,7 +4566,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
  				cfg.shaderOutputs,
  				cfg.resourceBindings,
  				cfg.discreteDescriptorSets,
@@ -14704,7 +14988,7 @@ index 47bbd4fc..9058de3c 100644
  	}
  
  	template<class Archive>
-@@ -2978,7 +4626,10 @@ void serialize(Archive & archive, SPIRVToMSLConversionResultInfo& scr) {
+@@ -2978,7 +4586,10 @@ void serialize(Archive & archive, SPIRVToMSLConversionResultInfo& scr) {
  				scr.needsViewRangeBuffer,
  				scr.needsDrawId,
  				scr.needsDepthClipStateBuffer,
@@ -14716,7 +15000,7 @@ index 47bbd4fc..9058de3c 100644
  	}
  
  	template<class Archive>
-@@ -3042,6 +4693,24 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3042,6 +4653,24 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  	return [_mtlRenderPipelineState retain];
  }
  
@@ -14741,7 +15025,7 @@ index 47bbd4fc..9058de3c 100644
  bool MVKRenderPipelineCompiler::compileComplete(id<MTLRenderPipelineState> mtlRenderPipelineState, NSError* compileError) {
  	lock_guard<mutex> lock(_completionLock);
  
-@@ -3124,18 +4793,36 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+@@ -3124,18 +4753,36 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
  
  void mvkValidateCeralArchiveDefinitions() {
  	[[maybe_unused]] size_t missingBytes = 0;
@@ -14841,10 +15125,10 @@ index 51bd5412..e1f636f3 100644
  	}
  }
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
-index 665c5484..8e55be2f 100644
+index 665c5484..89bcb9fe 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
-@@ -229,6 +229,31 @@ protected:
+@@ -229,6 +229,63 @@ protected:
  };
  
  
@@ -14873,19 +15157,78 @@ index 665c5484..8e55be2f 100644
 +};
 +
 +
++#pragma mark -
++#pragma mark MVKTransformFeedbackQueryPool
++
++/**
++ * A Vulkan query pool for transform feedback stream queries: { written, needed } primitives per query.
++ * Captures add to the results of the queries active in their command encoder (cmdTransformFeedbackAdvance).
++ */
++class MVKTransformFeedbackQueryPool : public MVKQueryPool {
++
++public:
++	/** Returns the GPU address of the specified query's results. */
++	uint64_t getResultGPUAddress(uint32_t query) const { return _resultMTLBuffer.gpuAddress + getResultOffset(query); }
++	static NSUInteger getResultOffset(uint32_t query) { return query * 2 * kMVKQuerySlotSizeInBytes; }
++
++	void beginQuery(uint32_t query, VkQueryControlFlags flags, MVKCommandEncoder* cmdEncoder) override;
++	void endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) override;
++	void resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) override;
++
++	MVKTransformFeedbackQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo);
++	~MVKTransformFeedbackQueryPool() override;
++
++protected:
++	void propagateDebugName() override;
++	NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) override;
++	id<MTLBuffer> getResultBuffer(MVKCommandEncoder*, uint32_t firstQuery, uint32_t, NSUInteger& offset) override;
++	id<MTLComputeCommandEncoder> encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery,
++													 uint32_t, uint32_t index) override;
++
++	id<MTLBuffer> _resultMTLBuffer;
++};
++
++
  #pragma mark -
  #pragma mark MVKPipelineStatisticsQueryPool
  
-@@ -255,4 +280,3 @@ public:
+@@ -255,4 +312,3 @@ public:
  protected:
  	void propagateDebugName() override {}
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
-index e5d4baeb..b98b687e 100644
+index e5d4baeb..7df698a0 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
-@@ -423,6 +423,53 @@
+@@ -132,11 +132,13 @@
+ 
+ 	// Output the results of this query
+ 	if (shouldOutput) {
+-		uint64_t rsltVal = ((uint64_t*)srcData.bytes)[query - srcDataQueryOffset];
+-		if (shouldOutput64Bit) {
+-			*(uint64_t*)pDstData = rsltVal;
+-		} else {
+-			*(uint32_t*)pDstData = (uint32_t)rsltVal;
++		for (uint32_t e = 0; e < _queryElementCount; e++) {
++			uint64_t rsltVal = ((uint64_t*)srcData.bytes)[(query - srcDataQueryOffset) * _queryElementCount + e];
++			if (shouldOutput64Bit) {
++				((uint64_t*)pDstData)[e] = rsltVal;
++			} else {
++				((uint32_t*)pDstData)[e] = (uint32_t)rsltVal;
++			}
+ 		}
+ 	}
+ 
+@@ -185,6 +187,7 @@
+ 		_availabilityLock.lock();
+ 		cmdEncoder->setComputeBytes(mtlComputeCmdEnc, _availability.data() + firstQuery, queryCount * sizeof(Status), 5);
+ 		_availabilityLock.unlock();
++		state.bindStructBytes(mtlComputeCmdEnc, &_queryElementCount, 6);
+ 
+ 		// Run one thread per query. Try to fill up a subgroup.
+ 		NSUInteger threadCount = NSUInteger(queryCount);
+@@ -423,6 +426,112 @@
  }
  
  
@@ -14934,6 +15277,65 @@ index e5d4baeb..b98b687e 100644
 +}
 +
 +MVKAccelerationStructureQueryPool::~MVKAccelerationStructureQueryPool() { [_resultMTLBuffer release]; }
++
++
++#pragma mark -
++#pragma mark MVKTransformFeedbackQueryPool
++
++void MVKTransformFeedbackQueryPool::propagateDebugName() { setMetalObjectLabel(_resultMTLBuffer, _debugName); }
++
++// Results were zeroed by the required reset; captures add to them while the query is active.
++void MVKTransformFeedbackQueryPool::beginQuery(uint32_t query, VkQueryControlFlags flags, MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->beginTransformFeedbackQuery(_resultMTLBuffer, getResultGPUAddress(query));
++}
++
++void MVKTransformFeedbackQueryPool::endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->endTransformFeedbackQuery(getResultGPUAddress(query));
++	MVKQueryPool::endQuery(query, cmdEncoder);
++}
++
++void MVKTransformFeedbackQueryPool::resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) {
++	MVKQueryPool::resetResults(firstQuery, queryCount, cmdEncoder);
++	NSUInteger offset = getResultOffset(firstQuery);
++	NSUInteger length = getResultOffset(queryCount);
++	if (cmdEncoder) {
++		id<MTLBlitCommandEncoder> encoder = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseResetQueryPool);
++		[encoder fillBuffer:_resultMTLBuffer range:NSMakeRange(offset, length) value:0];
++	} else {
++		mvkClear((char*)_resultMTLBuffer.contents + offset, length);
++	}
++}
++
++NSData* MVKTransformFeedbackQueryPool::getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) {
++	return [NSData dataWithBytesNoCopy:(void*)((uintptr_t)_resultMTLBuffer.contents + getResultOffset(firstQuery))
++	                          length:getResultOffset(queryCount)
++	                    freeWhenDone:false];
++}
++
++id<MTLBuffer> MVKTransformFeedbackQueryPool::getResultBuffer(MVKCommandEncoder*, uint32_t firstQuery, uint32_t, NSUInteger& offset) {
++	offset = getResultOffset(firstQuery);
++	return _resultMTLBuffer;
++}
++
++id<MTLComputeCommandEncoder> MVKTransformFeedbackQueryPool::encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery,
++																				  uint32_t, uint32_t index) {
++	id<MTLComputeCommandEncoder> encoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseCopyQueryPoolResults);
++	cmdEncoder->getMtlCompute().bindBuffer(encoder, _resultMTLBuffer, getResultOffset(firstQuery), index);
++	return encoder;
++}
++
++MVKTransformFeedbackQueryPool::MVKTransformFeedbackQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo)
++	: MVKQueryPool(device, pCreateInfo, 2) {
++	_resultMTLBuffer = [getMTLDevice() newBufferWithLength:std::max<NSUInteger>(getResultOffset(pCreateInfo->queryCount), 16)
++	                                               options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache];
++	[_resultMTLBuffer setLabel:@"Transform Feedback Query Result Buffer"];
++	_device->makeResident(_resultMTLBuffer);	// Written through its GPU address
++}
++
++MVKTransformFeedbackQueryPool::~MVKTransformFeedbackQueryPool() {
++	_device->removeResidency(_resultMTLBuffer);
++	[_resultMTLBuffer release];
++}
 +
 +
  #pragma mark -
@@ -15713,7 +16115,7 @@ index b6841665..808aee32 100644
  #pragma mark Support functions
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
-index c5b74991..d7ff57bd 100644
+index c5b74991..d0be6d67 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 @@ -32,6 +32,9 @@ class MVKShaderCacheIterator;
@@ -15746,18 +16148,8 @@ index c5b74991..d7ff57bd 100644
  
  	/** Convert the SPIR-V to MSL, using the specified shader conversion configuration. */
  	bool convert(mvk::SPIRVToMSLConversionConfiguration* pShaderConfig,
-@@ -274,6 +279,9 @@ protected:
- 	friend MVKShaderCacheIterator;
- 
- 	void propagateDebugName() override {}
-+	// Generates a pass-through vertex function (used by the transform-feedback raster
-+	// stage) that reads back the captured SO buffers.
-+	void generatePassThruVertexShader(const std::string& entryPoint, mvk::SPIRVToMSLConversionResult& conversionResult);
- 
- 	MVKShaderLibraryCache _shaderLibraryCache;
- 	mvk::SPIRVToMSLConverter _spvConverter;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..94db0ef6 100644
+index 3aa44a44..41a83bc3 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -20,6 +20,8 @@
@@ -15852,281 +16244,7 @@ index 3aa44a44..94db0ef6 100644
  }
  
  bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
-@@ -463,12 +494,273 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
- 
- 	if (wasConverted) {
- 		if (shouldLogCode) { MVKLogInfo("%s", conversionResult.resultLog.c_str()); }
-+		if (conversionResult.resultInfo.needsTransformFeedback) {
-+			generatePassThruVertexShader(pShaderConfig->options.entryPointName, conversionResult);
-+		}
- 	} else {
- 		reportError(VK_ERROR_INITIALIZATION_FAILED, "Unable to convert SPIR-V to MSL:\n%s", conversionResult.resultLog.c_str());
- 	}
- 	return wasConverted;
- }
- 
-+// Returns the MVKGLSLConversionShaderStage corresponding to the shader stage in the SPIR-V conversion configuration.
-+
-+static std::string mvkTypeToMSL(const SPIRVShaderOutput& output) {
-+	std::ostringstream os;
-+	switch (output.baseType) {
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Boolean:
-+			os << "bool";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::SByte:
-+			os << "char";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::UByte:
-+			os << "uchar";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Short:
-+			os << "short";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::UShort:
-+			os << "ushort";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Int:
-+			os << "int";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::UInt:
-+			os << "uint";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Int64:
-+			os << "long";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::UInt64:
-+			os << "ulong";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Half:
-+			os << "half";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Float:
-+			os << "float";
-+			break;
-+		case SPIRV_CROSS_NAMESPACE::SPIRType::Double:
-+			os << "double";
-+			break;
-+		default:
-+			os << "unknown";
-+			break;
-+	}
-+	if (output.vecWidth > 1) {
-+		os << output.vecWidth;
-+	}
-+	return os.str();
-+}
-+
-+static std::string mvkBuiltInToName(const SPIRVShaderOutput& output) {
-+	std::ostringstream os;
-+	switch (output.builtin) {
-+		case spv::BuiltInPosition:
-+			return "gl_Position";
-+		case spv::BuiltInPointSize:
-+			return "gl_PointSize";
-+		case spv::BuiltInClipDistance:
-+			os << "gl_ClipDistance_" << output.arrayIndex;
-+			return os.str();
-+		case spv::BuiltInCullDistance:
-+			os << "gl_CullDistance_" << output.arrayIndex;
-+			return os.str();
-+		default:
-+			// No other builtins should appear as a vertex shader output.
-+			return "unknown";
-+	}
-+}
-+
-+static std::string mvkBuiltInToAttr(const SPIRVShaderOutput& output) {
-+	std::ostringstream os;
-+	switch (output.builtin) {
-+		case spv::BuiltInPosition:
-+			return "position";
-+		case spv::BuiltInPointSize:
-+			return "point_size";
-+		case spv::BuiltInClipDistance:
-+			os << "user(clip" << output.arrayIndex << ")";
-+			return os.str();
-+		case spv::BuiltInCullDistance:
-+			os << "user(cull" << output.arrayIndex << ")";
-+			return os.str();
-+		default:
-+			// No other builtins should appear as a vertex shader output.
-+			return "unknown";
-+	}
-+}
-+
-+static std::string mvkVertexAttrToName(const SPIRVShaderOutput& output) {
-+	std::ostringstream os;
-+	os << "m" << output.location;
-+	if (output.component > 0)
-+		os << "_" << output.component;
-+	return os.str();
-+}
-+
-+static std::string mvkVertexAttrToUserAttr(const SPIRVShaderOutput& output) {
-+	std::ostringstream os;
-+	os << "locn" << output.location;
-+	if (output.component > 0)
-+		os << "_" << output.component;
-+	return os.str();
-+}
-+
-+void MVKShaderModule::generatePassThruVertexShader(const std::string& entryName, SPIRVToMSLConversionResult& conversionResult) {
-+	MVKSmallVector<SPIRVShaderOutput, 16> vtxOutputs;
-+	std::string errorLog;
-+	std::unordered_map<uint32_t, std::vector<size_t>> xfbBuffers;
-+	uint32_t clipDistances = 0;
-+	getShaderOutputs(getSPIRV(), spv::ExecutionModelVertex, entryName, vtxOutputs, errorLog);
-+	for (size_t i = 0; i < vtxOutputs.size(); ++i) {
-+		xfbBuffers[vtxOutputs[i].xfbBufferIndex].push_back(i);
-+	}
-+	// Sort XFB buffers by offset; sort the other outputs by index.
-+	for (auto& buffer : xfbBuffers) {
-+		if (buffer.first == (uint32_t)(-1)) {
-+			std::sort(buffer.second.begin(), buffer.second.end(), [&vtxOutputs](uint32_t a, uint32_t b) {
-+				if (vtxOutputs[a].location == vtxOutputs[b].location)
-+					return vtxOutputs[a].component < vtxOutputs[b].component;
-+				return vtxOutputs[a].location < vtxOutputs[b].location;
-+			});
-+		} else {
-+			std::sort(buffer.second.begin(), buffer.second.end(), [&vtxOutputs](uint32_t a, uint32_t b) {
-+				return vtxOutputs[a].xfbBufferOffset < vtxOutputs[b].xfbBufferOffset;
-+			});
-+		}
-+	}
-+	// Emit the buffer structures used by the passthrough function. We can't
-+	// reuse the ones from SPIRV-Cross because the reflection gave us the vertex
-+	// outputs broken up (no structs or arrays), but SPIRV-Cross has the
-+	// structs and arrays intact. Mapping between the two is difficult without
-+	// additional information and code.
-+	// FIXME: Do we want to use a "fast string concatenation" type here?
-+	conversionResult.msl += "\n";
-+	for (const auto& buffer : xfbBuffers) {
-+		if (buffer.first == (uint32_t)(-1)) {
-+			conversionResult.msl += "struct " + entryName + "_pt_misc\n"
-+				"{\n";
-+		} else {
-+			std::ostringstream os;
-+			os << "struct " << entryName + "_pt_xfb" << buffer.first << "\n";
-+			conversionResult.msl += os.str() + "{\n";
-+		}
-+		uint32_t offset = 0;
-+		uint32_t padNo = 0;
-+		uint32_t stride = vtxOutputs[buffer.second[0]].xfbBufferStride;
-+		for (const auto& outputIdx : buffer.second) {
-+			if (offset < vtxOutputs[outputIdx].xfbBufferOffset) {
-+				// Emit padding to put us at the right offset.
-+				std::ostringstream os;
-+				os << "    char pad" << padNo++ << "[" << vtxOutputs[outputIdx].xfbBufferOffset - offset << "];\n";
-+				conversionResult.msl += os.str();
-+			} else {
-+				offset = vtxOutputs[outputIdx].xfbBufferOffset;
-+			}
-+			// If the offset isn't at the natural alignment of the type, we'll have to use a packed type.
-+			conversionResult.msl += "    ";
-+			if (offset % getShaderOutputAlignment(vtxOutputs[outputIdx]) != 0)
-+				conversionResult.msl += "packed_";
-+			conversionResult.msl +=	mvkTypeToMSL(vtxOutputs[outputIdx]) + " ";
-+			if (vtxOutputs[outputIdx].builtin != spv::BuiltInMax) {
-+				conversionResult.msl += mvkBuiltInToName(vtxOutputs[outputIdx]);
-+			} else {
-+				conversionResult.msl += mvkVertexAttrToName(vtxOutputs[outputIdx]);
-+			}
-+			conversionResult.msl += ";\n";
-+			offset = vtxOutputs[outputIdx].xfbBufferOffset + getShaderOutputSize(vtxOutputs[outputIdx]);
-+		}
-+		// Emit additional padding for the buffer stride.
-+		if (stride != offset) {
-+			std::ostringstream os;
-+			os << "    char pad" << padNo++ << "[" << stride - offset << "];\n";
-+			conversionResult.msl += os.str();
-+		}
-+		conversionResult.msl += "};\n";
-+	}
-+	// Emit the vertex stage output structure.
-+	conversionResult.msl += "\n"
-+		"struct " + entryName + "_passthru\n"
-+		"{\n";
-+	for (const auto& output : vtxOutputs) {
-+		if (output.builtin == spv::BuiltInPointSize) { continue; }
-+		conversionResult.msl += "    " + mvkTypeToMSL(output) + " ";
-+		if (output.builtin != spv::BuiltInMax) {
-+			conversionResult.msl += mvkBuiltInToName(output) + " [[" + mvkBuiltInToAttr(output) + "]]";
-+			if (output.builtin == spv::BuiltInClipDistance) {
-+				clipDistances++;
-+			}
-+		} else {
-+			conversionResult.msl += mvkVertexAttrToName(output) + " [[user(" +
-+			                        mvkVertexAttrToUserAttr(output) + ")]]";
-+		}
-+		conversionResult.msl += ";\n";
-+	}
-+	if (clipDistances > 0) {
-+		std::ostringstream os;
-+		os << "    float gl_ClipDistance [[clip_distance]] [" << clipDistances << "];\n";
-+		conversionResult.msl += os.str();
-+	}
-+	conversionResult.msl += "};\n\n";
-+	conversionResult.msl += "vertex " + entryName + "_passthru " +
-+	                        conversionResult.resultInfo.entryPoint.mtlFunctionName + "_PassThru(";
-+	std::ostringstream os;
-+	// Emit parameters for XFB buffers and the other output buffer.
-+	for (const auto& buffer : xfbBuffers) {
-+		if (!os.str().empty())
-+			os << ", ";
-+		if (buffer.first == -1)
-+			os << "const device " << entryName << "_pt_misc* misc_in [[buffer(4)]]";
-+		else
-+			os << "const device " << entryName << "_pt_xfb" << buffer.first << "* xfb" << buffer.first << " [[buffer(" << buffer.first << ")]]";
-+	}
-+	if (!os.str().empty())
-+		os << ", ";
-+	os << "uint gl_VertexIndex [[vertex_id]]";
-+	conversionResult.msl += os.str();
-+	conversionResult.msl += ")\n"
-+		"{\n"
-+		"    " + entryName + "_passthru out;\n";
-+	// Emit loads from the XFB buffers and stores to stage out.
-+	for (const auto& output : vtxOutputs) {
-+		if (output.builtin == spv::BuiltInPointSize) { continue; }
-+		std::ostringstream loadStore;
-+		loadStore << "out.";
-+		if (output.builtin != spv::BuiltInMax) {
-+			loadStore << mvkBuiltInToName(output);
-+		} else {
-+			loadStore << mvkVertexAttrToName(output);
-+		}
-+		loadStore << " = ";
-+		if (output.xfbBufferIndex == -1) {
-+			loadStore << "misc_in[gl_VertexIndex].";
-+		} else {
-+			loadStore << "xfb" << output.xfbBufferIndex << "[gl_VertexIndex].";
-+		}
-+		if (output.builtin != spv::BuiltInMax) {
-+			loadStore << mvkBuiltInToName(output);
-+		} else {
-+			loadStore << mvkVertexAttrToName(output);
-+		}
-+		conversionResult.msl += "    " + loadStore.str() + ";\n";
-+		if (output.builtin == spv::BuiltInClipDistance) {
-+			std::ostringstream clipLoadStore;
-+			clipLoadStore << "out.gl_ClipDistance[" << output.arrayIndex << "] = ";
-+			if (output.xfbBufferIndex == -1) {
-+				clipLoadStore << "misc_in[gl_VertexIndex].";
-+			} else {
-+				clipLoadStore << "xfb" << output.xfbBufferIndex << "[gl_VertexIndex].";
-+			}
-+			clipLoadStore << mvkBuiltInToName(output);
-+			conversionResult.msl += "    " + clipLoadStore.str() + ";\n";
-+		}
-+	}
-+	conversionResult.msl += "    return out;\n"
-+		"}\n";
-+}
-+
- void MVKShaderModule::setWorkgroupSize(uint32_t x, uint32_t y, uint32_t z) {
- 	if(_directMSLLibrary) { _directMSLLibrary->setWorkgroupSize(x, y, z); }
- }
-@@ -741,4 +1033,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +772,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }
@@ -16815,7 +16933,7 @@ index 9ee4db10..e18d611a 100644
          result |= 1 << kMVKBarrierStageCopy;
  
 diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
-index 9ee0c4eb..1dc034ae 100644
+index 9ee0c4eb..bfe76fcc 100644
 --- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 +++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 @@ -41,6 +41,7 @@
@@ -17418,15 +17536,35 @@ index 9ee0c4eb..1dc034ae 100644
  	VkCommandBuffer                             commandBuffer,
  	const VkSampleLocationsInfoEXT*             pSampleLocationsInfo) {
  
-@@ -4409,6 +4814,48 @@ void vkCmdSetSampleLocationsEXT(
+@@ -4409,6 +4814,68 @@ void vkCmdSetSampleLocationsEXT(
  
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkGetPhysicalDeviceToolProperties, EXT);
  
 +#pragma mark VK_EXT_transform_feedback extension
 +
-+MVK_PUBLIC_VULKAN_STUB(vkCmdBeginQueryIndexedEXT, void, VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags, uint32_t)
++// Only stream 0 exists (maxTransformFeedbackStreams is 1), so indexed queries are plain queries.
++MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBeginQueryIndexedEXT(
++	VkCommandBuffer                             commandBuffer,
++	VkQueryPool                                 queryPool,
++	uint32_t                                    query,
++	VkQueryControlFlags                         flags,
++	uint32_t                                    index) {
++
++	MVKTraceVulkanCallStart();
++	MVKAddCmd(BeginQuery, commandBuffer, queryPool, query, flags);
++	MVKTraceVulkanCallEnd();
++}
 +MVK_PUBLIC_VULKAN_STUB(vkCmdDrawIndirectByteCountEXT, void, VkCommandBuffer, uint32_t, uint32_t, VkBuffer, VkDeviceSize, uint32_t, uint32_t)
-+MVK_PUBLIC_VULKAN_STUB(vkCmdEndQueryIndexedEXT, void, VkCommandBuffer, VkQueryPool, uint32_t, uint32_t)
++MVK_PUBLIC_VULKAN_SYMBOL void vkCmdEndQueryIndexedEXT(
++	VkCommandBuffer                             commandBuffer,
++	VkQueryPool                                 queryPool,
++	uint32_t                                    query,
++	uint32_t                                    index) {
++
++	MVKTraceVulkanCallStart();
++	MVKAddCmd(EndQuery, commandBuffer, queryPool, query);
++	MVKTraceVulkanCallEnd();
++}
 +
 +MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBeginTransformFeedbackEXT(
 +	VkCommandBuffer                             commandBuffer,
@@ -17455,13 +17593,13 @@ index 9ee0c4eb..1dc034ae 100644
 +
 +MVK_PUBLIC_VULKAN_SYMBOL void vkCmdEndTransformFeedbackEXT(
 +	VkCommandBuffer                             commandBuffer,
-+	uint32_t,
-+	uint32_t,
-+	const VkBuffer*,
-+	const VkDeviceSize*) {
++	uint32_t                                    firstCounterBuffer,
++	uint32_t                                    counterBufferCount,
++	const VkBuffer*                             pCounterBuffers,
++	const VkDeviceSize*                         pCounterBufferOffsets) {
 +
 +	MVKTraceVulkanCallStart();
-+	MVKAddCmd(EndTransformFeedback, commandBuffer);
++	MVKAddCmd(EndTransformFeedback, commandBuffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
 +	MVKTraceVulkanCallEnd();
 +}
  

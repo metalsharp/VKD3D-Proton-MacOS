@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 1/6] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
+Subject: [PATCH 1/7] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
  texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 2/6] Keep the transform feedback structures linked when stream
+Subject: [PATCH 2/7] Keep the transform feedback structures linked when stream
  output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 3/6] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 3/7] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 4/6] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
+Subject: [PATCH 4/7] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
  16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 5/6] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 5/7] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,7 +329,7 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 6/6] MoltenVK: typed buffer views start at aligned offsets via
+Subject: [PATCH 6/7] MoltenVK: typed buffer views start at aligned offsets via
  the typed offset buffer (no env bypass)
 
 ---
@@ -385,6 +385,114 @@ index a8fc26b1..bf474e86 100644
              bound_range->element_offset = first_element - begin_range;
              bound_range->element_count = num_elements;
  
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 19:03:16 -0600
+Subject: [PATCH 7/7] MoltenVK: require transform feedback again
+
+The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
+copy of the vertex shader, counter buffers, overflow and stream queries), so
+stream output no longer has to be disabled on it.
+---
+ libs/vkd3d/command.c | 42 ------------------------------------------
+ libs/vkd3d/device.c  | 13 ++-----------
+ 2 files changed, 2 insertions(+), 53 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index fc696f7e..8a632d2d 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -5031,39 +5031,6 @@ static void d3d12_command_list_reset_active_query(struct d3d12_command_list *lis
+     query->state = VKD3D_ACTIVE_QUERY_RESET;
+ }
+ 
+-static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type);
+-
+-/* Without VK_EXT_transform_feedback (MoltenVK) stream output is disabled, so SO statistics
+- * queries never reach Vulkan: ending one stores zero primitives written and needed. */
+-static bool d3d12_query_type_needs_missing_xfb(struct d3d12_command_list *list, D3D12_QUERY_TYPE type)
+-{
+-    return d3d12_query_type_is_indexed(type) && !list->device->vk_info.EXT_transform_feedback;
+-}
+-
+-static void d3d12_command_list_write_zero_query(struct d3d12_command_list *list,
+-        struct d3d12_query_heap *heap, uint32_t index)
+-{
+-    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+-    size_t stride = get_query_heap_stride(heap->desc.Type);
+-    VkMemoryBarrier2 vk_barrier;
+-    VkDependencyInfo dep_info;
+-
+-    d3d12_command_list_end_current_render_pass(list, true);
+-    VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, heap->vk_buffer, index * stride, stride, 0));
+-
+-    memset(&vk_barrier, 0, sizeof(vk_barrier));
+-    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+-    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+-    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+-    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+-    vk_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+-    memset(&dep_info, 0, sizeof(dep_info));
+-    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+-    dep_info.memoryBarrierCount = 1;
+-    dep_info.pMemoryBarriers = &vk_barrier;
+-    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+-}
+-
+ static bool d3d12_command_list_enable_query(struct d3d12_command_list *list,
+         struct d3d12_query_heap *heap, uint32_t index, D3D12_QUERY_TYPE type)
+ {
+@@ -17451,9 +17418,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
+-    if (d3d12_query_type_needs_missing_xfb(list, type))
+-        return;
+-
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (d3d12_command_list_is_query_resolve_pending(list, query_heap, index))
+@@ -17499,12 +17463,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
+-    if (d3d12_query_type_needs_missing_xfb(list, type))
+-    {
+-        d3d12_command_list_write_zero_query(list, query_heap, index);
+-        return;
+-    }
+-
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 9c6839ea..4717e179 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2501,17 +2501,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        /* Metal (MoltenVK) has no transform feedback. Everything else in D3D12 works without it:
+-         * stream output and its queries are turned off instead of failing device creation. */
+-        WARN("Lacking transform-feedback behavior; stream output is disabled (VKMT).\n");
+-        vulkan_info->EXT_transform_feedback = false;
+-        /* The structures stay linked into the feature and property chains (which the device is
+-         * created with), so only their values are cleared. */
+-        physical_device_info->xfb_features.transformFeedback = VK_FALSE;
+-        physical_device_info->xfb_features.geometryStreams = VK_FALSE;
+-        memset((char *)&physical_device_info->xfb_properties + offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams),
+-                0, sizeof(physical_device_info->xfb_properties) - offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams));
+-        vulkan_info->rasterization_stream = false;
++        ERR("Lacking support for transform feedback.\n");
++        return E_INVALIDARG;
+     }
+ 
+     single_storage_texel =
 -- 
 2.54.0 (Apple Git-157)
 

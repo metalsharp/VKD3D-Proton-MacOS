@@ -33,7 +33,7 @@ git -C "$SRC" diff --quiet -- libs/vkd3d/swapchain.c || {
     exit 1
 }
 # A plain upstream checkout gets the MoltenVK patch committed on top; the metalsharp-moltenvk branch has it.
-if ! git -C "$SRC" grep -q "stream output is disabled (VKMT)" -- libs/vkd3d/device.c; then
+if ! git -C "$SRC" grep -q "aligned through the typed offset buffer" -- libs/vkd3d/device.c; then
     git -C "$SRC" am -q "$MOLTENVK_PATCH"
 fi
 git -C "$SRC" apply --check "$DXGI_LIFECYCLE_PATCH"
