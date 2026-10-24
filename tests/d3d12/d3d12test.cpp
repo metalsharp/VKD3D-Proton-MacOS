@@ -2254,6 +2254,121 @@ float4 ps_main(V i) : SV_Target { return float4(i.color, 1); }
     return true;
 }
 
+// Tessellation: a hull shader with constant edge factors and a domain shader placing each tessellated triangle
+// patch, drawn as two patches of 3 control points covering the target's halves (colored by the patch ID).
+static bool test_tessellation()
+{
+    static const char *src = R"(
+struct VSOut { float2 pos : POS; };
+VSOut vs(uint id : SV_VertexID)
+{
+    // Two triangles: the left and right halves (upper-left and lower-right of each half covered by its patch).
+    static const float2 p[6] = { float2(-1, -1), float2(0, -1), float2(-1, 1), float2(0, -1), float2(1, -1), float2(0, 1) };
+    VSOut o;
+    o.pos = p[id];
+    return o;
+}
+struct HSConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };
+HSConst hs_const(InputPatch<VSOut, 3> ip, uint pid : SV_PrimitiveID)
+{
+    HSConst c;
+    c.edges[0] = c.edges[1] = c.edges[2] = 4.0;
+    c.inside = 4.0;
+    return c;
+}
+[domain("tri")]
+[partitioning("integer")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("hs_const")]
+VSOut hs(InputPatch<VSOut, 3> ip, uint i : SV_OutputControlPointID)
+{
+    return ip[i];
+}
+struct DSOut { float4 pos : SV_Position; nointerpolation uint pid : PID; };
+[domain("tri")]
+DSOut ds(HSConst c, float3 b : SV_DomainLocation, const OutputPatch<VSOut, 3> op, uint pid : SV_PrimitiveID)
+{
+    DSOut o;
+    o.pos = float4(op[0].pos * b.x + op[1].pos * b.y + op[2].pos * b.z, 0, 1);
+    o.pid = pid;
+    return o;
+}
+float4 ps(DSOut i) : SV_Target { return i.pid == 0 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), hs = compile_dxc(src, "hs", "hs_6_0"),
+                      ds = compile_dxc(src, "ds", "ds_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || hs.empty() || ds.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.HS = { hs.data(), hs.size() };
+    pd.DS = { ds.data(), ds.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT W = 16, H = 8;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 1, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+    g.list->DrawInstanced(6, 1, 0, 0);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * H };
+    rb->Map(0, &range, (void **)&px);
+    // Patch 0 covers the left half's upper-left triangle, patch 1 the right half's: pixel (1, 1) of each half
+    // (D3D12's y points down: NDC y = -1 is the bottom row, so the triangles' right angles are at the bottom).
+    uint32_t left = px[(H - 2) * 64 + 1], right = px[(H - 2) * 64 + W / 2 + 1], none = px[1 * 64 + W / 2 - 1];
+    EXPECT(left == 0xff0000ff, "patch 0 pixel 0x%08x, want 0xff0000ff", left);
+    EXPECT(right == 0xff00ff00, "patch 1 pixel 0x%08x, want 0xff00ff00", right);
+    EXPECT(none == 0xffff0000, "uncovered pixel 0x%08x, want the clear color 0xffff0000", none);
+    rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -2265,6 +2380,7 @@ static const Test tests[] = {
     { "rayquery", test_rayquery },
     { "dispatchrays", test_dispatchrays },
     { "mesh", test_mesh },
+    { "tessellation", test_tessellation },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
