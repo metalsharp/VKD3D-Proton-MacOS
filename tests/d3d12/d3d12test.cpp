@@ -4,6 +4,7 @@
 #include <math.h>
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d11on12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <dxcapi.h>
@@ -3537,6 +3538,82 @@ float4 ps(V i, uint view : SV_ViewID) : SV_Target { return float4(i.r / 16.0, (v
     return true;
 }
 
+// D3D11On12: a D3D11 device on the D3D12 device and queue clears a wrapped D3D12 texture, and copies a texture it
+// creates (with initial data) into a corner of it; D3D12 reads the result back.
+static bool test_d3d11on12()
+{
+    HMODULE d3d11 = LoadLibraryA("d3d11.dll");
+    auto create = d3d11 ? (PFN_D3D11ON12_CREATE_DEVICE)(void *)GetProcAddress(d3d11, "D3D11On12CreateDevice") : nullptr;
+    if (!create)
+    {
+        printf("  skipped: no D3D11On12CreateDevice\n");
+        return true;
+    }
+    ID3D11Device *dev11 = nullptr;
+    ID3D11DeviceContext *ctx = nullptr;
+    D3D_FEATURE_LEVEL fl = {};
+    IUnknown *queues[] = { g.queue };
+    CHECK_HR(create(g.device, 0, nullptr, 0, queues, 1, 0, &dev11, &ctx, &fl));
+    printf("  D3D11 feature level 0x%x\n", fl);
+    ID3D11On12Device *on12 = nullptr;
+    CHECK_HR(dev11->QueryInterface(IID_PPV_ARGS(&on12)));
+
+    const UINT W = 4, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *tex12 = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&tex12)));
+    D3D11_RESOURCE_FLAGS flags11 = { D3D11_BIND_RENDER_TARGET };
+    ID3D11Texture2D *wrapped = nullptr;
+    CHECK_HR(on12->CreateWrappedResource(tex12, &flags11, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                         IID_PPV_ARGS(&wrapped)));
+    ID3D11RenderTargetView *rtv = nullptr;
+    CHECK_HR(dev11->CreateRenderTargetView(wrapped, nullptr, &rtv));
+    // A 2x2 texture of D3D11's own, with initial data.
+    const uint32_t texels[4] = { 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff };
+    D3D11_TEXTURE2D_DESC d11 = { 2, 2, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA init = { texels, 8, 0 };
+    ID3D11Texture2D *small = nullptr;
+    CHECK_HR(dev11->CreateTexture2D(&d11, &init, &small));
+
+    ID3D11Resource *res = wrapped;
+    on12->AcquireWrappedResources(&res, 1);
+    const float gray[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+    ctx->ClearRenderTargetView(rtv, gray);
+    ctx->CopySubresourceRegion(wrapped, 0, 2, 2, 0, small, 0, nullptr);
+    on12->ReleaseWrappedResources(&res, 1);
+    ctx->Flush();
+
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = tex12;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    EXPECT(px[0] == 0xff808080 || px[0] == 0xff7f7f7f, "cleared texel 0x%08x, want 0xff808080", px[0]);
+    for (UINT i = 0; i < 4; i++)
+    {
+        uint32_t got = px[(2 + i / 2) * 64 + 2 + i % 2];
+        EXPECT(got == texels[i], "copied texel %u: 0x%08x, want 0x%08x", i, got, texels[i]);
+    }
+    rb->Unmap(0, nullptr);
+    rb->Release(); small->Release(); rtv->Release(); wrapped->Release(); tex12->Release();
+    on12->Release(); ctx->Release(); dev11->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -3557,6 +3634,7 @@ static const Test tests[] = {
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "viewinstancing", test_viewinstancing },
+    { "d3d11on12", test_d3d11on12 },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },

@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../d3d12_pso_desc_ms.h"
 
 #define WIDTH 640
 #define HEIGHT 480
@@ -66,7 +65,8 @@ static const char *hr_text(HRESULT hr)
 
 static int hr_ok_or_unsupported(HRESULT hr)
 {
-    return SUCCEEDED(hr) || hr == DXGI_ERROR_UNSUPPORTED || hr == E_NOTIMPL;
+    /* GetFrameStatistics may also return DXGI_ERROR_FRAME_STATISTICS_DISJOINT (documented, windowed DXVK 2). */
+    return SUCCEEDED(hr) || hr == DXGI_ERROR_UNSUPPORTED || hr == E_NOTIMPL || hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
 }
 
 static int load_file(const char *path, unsigned char **data, unsigned long *size)
@@ -173,7 +173,7 @@ static int create_runtime(Runtime *runtime)
 {
     D3D12_COMMAND_QUEUE_DESC queue_desc;
     D3D12_ROOT_SIGNATURE_DESC root_desc;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC_MS pso_desc;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;   /* The real one: mesh shaders come with pipeline state streams. */
     ID3DBlob *root_blob = NULL, *root_error = NULL;
     DXGI_ADAPTER_DESC1 adapter_desc;
     LUID device_luid;

@@ -1,0 +1,222 @@
+From 3b2ca4c78f2e6ed6fea3891bfe052a3d804b2834 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 21:55:10 -0600
+Subject: [PATCH 24/24] MSL: cull distances as clip distances
+
+Metal has no cull distances. With cull_distance_as_clip_distance, the rasterizing stage (vertex, tessellation
+evaluation, geometry or mesh shader) writes each as a clip distance: the cull distance where it is negative,
+1e20 elsewhere, so a primitive whose vertices all have a negative one is clipped away and any other is clipped
+at its negative vertices only. Also: a geometry shader's outputs that go to the stage output struct at the end
+of the entry point (clip and cull distances of the gl_PerVertex block) go there for each EmitVertex; it reads
+clip and cull distance arrays of gl_in from the payload element by element; a mesh shader's per-vertex output
+doesn't write a cull distance array the per-vertex struct doesn't have; and the vertex wrapper of a geometry
+pipeline doesn't pass ViewIndex (the vertex function derives it).
+---
+ spirv_msl.cpp | 105 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ spirv_msl.hpp |  18 ++++++++-
+ 2 files changed, 121 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 07e3d70b..e3ada8ee 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2471,6 +2471,11 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 				case BuiltInPosition:
+ 					attribute = "[[position]]";
+ 					break;
++				case BuiltInClipDistance:
++				case BuiltInCullDistance:
++					// Payload data, at the vertex shader output's location.
++					attribute = join("[[user(locn", std::to_string(kv.second.location), ")]]");
++					break;
+ 				default:
+ 					fprintf(stderr, "Builtin not handled: %u\n", kv.second.builtin);
+ 				case BuiltInMax:
+@@ -2574,6 +2579,16 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 						continue;
+ 
+ 					string member_name = CompilerGLSL::builtin_to_glsl(builtin, StorageClassInput);
++					auto &mbr_type = get<SPIRType>(block_type->member_types[mbr_idx]);
++					if ((builtin == BuiltInClipDistance || builtin == BuiltInCullDistance) && is_array(mbr_type))
++					{
++						// Arrays in the block; in the payload, a float or a vector of the distances.
++						uint32_t count = std::min(to_array_size_literal(mbr_type), std::max(payload_it->second.vecsize, 1u));
++						for (uint32_t k = 0; k < count; k++)
++							statement(to_name(stage_in_var_id), ".", input_block_name, "[i].", member_name, "[", k, "] = out.in",
++							          payload_it->second.location, payload_it->second.vecsize > 1 ? join("[", k, "]") : "", ";");
++						continue;
++					}
+ 					statement(to_name(stage_in_var_id), ".", input_block_name, "[i].",
+ 					          member_name, " = out.in",
+ 					          std::to_string(payload_it->second.location), ";");
+@@ -2801,6 +2816,19 @@ string CompilerMSL::compile()
+ 	if (is_tese_shader())
+ 		patch_stage_in_var_id = add_interface_block(StorageClassInput, true);
+ 
++	if (msl_options.cull_distance_as_clip_distance && stage_out_var_id && !capture_output_to_buffer &&
++	    ((get_execution_model() == ExecutionModelVertex && !msl_options.for_mesh_pipeline) || is_tese_shader() ||
++	     get_execution_model() == ExecutionModelGeometry))
++	{
++		auto cull = std::make_shared<CullAsClip>();
++		if (add_cull_distances_to_clip_distances(get_variable_data_type(get<SPIRVariable>(stage_out_var_id)), *cull))
++		{
++			get<SPIRFunction>(ir.default_entry_point).fixup_hooks_out.push_back([this, cull]() {
++				emit_cull_distances_as_clip_distances(to_name(stage_out_var_id), *cull);
++			});
++		}
++	}
++
+ 	if (is_tesc_shader())
+ 		stage_out_ptr_var_id = add_interface_block_pointer(stage_out_var_id, StorageClassOutput);
+ 	if (is_tessellation_shader())
+@@ -2811,6 +2839,12 @@ string CompilerMSL::compile()
+ 		mesh_out_per_vertex = add_meshlet_block(false);
+ 		mesh_out_per_primitive = add_meshlet_block(true);
+ 	}
++	if (msl_options.cull_distance_as_clip_distance && is_mesh_shader() && mesh_out_per_vertex)
++	{
++		mesh_cull_as_clip = std::make_shared<CullAsClip>();
++		if (!add_cull_distances_to_clip_distances(get<SPIRType>(mesh_out_per_vertex), *mesh_cull_as_clip))
++			mesh_cull_as_clip.reset();
++	}
+ 
+ 	// Metal vertex functions that define no output must disable rasterization and return void.
+ 	if (!stage_out_var_id)
+@@ -6252,6 +6286,66 @@ uint32_t CompilerMSL::add_interface_block_pointer(uint32_t ib_var_id, StorageCla
+ 	return ib_ptr_var_id;
+ }
+ 
++// Makes room in an output interface block's clip distance array (adding one if it has none) for its cull distances.
++bool CompilerMSL::add_cull_distances_to_clip_distances(SPIRType &ib_type, CullAsClip &cull)
++{
++	uint32_t clip_member = ~0u;
++	for (uint32_t i = 0; i < uint32_t(ib_type.member_types.size()); i++)
++	{
++		if (!has_member_decoration(ib_type.self, i, DecorationBuiltIn))
++			continue;
++		auto builtin = BuiltIn(get_member_decoration(ib_type.self, i, DecorationBuiltIn));
++		bool user = has_member_decoration(ib_type.self, i, DecorationIndex);
++		if (builtin == BuiltInClipDistance && !user)
++			clip_member = i;
++		else if (builtin == BuiltInCullDistance && user)
++			cull.cull_names.push_back(to_member_name(ib_type, i));
++	}
++	if (cull.cull_names.empty())
++		return false;
++
++	uint32_t next_id = ir.increase_bound_by(2);
++	uint32_t float_id = next_id + 1;
++	SPIRType float_type { OpTypeFloat };
++	float_type.basetype = SPIRType::Float;
++	float_type.width = 32;
++	set<SPIRType>(float_id, float_type).self = float_id;
++	SPIRType array_type = float_type;
++	if (clip_member != ~0u)
++	{
++		auto &clip_type = get<SPIRType>(ib_type.member_types[clip_member]);
++		cull.clip_count = to_array_size_literal(clip_type);
++		array_type = clip_type;
++		array_type.array.back() = cull.clip_count + uint32_t(cull.cull_names.size());
++	}
++	else
++	{
++		array_type.op = OpTypeArray;
++		array_type.parent_type = float_id;
++		array_type.array.push_back(uint32_t(cull.cull_names.size()));
++		array_type.array_size_literal.push_back(true);
++		clip_member = uint32_t(ib_type.member_types.size());
++		ib_type.member_types.push_back(0);
++		set_member_decoration(ib_type.self, clip_member, DecorationBuiltIn, BuiltInClipDistance);
++		set_member_name(ib_type.self, clip_member, builtin_to_glsl(BuiltInClipDistance, StorageClassOutput));
++		active_output_builtins.set(BuiltInClipDistance);
++	}
++	auto &t = set<SPIRType>(next_id, array_type);
++	t.self = next_id;
++	ib_type.member_types[clip_member] = next_id;
++	cull.clip_name = to_member_name(ib_type, clip_member);
++	return true;
++}
++
++void CompilerMSL::emit_cull_distances_as_clip_distances(const std::string &ib_var, const CullAsClip &cull)
++{
++	for (uint32_t i = 0; i < uint32_t(cull.cull_names.size()); i++)
++	{
++		string c = join(ib_var, ".", cull.cull_names[i]);
++		statement(ib_var, ".", cull.clip_name, "[", cull.clip_count + i, "] = ", c, " < 0.0 ? ", c, " : 1e20;");
++	}
++}
++
+ uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
+ {
+ 	// Accumulate the variables that should appear in the interface struct.
+@@ -13152,6 +13246,11 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		if (needs_multiview_layer_output())
+ 			statement(builtin_to_glsl(BuiltInLayer, StorageClassOutput), " = ", to_expression(view_mask_buffer_id), "[0] - ",
+ 			          to_expression(view_mask_buffer_id), "[2];");
++		// The outputs that go to the stage output struct at the end of the entry point (clip and cull distances
++		// of the gl_PerVertex block), go there for each vertex.
++		if (current_function && current_function->self == ir.default_entry_point)
++			for (auto &hook : get<SPIRFunction>(ir.default_entry_point).fixup_hooks_out)
++				hook();
+ 		if (!needs_geometry_transform_feedback())
+ 		{
+ 			statement("meshStream.EmitVertex();");
+@@ -24788,7 +24887,9 @@ void CompilerMSL::emit_mesh_outputs()
+ 					// Declare the Clip/CullDistance as [[user(clip/cullN)]].
+ 					const uint32_t orig_index = get_member_decoration(type_vert.self, index, DecorationIndex);
+ 					access += "[" + to_string(orig_index) + "]";
+-					statement("spvV.", builtin_to_glsl(builtin, StorageClassOutput), "[", orig_index, "] = ", to_name(orig_var), "[spvVI]", access, ";");
++					// The block has a [[clip_distance]] array, but no cull distance one.
++					if (builtin == BuiltInClipDistance)
++						statement("spvV.", builtin_to_glsl(builtin, StorageClassOutput), "[", orig_index, "] = ", to_name(orig_var), "[spvVI]", access, ";");
+ 				}
+ 			}
+ 
+@@ -24799,6 +24900,8 @@ void CompilerMSL::emit_mesh_outputs()
+ 				          to_member_name(type_vert, index), ".y);", "    // Invert Y-axis for Metal");
+ 			}
+ 		}
++		if (mesh_cull_as_clip)
++			emit_cull_distances_as_clip_distances("spvV", *mesh_cull_as_clip);
+ 		statement("spvMesh.set_vertex(spvVI, spvV);");
+ 		end_scope();
+ 	}
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de0dc5ef..fc61ae69 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -492,6 +492,12 @@ public:
+ 		// can be read in subsequent stages.
+ 		bool enable_clip_distance_user_varying = true;
+ 
++		// Metal has no cull distances: rasterizing stages that write them also write each as a clip distance,
++		// the cull distance where it is negative and a huge one elsewhere. A primitive whose vertices all have
++		// a negative cull distance is clipped away (culled); for any other, the huge distances move the clip
++		// to the vertices with a negative one.
++		bool cull_distance_as_clip_distance = false;
++
+ 		// In a tessellation control shader, assume that more than one patch can be processed in a
+ 		// single workgroup. This requires changes to the way the InvocationId and PrimitiveId
+ 		// builtins are processed, but should result in more efficient usage of the GPU.
+@@ -1440,7 +1446,17 @@ protected:
+ 	uint32_t builtin_base_instance_id = 0;
+ 	uint32_t builtin_view_idx_id = 0;
+ 	uint32_t builtin_layer_id = 0;
+-	uint32_t multiview_layer_output_id = 0;	// The Layer output a multiview tessellation evaluation, geometry or mesh shader writes.
++	uint32_t multiview_layer_output_id = 0;
++	// cull_distance_as_clip_distance: the stage output's clip distance array, its own clip distances, and its cull distances.
++	struct CullAsClip
++	{
++		std::string clip_name;
++		uint32_t clip_count = 0;
++		SmallVector<std::string> cull_names;
++	};
++	bool add_cull_distances_to_clip_distances(SPIRType &ib_type, CullAsClip &cull);
++	std::shared_ptr<CullAsClip> mesh_cull_as_clip;
++	void emit_cull_distances_as_clip_distances(const std::string &ib_var, const CullAsClip &cull);	// The Layer output a multiview tessellation evaluation, geometry or mesh shader writes.
+ 	uint32_t builtin_invocation_id_id = 0;
+ 	uint32_t builtin_primitive_id_id = 0;
+ 	uint32_t builtin_subgroup_invocation_id_id = 0;
+-- 
+2.54.0 (Apple Git-157)
+
