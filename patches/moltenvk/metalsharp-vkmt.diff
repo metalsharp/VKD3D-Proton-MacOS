@@ -14554,7 +14554,7 @@ index e385e9bd..9cd187d8 100644
  #pragma mark Construction
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 47bbd4fc..fdb3e2f7 100644
+index 47bbd4fc..b78591b5 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -21,7 +21,6 @@
@@ -15107,7 +15107,7 @@ index 47bbd4fc..fdb3e2f7 100644
 +
 +	// Mesh pipelines have no vertex shader (the mesh shader takes its place).
 +	if ( !_isMeshPipeline ) {
-+		_isTransformFeedback = getUsesTransformFeedback(((MVKShaderModule*)pVertexSS->module)->getSPIRV(),
++		_isTransformFeedback = getUsesTransformFeedback(_vertexModule->getSPIRV(),
 +														spv::ExecutionModelVertex,
 +														pVertexSS->pName,
 +														reflectErrorLog);
@@ -15406,7 +15406,7 @@ index 47bbd4fc..fdb3e2f7 100644
 +
 +    std::string errorLog;
 +    SPIRVShaderOutputs vertexOutputs, geometryOutputs;
-+    if (!getShaderOutputs(((MVKShaderModule*)pVertexSS->module)->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
++    if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
 +        reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
 +        return nullptr;
 +    }
@@ -15420,7 +15420,7 @@ index 47bbd4fc..fdb3e2f7 100644
 +        if (!addGeometryShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pGeometrySS, pGeometryFB, vertexOutputs))
 +            return nullptr;
 +
-+        if (!getShaderOutputs(((MVKShaderModule*)pGeometrySS->module)->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
++        if (!getShaderOutputs(_geometryModule->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
 +            reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
 +            return nullptr;
 +        }
