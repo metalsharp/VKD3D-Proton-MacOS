@@ -3614,12 +3614,132 @@ static bool test_d3d11on12()
     return true;
 }
 
+// SM 6.7 advanced texture ops (AdvancedTextureOpsSupported) and quad ops in compute: sampling an integer texture,
+// GatherRaw, SampleCmpLevel in a compute shader, texel offsets that aren't immediates, QuadAll.
+static bool test_sm67_textures()
+{
+    static const char *src = R"(
+Texture2D<uint> ti : register(t0);
+Texture2D<float> tf : register(t1);
+SamplerState s : register(s0);
+SamplerComparisonState c : register(s1);
+cbuffer C : register(b0) { int2 off; };
+RWStructuredBuffer<uint4> o : register(u0);
+[numthreads(2, 2, 1)]
+void main(uint2 t : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    bool all_in = QuadAll(t.x < 2);
+    bool all_zero = QuadAll(t.x == 0);
+    if (gi != 0)
+        return;
+    o[0] = uint4(ti.SampleLevel(s, float2(0.75, 0.25), 0), ti.SampleLevel(s, float2(0.25, 0.25), 0, off), all_in, all_zero);
+    o[1] = ti.GatherRaw(s, float2(0.5, 0.5));
+    o[2] = uint4(tf.SampleCmpLevel(c, float2(0.25, 0.25), 0.25, 0) * 100, tf.SampleCmpLevel(c, float2(0.75, 0.75), 0.25, 0) * 100, 0, 0);
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_7");
+    if (cs.empty())
+        return false;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof(o14));
+    if (!o14.AdvancedTextureOpsSupported)
+    {
+        printf("  skipped: no advanced texture ops\n");
+        return true;
+    }
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 2;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    for (auto &p : rp)
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+    for (UINT i = 0; i < 2; i++)
+    {
+        ss[i].Filter = i ? D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_POINT;
+        ss[i].AddressU = ss[i].AddressV = ss[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss[i].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+        ss[i].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[i].ShaderRegister = i;
+        ss[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 2, ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+
+    // 2x2 textures: R32_UINT { 1, 2; 3, 4 } and R32_FLOAT { 0.1, 0.2; 0.3, 0.4 }.
+    ID3D12Resource *upload = create_buffer(1024, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    const uint32_t ui[4] = { 1, 2, 3, 4 };
+    const float fl[4] = { 0.1f, 0.2f, 0.3f, 0.4f };
+    memcpy(u, ui, 8); memcpy(u + 256, ui + 2, 8);
+    memcpy(u + 512, fl, 8); memcpy(u + 768, fl + 2, 8);
+    upload->Unmap(0, nullptr);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 2; td.Height = 2; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex[2] = {};
+    const DXGI_FORMAT formats[2] = { DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < 2; i++)
+    {
+        td.Format = formats[i];
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex[i])));
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = tex[i];
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = 512 * i;
+        srcl.PlacedFootprint.Footprint = { formats[i], 2, 2, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        transition(tex[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g.device->CreateShaderResourceView(tex[i], nullptr, h);
+        h.ptr += g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const int off[2] = { 1, 1 };   // From the texel at (0, 0) to the one at (1, 1).
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRoot32BitConstants(1, 2, off, 0);
+    g.list->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 48, &rb);
+    if (!v)
+        return false;
+    EXPECT(v[0] == 2, "integer texture sample %u, want 2", v[0]);
+    EXPECT(v[1] == 4, "sample with an offset that isn't an immediate %u, want 4", v[1]);
+    EXPECT(v[2] == 1 && v[3] == 0, "QuadAll %u %u, want 1 0", v[2], v[3]);
+    // Gather order: (0, 1), (1, 1), (1, 0), (0, 0).
+    EXPECT(v[4] == 3 && v[5] == 4 && v[6] == 2 && v[7] == 1, "GatherRaw %u %u %u %u, want 3 4 2 1", v[4], v[5], v[6], v[7]);
+    EXPECT(v[8] == 0 && v[9] == 100, "SampleCmpLevel 0.25 < 0.1: %u, 0.25 < 0.4: %u, want 0 100", v[8], v[9]);
+    rb->Release(); out->Release(); heap->Release(); tex[0]->Release(); tex[1]->Release(); upload->Release();
+    ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
     { "compute_dxil", test_compute_dxil },
     { "compute_dxbc", test_compute_dxbc },
     { "sm67", test_sm67 },
+    { "sm67_textures", test_sm67_textures },
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
