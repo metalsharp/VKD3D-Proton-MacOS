@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+/* 64-bit atomics on shared memory: 128 invocations add, take the minimum and maximum, and count through
+ * compare-exchange; each workgroup writes its results. */
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer B { uint64_t r[]; };
+shared uint64_t s_add, s_min, s_max, s_cas, s_xchg;
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    if (i == 0)
+    {
+        s_add = 0ul;
+        s_min = ~0ul;
+        s_max = 0ul;
+        s_cas = 0ul;
+        s_xchg = 0ul;
+    }
+    barrier();
+    uint64_t v = (uint64_t(i + 1) << 33) | uint64_t(gl_WorkGroupID.x);
+    atomicAdd(s_add, v);
+    atomicMin(s_min, v);
+    atomicMax(s_max, v);
+    uint64_t old = s_cas, prev;
+    while ((prev = atomicCompSwap(s_cas, old, old + 0x100000001ul)) != old)
+        old = prev;
+    atomicExchange(s_xchg, v);
+    barrier();
+    if (i == 0)
+    {
+        uint base = gl_WorkGroupID.x * 5;
+        r[base + 0] = s_add;
+        r[base + 1] = s_min;
+        r[base + 2] = s_max;
+        r[base + 3] = s_cas;
+        r[base + 4] = s_xchg;
+    }
+}

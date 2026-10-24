@@ -10796,7 +10796,7 @@ index 534a414f..3ae28a07 100644
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..2e608e1a 100644
+index 359f8a2b..9432a361 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -10826,16 +10826,18 @@ index 359f8a2b..2e608e1a 100644
  }
  
  
-@@ -178,7 +184,8 @@
+@@ -178,8 +184,9 @@
  		.storageBuffer8BitAccess = true,
  		.uniformAndStorageBuffer8BitAccess = true,
  		.storagePushConstant8 = true,
 -		.shaderBufferInt64Atomics = false,
+-		.shaderSharedInt64Atomics = false,
 +		// Emulated with a lock table in SPIRV-Cross (needs MSL 3.2 device-scope fences).
 +		.shaderBufferInt64Atomics = _metalFeatures.mslVersion >= 30200,
- 		.shaderSharedInt64Atomics = false,
++		.shaderSharedInt64Atomics = _metalFeatures.mslVersion >= 30200,	// Emulated with the 64-bit atomic lock table, like buffer atomics.
  		.shaderFloat16 = true,
  		.shaderInt8 = true,
+ 		.descriptorIndexing = _vulkan12NoExtFeatures.descriptorIndexing,
 @@ -572,6 +579,25 @@
  				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
  				break;

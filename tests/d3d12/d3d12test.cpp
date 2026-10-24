@@ -1914,6 +1914,68 @@ static bool test_native16bit()
     return true;
 }
 
+// 64-bit atomics on groupshared memory (SM 6.6): add, min, max and compare-exchange from 64 threads in 4 groups.
+static const char *cs_gs64_src = R"(
+RWStructuredBuffer<uint64_t> r : register(u0);
+groupshared uint64_t s_add, s_min, s_max, s_cas;
+[numthreads(64, 1, 1)]
+void main(uint i : SV_GroupIndex, uint g : SV_GroupID)
+{
+    if (i == 0) { s_add = 0; s_min = ~0ull; s_max = 0; s_cas = 0; }
+    GroupMemoryBarrierWithGroupSync();
+    uint64_t v = (uint64_t(i + 1) << 33) | g;
+    uint64_t prev;
+    InterlockedAdd(s_add, v, prev);
+    InterlockedMin(s_min, v, prev);
+    InterlockedMax(s_max, v, prev);
+    uint64_t old = s_cas;
+    while (true)
+    {
+        InterlockedCompareExchange(s_cas, old, old + 0x100000001ull, prev);
+        if (prev == old)
+            break;
+        old = prev;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (i == 0) { r[g * 4] = s_add; r[g * 4 + 1] = s_min; r[g * 4 + 2] = s_max; r[g * 4 + 3] = s_cas; }
+}
+)";
+
+static bool test_groupshared64()
+{
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(cs_gs64_src, "main", "cs_6_6"));
+    if (!rs || !ps)
+        return false;
+    const UINT groups = 4;
+    ID3D12Resource *buf = create_buffer(groups * 32, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->Dispatch(groups, 1, 1);
+    ID3D12Resource *rb;
+    const uint64_t *r = (const uint64_t *)read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, groups * 32, &rb);
+    if (!r)
+        return false;
+    for (UINT gi = 0; gi < groups; gi++)
+    {
+        uint64_t sum = 0;
+        for (UINT i = 0; i < 64; i++)
+            sum += ((uint64_t)(i + 1) << 33) | gi;
+        EXPECT(r[gi * 4] == sum, "group %u add %llx, want %llx", gi, (unsigned long long)r[gi * 4], (unsigned long long)sum);
+        EXPECT(r[gi * 4 + 1] == ((1ull << 33) | gi), "group %u min %llx", gi, (unsigned long long)r[gi * 4 + 1]);
+        EXPECT(r[gi * 4 + 2] == ((64ull << 33) | gi), "group %u max %llx", gi, (unsigned long long)r[gi * 4 + 2]);
+        EXPECT(r[gi * 4 + 3] == 64 * 0x100000001ull, "group %u compare-exchange %llx", gi, (unsigned long long)r[gi * 4 + 3]);
+    }
+    rb->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1934,6 +1996,7 @@ static const Test tests[] = {
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
     { "predication", test_predication },
     { "native16bit", test_native16bit },
+    { "groupshared64", test_groupshared64 },
 };
 
 int main(int argc, char **argv)
