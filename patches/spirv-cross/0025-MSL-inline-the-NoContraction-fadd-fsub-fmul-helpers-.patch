@@ -1,0 +1,77 @@
+From 15cd513ffdf84dc3e599adf1948e111507cd8334 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 23:52:00 -0600
+Subject: [PATCH 25/25] MSL: inline the NoContraction fadd/fsub/fmul helpers
+ instead of [[clang::optnone]]
+
+The explicit fma() already keeps them from contracting; optnone left them as real
+calls through the stack, costing about a third of fragment time in PEAK's shaders.
+---
+ spirv_msl.cpp | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index e3ada8ee..12ac8ff2 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -8032,9 +8032,12 @@ void CompilerMSL::emit_custom_functions()
+ 			break;
+ 
+ 		// "fadd" intrinsic support
++		// The explicit fma() already keeps these from contracting with neighbouring operations, so the
++		// helpers can be inlined. [[clang::optnone]] kept them as real calls through the stack, which
++		// cost about a third of the fragment time of shaders that use NoContraction heavily.
+ 		case SPVFuncImplFAdd:
+ 			statement("template<typename T>");
+-			statement("[[clang::optnone]] T spvFAdd(T l, T r)");
++			statement("static inline __attribute__((always_inline)) T spvFAdd(T l, T r)");
+ 			begin_scope();
+ 			statement("return fma(T(1), l, r);");
+ 			end_scope();
+@@ -8044,7 +8047,7 @@ void CompilerMSL::emit_custom_functions()
+ 		// "fsub" intrinsic support
+ 		case SPVFuncImplFSub:
+ 			statement("template<typename T>");
+-			statement("[[clang::optnone]] T spvFSub(T l, T r)");
++			statement("static inline __attribute__((always_inline)) T spvFSub(T l, T r)");
+ 			begin_scope();
+ 			statement("return fma(T(-1), r, l);");
+ 			end_scope();
+@@ -8054,14 +8057,14 @@ void CompilerMSL::emit_custom_functions()
+ 		// "fmul' intrinsic support
+ 		case SPVFuncImplFMul:
+ 			statement("template<typename T>");
+-			statement("[[clang::optnone]] T spvFMul(T l, T r)");
++			statement("static inline __attribute__((always_inline)) T spvFMul(T l, T r)");
+ 			begin_scope();
+ 			statement("return fma(l, r, T(0));");
+ 			end_scope();
+ 			statement("");
+ 
+ 			statement("template<typename T, int Cols, int Rows>");
+-			statement("[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix(vec<T, Rows> v, matrix<T, Cols, Rows> m)");
++			statement("static inline __attribute__((always_inline)) vec<T, Cols> spvFMulVectorMatrix(vec<T, Rows> v, matrix<T, Cols, Rows> m)");
+ 			begin_scope();
+ 			statement("vec<T, Cols> res = vec<T, Cols>(0);");
+ 			statement("for (uint i = Rows; i > 0; --i)");
+@@ -8078,7 +8081,7 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 
+ 			statement("template<typename T, int Cols, int Rows>");
+-			statement("[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector(matrix<T, Cols, Rows> m, vec<T, Cols> v)");
++			statement("static inline __attribute__((always_inline)) vec<T, Rows> spvFMulMatrixVector(matrix<T, Cols, Rows> m, vec<T, Cols> v)");
+ 			begin_scope();
+ 			statement("vec<T, Rows> res = vec<T, Rows>(0);");
+ 			statement("for (uint i = Cols; i > 0; --i)");
+@@ -8090,7 +8093,7 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 
+ 			statement("template<typename T, int LCols, int LRows, int RCols, int RRows>");
+-			statement("[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix(matrix<T, LCols, LRows> l, matrix<T, RCols, RRows> r)");
++			statement("static inline __attribute__((always_inline)) matrix<T, RCols, LRows> spvFMulMatrixMatrix(matrix<T, LCols, LRows> l, matrix<T, RCols, RRows> r)");
+ 			begin_scope();
+ 			statement("static_assert(LCols == RRows, \"column-row configuration mismatch\");");
+ 			statement("matrix<T, RCols, LRows> res;");
+-- 
+2.54.0 (Apple Git-157)
+

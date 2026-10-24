@@ -1,8 +1,8 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 1/7] vkd3d: Run on MoltenVK: optional transform feedback, VKMT
- texel alignment, Metal-safe decompression shaders.
+Subject: [PATCH 01/11] vkd3d: Run on MoltenVK: optional transform feedback,
+ VKMT texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
   device creation; SO statistics queries resolve to zero.
@@ -186,8 +186,8 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 2/7] Keep the transform feedback structures linked when stream
- output is disabled
+Subject: [PATCH 02/11] Keep the transform feedback structures linked when
+ stream output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
 the device is created with, which dropped every structure after them (robustness2 included).
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 3/7] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 03/11] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,8 +252,8 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 4/7] MoltenVK: emulated VRS tier 2 (full-rate shading) with a
- 16-pixel shading rate tile
+Subject: [PATCH 04/11] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+ a 16-pixel shading rate tile
 
 ---
  libs/vkd3d/device.c             | 3 +++
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 5/7] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 05/11] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,8 +329,8 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 6/7] MoltenVK: typed buffer views start at aligned offsets via
- the typed offset buffer (no env bypass)
+Subject: [PATCH 06/11] MoltenVK: typed buffer views start at aligned offsets
+ via the typed offset buffer (no env bypass)
 
 ---
  libs/vkd3d/device.c   | 14 ++++++++------
@@ -392,7 +392,7 @@ index a8fc26b1..bf474e86 100644
 From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 19:03:16 -0600
-Subject: [PATCH 7/7] MoltenVK: require transform feedback again
+Subject: [PATCH 07/11] MoltenVK: require transform feedback again
 
 The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
 copy of the vertex shader, counter buffers, overflow and stream queries), so
@@ -493,6 +493,281 @@ index 9c6839ea..4717e179 100644
      }
  
      single_storage_texel =
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 23 Oct 2026 23:25:55 -0600
+Subject: [PATCH 08/11] vkd3d: Typed resources that aren't UAVs only take views
+ of their format or its sRGB one.
+
+The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
+targets with MTLTextureUsagePixelFormatView, which costs Metal's lossless compression (a full-screen copy from such
+a texture takes about 2.9x as long on an M4).
+---
+ libs/vkd3d/resource.c | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index bf474e86..56118e03 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -369,6 +369,29 @@ static bool vkd3d_get_castable_format_compatibility_list(const struct d3d12_devi
+     return list->format_count != 0;
+ }
+ 
++static VkFormat vkd3d_vk_format_srgb_counterpart(VkFormat format)
++{
++    static const VkFormat pairs[][2] =
++    {
++        { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB },
++        { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB },
++        { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK },
++        { VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK },
++        { VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK },
++        { VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(pairs); i++)
++    {
++        if (pairs[i][0] == format)
++            return pairs[i][1];
++        if (pairs[i][1] == format)
++            return pairs[i][0];
++    }
++    return VK_FORMAT_UNDEFINED;
++}
++
+ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *device,
+         const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_format_compatibility_list *list, VkImageCreateFlags *vk_flags)
+ {
+@@ -390,6 +413,22 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
+     if (desc->Format < device->format_compatibility_list_count)
+         *list = device->format_compatibility_lists[desc->Format];
+ 
++    /* A typed resource that isn't a UAV only takes views of its format or the sRGB / UNORM one: the integer formats
++     * in its list serve UAV clears. Leaving them out lets drivers keep the image compressed (Metal can't, for views
++     * of other formats than sRGB ones). */
++    if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && format->type != VKD3D_FORMAT_TYPE_TYPELESS)
++    {
++        VkFormat srgb = vkd3d_vk_format_srgb_counterpart(format->vk_format);
++        unsigned int count = 0;
++
++        for (i = 0; i < list->format_count; i++)
++        {
++            if (list->vk_formats[i] == format->vk_format || list->vk_formats[i] == srgb)
++                list->vk_formats[count++] = list->vk_formats[i];
++        }
++        list->format_count = count;
++    }
++
+     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+     {
+         /* Legacy D3D11 compatibility rule that allows typed UAV loads on FL11.0 hardware.
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 23:52:01 -0600
+Subject: [PATCH 09/11] MoltenVK: root CBVs as push descriptors, no staggered
+ submits; fix EndRenderPass state tracking
+
+---
+ libs/vkd3d/command.c | 11 ++++++++++-
+ libs/vkd3d/state.c   |  5 ++++-
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8a632d2d..373cd989 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -20635,6 +20635,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginRenderPass(d3d12_command_l
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+ 
++    /* Set again below by the clears and resolves of this render pass. */
++    list->rendering_info.has_pending_render_pass_load_store_work = false;
++
+     /* It's possible we're attempting to resume an existing suspend in the same command buffer,
+      * however, it's not *necessarily* compatible because D3D12 render passes are being
+      * annoying as usual. */
+@@ -20923,7 +20926,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndRenderPass(d3d12_command_lis
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+     if (list->rendering_info.has_pending_render_pass_load_store_work &&
+-            !(list->rendering_info.info.flags & VKD3D_RENDERING_ACTIVE))
++            !(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
+     {
+         /* If we never started the render pass due to no draw calls,
+          * forcefully start it so that we can get the fused clears in the proper render pass,
+@@ -20960,6 +20963,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndRenderPass(d3d12_command_lis
+         d3d12_command_list_debug_mark_end_region(list);
+         list->is_inside_render_pass = false;
+         list->render_pass_flags = 0;
++        list->rendering_info.has_pending_render_pass_load_store_work = false;
+     }
+ }
+ 
+@@ -25283,6 +25287,11 @@ static bool d3d12_command_queue_needs_staggered_submissions(struct d3d12_command
+     if (command_queue->device->workarounds.tiler_suspend_resume)
+         return false;
+ 
++    /* MoltenVK has a single queue, which Metal runs in submission order: staggering only adds CPU waits for each
++     * chunk to complete, leaving one command buffer in flight at a time. */
++    if (command_queue->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++        return false;
++
+     pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
+ 
+     if (command_queue->vkd3d_queue->command_queue_count == 1)
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 1945f15a..b2e27034 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -7867,9 +7867,12 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
+      * The difference in performance is profound (~15% in some cases).
+      * On ACO, BDA with NonWritable can be promoted directly to scalar loads,
+      * which is great. */
++    /* On MoltenVK, push descriptor CBVs become Metal constant buffers, which read 1.5-1.7x as fast as constants
++     * through buffer device addresses on Apple GPUs. */
+     if (VKD3D_CONFIG_FLAG_IS_SET(FORCE_RAW_VA_CBV) ||
+             (device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_NVIDIA &&
+-	     device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_QUALCOMM))
++	     device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_QUALCOMM &&
++	     device_info->vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK))
+         flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV;
+ 
+     if (device_info->properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA &&
+-- 
+2.54.0 (Apple Git-157)
+
+
+From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 00:34:44 -0600
+Subject: [PATCH 10/11] swapchain: on MoltenVK, release the frame latency
+ waitable at GPU completion instead of present wait
+
+MoltenVK completes present waits once the frame is on screen, which serialized
+Unity's CPU frame with the GPU frame. VKD3D_SWAPCHAIN_PRESENT_WAIT=1 restores it.
+---
+ libs/vkd3d/swapchain.c | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 4d3e1bf4..6b0639ba 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1434,6 +1434,7 @@ static void dxgi_vk_swap_chain_update_wait_timing_capabilities(struct dxgi_vk_sw
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     VkPresentTimingSurfaceCapabilitiesEXT present_timing_caps;
++    bool no_present_wait = false;
+     VkPresentStageFlagBitsEXT primary_stage, secondary_stage;
+     struct d3d12_device *device = chain->queue->device;
+     VkSurfaceCapabilitiesPresentWait2KHR wait2_caps;
+@@ -1482,16 +1483,29 @@ static void dxgi_vk_swap_chain_update_wait_timing_capabilities(struct dxgi_vk_sw
+     VK_CALL(vkGetPhysicalDeviceSurfaceCapabilities2KHR(vk_physical_device, &surface_info2, &caps2));
+ 
+     chain->present.wait2 = id2_caps.presentId2Supported && wait2_caps.presentWait2Supported;
++
++    /* MoltenVK completes present waits from the drawable's presented handler, once the frame is on
++     * screen. Gating the latency waitable on that serializes the app's CPU frame with the GPU frame
++     * (Unity waits on it before recording the next frame). Releasing it when the present blit
++     * completes on the GPU, as Windows does, lets them overlap. VKD3D_SWAPCHAIN_PRESENT_WAIT=1 restores it. */
++    if (chain->queue->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++    {
++        char env[16];
++        if (!vkd3d_get_env_var("VKD3D_SWAPCHAIN_PRESENT_WAIT", env, sizeof(env)) || strcmp(env, "1") != 0)
++            no_present_wait = true;
++    }
++    if (no_present_wait)
++        chain->present.wait2 = false;
+     chain->present.timing = chain->present.wait2 && present_timing_caps.presentTimingSupported &&
+             (present_timing_caps.presentStageQueries & useful_present_stages);
+     chain->present.timing_relative = chain->present.timing && present_timing_caps.presentAtRelativeTimeSupported;
+     chain->present.timing_absolute = chain->present.timing && present_timing_caps.presentAtAbsoluteTimeSupported;
+ 
+-    chain->present.wait =
+-            chain->queue->device->device_info.present_wait_features.presentWait ||
+-            chain->present.wait2;
++    chain->present.wait = !no_present_wait &&
++            (chain->queue->device->device_info.present_wait_features.presentWait ||
++            chain->present.wait2);
+ 
+-    if (!chain->present.wait)
++    if (!chain->present.wait && !no_present_wait)
+         FIXME_ONCE("Implementation supports neither present_wait1 or present_wait2. Latency will increase.\n");
+ 
+     if (!chain->present.timing_relative)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 00:47:45 -0600
+Subject: [PATCH 11/11] swapchain: log the app's frame latency;
+ VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
+
+---
+ libs/vkd3d/swapchain.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 6b0639ba..382c7b4d 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -918,6 +918,23 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetGammaControl(IDXGIVkSwapC
+     return E_NOTIMPL;
+ }
+ 
++/* VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises the latency the frame latency waitable allows, for
++ * applications whose CPU frame otherwise cannot overlap the previous GPU frame. */
++static UINT dxgi_vk_swap_chain_min_frame_latency(void)
++{
++    static UINT min_latency;
++    char env[8];
++
++    if (!min_latency)
++    {
++        UINT value = 1;
++        if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY", env, sizeof(env)))
++            value = strtoul(env, NULL, 0);
++        min_latency = max(1, min(value, DXGI_MAX_SWAP_CHAIN_BUFFERS));
++    }
++    return min_latency;
++}
++
+ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapChain2 *iface, UINT MaxLatency)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+@@ -937,6 +954,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapC
+         return DXGI_ERROR_INVALID_CALL;
+     }
+ 
++    INFO("Application sets maximum frame latency %u.\n", MaxLatency);
++    MaxLatency = max(MaxLatency, dxgi_vk_swap_chain_min_frame_latency());
++
+     /* Only increasing the latency is handled here; apparently it is
+      * the application's responsibility to reduce the semaphore value
+      * in case the latency gets reduced. */
+@@ -1582,8 +1602,8 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
+ 
+     if (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+     {
+-        INFO("Enabling frame latency handles.\n");
+-        chain->frame_latency = 1;
++        chain->frame_latency = dxgi_vk_swap_chain_min_frame_latency();
++        INFO("Enabling frame latency handles (initial latency %u).\n", chain->frame_latency);
+ 
+         if (FAILED(hr = vkd3d_native_sync_handle_create(chain->frame_latency,
+                 VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE, &chain->frame_latency_event)))
 -- 
 2.54.0 (Apple Git-157)
 
