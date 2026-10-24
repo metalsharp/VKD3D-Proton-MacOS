@@ -1564,6 +1564,122 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
     return run_streamoutput("DXBC", compile_fxc(src, "vs", "vs_5_0"), compile_fxc(src, "ps", "ps_5_0")) && ok;
 }
 
+// Stream output from a geometry shader (DXIL and DXBC), without render targets or rasterization: each point
+// becomes a strip of 2 + id % 3 vertexes (0, 1 or 2 triangles), streamed out in order with the strips
+// decomposed into triangles.
+static bool run_gs_streamoutput(const char *what, const std::vector<char> &vs, const std::vector<char> &gs, const std::vector<char> &ps)
+{
+    if (vs.empty() || gs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_SO_DECLARATION_ENTRY decl[1] = { { 0, "TEXCOORD", 0, 0, 4, 0 } };
+    UINT strides[1] = { 16 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.GS = { gs.data(), gs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.StreamOutput = { decl, 1, strides, 1, D3D12_SO_NO_RASTERIZED_STREAM };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT64 size = 4096;
+    ID3D12Resource *upload = create_buffer(size, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    for (UINT i = 0; i < size / 4; i++)
+        init[i] = 0xdeadbeef;
+    memset(init, 0, 16);
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *so = create_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(so, 0, upload, 0, size);
+    transition(so, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    D3D12_QUERY_HEAP_DESC qhd = { D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1 };
+    ID3D12QueryHeap *qh = nullptr;
+    CHECK_HR(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)));
+    ID3D12Resource *qres = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+
+    // A stream output only pass: no render targets (VKD3D-Proton then renders into the largest framebuffer).
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { so->GetGPUVirtualAddress() + 256, 2048, so->GetGPUVirtualAddress() };
+    g.list->SOSetTargets(0, 1, &view);
+    g.list->BeginQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    g.list->DrawInstanced(6, 1, 0, 0);
+    g.list->EndQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    g.list->SOSetTargets(0, 0, nullptr);
+    g.list->ResolveQueryData(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 1, qres, 0);
+    ID3D12Resource *sorb = nullptr;
+    const uint32_t *d = read_buffer(so, D3D12_RESOURCE_STATE_STREAM_OUT, size, &sorb);
+    if (!d)
+        return false;
+
+    // Points 1, 2, 4, 5 make 1, 2, 1, 2 triangles: 6 triangles, 18 vertexes.
+    EXPECT(d[0] == 18 * 16, "%s: filled size %u, want %u", what, d[0], 18 * 16);
+    UINT t = 0;
+    for (UINT p = 0; p < 6; p++)
+        for (UINT tri = 0; tri < p % 3; tri++, t++)
+        {
+            UINT k[3] = { tri, tri + 1 + (tri & 1), tri + 2 - (tri & 1) };
+            for (UINT j = 0; j < 3; j++)
+            {
+                const float *v = (const float *)&d[(256 + 16 * (3 * t + j)) / 4];
+                EXPECT(v[0] == p && v[1] == k[j] && v[3] == 5.0f, "%s: triangle %u vertex %u = (%g %g %g %g), want (%u %u * 5)",
+                       what, t, j, v[0], v[1], v[2], v[3], p, k[j]);
+            }
+        }
+    EXPECT(d[(256 + 18 * 16) / 4] == 0xdeadbeef, "%s: written past the filled size", what);
+    const UINT64 *q = nullptr;
+    D3D12_RANGE qr = { 0, 16 };
+    qres->Map(0, &qr, (void **)&q);
+    EXPECT(q[0] == 6 && q[1] == 6, "%s: SO statistics %llu written / %llu needed, want 6 / 6", what,
+           (unsigned long long)q[0], (unsigned long long)q[1]);
+    qres->Release(); qh->Release(); sorb->Release(); so->Release(); upload->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static const char *gs_so_src = R"(
+struct V { float4 pos : SV_Position; uint id : ID; };
+V vs(uint id : SV_VertexID) { V v; v.pos = float4(0, 0, 0, 1); v.id = id; return v; }
+struct O { float4 pos : SV_Position; float4 t : TEXCOORD0; };
+[maxvertexcount(4)]
+void gs(point V input[1], inout TriangleStream<O> stream)
+{
+    uint n = 2 + input[0].id % 3;
+    for (uint k = 0; k < n; k++)
+    {
+        O o;
+        o.pos = float4(k * 0.5 - 1, (k & 1) * 0.5, 0, 1);
+        o.t = float4(input[0].id, k, 0, 5);
+        stream.Append(o);
+    }
+}
+float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
+)";
+
+static bool test_gs_streamoutput_dxil()
+{
+    return run_gs_streamoutput("DXIL", compile_dxc(gs_so_src, "vs", "vs_6_0"), compile_dxc(gs_so_src, "gs", "gs_6_0"),
+                               compile_dxc(gs_so_src, "ps", "ps_6_0"));
+}
+
+static bool test_gs_streamoutput_dxbc()
+{
+    return run_gs_streamoutput("DXBC", compile_fxc(gs_so_src, "vs", "vs_5_0"), compile_fxc(gs_so_src, "gs", "gs_5_0"),
+                               compile_fxc(gs_so_src, "ps", "ps_5_0"));
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -1580,6 +1696,8 @@ static const Test tests[] = {
     { "robust", test_robust },
     { "logicop", test_logicop },
     { "streamoutput", test_streamoutput },
+    { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
+    { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
 };
 
 int main(int argc, char **argv)

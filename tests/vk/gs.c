@@ -1,13 +1,17 @@
 /* GPU test: geometry shaders (run as Metal object and mesh stages): point to quad expansion, instancing,
  * triangle strip output winding (with front faces culled), the primitive ID and input vertex order for
  * triangle lists, strips and fans, indexed draws, line lists and strips with point output, and lines and
- * triangles with adjacency (lists and a triangle strip), and indirect (and indirect count) draws. */
+ * triangles with adjacency (lists and a triangle strip), indirect (and indirect count) draws, and transform
+ * feedback from an instanced geometry shader (ordered by input primitive and invocation, strips decomposed,
+ * overflow, the stream query). */
 #include "vkcommon.h"
 
 #define W 16
 #define H 16
 
 struct gsctx { struct vkctx c; VkPipelineLayout layout; VkShaderModule vs, fs; struct vkimg rt; const char *dir; };
+
+static int no_attachments;
 
 static VkPipeline make_pipeline(struct gsctx *g, const char *geom, VkPrimitiveTopology topology, VkCullModeFlags cull)
 {
@@ -32,7 +36,9 @@ static VkPipeline make_pipeline(struct gsctx *g, const char *geom, VkPrimitiveTo
     VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn };
     VkFormat color = VK_FORMAT_R8G8B8A8_UINT;
-    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &color };
+    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, no_attachments ? 0 : 1, &color };
+    if (no_attachments)
+        blend.attachmentCount = 0;
     VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, 3, stages, &vi, &ia, NULL, &vp, &rs, &ms, &ds,
                                          &blend, &dy, g->layout };
     VkPipeline p;
@@ -148,10 +154,12 @@ int main(int argc, char **argv)
     struct gsctx g = { 0 };
     g.dir = argc > 1 ? argv[1] : ".";
     char path[1024];
-    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT xf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT };
+    xf.transformFeedback = VK_TRUE;
+    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &xf };
     f2.features.geometryShader = VK_TRUE;
-    static const char *const de[] = { "VK_KHR_portability_subset" };
-    vkctx_init(&g.c, &f2, de, 1);
+    static const char *const de[] = { "VK_KHR_portability_subset", "VK_EXT_transform_feedback" };
+    vkctx_init(&g.c, &f2, de, 2);
     VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, 8 };
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL, 1, &pcr };
     CHECK(vkCreatePipelineLayout(g.c.device, &pli, NULL, &g.layout));
@@ -260,6 +268,99 @@ int main(int argc, char **argv)
     px = draw_args(&g, tri, 1, INDIRECT_COUNT, dic, 2, 1, indices, 6);
     expect_px("indexed indirect count (1 of 2)", px, 1, 4, 1, 1, 2, 3);
     expect_px("indexed indirect count (1 of 2)", px, 9, 2, 0, 0, 0, 0);
+
+    /* Transform feedback: 6 points, 2 invocations each; point p emits a strip of 2 + p % 3 vertexes. Then again
+     * with room for 10 of the 12 triangles in the position buffer. */
+    PFN_vkCmdBindTransformFeedbackBuffersEXT bind = (void *)vkGetDeviceProcAddr(g.c.device, "vkCmdBindTransformFeedbackBuffersEXT");
+    PFN_vkCmdBeginTransformFeedbackEXT xfb_begin = (void *)vkGetDeviceProcAddr(g.c.device, "vkCmdBeginTransformFeedbackEXT");
+    PFN_vkCmdEndTransformFeedbackEXT xfb_end = (void *)vkGetDeviceProcAddr(g.c.device, "vkCmdEndTransformFeedbackEXT");
+    PFN_vkCmdBeginQueryIndexedEXT begin_query = (void *)vkGetDeviceProcAddr(g.c.device, "vkCmdBeginQueryIndexedEXT");
+    PFN_vkCmdEndQueryIndexedEXT end_query = (void *)vkGetDeviceProcAddr(g.c.device, "vkCmdEndQueryIndexedEXT");
+    VkPipeline xfbp = make_pipeline(&g, "gs_xfb", VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_CULL_MODE_NONE);
+    VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 1 };
+    VkQueryPool qp;
+    CHECK(vkCreateQueryPool(g.c.device, &qpi, NULL, &qp));
+    VkBufferUsageFlags xfb_usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
+    no_attachments = 1;
+    VkPipeline xfbp_noatt = make_pipeline(&g, "gs_xfb", VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_CULL_MODE_NONE);
+    no_attachments = 0;
+    for (int overflow = 0; overflow < 4; overflow++)
+    {
+        /* The third run renders without attachments (in the largest framebuffer), the fourth with a null color attachment. */
+        int attachmentless = overflow == 2, null_view = overflow == 3;
+        struct vkbuf b0 = vkctx_buffer(&g.c, 1024, xfb_usage), b1 = vkctx_buffer(&g.c, 1024, xfb_usage);
+        struct vkbuf cnt = vkctx_buffer(&g.c, 64, xfb_usage);
+        memset(b0.map, 0xff, 1024);
+        memset(b1.map, 0xff, 1024);
+        memset(cnt.map, 0, 64);
+        VkCommandBuffer cb = vkctx_begin(&g.c);
+        vkCmdResetQueryPool(cb, qp, 0, 1);
+        vkctx_barrier(cb, g.rt.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, null_view ? VK_NULL_HANDLE : g.rt.view,
+                                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo rinfo = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { W, H } }, 1, 0, attachmentless ? 0 : 1, &att };
+        if (attachmentless)
+        {
+            /* Like VKD3D-Proton without render targets: the largest framebuffer. */
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(g.c.physical, &props);
+            rinfo.renderArea.extent.width = props.limits.maxFramebufferWidth;
+            rinfo.renderArea.extent.height = props.limits.maxFramebufferHeight;
+            rinfo.layerCount = props.limits.maxFramebufferLayers;
+        }
+        vkCmdBeginRendering(cb, &rinfo);
+        VkViewport v = { 0, 0, W, H, 0, 1 };
+        VkRect2D s = { { 0, 0 }, { W, H } };
+        vkCmdSetViewport(cb, 0, 1, &v);
+        vkCmdSetScissor(cb, 0, 1, &s);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, attachmentless ? xfbp_noatt : xfbp);
+        uint32_t pc[2] = { 0, 0 };
+        vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT, 0, sizeof(pc), pc);
+        VkBuffer bufs[2] = { b0.buffer, b1.buffer };
+        VkDeviceSize offs[2] = { 0, 0 }, sizes[2] = { 1024, overflow == 1 ? 10 * 48 : 1024 };
+        bind(cb, 0, 2, bufs, offs, sizes);
+        VkBuffer counters[2] = { cnt.buffer, cnt.buffer };
+        VkDeviceSize counter_offsets[2] = { 0, 4 };
+        begin_query(cb, qp, 0, 0, 0);
+        xfb_begin(cb, 0, 0, NULL, NULL);
+        vkCmdDraw(cb, 6, 1, 0, 0);
+        xfb_end(cb, 0, 2, counters, counter_offsets);
+        end_query(cb, qp, 0, 0);
+        vkCmdEndRendering(cb);
+        vkctx_submit(&g.c, cb);
+
+        const char *what = null_view ? "xfb with a null color attachment" : attachmentless ? "xfb without attachments" :
+                           overflow ? "xfb overflow" : "xfb";
+        unsigned expected = overflow == 1 ? 10 : 12, t = 0;
+        char name[128];
+        for (unsigned p = 0; p < 6; p++)
+            for (unsigned inv = 0; inv < 2; inv++)
+                for (unsigned tri = 0; tri < p % 3; tri++, t++)
+                {
+                    unsigned k[3] = { tri, tri + 1 + (tri & 1), tri + 2 - (tri & 1) };
+                    for (unsigned j = 0; j < 3; j++)
+                    {
+                        const float *o = (const float *)b0.map + 4 * (3 * t + j), *pos = (const float *)b1.map + 4 * (3 * t + j);
+                        int want = t < expected;
+                        int ok = o[0] == p && o[1] == k[j] && o[2] == inv && o[3] == 1.0f && pos[0] == -1.0f + 0.5f * k[j] &&
+                                 pos[1] == -1.0f + 0.25f * (p + (k[j] & 1));
+                        if (!want)
+                            ok = ((const uint32_t *)pos)[0] == 0xffffffffu;
+                        snprintf(name, sizeof(name), "%s: triangle %u vertex %u (point %u, invocation %u): (%g %g %g %g) at (%g %g)",
+                                 what, t, j, p, inv, o[0], o[1], o[2], o[3], pos[0], pos[1]);
+                        EXPECT_EQ(name, ok, 1);
+                    }
+                }
+        uint64_t q[2] = { 0 };
+        CHECK(vkGetQueryPoolResults(g.c.device, qp, 0, 1, sizeof(q), q, sizeof(q), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        printf("%s: %llu written, %llu needed; counters %u %u\n", what, (unsigned long long)q[0], (unsigned long long)q[1],
+               ((uint32_t *)cnt.map)[0], ((uint32_t *)cnt.map)[1]);
+        EXPECT_EQ("xfb primitives written", q[0], expected);
+        EXPECT_EQ("xfb primitives needed", q[1], 12);
+        EXPECT_EQ("xfb counter 0", ((uint32_t *)cnt.map)[0], expected * 48);
+        EXPECT_EQ("xfb counter 1", ((uint32_t *)cnt.map)[1], expected * 48);
+    }
 
     printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

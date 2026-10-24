@@ -1,0 +1,375 @@
+From 5954761ab4f81bd002d9c0aa565d37f766b62a00 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 20:13:08 -0600
+Subject: [PATCH 21/21] MSL: transform feedback from geometry shaders run as
+ mesh stages
+
+- A geometry shader with Xfb takes a spvXfbGeometry state (xfb_geometry_buffer_index):
+  in count mode it records the primitives of each input primitive and invocation
+  (ordered by instance, input primitive, invocation) and emits none; in capture
+  mode each completed primitive is written, in the strip's order, at the
+  exclusive prefix sum of the counts plus its index, if it fits in every buffer.
+  The first invocation records written / needed primitives and bytes.
+- The payload's primitive fields (ID, instance, primitive count) come before the
+  vertexes, whose layout the two stages declare separately.
+- Geometry shader helper functions return their values (only the entry point
+  returns void), and only gl_InvocationID and gl_PrimitiveIDIn are passed from
+  the mesh wrapper (per-vertex builtins come with the stage input).
+---
+ spirv_msl.cpp | 192 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ spirv_msl.hpp |  28 ++++++++
+ 2 files changed, 213 insertions(+), 7 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 567308d0..6b95b9f5 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2144,10 +2144,13 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		auto out_var_type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
+ 
+ 		// Emit the payload struct
++		// The primitive's fields come first: the mesh stage declares the vertexes from the interface it reads.
+ 		statement("struct Payload");
+ 		begin_scope();
+-		statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
+ 		statement("uint primitiveId;");
++		statement("uint instance;");
++		statement("uint primitiveCount;");
++		statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
+ 		if (msl_options.conservative_raster_mesh)
+ 		{
+ 			statement("float2 conservativeExtent;");
+@@ -2384,6 +2387,8 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 			statement("payload.conservativeFlags = drawInfo->conservativeFlags;");
+ 		}
+ 		statement("payload.primitiveId = positionInGrid.x;");
++		statement("payload.instance = positionInGrid.y;");
++		statement("payload.primitiveCount = drawInfo->primitiveCount;");
+ 		statement("meshGridProperties.set_threadgroups_per_grid(uint3(", std::max(msl_options.geometry_invocations, 1u), ", 1, 1));");
+ 
+ 		end_scope();
+@@ -2421,8 +2426,10 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 
+ 		end_scope(";");
+ 
+-		statement(join("payload_vertex vertices[", std::to_string(vertex_count_in_primitive(geometry_input_primitive(execution.flags))), "];"));
+ 		statement("uint primitiveId;");
++		statement("uint instance;");
++		statement("uint primitiveCount;");
++		statement(join("payload_vertex vertices[", std::to_string(vertex_count_in_primitive(geometry_input_primitive(execution.flags))), "];"));
+ 		end_scope(";");
+ 
+ 		// Mesh entry point.
+@@ -2444,6 +2451,8 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 		for (auto &decl : arg_buffer_decls)
+ 			statement(decl);
+ 
++		if (needs_geometry_transform_feedback())
++			statement("constant spvXfbGeometry& spvXfbGeom [[buffer(", msl_options.xfb_geometry_buffer_index, ")]],");
+ 		statement("uint lid [[thread_index_in_threadgroup]], uint tid [[threadgroup_position_in_grid]])");
+ 
+ 		begin_scope();
+@@ -2549,7 +2558,12 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 
+ 		end_scope();
+ 
+-		statement(join(execution.name, "(outputMesh", stage_in_var_id ? ", " + to_name(stage_in_var_id) : string()));
++		// Captures are ordered by instance, then input primitive, then invocation.
++		string xfb_args;
++		if (needs_geometry_transform_feedback())
++			xfb_args = join(", spvXfbGeom, (payload.instance * payload.primitiveCount + payload.primitiveId) * ",
++			                std::max(execution.invocations, 1u), "u + tid");
++		statement(join(execution.name, "(outputMesh", xfb_args, stage_in_var_id ? ", " + to_name(stage_in_var_id) : string()));
+ 		for (auto &name : arg_buffer_names)
+ 			statement(", ", name);
+ 		// Same order as entry_point_args_discrete_descriptors().
+@@ -2561,10 +2575,11 @@ void CompilerMSL::emit_mesh_wrapper() {
+ 				return;
+ 			if (has_decoration(get<SPIRType>(var.basetype).self, DecorationBlock) || mesh_geometry_input_block_vars.count(var_id))
+ 				return;
++			// Per-vertex builtins (gl_in[]) come with the stage input.
+ 			switch (get_decoration(var_id, DecorationBuiltIn)) {
+ 			case BuiltInInvocationId: statement(", tid"); break;
+ 			case BuiltInPrimitiveId: statement(", payload.primitiveId"); break;
+-			default: statement(", 0 /* Unhandled builtin ", get_decoration(var_id, DecorationBuiltIn), " */"); break;
++			default: break;
+ 			}
+ 		});
+ 
+@@ -2755,12 +2770,50 @@ string CompilerMSL::compile()
+ 	// Add fixup hooks required by shader inputs and outputs. This needs to happen before
+ 	// the loop, so the hooks aren't added multiple times.
+ 	fix_up_shader_inputs_outputs();
++	if (needs_geometry_transform_feedback())
++		analyze_geometry_xfb();
+ 
+ 	if (execution.model == ExecutionModelGeometry) {
+ 		auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
+ 
+ 		entry_func.fixup_hooks_in.push_back([=]() {
+ 			statement("mesh_stream_t meshStream(spvMeshOut, ", to_name(stage_out_var_id),", ", to_name(stage_out_mesh_primitive_var_id) ,");");
++			if (needs_geometry_transform_feedback())
++			{
++				// The state is { offset[4], size[4], written, needed, bytes[4] } (see MoltenVK's transform feedback).
++				uint32_t vpp = geometry_xfb_vertices_per_primitive();
++				statement("uint spvXfbMode = spvXfbGeom.mode;");
++				statement("device uint* spvXfbCounts = reinterpret_cast<device uint*>(spvXfbGeom.counts);");
++				statement("device uint* spvXfbState = reinterpret_cast<device uint*>(spvXfbGeom.state);");
++				statement("if (spvXfbMode == 1) meshStream.xfbCount = spvXfbCounts + spvXfbLinear;");
++				statement("uint spvXfbBase = 0, spvXfbWritten = 0;");
++				statement("if (spvXfbMode == 2)");
++				begin_scope();
++				statement("spvXfbBase = spvXfbCounts[spvXfbLinear];");
++				statement("uint spvXfbTotal = spvXfbCounts[spvXfbGeom.countSize];");
++				statement("uint spvXfbCap = 0xffffffffu;");
++				for (uint32_t b = 0; b < 4; b++)
++					if (geometry_xfb_strides[b])
++						statement("spvXfbCap = min(spvXfbCap, spvXfbState[", 4 + b, "] > spvXfbState[", b, "] ? (spvXfbState[", 4 + b,
++						          "] - spvXfbState[", b, "]) / ", geometry_xfb_strides[b] * vpp, "u : 0u);");
++				statement("spvXfbWritten = min(spvXfbTotal, spvXfbCap);");
++				statement("if (spvXfbLinear == 0)");
++				begin_scope();
++				statement("spvXfbState[8] = spvXfbWritten;");
++				statement("spvXfbState[9] = spvXfbTotal;");
++				for (uint32_t b = 0; b < 4; b++)
++					if (geometry_xfb_strides[b])
++						statement("spvXfbState[", 10 + b, "] = spvXfbWritten * ", geometry_xfb_strides[b] * vpp, "u;");
++				end_scope();
++				end_scope();
++				for (uint32_t i = 0; i < geometry_xfb_outputs.size(); i++)
++				{
++					auto &o = geometry_xfb_outputs[i];
++					auto &type = get_variable_data_type(get<SPIRVariable>(o.var_id));
++					auto &value_type = o.member == ~0u ? type : get<SPIRType>(type.member_types[o.member]);
++					statement(type_to_glsl(value_type), " spvXfbRing", i, "[3];");
++				}
++			}
+ 		});
+ 	}
+ 
+@@ -2807,6 +2860,18 @@ string CompilerMSL::compile()
+ 			auto prim_type = type_to_glsl(get_variable_data_type(get<SPIRVariable>(stage_out_mesh_primitive_var_id)));
+ 
+ 			statement("enum { VERTEX_COUNT = ", std::to_string(execution.output_vertices), ", PRIMITIVE_COUNT = ", std::to_string(output_primitives), "};");
++			if (needs_geometry_transform_feedback())
++			{
++				statement("struct spvXfbGeometry");
++				begin_scope();
++				statement("uint mode;");
++				statement("uint countSize;");
++				statement("ulong counts;");
++				statement("ulong state;");
++				statement("ulong buffers[4];");
++				end_scope_decl();
++				statement("");
++			}
+ 			statement("using mesh_stream_t = spvMeshStream<", vertex_type, ", ", prim_type, ", VERTEX_COUNT, PRIMITIVE_COUNT, metal::topology::", topology, ">;");
+ 		}
+ 
+@@ -7395,9 +7460,12 @@ void CompilerMSL::emit_custom_templates()
+ 			begin_scope();
+ 			end_scope();
+ 
++			// Counting transform feedback primitives: record them, and emit none.
++			statement("device uint* xfbCount = nullptr;");
+ 			statement("~spvMeshStream()");
+ 			begin_scope();
+-			statement("meshOut.set_primitive_count(currentPrimitive);");
++			statement("if (xfbCount) *xfbCount = currentPrimitive;");
++			statement("meshOut.set_primitive_count(xfbCount ? 0 : currentPrimitive);");
+ 			end_scope();
+ 
+ 			statement("int VperP()");
+@@ -13009,7 +13077,53 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpEmitVertex:
+ 	{
+ 		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		if (!needs_geometry_transform_feedback())
++		{
++			statement("meshStream.EmitVertex();");
++			break;
++		}
++		// Keep the captured outputs of the last three vertexes; capture each primitive once it is complete,
++		// in the strip's order (odd triangles swap their last two vertexes).
++		uint32_t vpp = geometry_xfb_vertices_per_primitive();
++		statement("if (spvXfbMode == 2)");
++		begin_scope();
++		for (uint32_t i = 0; i < geometry_xfb_outputs.size(); i++)
++			statement("spvXfbRing", i, "[meshStream.currentVertex % 3] = ", geometry_xfb_expression(geometry_xfb_outputs[i]), ";");
++		end_scope();
+ 		statement("meshStream.EmitVertex();");
++		statement("if (spvXfbMode == 2 && meshStream.currentVertexInPrimitive >= meshStream.VperP())");
++		begin_scope();
++		statement("uint spvXfbPrim = spvXfbBase + uint(meshStream.currentPrimitive - 1);");
++		statement("if (spvXfbPrim < spvXfbWritten)");
++		begin_scope();
++		statement("int spvXfbCv = meshStream.currentVertex;");
++		if (vpp == 3)
++		{
++			statement("bool spvXfbOdd = (meshStream.currentVertexInPrimitive - 3) & 1;");
++			statement("int spvXfbV[3] = { spvXfbCv - 3, spvXfbOdd ? spvXfbCv - 1 : spvXfbCv - 2, spvXfbOdd ? spvXfbCv - 2 : spvXfbCv - 1 };");
++		}
++		else if (vpp == 2)
++			statement("int spvXfbV[2] = { spvXfbCv - 2, spvXfbCv - 1 };");
++		else
++			statement("int spvXfbV[1] = { spvXfbCv - 1 };");
++		statement("for (uint spvXfbK = 0; spvXfbK < ", vpp, "u; spvXfbK++)");
++		begin_scope();
++		statement("uint spvXfbR = uint(spvXfbV[spvXfbK]) % 3u;");
++		for (uint32_t i = 0; i < geometry_xfb_outputs.size(); i++)
++		{
++			auto &o = geometry_xfb_outputs[i];
++			auto &type = get_variable_data_type(get<SPIRVariable>(o.var_id));
++			auto &value_type = o.member == ~0u ? type : get<SPIRType>(type.member_types[o.member]);
++			string t = type_to_glsl(value_type);
++			if (value_type.vecsize > 1)
++				t = "packed_" + t;
++			statement("*reinterpret_cast<device ", t, "*>(reinterpret_cast<device uchar*>(spvXfbGeom.buffers[", o.buffer,
++			          "]) + spvXfbState[", o.buffer, "] + (spvXfbPrim * ", vpp, "u + spvXfbK) * ", geometry_xfb_strides[o.buffer],
++			          "u + ", o.offset, "u) = spvXfbRing", i, "[spvXfbR];");
++		}
++		end_scope();
++		end_scope();
++		end_scope();
+ 		break;
+ 	}
+ 
+@@ -14689,7 +14803,13 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
+ 		else
+ 			args += entry_point_args_classic(!func.arguments.empty());
+ 		if (geometry_mesh)
+-			decl += args.empty() && func.arguments.empty() ? "mesh_stream_t::mesh_t spvMeshOut" : "mesh_stream_t::mesh_t spvMeshOut, ";
++		{
++			decl += "mesh_stream_t::mesh_t spvMeshOut";
++			if (needs_geometry_transform_feedback())
++				decl += ", constant spvXfbGeometry& spvXfbGeom, uint spvXfbLinear";
++			if (!args.empty() || !func.arguments.empty())
++				decl += ", ";
++		}
+ 		decl += args;
+ 
+ 		// append entry point args to avoid conflicts in local variable names.
+@@ -17153,8 +17273,9 @@ bool CompilerMSL::entry_point_requires_const_device_buffers() const
+ // entry type if the current function is the entry point function
+ string CompilerMSL::func_type_decl(SPIRType &type)
+ {
++	// A geometry shader's entry point emits through the mesh stream; its other functions return as usual.
+ 	auto &execution = get_entry_point();
+-	if (execution.model == ExecutionModelGeometry)
++	if (execution.model == ExecutionModelGeometry && processing_entry_point)
+ 		return "void";
+ 
+ 	// The regular function return type. If not processing the entry point function, that's all we need
+@@ -24093,6 +24214,63 @@ void CompilerMSL::activate_argument_buffer_resources()
+ 	});
+ }
+ 
++void CompilerMSL::analyze_geometry_xfb()
++{
++	geometry_xfb_outputs.clear();
++	for (auto &stride : geometry_xfb_strides)
++		stride = 0;
++	ir.for_each_typed_id<SPIRVariable>([&](uint32_t self, SPIRVariable &var) {
++		if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(self))
++			return;
++		auto &type = get_variable_data_type(var);
++		uint32_t buffer = get_decoration(self, DecorationXfbBuffer);
++		uint32_t stride = get_decoration(self, DecorationXfbStride);
++		auto add = [&](uint32_t member, uint32_t buf, uint32_t offset, uint32_t str) {
++			if (buf >= 4)
++				SPIRV_CROSS_THROW("Transform feedback buffer out of range.");
++			geometry_xfb_outputs.push_back({ self, member, buf, offset });
++			if (str)
++				geometry_xfb_strides[buf] = str;
++		};
++		if (type.basetype == SPIRType::Struct && has_decoration(type.self, DecorationBlock))
++		{
++			for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
++			{
++				if (!has_member_decoration(type.self, i, DecorationOffset))
++					continue;
++				uint32_t buf = has_member_decoration(type.self, i, DecorationXfbBuffer) ?
++				               get_member_decoration(type.self, i, DecorationXfbBuffer) : buffer;
++				uint32_t str = has_member_decoration(type.self, i, DecorationXfbStride) ?
++				               get_member_decoration(type.self, i, DecorationXfbStride) : stride;
++				add(i, buf, get_member_decoration(type.self, i, DecorationOffset), str);
++			}
++		}
++		else if (has_decoration(self, DecorationOffset))
++			add(~0u, buffer, get_decoration(self, DecorationOffset), stride);
++	});
++}
++
++// The value of a captured output of a geometry shader, as written to the stage output.
++string CompilerMSL::geometry_xfb_expression(const GeometryXfbOutput &output)
++{
++	if (output.member == ~0u)
++		return to_expression(output.var_id);
++	auto &type = get_variable_data_type(get<SPIRVariable>(output.var_id));
++	auto &qualified = get_member_qualified_name(type.self, output.member);
++	if (!qualified.empty())
++		return qualified;
++	if (has_member_decoration(type.self, output.member, DecorationBuiltIn))
++		return join(to_name(stage_out_var_id), ".",
++		            builtin_to_glsl(BuiltIn(get_member_decoration(type.self, output.member, DecorationBuiltIn)), StorageClassOutput));
++	return join(to_name(stage_out_var_id), ".", to_member_name(type, output.member));
++}
++
++uint32_t CompilerMSL::geometry_xfb_vertices_per_primitive() const
++{
++	auto &flags = get_entry_point().flags;
++	return flags.get(ExecutionModeOutputPoints) ? 1 : flags.get(ExecutionModeOutputLineStrip) ? 2 : 3;
++}
++
+ void CompilerMSL::analyze_xfb_buffers()
+ {
+ 	// Gather all used outputs and sort them out into transform feedback buffers.
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 6088eb64..9d67b4d6 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -657,6 +657,12 @@ public:
+ 		// With for_mesh_pipeline on a vertex shader: the geometry shader's invocation count (mesh threadgroups
+ 		// per input primitive).
+ 		uint32_t geometry_invocations = 1;
++
++		// With for_mesh_pipeline, a geometry shader with transform feedback takes its capture state, a
++		// spvXfbGeometry, at this buffer index. Its mode is 0 (off), 1 (count the primitives of each input
++		// primitive and invocation into counts, emitting none) or 2 (capture each primitive at the exclusive
++		// prefix sum of the counts in counts, with the total at counts[countSize], and emit them).
++		uint32_t xfb_geometry_buffer_index = 0;
+ 		// Known primitive types. Largely uses the same values as VkPrimitiveTopology.
+ 		enum class PrimitiveType
+ 		{
+@@ -732,6 +738,28 @@ public:
+ 	// for transform feedback if a vertex pipeline shader requires it.
+ 	// Transform feedback is captured by a compute version of the shader (capture_output_to_buffer);
+ 	// a regular vertex function of the same shader rasterizes and ignores the Xfb decorations.
++	// A geometry shader with transform feedback, run as the mesh stage.
++	bool needs_geometry_transform_feedback() const
++	{
++		auto &execution = get_entry_point();
++		return execution.model == spv::ExecutionModelGeometry && execution.flags.get(spv::ExecutionModeXfb) &&
++		       msl_options.for_mesh_pipeline;
++	}
++
++	// The captured outputs of a geometry shader: the variable (and block member, or ~0u), buffer and offset.
++	struct GeometryXfbOutput
++	{
++		uint32_t var_id;
++		uint32_t member;
++		uint32_t buffer;
++		uint32_t offset;
++	};
++	SmallVector<GeometryXfbOutput> geometry_xfb_outputs;
++	uint32_t geometry_xfb_strides[4] = {};
++	void analyze_geometry_xfb();
++	std::string geometry_xfb_expression(const GeometryXfbOutput &output);
++	uint32_t geometry_xfb_vertices_per_primitive() const;
++
+ 	bool needs_transform_feedback() const
+ 	{
+ 		auto &execution = get_entry_point();
+-- 
+2.54.0 (Apple Git-157)
+
