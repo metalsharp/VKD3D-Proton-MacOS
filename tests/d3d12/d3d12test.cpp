@@ -2533,6 +2533,285 @@ void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(64 + id * 4, 1); }
     return true;
 }
 
+// Dynamic resources (SM 6.6): ResourceDescriptorHeap and SamplerDescriptorHeap indexed by values from a root
+// constant: a structured buffer SRV, a texture sampled with a heap sampler, and a UAV written through the heap.
+static bool test_dynamicresources()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint srv_index; uint tex_index; uint uav_index; uint sampler_index; };
+[numthreads(4, 1, 1)]
+void main(uint t : SV_DispatchThreadID)
+{
+    StructuredBuffer<uint> in_buf = ResourceDescriptorHeap[srv_index];
+    Texture2D<float4> tex = ResourceDescriptorHeap[tex_index];
+    SamplerState smp = SamplerDescriptorHeap[sampler_index];
+    RWStructuredBuffer<uint> out_buf = ResourceDescriptorHeap[uav_index];
+    float4 c = tex.SampleLevel(smp, float2(0.25 + 0.5 * (t & 1), 0.5), 0);
+    out_buf[t] = in_buf[t] * 10 + uint(c.r * 255.0 + 0.5);
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_6");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 4;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED };
+    ID3D12Device *dev = g.device;
+    // Directly indexed heaps need root signature 1.1.
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrsd = {};
+    vrsd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    D3D12_ROOT_PARAMETER1 rp1 = {};
+    rp1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp1.Constants.Num32BitValues = 4;
+    rp1.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    vrsd.Desc_1_1 = { 1, &rp1, 0, nullptr, rsd.Flags };
+    ID3DBlob *blob = nullptr, *error = nullptr;
+    CHECK_HR(D3D12SerializeVersionedRootSignature(&vrsd, &blob, &error));
+    ID3D12RootSignature *rs = nullptr;
+    CHECK_HR(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    blob->Release();
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+
+    // Resources: a structured buffer {1, 2, 3, 4}, a 2x1 texture (r = 10, 20), the output buffer.
+    ID3D12Resource *upload = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT i = 0; i < 4; i++)
+        u[i] = i + 1;
+    u[512] = 10;   // texel (0, 0), RGBA8: r = 10
+    u[513] = 20;   // texel (1, 0)
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *in_buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *out_buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 2; td.Height = 1; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    g.list->CopyBufferRegion(in_buf, 0, upload, 0, 16);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = tex;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcl.pResource = upload;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcl.PlacedFootprint.Offset = 2048;
+    srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 2, 1, 1, 256 };
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    transition(in_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // Heaps: the descriptors at scattered indexes.
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 16, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *sheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    UINT sinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    auto cpu = [&](ID3D12DescriptorHeap *h, UINT i, UINT step) { D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart(); c.ptr += i * step; return c; };
+    const UINT srv_index = 37, tex_index = 5, uav_index = 60, sampler_index = 11;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = 4;
+    srv.Buffer.StructureByteStride = 4;
+    dev->CreateShaderResourceView(in_buf, &srv, cpu(heap, srv_index, inc));
+    dev->CreateShaderResourceView(tex, nullptr, cpu(heap, tex_index, inc));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = 4;
+    uav.Buffer.StructureByteStride = 4;
+    dev->CreateUnorderedAccessView(out_buf, nullptr, &uav, cpu(heap, uav_index, inc));
+    D3D12_SAMPLER_DESC sd = {};
+    sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sd.MaxLOD = D3D12_FLOAT32_MAX;
+    dev->CreateSampler(&sd, cpu(sheap, sampler_index, sinc));
+
+    ID3D12DescriptorHeap *heaps[2] = { heap, sheap };
+    g.list->SetDescriptorHeaps(2, heaps);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    UINT idx[4] = { srv_index, tex_index, uav_index, sampler_index };
+    g.list->SetComputeRoot32BitConstants(0, 4, idx, 0);
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 16, &rb);
+    if (!v)
+        return false;
+    for (UINT t = 0; t < 4; t++)
+    {
+        uint32_t want = (t + 1) * 10 + ((t & 1) ? 20 : 10);
+        EXPECT(v[t] == want, "thread %u = %u, want %u", t, v[t], want);
+    }
+    rb->Release(); heap->Release(); sheap->Release(); tex->Release(); out_buf->Release(); in_buf->Release(); upload->Release();
+    ps->Release(); rs->Release();
+    return true;
+}
+
+// Render target basics: 4x MSAA with a resolve, a depth test, a stencil write and test (D24S8, which Metal has
+// as D32S8), and occlusion and timestamp queries.
+static bool test_msaa_depth_stencil()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { float4 color; float z; };
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    // A triangle over the lower-left half of the target (through the corners).
+    static const float2 p[3] = { float2(-1, -1), float2(1, -1), float2(-1, 1) };
+    return float4(p[id], z, 1);
+}
+float4 ps() : SV_Target { return color; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 5;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    auto make_pso = [&](bool stencil_write, bool stencil_test, ID3D12PipelineState **pso) -> HRESULT {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        pd.DepthStencilState.StencilEnable = stencil_write || stencil_test;
+        pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xff;
+        D3D12_DEPTH_STENCILOP_DESC op = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                          stencil_write ? D3D12_STENCIL_OP_REPLACE : D3D12_STENCIL_OP_KEEP,
+                                          stencil_test ? D3D12_COMPARISON_FUNC_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS };
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = op;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        pd.SampleDesc.Count = 4;
+        return g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso));
+    };
+    ID3D12PipelineState *pso_write = nullptr, *pso_test = nullptr;
+    CHECK_HR(make_pso(true, false, &pso_write));
+    CHECK_HR(make_pso(false, true, &pso_test));
+
+    const UINT W = 8, H = 8;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 4;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *msaa = nullptr, *resolved = nullptr, *ds = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&msaa)));
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_NONE;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr, IID_PPV_ARGS(&resolved)));
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    td.SampleDesc.Count = 4;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE dcv = { DXGI_FORMAT_D24_UNORM_S8_UINT };
+    dcv.DepthStencil = { 1.0f, 0 };
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dcv, IID_PPV_ARGS(&ds)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 }, dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    CHECK_HR(g.device->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dsv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart(), dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(msaa, nullptr, rtv);
+    g.device->CreateDepthStencilView(ds, nullptr, dsv);
+    D3D12_QUERY_HEAP_DESC ohd = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2 }, thd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2 };
+    ID3D12QueryHeap *occ = nullptr, *ts = nullptr;
+    CHECK_HR(g.device->CreateQueryHeap(&ohd, IID_PPV_ARGS(&occ)));
+    CHECK_HR(g.device->CreateQueryHeap(&thd, IID_PPV_ARGS(&ts)));
+    ID3D12Resource *qres = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+
+    float clear[4] = { 0, 0, 0, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+    g.list->EndQuery(ts, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // 1: red at z = 0.5, writing stencil 1 (counted by the occlusion query).
+    float c1[5] = { 1, 0, 0, 1, 0.5f };
+    g.list->SetPipelineState(pso_write);
+    g.list->OMSetStencilRef(1);
+    g.list->SetGraphicsRoot32BitConstants(0, 5, c1, 0);
+    g.list->BeginQuery(occ, D3D12_QUERY_TYPE_OCCLUSION, 0);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    g.list->EndQuery(occ, D3D12_QUERY_TYPE_OCCLUSION, 0);
+    // 2: green behind it (z = 0.75): fails the depth test everywhere; counted as 0 samples.
+    float c2[5] = { 0, 1, 0, 1, 0.75f };
+    g.list->SetGraphicsRoot32BitConstants(0, 5, c2, 0);
+    g.list->BeginQuery(occ, D3D12_QUERY_TYPE_OCCLUSION, 1);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    g.list->EndQuery(occ, D3D12_QUERY_TYPE_OCCLUSION, 1);
+    // 3: blue in front (z = 0.25) only where stencil == 1.
+    float c3[5] = { 0, 0, 1, 1, 0.25f };
+    g.list->SetPipelineState(pso_test);
+    g.list->SetGraphicsRoot32BitConstants(0, 5, c3, 0);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    g.list->EndQuery(ts, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    g.list->ResolveQueryData(occ, D3D12_QUERY_TYPE_OCCLUSION, 0, 2, qres, 0);
+    g.list->ResolveQueryData(ts, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, qres, 16);
+    transition(msaa, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    g.list->ResolveSubresource(resolved, 0, msaa, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = resolved;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * H };
+    rb->Map(0, &range, (void **)&px);
+    // The triangle's hypotenuse runs from the top-left to the bottom-right corner: below it blue, above black,
+    // and on the diagonal pixels a resolved mix.
+    uint32_t inside = px[(H - 1) * 64 + 0], outside = px[0 * 64 + W - 1], edge = px[3 * 64 + 3];
+    EXPECT(inside == 0xffff0000, "covered pixel 0x%08x, want blue 0xffff0000", inside);
+    EXPECT(outside == 0xff000000, "uncovered pixel 0x%08x, want black", outside);
+    uint32_t edge_blue = (edge >> 16) & 0xff;
+    EXPECT(edge_blue > 0 && edge_blue < 255 && (edge & 0xffff) == 0, "edge pixel 0x%08x, want a partial blue", edge);
+    const UINT64 *q = nullptr;
+    D3D12_RANGE qr = { 0, 32 };
+    qres->Map(0, &qr, (void **)&q);
+    // 28 of the 64 pixels are fully inside (plus partial ones), at 4 samples each.
+    EXPECT(q[0] >= 28 * 4 && q[0] <= 36 * 4, "occlusion samples %llu, want about %u", (unsigned long long)q[0], 32 * 4);
+    EXPECT(q[1] == 0, "occluded draw samples %llu, want 0", (unsigned long long)q[1]);
+    EXPECT(q[3] > q[2], "timestamps %llu %llu do not increase", (unsigned long long)q[2], (unsigned long long)q[3]);
+    rb->Release(); qres->Release(); ts->Release(); occ->Release(); rtv_heap->Release(); dsv_heap->Release();
+    ds->Release(); resolved->Release(); msaa->Release(); pso_write->Release(); pso_test->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -2546,6 +2825,8 @@ static const Test tests[] = {
     { "mesh", test_mesh },
     { "tessellation", test_tessellation },
     { "executeindirect", test_executeindirect },
+    { "dynamicresources", test_dynamicresources },
+    { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
