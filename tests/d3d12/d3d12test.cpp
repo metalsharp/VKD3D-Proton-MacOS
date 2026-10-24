@@ -2121,6 +2121,139 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
     return true;
 }
 
+// Mesh shaders (tier 1): an amplification shader launches two mesh groups with a payload of colors; each emits
+// a quad covering one half of the render target.
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE T, typename V>
+struct alignas(void *) StreamSubobject { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = T; V value; };
+
+static bool test_mesh()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+    if (o7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1)
+    {
+        printf("  skipped: mesh shader tier %d\n", o7.MeshShaderTier);
+        return true;
+    }
+    static const char *src = R"(
+struct Payload { float3 color[2]; };
+groupshared Payload pl;
+[numthreads(1, 1, 1)]
+void as_main()
+{
+    pl.color[0] = float3(1, 0, 0);
+    pl.color[1] = float3(0, 1, 0);
+    DispatchMesh(2, 1, 1, pl);
+}
+struct V { float4 pos : SV_Position; float3 color : COLOR; };
+[numthreads(4, 1, 1)]
+[outputtopology("triangle")]
+void ms_main(uint t : SV_GroupThreadID, uint g : SV_GroupID, in payload Payload p, out vertices V v[4], out indices uint3 tri[2])
+{
+    SetMeshOutputCounts(4, 2);
+    // A quad over half the target: x in [-1, 0] or [0, 1].
+    float x0 = g == 0 ? -1.0 : 0.0;
+    v[t].pos = float4(x0 + float(t & 1), (t & 2) ? 1.0 : -1.0, 0, 1);
+    v[t].color = p.color[g];
+    if (t < 2)
+        tri[t] = t == 0 ? uint3(0, 1, 2) : uint3(1, 3, 2);
+}
+float4 ps_main(V i) : SV_Target { return float4(i.color, 1); }
+)";
+    std::vector<char> as = compile_dxc(src, "as_main", "as_6_5"), ms = compile_dxc(src, "ms_main", "ms_6_5"),
+                      ps = compile_dxc(src, "ps_main", "ps_6_5");
+    if (as.empty() || ms.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_RASTERIZER_DESC rast = {};
+    rast.FillMode = D3D12_FILL_MODE_SOLID;
+    rast.CullMode = D3D12_CULL_MODE_NONE;
+    rast.DepthClipEnable = TRUE;
+    D3D12_BLEND_DESC blend = {};
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    D3D12_RT_FORMAT_ARRAY rtv_formats = {};
+    rtv_formats.NumRenderTargets = 1;
+    rtv_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    struct
+    {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+    } stream;
+    stream.rs.value = rs;
+    stream.as.value = { as.data(), as.size() };
+    stream.ms.value = { ms.data(), ms.size() };
+    stream.ps.value = { ps.data(), ps.size() };
+    stream.rast.value = rast;
+    stream.blend.value = blend;
+    stream.mask.value = ~0u;
+    stream.rtvs.value = rtv_formats;
+    stream.sample.value = { 1, 0 };
+    D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(stream), &stream };
+    ID3D12Device2 *dev2 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev2)));
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)));
+    ID3D12GraphicsCommandList6 *list6 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list6)));
+
+    const UINT W = 8, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 1, 1 };
+    list6->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    list6->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    list6->RSSetViewports(1, &vp);
+    list6->RSSetScissorRects(1, &sc);
+    list6->SetGraphicsRootSignature(rs);
+    list6->SetPipelineState(pso);
+    list6->DispatchMesh(1, 1, 1);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list6->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * H };
+    rb->Map(0, &range, (void **)&px);
+    for (UINT y = 0; y < H; y++)
+        for (UINT x = 0; x < W; x++)
+        {
+            uint32_t want = x < W / 2 ? 0xff0000ff : 0xff00ff00;
+            uint32_t got = px[y * 64 + x];
+            EXPECT(got == want, "pixel (%u, %u) = 0x%08x, want 0x%08x", x, y, got, want);
+        }
+    rb->Release(); rtv_heap->Release(); rt->Release(); list6->Release(); pso->Release(); dev2->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
@@ -2131,6 +2264,7 @@ static const Test tests[] = {
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
     { "dispatchrays", test_dispatchrays },
+    { "mesh", test_mesh },
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
