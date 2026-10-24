@@ -14,7 +14,7 @@ for src in "$HERE"/*.c; do
     name="$(basename "$src" .c)"
     clang -O1 -g -I"$HEADERS" "$src" -L"$MVK" -lMoltenVK -Wl,-rpath,"$MVK" -o "$OUT/$name"
 done
-for shader in "$HERE"/*.comp "$HERE"/*.vert "$HERE"/*.frag; do
+for shader in "$HERE"/*.comp "$HERE"/*.vert "$HERE"/*.geom "$HERE"/*.frag; do
     [ -e "$shader" ] || continue
     glslangValidator -V --target-env vulkan1.3 "$shader" -o "$OUT/$(basename "$shader" | tr . _).spv" >/dev/null
 done
