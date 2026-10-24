@@ -3904,11 +3904,73 @@ RWStructuredBuffer<uint> b : register(u0);
     return true;
 }
 
+// FXC shaders preserve NaN and Inf (SignedZeroInfNanPreserve), which MoltenVK compiles with the default (not
+// precise::) Metal transcendentals: the special values D3D defines for them must hold anyway, and the
+// results stay within D3D's precision. Inputs come from root constants so FXC can't fold them.
+static const char *cs_special_src = R"(
+cbuffer c : register(b0) { float4 a; float4 b; };  // a = (0, inf, -inf, nan), b = (-1, 2, 300, 0.5)
+RWByteAddressBuffer o : register(u0);
+[numthreads(1, 1, 1)]
+void main()
+{
+    float r[25] = {
+        log2(a.x), log2(a.y), log2(b.x), log2(a.w), exp2(a.z), exp2(a.y), exp2(a.w), sqrt(b.x), sqrt(a.y), rsqrt(a.x),
+        rsqrt(a.y), rsqrt(b.x), sin(a.y), cos(a.w), sin(b.z), cos(b.z), pow(a.x, b.y), pow(b.y, b.w), asin(b.y),
+        max(log2(a.x), -100.0), acos(a.w), atan(a.y), tan(a.y), sin(a.z), cos(a.y) };
+    [unroll] for (uint i = 0; i < 25; i++)
+        o.Store(i * 4, asuint(r[i]));
+}
+)";
+
+static bool test_special_values_dxbc()
+{
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 8;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_fxc(cs_special_src, "main", "cs_5_0"));
+    if (!rs || !ps)
+        return false;
+    const float inf = INFINITY, nan = NAN;
+    const float in[8] = { 0.0f, inf, -inf, nan, -1.0f, 2.0f, 300.0f, 0.5f };
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRoot32BitConstants(0, 8, in, 0);
+    g.list->SetComputeRootUnorderedAccessView(1, buf->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const float *v = (const float *)read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    static const char *names[25] = { "log2(0)", "log2(inf)", "log2(-1)", "log2(nan)", "exp2(-inf)", "exp2(inf)", "exp2(nan)",
+                                     "sqrt(-1)", "sqrt(inf)", "rsqrt(0)", "rsqrt(inf)", "rsqrt(-1)", "sin(inf)", "cos(nan)",
+                                     "sin(300)", "cos(300)", "pow(0, 2)", "pow(2, 0.5)", "asin(2)", "max(log2(0), -100)", "acos(nan)",
+                                     "atan(inf)", "tan(inf)", "sin(-inf)", "cos(inf)" };
+    // nan marks results that must be NaN; tolerances are D3D's (0.0008 absolute for sin/cos, ~22 bits for exp2/log2).
+    const float want[25] = { -inf, inf, nan, nan, 0.0f, inf, nan, nan, inf, inf, 0.0f, nan, nan, nan,
+                             sinf(300.0f), cosf(300.0f), 0.0f, sqrtf(2.0f), nan, -100.0f, nan, 1.5707964f, nan, nan, nan };
+    const float tol[25] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0008f, 0.0008f, 0, 0.0001f, 0, 0, 0, 0.0001f };
+    for (int i = 0; i < 25; i++)
+    {
+        bool ok = isnan(want[i]) ? isnan(v[i]) : isinf(want[i]) ? v[i] == want[i] : fabsf(v[i] - want[i]) <= tol[i];
+        EXPECT(ok, "%s = %g, want %g", names[i], v[i], want[i]);
+    }
+    rb->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 struct Test { const char *name; bool (*fn)(); };
 static const Test tests[] = {
     { "caps", test_caps },
     { "compute_dxil", test_compute_dxil },
     { "compute_dxbc", test_compute_dxbc },
+    { "special_values_dxbc", test_special_values_dxbc },
     { "sm67", test_sm67 },
     { "sm67_textures", test_sm67_textures },
     { "rootcbv", test_rootcbv },
