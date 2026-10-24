@@ -22,12 +22,40 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WINE = "/Volumes/AverySSD/fex-test-home/runtime/wine/bin/wine"
 DEFAULT_EXE = os.path.join(HERE, "../../artifacts/build/perf/d3d12_perf_probe-x86_64.exe")
+DEFAULT_DXCOMPILER = "Z:\\Volumes\\AverySSD\\fex-test-home\\runtime\\MetalSharp-Wine.app\\Contents\\share\\wine\\shadercompilers\\arm64\\dxcompiler.dll"
+DXIL_CACHE = os.path.join(HERE, "../../artifacts/perf/dxilcache")
 
 
 def list_scenes(wine, exe, env):
+    """Scene names, and the set of those needing DXIL (tagged [dxil])."""
     out = subprocess.run([wine, exe, "list"], env=env, capture_output=True, text=True, timeout=120).stdout
-    return [line.split()[0] for line in out.replace("\r", "").splitlines() if line and not line.startswith(("info:", "warn"))
-            and re.match(r"^[a-z_0-9]+\s", line)]
+    names, dxil = [], set()
+    for line in out.replace("\r", "").splitlines():
+        m = re.match(r"^([a-z_0-9]+)\s+(\[dxil\])?", line)
+        if m and not line.startswith(("info:", "warn")):
+            names.append(m.group(1))
+            if m.group(2):
+                dxil.add(m.group(1))
+    return names, dxil
+
+
+def windows_path(path):
+    return "Z:" + os.path.abspath(path).replace("/", "\\")
+
+
+def prepare_dxil(wine, exe, scenes, env, timeout, frames, warmup, salt):
+    """Fill the DXIL cache: the aarch64 probe (native, can load dxcompiler.dll) runs each scene once."""
+    arm = exe.replace("x86_64", "aarch64")
+    if not os.path.exists(arm) or not scenes:
+        return
+    penv = dict(env)
+    penv.setdefault("DXCOMPILER_PATH", DEFAULT_DXCOMPILER)
+    for scene in scenes:
+        p = subprocess.run([wine, arm, "prepare", scene, str(frames), str(warmup), str(salt)], env=penv, capture_output=True,
+                           text=True, timeout=timeout)
+        if "D3D12_PERF_PROBE_OK" not in p.stdout:
+            tail = "\n".join(l for l in (p.stdout + p.stderr).replace("\r", "").splitlines() if "error" in l)[-600:]
+            print("%-18s DXIL prepare failed\n%s" % (scene, tail), flush=True)
 
 
 def parse(text):
@@ -46,10 +74,10 @@ def parse(text):
     return r
 
 
-def run_scene(wine, exe, scene, frames, warmup, env, timeout):
+def run_scene(wine, exe, scene, frames, warmup, env, timeout, salt):
     t = time.time()
     try:
-        p = subprocess.run([wine, exe, scene, str(frames), str(warmup)], env=env, capture_output=True, text=True,
+        p = subprocess.run([wine, exe, scene, str(frames), str(warmup), str(salt)], env=env, capture_output=True, text=True,
                            timeout=timeout)
         text = (p.stdout + p.stderr).replace("\r", "")
     except subprocess.TimeoutExpired as e:
@@ -65,16 +93,23 @@ def cmd_run(args):
     env = dict(os.environ)
     env.setdefault("GRAPHICS_BACKEND", "vkd3d")
     env.setdefault("FEX_DISKCACHE", "0")
+    env.setdefault("MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING", "1")
     for kv in args.env or []:
         k, v = kv.split("=", 1)
         env[k] = v
     exe = os.path.abspath(args.exe)
-    scenes = args.scenes.split(",") if args.scenes else list_scenes(args.wine, exe, env)
+    os.makedirs(DXIL_CACHE, exist_ok=True)
+    env.setdefault("PROBE_DXIL_CACHE", windows_path(DXIL_CACHE))
+    all_scenes, dxil_scenes = list_scenes(args.wine, exe, env)
+    scenes = args.scenes.split(",") if args.scenes else all_scenes
+    # One salt per run: cold-compile scenes get shaders no earlier run (or disk cache) has seen.
+    salt = int(time.time()) % 100000
+    prepare_dxil(args.wine, exe, [s for s in scenes if s in dxil_scenes], env, args.timeout, args.frames, args.warmup, salt)
     data = {"label": args.label, "exe": exe, "wine": args.wine, "frames": args.frames, "warmup": args.warmup,
             "env": {k: env[k] for k in sorted(env) if k.startswith(("MVK_", "VKD3D", "FEX_", "GRAPHICS_", "DXVK"))},
             "time": time.strftime("%Y-%m-%d %H:%M:%S"), "scenes": {}}
     for scene in scenes:
-        runs = [run_scene(args.wine, exe, scene, args.frames, args.warmup, env, args.timeout) for _ in range(args.repeat)]
+        runs = [run_scene(args.wine, exe, scene, args.frames, args.warmup, env, args.timeout, salt) for _ in range(args.repeat)]
         good = [r for r in runs if r["ok"]]
         best = min(good, key=lambda r: r.get("cpu_median", 1e9)) if good else runs[-1]
         data["scenes"][scene] = best
