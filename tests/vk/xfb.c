@@ -1,7 +1,10 @@
 /* GPU test: transform feedback. Captures of draws and indexed draws with instancing into two buffers with
  * a gap between their bindings, resuming from counter buffers, overflow of the smaller buffer (a primitive
  * goes to every buffer or none), the primitives-written query, counter buffers given to End that differ from
- * Begin's (also with nothing drawn), draws outside transform feedback, and rasterization of the captures. */
+ * Begin's (also with nothing drawn), draws outside transform feedback, rasterization of the captures, and
+ * a triangle strip drawn with a triangle list pipeline through dynamic primitive topology, indexed draws with
+ * a first index and vertex offset, indirect draws (two draws each, indexed and not), and a draw with its vertex
+ * count from a counter buffer (vkCmdDrawIndirectByteCountEXT). */
 #include "vkcommon.h"
 
 #define W 8
@@ -10,7 +13,7 @@
 
 static const float pos[3][2] = { { -1, -1 }, { 3, -1 }, { -1, 3 } };
 
-static VkPipeline make_pipeline(struct vkctx *c, VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
+static VkPipeline make_pipeline(struct vkctx *c, VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, int dynamic_topology)
 {
     VkPipelineShaderStageCreateInfo stages[2] = {
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
@@ -28,8 +31,8 @@ static VkPipeline make_pipeline(struct vkctx *c, VkPipelineLayout layout, VkShad
     VkPipelineColorBlendAttachmentState ba = { 0 };
     ba.colorWriteMask = 0xf;
     VkPipelineColorBlendStateCreateInfo blend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, 0, 1, &ba };
-    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn };
+    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, dynamic_topology ? 3 : 2, dyn };
     VkFormat color = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &color };
     VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, 2, stages, &vi, &ia, NULL, &vp, &rs, &ms, &ds,
@@ -89,12 +92,14 @@ int main(int argc, char **argv)
            xp.transformFeedbackDraw);
     EXPECT_EQ("maxTransformFeedbackBuffers", xp.maxTransformFeedbackBuffers >= 4, 1);
     EXPECT_EQ("transformFeedbackQueries", xp.transformFeedbackQueries, 1);
+    EXPECT_EQ("transformFeedbackDraw", xp.transformFeedbackDraw, 1);
 
     PFN_vkCmdBindTransformFeedbackBuffersEXT bind = (void *)vkGetDeviceProcAddr(c.device, "vkCmdBindTransformFeedbackBuffersEXT");
     PFN_vkCmdBeginTransformFeedbackEXT begin = (void *)vkGetDeviceProcAddr(c.device, "vkCmdBeginTransformFeedbackEXT");
     PFN_vkCmdEndTransformFeedbackEXT end = (void *)vkGetDeviceProcAddr(c.device, "vkCmdEndTransformFeedbackEXT");
     PFN_vkCmdBeginQueryIndexedEXT begin_query = (void *)vkGetDeviceProcAddr(c.device, "vkCmdBeginQueryIndexedEXT");
     PFN_vkCmdEndQueryIndexedEXT end_query = (void *)vkGetDeviceProcAddr(c.device, "vkCmdEndQueryIndexedEXT");
+    PFN_vkCmdDrawIndirectByteCountEXT draw_byte_count = (void *)vkGetDeviceProcAddr(c.device, "vkCmdDrawIndirectByteCountEXT");
 
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     VkPipelineLayout pl;
@@ -103,7 +108,8 @@ int main(int argc, char **argv)
     VkShaderModule vs = vkctx_shader(&c, path);
     snprintf(path, sizeof(path), "%s/xfb_frag.spv", dir);
     VkShaderModule fs = vkctx_shader(&c, path);
-    VkPipeline pipeline = make_pipeline(&c, pl, vs, fs);
+    VkPipeline pipeline = make_pipeline(&c, pl, vs, fs, 0);
+    VkPipeline dynamic_pipeline = make_pipeline(&c, pl, vs, fs, 1);
 
     struct vkbuf vtx = vkctx_buffer(&c, 12 * 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     for (unsigned v = 0; v < 12; v++)
@@ -223,6 +229,117 @@ int main(int argc, char **argv)
     EXPECT_EQ("2: primitives written", q[0], 1);
     EXPECT_EQ("2: primitives needed", q[1], 1);
     EXPECT_EQ("3: End's counter with nothing drawn", counter[6], 16 + 12 * 16);
+
+    /* 4: a 4-vertex triangle strip through dynamic topology: triangles (0 1 2) and (1 3 2), each possibly
+     * rotated (the provoking vertex need not be preserved). */
+    struct vkbuf s0 = vkctx_buffer(&c, 256, xfb_usage), s2 = vkctx_buffer(&c, 256, xfb_usage);
+    for (unsigned i = 0; i < 64; i++)
+        ((uint32_t *)s0.map)[i] = ((uint32_t *)s2.map)[i] = SENTINEL;
+    cb = vkctx_begin(&c);
+    begin_rendering(cb, &color);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dynamic_pipeline);
+    vkCmdSetPrimitiveTopology(cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+    vkCmdBindVertexBuffers(cb, 0, 1, &vtx.buffer, &zero);
+    bind(cb, 0, 1, &s0.buffer, &zero, NULL);
+    bind(cb, 2, 1, &s2.buffer, &zero, NULL);
+    begin(cb, 0, 0, NULL, NULL);
+    vkCmdDraw(cb, 4, 1, 0, 0);
+    end(cb, 0, 0, NULL, NULL);
+    vkCmdEndRendering(cb);
+    vkctx_submit(&c, cb);
+    static const unsigned strip[2][3] = { { 0, 1, 2 }, { 1, 3, 2 } };
+    for (unsigned t = 0; t < 2; t++)
+    {
+        const float *o = (const float *)s0.map + 12 * t;
+        unsigned got[3] = { (unsigned)o[2], (unsigned)o[6], (unsigned)o[10] };
+        int ok = 0;
+        for (unsigned r = 0; r < 3; r++)
+            ok |= got[r] == strip[t][0] && got[(r + 1) % 3] == strip[t][1] && got[(r + 2) % 3] == strip[t][2];
+        printf("strip triangle %u: %u %u %u\n", t, got[0], got[1], got[2]);
+        EXPECT_EQ("4: strip triangle", ok, 1);
+    }
+    EXPECT_EQ("4: b0 after the strip", ((uint32_t *)s0.map)[24], SENTINEL);
+
+    /* 5: an indexed draw with a first index and a vertex offset: indices 6 7 8 from index 3, offset 1. */
+    for (unsigned i = 0; i < 64; i++)
+        ((uint32_t *)s0.map)[i] = ((uint32_t *)s2.map)[i] = SENTINEL;
+    cb = vkctx_begin(&c);
+    begin_rendering(cb, &color);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindVertexBuffers(cb, 0, 1, &vtx.buffer, &zero);
+    vkCmdBindIndexBuffer(cb, idx.buffer, 0, VK_INDEX_TYPE_UINT32);
+    bind(cb, 0, 1, &s0.buffer, &zero, NULL);
+    bind(cb, 2, 1, &s2.buffer, &zero, NULL);
+    begin(cb, 0, 0, NULL, NULL);
+    vkCmdDrawIndexed(cb, 3, 1, 3, 1, 0);
+    end(cb, 0, 0, NULL, NULL);
+    vkCmdEndRendering(cb);
+    vkctx_submit(&c, cb);
+    o0 = s0.map;
+    o1 = s2.map;
+    for (unsigned v = 0; v < 3; v++, o0 += 4, o1 += 2)
+    {
+        expect_o0("5: indexed draw with offsets", o0, 7 + v, 0);
+        expect_o1("5: indexed draw with offsets", o1, 7 + v, 0);
+    }
+
+    /* 6: indirect draws: { 3 vertices from 3, 2 instances from 1 } and { 3 from 6 }, then indexed
+     * { indexes 3..5 (6 7 8), vertex offset 1 } and { indexes 0..2, instance 2 }. */
+    struct vkbuf ind = vkctx_buffer(&c, 256, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    VkDrawIndirectCommand *dc = ind.map;
+    dc[0] = (VkDrawIndirectCommand){ 3, 2, 3, 1 };
+    dc[1] = (VkDrawIndirectCommand){ 3, 1, 6, 0 };
+    VkDrawIndexedIndirectCommand *dic = (VkDrawIndexedIndirectCommand *)((char *)ind.map + 128);
+    dic[0] = (VkDrawIndexedIndirectCommand){ 3, 1, 3, 1, 0 };
+    dic[1] = (VkDrawIndexedIndirectCommand){ 3, 1, 0, 0, 2 };
+    for (unsigned i = 0; i < 64; i++)
+        ((uint32_t *)s0.map)[i] = ((uint32_t *)s2.map)[i] = SENTINEL;
+    cb = vkctx_begin(&c);
+    vkCmdResetQueryPool(cb, qp, 0, 1);
+    begin_rendering(cb, &color);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindVertexBuffers(cb, 0, 1, &vtx.buffer, &zero);
+    vkCmdBindIndexBuffer(cb, idx.buffer, 0, VK_INDEX_TYPE_UINT32);
+    bind(cb, 0, 1, &s0.buffer, &zero, NULL);
+    bind(cb, 2, 1, &s2.buffer, &zero, NULL);
+    begin_query(cb, qp, 0, 0, 0);
+    begin(cb, 0, 0, NULL, NULL);
+    vkCmdDrawIndirect(cb, ind.buffer, 0, 2, sizeof(VkDrawIndirectCommand));
+    vkCmdDrawIndexedIndirect(cb, ind.buffer, 128, 2, sizeof(VkDrawIndexedIndirectCommand));
+    end(cb, 0, 0, NULL, NULL);
+    end_query(cb, qp, 0, 0);
+    vkCmdEndRendering(cb);
+    vkctx_submit(&c, cb);
+    static const unsigned ind_v[5] = { 3, 3, 6, 7, 0 }, ind_i[5] = { 1, 2, 0, 0, 2 };
+    o0 = s0.map;
+    o1 = s2.map;
+    for (unsigned t = 0; t < 5; t++)
+        for (unsigned v = 0; v < 3; v++, o0 += 4, o1 += 2)
+        {
+            expect_o0("6: indirect draw", o0, ind_v[t] + v, ind_i[t]);
+            expect_o1("6: indirect draw", o1, ind_v[t] + v, ind_i[t]);
+        }
+    CHECK(vkGetQueryPoolResults(c.device, qp, 0, 1, sizeof(q), q, sizeof(q), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    EXPECT_EQ("6: primitives written", q[0], 5);
+
+    /* 7: the counter at offset 0 holds 208 bytes: past a counter offset of 16, 12 vertices of 16 bytes (instance 1). */
+    for (unsigned i = 0; i < 64; i++)
+        ((uint32_t *)s0.map)[i] = ((uint32_t *)s2.map)[i] = SENTINEL;
+    struct vkbuf big0 = vkctx_buffer(&c, 1024, xfb_usage), big2 = vkctx_buffer(&c, 1024, xfb_usage);
+    cb = vkctx_begin(&c);
+    begin_rendering(cb, &color);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindVertexBuffers(cb, 0, 1, &vtx.buffer, &zero);
+    bind(cb, 0, 1, &big0.buffer, &zero, NULL);
+    bind(cb, 2, 1, &big2.buffer, &zero, NULL);
+    begin(cb, 0, 0, NULL, NULL);
+    draw_byte_count(cb, 1, 1, cnt.buffer, 0, 16, 16);
+    end(cb, 0, 0, NULL, NULL);
+    vkCmdEndRendering(cb);
+    vkctx_submit(&c, cb);
+    o0 = big0.map;
+    for (unsigned v = 0; v < 12; v++, o0 += 4)
+        expect_o0("7: byte count draw", o0, v, 1);
 
     printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
