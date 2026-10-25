@@ -526,6 +526,8 @@ static ID3D12RootSignature *serialize_root_signature(const D3D12_ROOT_SIGNATURE_
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
 
+static D3D_FEATURE_LEVEL g_level = D3D_FEATURE_LEVEL_11_0;   // the selected scene's
+
 static void setup()
 {
     WNDCLASSA wc = {};
@@ -540,7 +542,11 @@ static void setup()
 
     IDXGIFactory4 *factory = nullptr;
     CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
-    CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&p.device)));
+    if (FAILED(D3D12CreateDevice(nullptr, g_level, IID_PPV_ARGS(&p.device))))
+    {
+        printf("error: no D3D12 device at feature level %#x\n", g_level);
+        exit(4);
+    }
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     CHECK(p.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&p.queue)));
@@ -693,6 +699,7 @@ struct Scene
     bool present = false;   // Only the present scenes pace by the swap chain; the rest run offscreen.
     UINT sync_interval = 0;
     bool dxil = false;      // Needs SM 6 shaders: the runner fills the DXIL cache with the aarch64 probe first.
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;   // the device's: a scene fails where the device has less
 };
 
 static void set_quad_state(ID3D12GraphicsCommandList *l, ID3D12PipelineState *pso)
@@ -3610,15 +3617,264 @@ static std::vector<Scene> submit_scenes()
     };
 }
 
+// A heavy frame of the CPU side of a D3D12 game at feature level 12_2, every part timed on its own: 8 threads
+// recording draws with a fresh root CBV each, descriptor tables, pipeline and vertex/index buffer changes and
+// transitions; descriptor creation and copies; resource creation and release; an upload through a copy queue and
+// compute work on a compute queue, both waited for on the direct queue; two submissions; a CPU wait on a fence in
+// the middle of the frame; and a new pipeline from already compiled shaders.
+static std::vector<Scene> stress_scenes()
+{
+    enum { THREADS = 8, DRAWS = 600, PSOS = 8, CHURN = 8, COPIES = 4096, VIEWS = 256, DISPATCHES = 64,
+           UPLOAD = 2u << 20, RING = 4u << 20, COPY_BASE = 8000 };
+    static ID3D12PipelineState *psos[PSOS], *compute_pso, *variants[FRAMES_IN_FLIGHT];
+    static ID3D12CommandAllocator *alloc[THREADS][FRAMES_IN_FLIGHT], *copy_alloc[FRAMES_IN_FLIGHT],
+        *compute_alloc[FRAMES_IN_FLIGHT];
+    static ID3D12GraphicsCommandList *lists[THREADS], *copy_list, *compute_list;
+    static ID3D12CommandQueue *copy_queue, *compute_queue;
+    static ID3D12Fence *copy_fence, *compute_fence, *mid_fence;
+    static UINT64 copy_value, compute_value, mid_value;
+    static HANDLE mid_event;
+    static ID3D12Resource *rings[THREADS], *vb, *ib, *staging, *dst_buffer, *dst_texture, *churned[FRAMES_IN_FLIGHT][CHURN];
+    static uint8_t *ring_ptr[THREADS], *staging_ptr;
+    static ID3D12DescriptorHeap *cpu_heap;
+    static D3D12_GRAPHICS_PIPELINE_STATE_DESC variant_desc;
+    static std::vector<char> variant_vs, variant_ps;
+    static std::thread workers[THREADS];
+    static std::mutex lock;
+    static std::condition_variable start_cv, done_cv;
+    static UINT generation, done, work_frame;
+
+    auto record = [](UINT t, UINT f, UINT64 &offset) {
+        ID3D12GraphicsCommandList *l = lists[t];
+        CHECK(alloc[t][p.frame_index]->Reset());
+        CHECK(l->Reset(alloc[t][p.frame_index], psos[t % PSOS]));
+        ID3D12DescriptorHeap *heaps[] = { p.srv_heap };
+        l->SetDescriptorHeaps(1, heaps);
+        auto h = rtv(FRAMES_IN_FLIGHT);
+        l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+        l->SetGraphicsRootSignature(p.root_signature);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress(), 4096, 16 };
+        const D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), 4096, DXGI_FORMAT_R16_UINT };
+        for (UINT i = 0; i < DRAWS; i++)
+        {
+            if (i % 64 == 0) l->SetPipelineState(psos[(i / 64 + t) % PSOS]);
+            if (i % 16 == 0) { l->IASetVertexBuffers(0, 1, &vbv); l->IASetIndexBuffer(&ibv); }
+            if (i % 128 == 0) viewport(l);
+            if (i % 100 == 50)
+            {
+                // a sampled texture of this thread's moves to another read state and back, as engines do
+                barrier(l, p.textures[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(l, p.textures[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            if (offset + 256 > RING) offset = 0;
+            ((float *)(ring_ptr[t] + offset))[4] = (float)(t * 1000 + i);
+            l->SetGraphicsRootConstantBufferView(1, rings[t]->GetGPUVirtualAddress() + offset);
+            offset += 256;
+            if (i % 4 == 0) l->SetGraphicsRootDescriptorTable(2, srv_gpu(8 + (t * DRAWS + i) * 8 % 992));
+            float rc[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.01f, f * 0.01f };
+            l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+            l->DrawIndexedInstanced(3, 1, 0, 0, 0);
+        }
+        CHECK(l->Close());
+    };
+
+    return {
+        { "cpu_stress_12_2", "a heavy CPU frame at FL 12_2: 8 recording threads, descriptors, churn, copy and compute queues, a stall, a new PSO",
+          [record] {
+            const char *ps[] = { "ps_flat", "ps_tex", "ps_ui", "ps_post" };
+            for (UINT i = 0; i < PSOS; i++)
+            {
+                PsoDesc d; d.rt = HDR_FORMAT; d.ps = ps[i % 4]; d.blend = i / 4;
+                psos[i] = create_pso(d);
+            }
+            // the shaders and state of a pipeline that each frame then makes anew with another depth bias
+            PsoDesc d; d.rt = HDR_FORMAT; d.ps = "ps_tex";
+            d.tweak = [](D3D12_GRAPHICS_PIPELINE_STATE_DESC &g) {
+                variant_vs.assign((const char *)g.VS.pShaderBytecode, (const char *)g.VS.pShaderBytecode + g.VS.BytecodeLength);
+                variant_ps.assign((const char *)g.PS.pShaderBytecode, (const char *)g.PS.pShaderBytecode + g.PS.BytecodeLength);
+                variant_desc = g;
+            };
+            create_pso(d)->Release();
+            variant_desc.VS = { variant_vs.data(), variant_vs.size() };
+            variant_desc.PS = { variant_ps.data(), variant_ps.size() };
+            compute_pso = create_compute_pso();
+            D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_COPY };
+            CHECK(p.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&copy_queue)));
+            qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            CHECK(p.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue)));
+            for (UINT i = 0; i < FRAMES_IN_FLIGHT; i++)
+            {
+                CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&copy_alloc[i])));
+                CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&compute_alloc[i])));
+            }
+            CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, copy_alloc[0], nullptr, IID_PPV_ARGS(&copy_list)));
+            CHECK(copy_list->Close());
+            CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_alloc[0], nullptr, IID_PPV_ARGS(&compute_list)));
+            CHECK(compute_list->Close());
+            CHECK(p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence)));
+            CHECK(p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&compute_fence)));
+            CHECK(p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&mid_fence)));
+            mid_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+            vb = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+            ib = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+            uint16_t *indices;
+            CHECK(ib->Map(0, nullptr, (void **)&indices));
+            for (UINT i = 0; i < 2048; i++) indices[i] = i % 3;
+            ib->Unmap(0, nullptr);
+            staging = create_buffer(UPLOAD, D3D12_HEAP_TYPE_UPLOAD);
+            CHECK(staging->Map(0, nullptr, (void **)&staging_ptr));
+            dst_buffer = create_buffer(UPLOAD, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+            dst_texture = create_texture(512, 512, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+            D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, COPIES };
+            CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cpu_heap)));
+            for (UINT i = 0; i < COPIES; i++)
+            {
+                auto c = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+                c.ptr += (SIZE_T)i * p.srv_size;
+                p.device->CreateShaderResourceView(p.textures[i % 8], nullptr, c);
+            }
+            CHECK(p.allocators[0]->Reset());
+            CHECK(p.list->Reset(p.allocators[0], nullptr));
+            barrier(p.list, p.hdr_targets[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            submit_and_wait(p.list);
+            for (UINT t = 0; t < THREADS; t++)
+            {
+                for (UINT i = 0; i < FRAMES_IN_FLIGHT; i++)
+                    CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[t][i])));
+                CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[t][0], nullptr, IID_PPV_ARGS(&lists[t])));
+                CHECK(lists[t]->Close());
+                rings[t] = create_buffer(RING, D3D12_HEAP_TYPE_UPLOAD);
+                CHECK(rings[t]->Map(0, nullptr, (void **)&ring_ptr[t]));
+                workers[t] = std::thread([t, record] {
+                    UINT seen = 0;
+                    UINT64 offset = 0;
+                    for (;;)
+                    {
+                        UINT f;
+                        {
+                            std::unique_lock<std::mutex> g(lock);
+                            start_cv.wait(g, [&] { return generation != seen; });
+                            seen = generation;
+                            f = work_frame;
+                        }
+                        record(t, f, offset);
+                        std::lock_guard<std::mutex> g(lock);
+                        if (++done == THREADS) done_cv.notify_one();
+                    }
+                });
+                workers[t].detach();
+            }
+        }, [](UINT f) {
+            const UINT fi = p.frame_index;
+            double t0 = qpc_ms();
+            // descriptors: views written into a CPU heap, then a block copied into the shader-visible heap
+            for (UINT i = 0; i < VIEWS; i++)
+            {
+                auto c = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+                c.ptr += (SIZE_T)i * p.srv_size;
+                p.device->CreateShaderResourceView(p.textures[(i + f) % 8], nullptr, c);
+                c.ptr += (SIZE_T)VIEWS * p.srv_size;
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cv = { p.upload_ring->GetGPUVirtualAddress() + i * 256, 256 };
+                p.device->CreateConstantBufferView(&cv, c);
+            }
+            p.device->CopyDescriptorsSimple(COPIES, srv_cpu(COPY_BASE), cpu_heap->GetCPUDescriptorHandleForHeapStart(),
+                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            double t1 = qpc_ms();
+            // churn: what this slot made three frames ago is released, and as much made again
+            for (UINT i = 0; i < CHURN; i++)
+            {
+                if (churned[fi][i]) churned[fi][i]->Release();
+                churned[fi][i] = i < 6 ? create_buffer(65536ull << (i % 5), D3D12_HEAP_TYPE_DEFAULT)
+                                       : create_texture(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                                        D3D12_RESOURCE_STATE_COMMON);
+            }
+            double t2 = qpc_ms();
+            // upload: written through a mapped buffer, copied on the copy queue, waited for on the direct queue
+            memset(staging_ptr, f & 0xff, UPLOAD);
+            CHECK(copy_alloc[fi]->Reset());
+            CHECK(copy_list->Reset(copy_alloc[fi], nullptr));
+            copy_list->CopyBufferRegion(dst_buffer, 0, staging, 0, UPLOAD / 2);
+            D3D12_TEXTURE_COPY_LOCATION src = { staging, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            src.PlacedFootprint.Offset = UPLOAD / 2;
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 512, 512, 1, 512 * 4 };
+            D3D12_TEXTURE_COPY_LOCATION dst = { dst_texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            copy_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            CHECK(copy_list->Close());
+            ID3D12CommandList *copies[] = { copy_list };
+            copy_queue->ExecuteCommandLists(1, copies);
+            CHECK(copy_queue->Signal(copy_fence, ++copy_value));
+            CHECK(p.queue->Wait(copy_fence, copy_value));
+            double t3 = qpc_ms();
+            // compute: dispatches with UAV barriers on the compute queue, waited for on the direct queue
+            CHECK(compute_alloc[fi]->Reset());
+            CHECK(compute_list->Reset(compute_alloc[fi], compute_pso));
+            compute_list->SetComputeRootSignature(p.compute_root_signature);
+            compute_list->SetComputeRootUnorderedAccessView(1, p.uav_buffer->GetGPUVirtualAddress());
+            D3D12_RESOURCE_BARRIER uav = {};
+            uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav.UAV.pResource = p.uav_buffer;
+            for (UINT i = 0; i < DISPATCHES; i++)
+            {
+                uint32_t rc[4] = { i + f, 0, 0, 0 };
+                compute_list->SetComputeRoot32BitConstants(0, 4, rc, 0);
+                compute_list->Dispatch(1, 1, 1);
+                compute_list->ResourceBarrier(1, &uav);
+            }
+            CHECK(compute_list->Close());
+            ID3D12CommandList *computes[] = { compute_list };
+            compute_queue->ExecuteCommandLists(1, computes);
+            CHECK(compute_queue->Signal(compute_fence, ++compute_value));
+            CHECK(p.queue->Wait(compute_fence, compute_value));
+            double t4 = qpc_ms();
+            // recording on 8 threads
+            {
+                std::unique_lock<std::mutex> g(lock);
+                done = 0;
+                work_frame = f;
+                generation++;
+                start_cv.notify_all();
+                done_cv.wait(g, [] { return done == THREADS; });
+            }
+            double t5 = qpc_ms();
+            // two submissions, as engines split a frame
+            p.queue->ExecuteCommandLists(THREADS / 2, (ID3D12CommandList *const *)lists);
+            p.queue->ExecuteCommandLists(THREADS / 2, (ID3D12CommandList *const *)lists + THREADS / 2);
+            double t6 = qpc_ms();
+            // a CPU wait in the middle of the frame, as a readback or a full pipeline flush makes
+            CHECK(p.queue->Signal(mid_fence, ++mid_value));
+            CHECK(mid_fence->SetEventOnCompletion(mid_value, mid_event));
+            WaitForSingleObject(mid_event, INFINITE);
+            double t7 = qpc_ms();
+            // a pipeline of already compiled shaders in a state not seen before
+            if (variants[fi]) variants[fi]->Release();
+            variant_desc.RasterizerState.DepthBias = (INT)f + 1;
+            CHECK(p.device->CreateGraphicsPipelineState(&variant_desc, IID_PPV_ARGS(&variants[fi])));
+            double t8 = qpc_ms();
+            extras.add("descriptors_ms", t1 - t0);
+            extras.add("churn_ms", t2 - t1);
+            extras.add("upload_ms", t3 - t2);
+            extras.add("compute_ms", t4 - t3);
+            extras.add("record_ms", t5 - t4);
+            extras.add("execute_ms", t6 - t5);
+            extras.add("stall_ms", t7 - t6);
+            extras.add("pso_ms", t8 - t7);
+        }, false, 0, false, D3D_FEATURE_LEVEL_12_2 },
+    };
+}
+
 static std::vector<Scene> scenes()
 {
     std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes(),
-                       sub = submit_scenes();
+                       sub = submit_scenes(), stress = stress_scenes();
     all.insert(all.end(), more.begin(), more.end());
     all.insert(all.end(), sm6.begin(), sm6.end());
     all.insert(all.end(), feat.begin(), feat.end());
     all.insert(all.end(), eng.begin(), eng.end());
     all.insert(all.end(), sub.begin(), sub.end());
+    all.insert(all.end(), stress.begin(), stress.end());
     return all;
 }
 
@@ -3664,6 +3920,7 @@ int main(int argc, char **argv)
     for (const Scene &s : all) if (!strcmp(s.name, argv[1])) scene = &s;
     if (!scene) { printf("unknown scene %s\n", argv[1]); return 2; }
 
+    g_level = scene->level;
     setup();
     double t = qpc_ms();
     scene->init();
