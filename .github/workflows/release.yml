@@ -138,8 +138,10 @@ jobs:
           cp artifacts/mvk-new/libMoltenVK.dylib artifacts/mvk-new/MoltenVK_icd.json "$ROOT/"
           cp sources/MoltenVK/LICENSE "$ROOT/LICENSE.MoltenVK"
           codesign -f -s - "$ROOT/libMoltenVK.dylib"
-          lipo "$ROOT/libMoltenVK.dylib" -verify_arch arm64 x86_64
-          lipo -info "$ROOT/libMoltenVK.dylib"
+          ARCHS="$(lipo -archs "$ROOT/libMoltenVK.dylib")"
+          echo "libMoltenVK.dylib: $ARCHS"
+          case " $ARCHS " in *" arm64 "*) ;; *) echo "no arm64 slice" >&2; exit 1 ;; esac
+          case " $ARCHS " in *" x86_64 "*) ;; *) echo "no x86_64 slice" >&2; exit 1 ;; esac
           (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
           mkdir -p dist
           tar -C "$RUNNER_TEMP" -cf - "$NAME" | zstd -19 -q -o "dist/$NAME.tar.zst"
