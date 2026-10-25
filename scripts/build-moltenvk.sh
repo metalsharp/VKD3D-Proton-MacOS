@@ -21,8 +21,12 @@ if [ "$1" = "--externals" ]; then
         . ./Scripts/package_ext_libs_finish.sh'
 fi
 
+# Metal's private API (compiled libraries kept in pipeline caches, and what the runtime was tested with), and the key
+# pipeline caches are kept under (scripts/moltenvk-cache-key.sh), so a rebuild that changes no shader source keeps them.
+CACHE_KEY=$("$WS/scripts/moltenvk-cache-key.sh" "$SRC")
 xcodebuild build -project MoltenVKPackaging.xcodeproj -scheme "MoltenVK Package (macOS only)" \
     -destination "generic/platform=macOS" -configuration Release MACOSX_DEPLOYMENT_TARGET=15.0 \
+    GCC_PREPROCESSOR_DEFINITIONS="\$(inherited) MVK_USE_METAL_PRIVATE_API=1 MVK_PIPELINE_CACHE_SOURCES_HASH=0x${CACHE_KEY}ULL" \
     -derivedDataPath "$DD"
 mkdir -p "$OUT"
 cp Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib "$OUT/"
