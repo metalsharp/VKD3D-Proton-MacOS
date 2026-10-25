@@ -1,0 +1,178 @@
+name: Release
+
+# Builds the runtime's three parts from the pinned sources and this repository's patches:
+#   x86_64    VKD3D-Proton's d3d12.dll + d3d12core.dll, and DXVK's dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows)
+#   arm64     VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows)
+#   moltenvk  the universal libMoltenVK.dylib and its ICD file
+# A pushed tag vX.Y publishes them as one release, vX.Y, with each part a package of its own.
+# main and pull requests that change the build only build them (the archives are the run's artifacts).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/**'
+      - 'patches/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  LLVM_MINGW_VERSION: '20261020'
+
+jobs:
+  dlls:
+    name: ${{ matrix.lane }} DLLs
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [x86_64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install meson ninja glslang zstd
+          curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-macos-universal.tar.xz"
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          echo "LLVM_MINGW=$RUNNER_TEMP/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-macos-universal" >> "$GITHUB_ENV"
+          # fetch-sources.sh commits the patches it applies
+          git config --global user.name "MetalSharp"
+          git config --global user.email "metalsharp@users.noreply.github.com"
+
+      - name: Sources
+        run: |
+          if [ "${{ matrix.lane }}" = x86_64 ]; then
+            bash scripts/fetch-sources.sh vkd3d-proton dxvk
+          else
+            bash scripts/fetch-sources.sh vkd3d-proton
+          fi
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.lane }}" = x86_64 ]; then
+            bash scripts/build-vkd3d-proton.sh
+            bash scripts/build-dxvk.sh
+          else
+            bash scripts/build-vkd3d-proton-arm64x.sh
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || VERSION="$(git rev-parse --short HEAD)"
+          NAME="vkd3d-proton-$VERSION-${{ matrix.lane }}"
+          ROOT="$RUNNER_TEMP/$NAME"
+          if [ "${{ matrix.lane }}" = x86_64 ]; then
+            DIR="$ROOT/x86_64-windows"
+            mkdir -p "$DIR"
+            cp artifacts/build/vkd3d-proton/x86_64-windows/d3d12.dll artifacts/build/vkd3d-proton/x86_64-windows/d3d12core.dll "$DIR/"
+            cp artifacts/build/dxvk/x86_64-windows/dxgi.dll artifacts/build/dxvk/x86_64-windows/d3d11.dll \
+               artifacts/build/dxvk/x86_64-windows/d3d10core.dll "$DIR/"
+            cp sources/dxvk/LICENSE "$ROOT/LICENSE.dxvk"
+          else
+            DIR="$ROOT/aarch64-windows"
+            mkdir -p "$DIR"
+            cp artifacts/build/vkd3d-proton/aarch64-windows/d3d12.dll artifacts/build/vkd3d-proton/aarch64-windows/d3d12core.dll "$DIR/"
+          fi
+          cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.vkd3d-proton"
+          file "$DIR"/*.dll
+          (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+          mkdir -p dist
+          tar -C "$RUNNER_TEMP" -cf - "$NAME" | zstd -19 -q -o "dist/$NAME.tar.zst"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.lane }}
+          path: dist/*.tar.zst
+          if-no-files-found: error
+
+  moltenvk:
+    name: universal MoltenVK
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          # the newest installed Xcode: MoltenVK's macOS 26 features need its SDK
+          X="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -1)"
+          sudo xcode-select -s "$X"
+          xcodebuild -version
+          SDK="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK $SDK"
+          [ "${SDK%%.*}" -ge 26 ] || { echo "MoltenVK needs the macOS 26 SDK or later, the runner's newest is $SDK" >&2; exit 1; }
+          brew install zstd
+          git config --global user.name "MetalSharp"
+          git config --global user.email "metalsharp@users.noreply.github.com"
+
+      - name: Sources
+        run: bash scripts/fetch-sources.sh moltenvk
+
+      - name: Build
+        run: bash scripts/build-moltenvk.sh --externals
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || VERSION="$(git rev-parse --short HEAD)"
+          NAME="moltenvk-$VERSION-universal"
+          ROOT="$RUNNER_TEMP/$NAME"
+          mkdir -p "$ROOT"
+          cp artifacts/mvk-new/libMoltenVK.dylib artifacts/mvk-new/MoltenVK_icd.json "$ROOT/"
+          cp sources/MoltenVK/LICENSE "$ROOT/LICENSE.MoltenVK"
+          codesign -f -s - "$ROOT/libMoltenVK.dylib"
+          lipo -verify_arch arm64 x86_64 "$ROOT/libMoltenVK.dylib"
+          lipo -info "$ROOT/libMoltenVK.dylib"
+          (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+          mkdir -p dist
+          tar -C "$RUNNER_TEMP" -cf - "$NAME" | zstd -19 -q -o "dist/$NAME.tar.zst"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moltenvk
+          path: dist/*.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Releases
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [dlls, moltenvk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          cat > notes.md <<EOF
+          Built from $GITHUB_SHA. Each package holds its files, their licenses and SHA256SUMS.
+
+          - **vkd3d-proton-$TAG-x86_64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\`, with DXVK's \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\`, for x86_64 Windows programs (\`x86_64-windows\`). Stage them together.
+          - **vkd3d-proton-$TAG-arm64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`): native arm64 programs, and x86_64 programs as ARM64EC under FEX.
+          - **moltenvk-$TAG-universal**: the universal (arm64 + x86_64), ad-hoc signed \`libMoltenVK.dylib\` and \`MoltenVK_icd.json\` both lanes run on.
+          EOF
+          gh release create "$TAG" dist/x86_64/*.tar.zst dist/arm64/*.tar.zst dist/moltenvk/*.tar.zst \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "VKD3D-Proton MacOS $TAG" --notes-file notes.md
