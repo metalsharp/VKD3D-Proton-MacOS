@@ -3074,7 +3074,7 @@ index 9afc3ed8..a39c57e5 100644
 +	uint32_t _maxSequenceCount = 0;
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
-index d0452973..69d37235 100644
+index d0452973..91ac92e3 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 @@ -19,10 +19,7 @@
@@ -3890,7 +3890,7 @@ index d0452973..69d37235 100644
              } else if (drawIdx == 0 && vtxAdjmts.needsAdjustment()) {
                  // Similarly, for multiview, we need to adjust the instance count now.
                  // Unfortunately, this requires switching to compute. Luckily, we don't also
-@@ -1535,3 +1988,635 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1535,3 +1988,656 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          }
      }
  }
@@ -4322,8 +4322,29 @@ index d0452973..69d37235 100644
 +	uint32_t hasCount;
 +};
 +
++// MVK_CONFIG_DGC_STATS=1 logs, every 2000 calls, how many sequences the calls allowed and whether a count
++// buffer limited them, by action: what an application's GPU-driven work looks like.
++static void mvkLogGeneratedCommandsStats(VkIndirectCommandsTokenTypeEXT actionType, uint32_t maxSequenceCount, bool counted) {
++	static const bool enabled = mvkGetEnvVarNumber("MVK_CONFIG_DGC_STATS", 0) != 0;
++	if ( !enabled ) { return; }
++	static std::mutex lock;
++	static uint64_t calls, sequences, countedCalls, dispatchCalls, buckets[6];
++	std::lock_guard<std::mutex> guard(lock);
++	calls++;
++	sequences += maxSequenceCount;
++	countedCalls += counted;
++	dispatchCalls += actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
++	buckets[maxSequenceCount <= 1 ? 0 : maxSequenceCount <= 16 ? 1 : maxSequenceCount <= 64 ? 2 : maxSequenceCount <= 256 ? 3 : maxSequenceCount <= 1024 ? 4 : 5]++;
++	if (calls % 2000) { return; }
++	fprintf(stderr, "[mvk-info] vkCmdExecuteGeneratedCommandsEXT(): %llu calls, %llu dispatches, %llu with a count buffer, %.1f sequences"
++			   " allowed a call; max sequences 1: %llu, 2-16: %llu, 17-64: %llu, 65-256: %llu, 257-1024: %llu, more: %llu\n",
++			   calls, dispatchCalls, countedCalls, double(sequences) / calls,
++			   buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
++}
++
 +void MVKCmdExecuteGeneratedCommands::encode(MVKCommandEncoder* cmdEncoder) {
 +	if ( !_maxSequenceCount || !_layout || _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT ) { return; }
++	mvkLogGeneratedCommandsStats(_layout->_actionType, _maxSequenceCount, _mtlCount != nil);
 +
 +	uint32_t argsSize;
 +	switch (_layout->_actionType) {
@@ -5466,7 +5487,7 @@ index f6c94625..ea2a7108 100644
 +/** Returns a name, suitable for use as a MTLAccelerationStructureCommandEncoder label, based on the MVKCommandUse. */
 +NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse);
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-index de39c961..4ee04201 100644
+index de39c961..50d7651e 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 @@ -21,6 +21,7 @@
@@ -6042,7 +6063,7 @@ index de39c961..4ee04201 100644
  
  	if (_mtlComputeEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlComputeEncoder updateFence: getStageCountersMTLFence()]; }
  	endMetalEncoding(_mtlComputeEncoder);
-@@ -1074,9 +1394,29 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1074,13 +1394,41 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	endMetalEncoding(_mtlBlitEncoder);
      _mtlBlitEncoderUse = kMVKCommandUseNone;
  
@@ -6069,10 +6090,22 @@ index de39c961..4ee04201 100644
 +	return _mtlCmdBuffer ? VK_SUCCESS : VK_ERROR_OUT_OF_POOL_MEMORY;
 +}
 +
++// The application's dispatches run concurrently, as Vulkan lets them: a pipeline barrier between dispatches is a
++// memory barrier in the encoder (encodeDispatchMemoryBarrier()), and any other ends it. In a serial encoder each
++// dispatch waits for the previous one to finish, which leaves the GPU idle between small dispatches: 20 compute
++// ExecuteIndirects of 64 one-group dispatches took 4.6 ms of GPU time (d3d12_perf_probe execute_indirect_dispatch_exact).
++// MVK_CONFIG_CONCURRENT_DISPATCH=0 makes them serial.
  static MTLDispatchType getDispatchType(MVKCommandUse use) {
++	static const bool concurrentDispatch = mvkGetEnvVarNumber("MVK_CONFIG_CONCURRENT_DISPATCH", 1) != 0;
  	switch (use) {
  		case kMVKCommandUseAccumOcclusionQuery:
-@@ -1103,6 +1443,25 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+ 			return MTLDispatchTypeConcurrent;
++		case kMVKCommandUseDispatch:
++			return concurrentDispatch ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+ 		default:
+ 			return MTLDispatchTypeSerial;
+ 	}
+@@ -1103,6 +1451,25 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	return wantsSeparateComputeEncoder(prev) || wantsSeparateComputeEncoder(next);
  }
  
@@ -6090,7 +6123,7 @@ index de39c961..4ee04201 100644
 +		_pendingBarrierSrcStages |= srcStages;
 +		_pendingBarrierDstStages |= dstStages;
 +	}
-+	// Serial dispatches already run one after another; the barrier makes their writes visible.
++	// The later dispatches wait for the earlier ones and see their writes.
 +	[_mtlComputeEncoder memoryBarrierWithScope: MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
 +	return true;
 +}
@@ -6098,7 +6131,7 @@ index de39c961..4ee04201 100644
  id<MTLComputeCommandEncoder> MVKCommandEncoder::getMTLComputeEncoder(MVKCommandUse cmdUse) {
  	bool needWaits = false;
  	if (!_mtlComputeEncoder || shouldStartNewEncoder(_mtlComputeEncoderUse, cmdUse)) {
-@@ -1146,10 +1505,30 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1146,10 +1513,30 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	return _mtlBlitEncoder;
  }
  
@@ -6129,7 +6162,7 @@ index de39c961..4ee04201 100644
  	return nil;
  }
  
-@@ -1206,10 +1585,121 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1206,10 +1593,121 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // Copies the specified bytes into a temporary allocation within a pooled MTLBuffer, and returns the MTLBuffer allocation.
  const MVKMTLBufferAllocation* MVKCommandEncoder::copyToTempMTLBufferAllocation(const void* bytes, NSUInteger length, bool isDedicated) {
  	const MVKMTLBufferAllocation* mtlBuffAlloc = getTempMTLBuffer(length, false, isDedicated);
@@ -6254,7 +6287,7 @@ index de39c961..4ee04201 100644
  }
  
  
-@@ -1264,6 +1754,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1264,6 +1762,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	}
  }
  
@@ -6265,7 +6298,7 @@ index de39c961..4ee04201 100644
  // Metal stage GPU counters need to be configured in a Metal render, compute, or BLIT encoder, meaning that the
  // Metal encoder needs to know about any Vulkan timestamp commands that will be executed during the execution
  // of a renderpass, or set of Vulkan dispatch or BLIT commands. In addition, there are a very small number of
-@@ -1358,9 +1852,12 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1358,9 +1860,12 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  
  #pragma mark Construction
  
@@ -6279,7 +6312,7 @@ index de39c961..4ee04201 100644
  	, _prefillStyle(prefillStyle) {
  	_pActivatedQueries = nullptr;
  	_mtlCmdBuffer = nil;
-@@ -1371,15 +1868,20 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1371,15 +1876,20 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	_mtlComputeEncoderStages = 0;
  	_mtlBlitEncoder = nil;
  	_mtlBlitEncoderUse = kMVKCommandUseNone;
@@ -6300,7 +6333,7 @@ index de39c961..4ee04201 100644
  	// _stageCountersMTLFence is released after Metal command buffer completion
  }
  
-@@ -1415,6 +1917,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1415,6 +1925,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseUpdateBuffer:                    return @"vkCmdUpdateBuffer BlitEncoder";
          case kMVKCommandUseResetQueryPool:                  return @"vkCmdResetQueryPool BlitEncoder";
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
@@ -6310,7 +6343,7 @@ index de39c961..4ee04201 100644
  		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
          default:                                            return @"Unknown Use BlitEncoder";
      }
-@@ -1423,6 +1928,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1423,6 +1936,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
      switch (cmdUse) {
          case kMVKCommandUseDispatch:                        return @"vkCmdDispatch ComputeEncoder";
@@ -6318,7 +6351,7 @@ index de39c961..4ee04201 100644
          case kMVKCommandUseCopyBuffer:                      return @"vkCmdCopyBuffer ComputeEncoder";
          case kMVKCommandUseCopyBufferToImage:               return @"vkCmdCopyBufferToImage ComputeEncoder";
          case kMVKCommandUseCopyImageToBuffer:               return @"vkCmdCopyImageToBuffer ComputeEncoder";
-@@ -1434,6 +1940,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1434,6 +1948,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults ComputeEncoder";
          case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
          case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
@@ -14808,7 +14841,7 @@ index e385e9bd..c1a9dcb5 100644
  #pragma mark Construction
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 47bbd4fc..b73d0dae 100644
+index 47bbd4fc..d3cda7a7 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -21,7 +21,6 @@
@@ -17939,7 +17972,7 @@ index 47bbd4fc..b73d0dae 100644
 -	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
 -	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>();
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(5);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(8);
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
 +	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(5);
 +#else
@@ -17953,7 +17986,7 @@ index 47bbd4fc..b73d0dae 100644
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(33);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(36);			// Contains string
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
 +	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(31);			// Contains string
 +#else
@@ -17965,7 +17998,7 @@ index 47bbd4fc..b73d0dae 100644
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
 -	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
 +#if SPIRV_CROSS_MSL_RAY_TRACING_PIPELINE
-+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(129);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(132);	// Contains collection
 +#elif SPIRV_CROSS_MSL_ACCELERATION_STRUCTURE_DESCRIPTOR_AS_ADDRESS
 +	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(111);	// Contains collection
 +#else
