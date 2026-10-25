@@ -1,43 +1,35 @@
 #!/bin/bash
-# Build the custom MoltenVK universal dylib (x86_64 + arm64).
-# Verified working 2026-08-14 (evidence full-selfbuild-run1: the built dylib runs
-# the full D3D12 probe stack). Stages to $OUT.build.new; promotion requires probe evidence.
+# Build MetalSharp's MoltenVK (universal dylib) from sources/MoltenVK (scripts/fetch-sources.sh).
+#   scripts/build-moltenvk.sh [--externals]
+# --externals rebuilds SPIRV-Cross and SPIRV-Tools from sources/MoltenVK/External (needed after
+# changing External/SPIRV-Cross). Xcode's derived data lives in $TMPDIR: its build database
+# fails with disk I/O errors on some external volumes. Output: artifacts/mvk-new.
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
-source "$WS/scripts/env.sh"
 SRC="$WS/sources/MoltenVK"
-OUT="$WS/artifacts/build/moltenvk-vkmt"
-
-
-
-[ -d "$SRC/MoltenVK" ] || { echo "MoltenVK source missing"; exit 1; }
-
+DD="${TMPDIR:-/tmp}/metalsharp-moltenvk-dd"
+OUT="$WS/artifacts/mvk-new"
 cd "$SRC"
-# 1) externals (SPIRV-Cross, SPIRV-Tools, Vulkan-Headers, glslang, ...) — builds XCFrameworks
-# the fetch re-checks out the pinned SPIRV-Cross; the fork's patch script
-# re-applies the BuiltInFullyCoveredEXT MSL emission changes before the
-# XCFramework build.
-export MVK_FORK_SCRIPT_DIR="$WS/scripts"
-./fetchDependencies --macos
-# The MoltenVKShaderConverter has its own SPIRV-Cross checkout; apply the fork
-# patches there too (the MVK dylib links the converter's SPIRV-Cross code).
-"$WS/scripts/patch-spirv-cross.sh" "$SRC/MoltenVKShaderConverter/SPIRV-Cross/spirv_msl.cpp"
-"$WS/scripts/patch-spirv-cross.sh" "$SRC/MoltenVKShaderConverter/SPIRV-Cross/spirv_cross.cpp" 2>/dev/null || true
 
-# 2) dylib package. Pass the deployment target as an xcodebuild setting;
-# relying on the environment alone makes Xcode use the SDK's current version.
-DEVELOPER_DIR="$DEVELOPER_DIR" xcodebuild build \
-    -project MoltenVKPackaging.xcodeproj \
-    -scheme "MoltenVK Package (macOS only)" \
-    -destination "generic/platform=macOS" \
-    -configuration Release \
-    MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+if [ "$1" = "--externals" ]; then
+    xcodebuild -project ExternalDependencies.xcodeproj -scheme ExternalDependencies-macOS \
+        -destination "generic/platform=macOS" -configuration Release \
+        -enableAddressSanitizer NO -enableThreadSanitizer NO -enableUndefinedBehaviorSanitizer NO \
+        -derivedDataPath "$DD-ext" MACOSX_DEPLOYMENT_TARGET=15.0 build
+    PROJECT_DIR="." CONFIGURATION=Release SKIP_PACKAGING="" bash -c '
+        . ./Scripts/create_ext_lib_xcframeworks.sh
+        . ./Scripts/package_ext_libs_finish.sh'
+fi
 
-NEW="$OUT.build.new"
-rm -rf "$NEW"
-mkdir -p "$NEW"
-cp -R Package/Release/MoltenVK/dynamic/dylib/macOS/* "$NEW/"
-echo "== built (staged, not promoted) =="
-file "$NEW/libMoltenVK.dylib"
-shasum -a 256 "$NEW/libMoltenVK.dylib"
-echo "promote with: cp $NEW/* $OUT/  (after probe evidence)"
+# Metal's private API (compiled libraries kept in pipeline caches, and what the runtime was tested with), and the key
+# pipeline caches are kept under (scripts/moltenvk-cache-key.sh), so a rebuild that changes no shader source keeps them.
+CACHE_KEY=$("$WS/scripts/moltenvk-cache-key.sh" "$SRC")
+xcodebuild build -project MoltenVKPackaging.xcodeproj -scheme "MoltenVK Package (macOS only)" \
+    -destination "generic/platform=macOS" -configuration Release MACOSX_DEPLOYMENT_TARGET=15.0 \
+    GCC_PREPROCESSOR_DEFINITIONS="\$(inherited) MVK_USE_METAL_PRIVATE_API=1 MVK_PIPELINE_CACHE_SOURCES_HASH=0x${CACHE_KEY}ULL" \
+    -derivedDataPath "$DD"
+mkdir -p "$OUT"
+cp Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib "$OUT/"
+sed 's#"library_path": *"[^"]*"#"library_path": "./libMoltenVK.dylib"#' \
+    Package/Release/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json > "$OUT/MoltenVK_icd.json"
+shasum -a 256 "$OUT/libMoltenVK.dylib"

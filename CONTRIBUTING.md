@@ -68,5 +68,5 @@ the GitHub administrator bypass (`gh pr merge --admin`) when an exceptional
 direct merge is required.
 
 By contributing, you agree that your work can be distributed under the
-repository's [MIT License](LICENSE), unless a different upstream license
-applies to the contributed component.
+repository's [AGPL-3.0 License](LICENSE). Changes to an upstream project in
+`patches/` are distributed under that project's license.

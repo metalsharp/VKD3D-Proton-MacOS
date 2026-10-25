@@ -1,0 +1,11 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_multiview : require
+layout(local_size_x = 1) in;
+struct Payload { uint view; };
+taskPayloadSharedEXT Payload payload;
+void main()
+{
+    payload.view = 0u;  // glslang has no gl_ViewIndex in task shaders.
+    EmitMeshTasksEXT(1, 1, 1);
+}

@@ -2,6 +2,9 @@
 
 **Status:** shipped and publicly released as [`v1.0`](https://github.com/metalsharp/vkd3d-proton-macos/releases/tag/v1.0).
 
+> This records the v1.0 release. Current releases are built by CI with separate x86_64, arm64 and MoltenVK
+> packages: see [release.md](release.md) and [install.md](install.md).
+
 This is the consolidated final-state record for the Apple Silicon D3D12
 runtime. It replaces the numbered planning/evidence documents that were used
 during development.

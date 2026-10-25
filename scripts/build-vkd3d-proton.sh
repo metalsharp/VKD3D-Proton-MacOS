@@ -36,6 +36,7 @@ cpp = 'x86_64-w64-mingw32-clang++'
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 windres = 'llvm-windres'
+widl = 'x86_64-w64-mingw32-widl'
 [host_machine]
 system = 'windows'
 cpu_family = 'x86_64'

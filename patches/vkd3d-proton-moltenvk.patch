@@ -1,0 +1,1161 @@
+From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 14:37:47 -0600
+Subject: [PATCH 01/13] vkd3d: Run on MoltenVK: optional transform feedback,
+ VKMT texel alignment, Metal-safe decompression shaders.
+
+- Without VK_EXT_transform_feedback, stream output is disabled instead of failing
+  device creation; SO statistics queries resolve to zero.
+- VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT accepts the custom MoltenVK's emulated
+  unaligned texel buffer views.
+- The NV memory decompression shaders keep their dispatch size as three scalars:
+  MSL has no atomics on a vector component.
+---
+ libs/vkd3d/command.c                          | 42 +++++++++++++++++++
+ libs/vkd3d/device.c                           | 23 ++++++++--
+ ..._emit_nv_memory_decompression_regions.comp |  8 +++-
+ ...it_nv_memory_decompression_workgroups.comp | 10 ++++-
+ 4 files changed, 75 insertions(+), 8 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8a632d2d..fc696f7e 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -5031,6 +5031,39 @@ static void d3d12_command_list_reset_active_query(struct d3d12_command_list *lis
+     query->state = VKD3D_ACTIVE_QUERY_RESET;
+ }
+ 
++static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type);
++
++/* Without VK_EXT_transform_feedback (MoltenVK) stream output is disabled, so SO statistics
++ * queries never reach Vulkan: ending one stores zero primitives written and needed. */
++static bool d3d12_query_type_needs_missing_xfb(struct d3d12_command_list *list, D3D12_QUERY_TYPE type)
++{
++    return d3d12_query_type_is_indexed(type) && !list->device->vk_info.EXT_transform_feedback;
++}
++
++static void d3d12_command_list_write_zero_query(struct d3d12_command_list *list,
++        struct d3d12_query_heap *heap, uint32_t index)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    size_t stride = get_query_heap_stride(heap->desc.Type);
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++
++    d3d12_command_list_end_current_render_pass(list, true);
++    VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, heap->vk_buffer, index * stride, stride, 0));
++
++    memset(&vk_barrier, 0, sizeof(vk_barrier));
++    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &vk_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++}
++
+ static bool d3d12_command_list_enable_query(struct d3d12_command_list *list,
+         struct d3d12_query_heap *heap, uint32_t index, D3D12_QUERY_TYPE type)
+ {
+@@ -17418,6 +17451,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
++    if (d3d12_query_type_needs_missing_xfb(list, type))
++        return;
++
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (d3d12_command_list_is_query_resolve_pending(list, query_heap, index))
+@@ -17463,6 +17499,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
++    if (d3d12_query_type_needs_missing_xfb(list, type))
++    {
++        d3d12_command_list_write_zero_query(list, query_heap, index);
++        return;
++    }
++
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 817f8a80..8334e3b1 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2501,8 +2501,13 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        /* Metal (MoltenVK) has no transform feedback. Everything else in D3D12 works without it:
++         * stream output and its queries are turned off instead of failing device creation. */
++        WARN("Lacking transform-feedback behavior; stream output is disabled (VKMT).\n");
++        vulkan_info->EXT_transform_feedback = false;
++        memset(&physical_device_info->xfb_features, 0, sizeof(physical_device_info->xfb_features));
++        memset(&physical_device_info->xfb_properties, 0, sizeof(physical_device_info->xfb_properties));
++        vulkan_info->rasterization_stream = false;
+     }
+ 
+     single_storage_texel =
+@@ -2516,8 +2521,18 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment; the custom VKMT
++         * MoltenVK emulates unaligned views, which VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT vouches for. */
++        char allow[8];
++        if (vkd3d_get_env_var("VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT", allow, sizeof(allow)) && strcmp(allow, "0"))
++        {
++            WARN("Allowing non-single texel alignment (VKMT).\n");
++        }
++        else
++        {
++            ERR("Lacking support for single texel alignment.\n");
++            return E_INVALIDARG;
++        }
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+index 2978f0bb..8af6c20a 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+@@ -43,7 +43,11 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ buffer memory_regions_t {
+-  uvec3 region_count;
++  /* the indirect dispatch size, as three scalars (the same scalar layout as a uvec3): MSL has
++   * no atomics on a vector component, so SPIR-V's access chain into a uvec3 fails there */
++  uint  region_count_x;
++  uint  region_count_y;
++  uint  region_count_z;
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -102,7 +106,7 @@ void main() {
+ 
+   // Allocate an output region structure from the scratch buffer
+   memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-  uint out_index = atomicAdd(region_buffer.region_count.x, 1);
++  uint out_index = atomicAdd(region_buffer.region_count_x, 1);
+ 
+   // Compute absolute VAs for vkCmdDecompressMemoryIndirectCountNV
+   region_buffer.memory_regions[out_index] = memory_region_t(
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+index aea1124c..3863eb42 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+@@ -48,7 +48,11 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ writeonly buffer memory_regions_t {
+-  uvec3 region_count;
++  /* the indirect dispatch size, as three scalars (the same scalar layout as a uvec3): MSL has
++   * no atomics on a vector component, so SPIR-V's access chain into a uvec3 fails there */
++  uint  region_count_x;
++  uint  region_count_y;
++  uint  region_count_z;
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -70,7 +74,9 @@ void main() {
+   // Reset memory region count that is later passed the decompression command.
+   if (stream_index == 0u) {
+     memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-    region_buffer.region_count = uvec3(0u, 1u, 1u);
++    region_buffer.region_count_x = 0u;
++    region_buffer.region_count_y = 1u;
++    region_buffer.region_count_z = 1u;
+   }
+ 
+   if (stream_index >= stream_count)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 23 Oct 2026 16:36:29 -0600
+Subject: [PATCH 02/13] Keep the transform feedback structures linked when
+ stream output is disabled
+
+Zeroing them cleared their sType and pNext while they were in the feature and property chains
+the device is created with, which dropped every structure after them (robustness2 included).
+---
+ libs/vkd3d/device.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 8334e3b1..836a7441 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2505,8 +2505,12 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+          * stream output and its queries are turned off instead of failing device creation. */
+         WARN("Lacking transform-feedback behavior; stream output is disabled (VKMT).\n");
+         vulkan_info->EXT_transform_feedback = false;
+-        memset(&physical_device_info->xfb_features, 0, sizeof(physical_device_info->xfb_features));
+-        memset(&physical_device_info->xfb_properties, 0, sizeof(physical_device_info->xfb_properties));
++        /* The structures stay linked into the feature and property chains (which the device is
++         * created with), so only their values are cleared. */
++        physical_device_info->xfb_features.transformFeedback = VK_FALSE;
++        physical_device_info->xfb_features.geometryStreams = VK_FALSE;
++        memset((char *)&physical_device_info->xfb_properties + offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams),
++                0, sizeof(physical_device_info->xfb_properties) - offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams));
+         vulkan_info->rasterization_stream = false;
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 16:59:26 -0600
+Subject: [PATCH 03/13] device: accept FTZ-only FP32 denorm control on MoltenVK
+ for SM 6.2
+
+---
+ libs/vkd3d/device.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 836a7441..e4eecfcf 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9814,6 +9814,12 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
+             {
+                 denorm_behavior = device->device_info.vulkan_1_2_properties.shaderDenormFlushToZeroFloat32 &&
+                         device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat32;
++
++                /* MoltenVK: Apple GPUs always flush FP32 denorms and Metal has no preserve control.
++                 * DXIL defaults to "any" denorm mode, so only shaders that explicitly request
++                 * preserve (-denorm preserve) observe a deviation. Accept FTZ-only. */
++                if (!denorm_behavior && device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++                    denorm_behavior = device->device_info.vulkan_1_2_properties.shaderDenormFlushToZeroFloat32;
+             }
+         }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 17:51:33 -0600
+Subject: [PATCH 04/13] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+ a 16-pixel shading rate tile
+
+---
+ libs/vkd3d/device.c             | 3 +++
+ libs/vkd3d/device_workarounds.c | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index e4eecfcf..8ae68956 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9433,6 +9433,9 @@ static void d3d12_device_caps_init_feature_options6(struct d3d12_device *device)
+     if (options6->VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2)
+     {
+         options6->ShadingRateImageTileSize = d3d12_determine_shading_rate_image_tile_size(device);
++        /* Emulated tier 2 ignores shading rate images; report a valid tile size so apps can size them. */
++        if (!options6->ShadingRateImageTileSize && !d3d12_device_supports_variable_shading_rate_tier_2(device))
++            options6->ShadingRateImageTileSize = 16;
+ 
+         options6->PerPrimitiveShadingRateSupportedWithViewportIndexing =
+                 device->device_info.fragment_shading_rate_properties.primitiveFragmentShadingRateWithMultipleViewports;
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+index 55e17c26..5a7f58e7 100644
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -1173,6 +1173,11 @@ bool vkd3d_driver_id_wraps_ssbo_32bit_before_robustness(VkDriverId driver_id)
+ 
+ bool d3d12_device_allow_emulated_vrs_tier_2(struct d3d12_device *device)
+ {
++    /* MoltenVK: Metal has no per-draw or per-tile shading rates. Shade at full rate, as the
++     * RDNA1 compatibility path does: shading rate state is ignored, which only costs performance. */
++    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++        return true;
++
+     return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) &&
+             device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_AMD &&
+             device->device_info.vulkan_1_3_properties.minSubgroupSize == 32;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 18:35:19 -0600
+Subject: [PATCH 05/13] MoltenVK: tiled resources tier 3+ with Metal's
+ nonstandard 3D tile shape
+
+---
+ libs/vkd3d/device.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 8ae68956..ea779aa9 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -8972,8 +8972,12 @@ static D3D12_TILED_RESOURCES_TIER d3d12_device_determine_tiled_resources_tier(st
+             !device->device_info.vulkan_1_2_properties.filterMinmaxSingleComponentFormats)
+         return D3D12_TILED_RESOURCES_TIER_1;
+ 
++    /* MoltenVK: Metal's 3D sparse tiles are one slice deep (e.g. 128x128x1 for 32 bpp) rather than the
++     * standard 3D shapes. GetResourceTiling() reports the real tile shape, which is what applications
++     * size tiled volumes with, so accept the nonstandard shape. */
+     if (!features->sparseResidencyImage3D ||
+-            !sparse_properties->residencyStandard3DBlockShape)
++            (!sparse_properties->residencyStandard3DBlockShape &&
++             device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK))
+         return D3D12_TILED_RESOURCES_TIER_2;
+ 
+     return D3D12_TILED_RESOURCES_TIER_4;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 18:43:10 -0600
+Subject: [PATCH 06/13] MoltenVK: typed buffer views start at aligned offsets
+ via the typed offset buffer (no env bypass)
+
+---
+ libs/vkd3d/device.c   | 14 ++++++++------
+ libs/vkd3d/resource.c | 12 ++++++++++++
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ea779aa9..9c6839ea 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2525,12 +2525,14 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment; the custom VKMT
+-         * MoltenVK emulates unaligned views, which VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT vouches for. */
+-        char allow[8];
+-        if (vkd3d_get_env_var("VKMT_ALLOW_NON_SINGLE_TEXEL_ALIGNMENT", allow, sizeof(allow)) && strcmp(allow, "0"))
+-        {
+-            WARN("Allowing non-single texel alignment (VKMT).\n");
++        /* MoltenVK aligns texel buffer views to Metal's linear-texture alignment (16 bytes). Without
++         * descriptor buffers (which MoltenVK lacks), typed views go through the typed offset buffer:
++         * the view starts at an aligned offset and the shader adds the element offset
++         * (see vkd3d_buffer_view_get_aligned_view()). */
++        if (physical_device_info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
++                !vulkan_info->EXT_descriptor_buffer)
++        {
++            INFO("Typed buffer views are aligned through the typed offset buffer.\n");
+         }
+         else
+         {
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a8fc26b1..bf474e86 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -6372,6 +6372,18 @@ static bool vkd3d_buffer_view_get_aligned_view(
+             end_range = (first_element + num_elements + element_align - 1) & ~(element_align - 1);
+             end_range = min(end_range, max_resource_elements);
+ 
++            /* Without single texel alignment (MoltenVK: 16 bytes), the view must also start at an
++             * aligned byte offset; if quantizing did not get there, start the view at 0 instead. */
++            if (!device->device_info.vulkan_1_3_properties.storageTexelBufferOffsetSingleTexelAlignment ||
++                    !device->device_info.vulkan_1_3_properties.uniformTexelBufferOffsetSingleTexelAlignment)
++            {
++                VkDeviceSize byte_count = format ? vkd3d_get_format(device, format, false)->byte_count : sizeof(uint32_t);
++                VkDeviceSize align = max(device->device_info.vulkan_1_3_properties.storageTexelBufferOffsetAlignmentBytes,
++                        device->device_info.vulkan_1_3_properties.uniformTexelBufferOffsetAlignmentBytes);
++                if (align && (begin_range * byte_count) % align)
++                    begin_range = 0;
++            }
++
+             bound_range->element_offset = first_element - begin_range;
+             bound_range->element_count = num_elements;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 19:03:16 -0600
+Subject: [PATCH 07/13] MoltenVK: require transform feedback again
+
+The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
+copy of the vertex shader, counter buffers, overflow and stream queries), so
+stream output no longer has to be disabled on it.
+---
+ libs/vkd3d/command.c | 42 ------------------------------------------
+ libs/vkd3d/device.c  | 13 ++-----------
+ 2 files changed, 2 insertions(+), 53 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index fc696f7e..8a632d2d 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -5031,39 +5031,6 @@ static void d3d12_command_list_reset_active_query(struct d3d12_command_list *lis
+     query->state = VKD3D_ACTIVE_QUERY_RESET;
+ }
+ 
+-static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type);
+-
+-/* Without VK_EXT_transform_feedback (MoltenVK) stream output is disabled, so SO statistics
+- * queries never reach Vulkan: ending one stores zero primitives written and needed. */
+-static bool d3d12_query_type_needs_missing_xfb(struct d3d12_command_list *list, D3D12_QUERY_TYPE type)
+-{
+-    return d3d12_query_type_is_indexed(type) && !list->device->vk_info.EXT_transform_feedback;
+-}
+-
+-static void d3d12_command_list_write_zero_query(struct d3d12_command_list *list,
+-        struct d3d12_query_heap *heap, uint32_t index)
+-{
+-    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+-    size_t stride = get_query_heap_stride(heap->desc.Type);
+-    VkMemoryBarrier2 vk_barrier;
+-    VkDependencyInfo dep_info;
+-
+-    d3d12_command_list_end_current_render_pass(list, true);
+-    VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, heap->vk_buffer, index * stride, stride, 0));
+-
+-    memset(&vk_barrier, 0, sizeof(vk_barrier));
+-    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+-    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+-    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+-    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+-    vk_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+-    memset(&dep_info, 0, sizeof(dep_info));
+-    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+-    dep_info.memoryBarrierCount = 1;
+-    dep_info.pMemoryBarriers = &vk_barrier;
+-    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+-}
+-
+ static bool d3d12_command_list_enable_query(struct d3d12_command_list *list,
+         struct d3d12_query_heap *heap, uint32_t index, D3D12_QUERY_TYPE type)
+ {
+@@ -17451,9 +17418,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
+-    if (d3d12_query_type_needs_missing_xfb(list, type))
+-        return;
+-
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (d3d12_command_list_is_query_resolve_pending(list, query_heap, index))
+@@ -17499,12 +17463,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_track_query_heap(list, query_heap);
+ 
+-    if (d3d12_query_type_needs_missing_xfb(list, type))
+-    {
+-        d3d12_command_list_write_zero_query(list, query_heap, index);
+-        return;
+-    }
+-
+     if (d3d12_query_heap_type_is_inline(query_heap->desc.Type))
+     {
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 9c6839ea..4717e179 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2501,17 +2501,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        /* Metal (MoltenVK) has no transform feedback. Everything else in D3D12 works without it:
+-         * stream output and its queries are turned off instead of failing device creation. */
+-        WARN("Lacking transform-feedback behavior; stream output is disabled (VKMT).\n");
+-        vulkan_info->EXT_transform_feedback = false;
+-        /* The structures stay linked into the feature and property chains (which the device is
+-         * created with), so only their values are cleared. */
+-        physical_device_info->xfb_features.transformFeedback = VK_FALSE;
+-        physical_device_info->xfb_features.geometryStreams = VK_FALSE;
+-        memset((char *)&physical_device_info->xfb_properties + offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams),
+-                0, sizeof(physical_device_info->xfb_properties) - offsetof(VkPhysicalDeviceTransformFeedbackPropertiesEXT, maxTransformFeedbackStreams));
+-        vulkan_info->rasterization_stream = false;
++        ERR("Lacking support for transform feedback.\n");
++        return E_INVALIDARG;
+     }
+ 
+     single_storage_texel =
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 23 Oct 2026 23:25:55 -0600
+Subject: [PATCH 08/13] vkd3d: Typed resources that aren't UAVs only take views
+ of their format or its sRGB one.
+
+The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
+targets with MTLTextureUsagePixelFormatView, which costs Metal's lossless compression (a full-screen copy from such
+a texture takes about 2.9x as long on an M4).
+---
+ libs/vkd3d/resource.c | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index bf474e86..56118e03 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -369,6 +369,29 @@ static bool vkd3d_get_castable_format_compatibility_list(const struct d3d12_devi
+     return list->format_count != 0;
+ }
+ 
++static VkFormat vkd3d_vk_format_srgb_counterpart(VkFormat format)
++{
++    static const VkFormat pairs[][2] =
++    {
++        { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB },
++        { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB },
++        { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK },
++        { VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK },
++        { VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK },
++        { VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(pairs); i++)
++    {
++        if (pairs[i][0] == format)
++            return pairs[i][1];
++        if (pairs[i][1] == format)
++            return pairs[i][0];
++    }
++    return VK_FORMAT_UNDEFINED;
++}
++
+ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *device,
+         const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_format_compatibility_list *list, VkImageCreateFlags *vk_flags)
+ {
+@@ -390,6 +413,22 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
+     if (desc->Format < device->format_compatibility_list_count)
+         *list = device->format_compatibility_lists[desc->Format];
+ 
++    /* A typed resource that isn't a UAV only takes views of its format or the sRGB / UNORM one: the integer formats
++     * in its list serve UAV clears. Leaving them out lets drivers keep the image compressed (Metal can't, for views
++     * of other formats than sRGB ones). */
++    if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && format->type != VKD3D_FORMAT_TYPE_TYPELESS)
++    {
++        VkFormat srgb = vkd3d_vk_format_srgb_counterpart(format->vk_format);
++        unsigned int count = 0;
++
++        for (i = 0; i < list->format_count; i++)
++        {
++            if (list->vk_formats[i] == format->vk_format || list->vk_formats[i] == srgb)
++                list->vk_formats[count++] = list->vk_formats[i];
++        }
++        list->format_count = count;
++    }
++
+     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+     {
+         /* Legacy D3D11 compatibility rule that allows typed UAV loads on FL11.0 hardware.
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Fri, 23 Oct 2026 23:52:01 -0600
+Subject: [PATCH 09/13] MoltenVK: root CBVs as push descriptors, no staggered
+ submits; fix EndRenderPass state tracking
+
+---
+ libs/vkd3d/command.c | 11 ++++++++++-
+ libs/vkd3d/state.c   |  5 ++++-
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8a632d2d..373cd989 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -20635,6 +20635,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginRenderPass(d3d12_command_l
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+ 
++    /* Set again below by the clears and resolves of this render pass. */
++    list->rendering_info.has_pending_render_pass_load_store_work = false;
++
+     /* It's possible we're attempting to resume an existing suspend in the same command buffer,
+      * however, it's not *necessarily* compatible because D3D12 render passes are being
+      * annoying as usual. */
+@@ -20923,7 +20926,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndRenderPass(d3d12_command_lis
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+     if (list->rendering_info.has_pending_render_pass_load_store_work &&
+-            !(list->rendering_info.info.flags & VKD3D_RENDERING_ACTIVE))
++            !(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
+     {
+         /* If we never started the render pass due to no draw calls,
+          * forcefully start it so that we can get the fused clears in the proper render pass,
+@@ -20960,6 +20963,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndRenderPass(d3d12_command_lis
+         d3d12_command_list_debug_mark_end_region(list);
+         list->is_inside_render_pass = false;
+         list->render_pass_flags = 0;
++        list->rendering_info.has_pending_render_pass_load_store_work = false;
+     }
+ }
+ 
+@@ -25283,6 +25287,11 @@ static bool d3d12_command_queue_needs_staggered_submissions(struct d3d12_command
+     if (command_queue->device->workarounds.tiler_suspend_resume)
+         return false;
+ 
++    /* MoltenVK has a single queue, which Metal runs in submission order: staggering only adds CPU waits for each
++     * chunk to complete, leaving one command buffer in flight at a time. */
++    if (command_queue->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++        return false;
++
+     pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
+ 
+     if (command_queue->vkd3d_queue->command_queue_count == 1)
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 1945f15a..b2e27034 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -7867,9 +7867,12 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
+      * The difference in performance is profound (~15% in some cases).
+      * On ACO, BDA with NonWritable can be promoted directly to scalar loads,
+      * which is great. */
++    /* On MoltenVK, push descriptor CBVs become Metal constant buffers, which read 1.5-1.7x as fast as constants
++     * through buffer device addresses on Apple GPUs. */
+     if (VKD3D_CONFIG_FLAG_IS_SET(FORCE_RAW_VA_CBV) ||
+             (device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_NVIDIA &&
+-	     device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_QUALCOMM))
++	     device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_QUALCOMM &&
++	     device_info->vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK))
+         flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV;
+ 
+     if (device_info->properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA &&
+-- 
+2.54.0 (Apple Git-157)
+
+
+From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 00:34:44 -0600
+Subject: [PATCH 10/13] swapchain: on MoltenVK, release the frame latency
+ waitable at GPU completion instead of present wait
+
+MoltenVK completes present waits once the frame is on screen, which serialized
+Unity's CPU frame with the GPU frame. VKD3D_SWAPCHAIN_PRESENT_WAIT=1 restores it.
+---
+ libs/vkd3d/swapchain.c | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 4d3e1bf4..6b0639ba 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1434,6 +1434,7 @@ static void dxgi_vk_swap_chain_update_wait_timing_capabilities(struct dxgi_vk_sw
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     VkPresentTimingSurfaceCapabilitiesEXT present_timing_caps;
++    bool no_present_wait = false;
+     VkPresentStageFlagBitsEXT primary_stage, secondary_stage;
+     struct d3d12_device *device = chain->queue->device;
+     VkSurfaceCapabilitiesPresentWait2KHR wait2_caps;
+@@ -1482,16 +1483,29 @@ static void dxgi_vk_swap_chain_update_wait_timing_capabilities(struct dxgi_vk_sw
+     VK_CALL(vkGetPhysicalDeviceSurfaceCapabilities2KHR(vk_physical_device, &surface_info2, &caps2));
+ 
+     chain->present.wait2 = id2_caps.presentId2Supported && wait2_caps.presentWait2Supported;
++
++    /* MoltenVK completes present waits from the drawable's presented handler, once the frame is on
++     * screen. Gating the latency waitable on that serializes the app's CPU frame with the GPU frame
++     * (Unity waits on it before recording the next frame). Releasing it when the present blit
++     * completes on the GPU, as Windows does, lets them overlap. VKD3D_SWAPCHAIN_PRESENT_WAIT=1 restores it. */
++    if (chain->queue->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++    {
++        char env[16];
++        if (!vkd3d_get_env_var("VKD3D_SWAPCHAIN_PRESENT_WAIT", env, sizeof(env)) || strcmp(env, "1") != 0)
++            no_present_wait = true;
++    }
++    if (no_present_wait)
++        chain->present.wait2 = false;
+     chain->present.timing = chain->present.wait2 && present_timing_caps.presentTimingSupported &&
+             (present_timing_caps.presentStageQueries & useful_present_stages);
+     chain->present.timing_relative = chain->present.timing && present_timing_caps.presentAtRelativeTimeSupported;
+     chain->present.timing_absolute = chain->present.timing && present_timing_caps.presentAtAbsoluteTimeSupported;
+ 
+-    chain->present.wait =
+-            chain->queue->device->device_info.present_wait_features.presentWait ||
+-            chain->present.wait2;
++    chain->present.wait = !no_present_wait &&
++            (chain->queue->device->device_info.present_wait_features.presentWait ||
++            chain->present.wait2);
+ 
+-    if (!chain->present.wait)
++    if (!chain->present.wait && !no_present_wait)
+         FIXME_ONCE("Implementation supports neither present_wait1 or present_wait2. Latency will increase.\n");
+ 
+     if (!chain->present.timing_relative)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 00:47:45 -0600
+Subject: [PATCH 11/13] swapchain: log the app's frame latency;
+ VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
+
+---
+ libs/vkd3d/swapchain.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 6b0639ba..382c7b4d 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -918,6 +918,23 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetGammaControl(IDXGIVkSwapC
+     return E_NOTIMPL;
+ }
+ 
++/* VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises the latency the frame latency waitable allows, for
++ * applications whose CPU frame otherwise cannot overlap the previous GPU frame. */
++static UINT dxgi_vk_swap_chain_min_frame_latency(void)
++{
++    static UINT min_latency;
++    char env[8];
++
++    if (!min_latency)
++    {
++        UINT value = 1;
++        if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY", env, sizeof(env)))
++            value = strtoul(env, NULL, 0);
++        min_latency = max(1, min(value, DXGI_MAX_SWAP_CHAIN_BUFFERS));
++    }
++    return min_latency;
++}
++
+ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapChain2 *iface, UINT MaxLatency)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+@@ -937,6 +954,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapC
+         return DXGI_ERROR_INVALID_CALL;
+     }
+ 
++    INFO("Application sets maximum frame latency %u.\n", MaxLatency);
++    MaxLatency = max(MaxLatency, dxgi_vk_swap_chain_min_frame_latency());
++
+     /* Only increasing the latency is handled here; apparently it is
+      * the application's responsibility to reduce the semaphore value
+      * in case the latency gets reduced. */
+@@ -1582,8 +1602,8 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
+ 
+     if (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+     {
+-        INFO("Enabling frame latency handles.\n");
+-        chain->frame_latency = 1;
++        chain->frame_latency = dxgi_vk_swap_chain_min_frame_latency();
++        INFO("Enabling frame latency handles (initial latency %u).\n", chain->frame_latency);
+ 
+         if (FAILED(hr = vkd3d_native_sync_handle_create(chain->frame_latency,
+                 VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE, &chain->frame_latency_event)))
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 864bb1e06c9b2fb4eb9eb5bb4f60ac72bb66187b Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 03:33:43 -0600
+Subject: [PATCH 12/13] command: keep render passes open across read-only
+ texture transitions
+
+Read-after-read needs no synchronization; on MoltenVK image layouts don't exist either.
+D3D12 perf probe 'barriers' (1000 transitions between 500 draws): 31.4 -> 0.3 ms CPU, 37.9 -> 0.4 ms GPU.
+---
+ libs/vkd3d/command.c | 60 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 373cd989..b0aec561 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -13948,6 +13948,64 @@ static bool d3d12_command_list_check_resource_barrier_trivial_copy_resource(
+     return true;
+ }
+ 
++/* A batch of texture transitions between read-only states needs no synchronization (read after
++ * read). Recognizing it before the barrier code ends the render pass keeps the pass open: Unity
++ * and other engines transition textures between shader stages between draws, and every split
++ * render pass reloads and stores its attachments. MoltenVK has no image layouts, so a layout
++ * change between read-only states needs nothing there either. */
++static bool d3d12_command_list_check_resource_barrier_read_only_noop(
++    struct d3d12_command_list *list, UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
++{
++    const VkAccessFlags2 write_access = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
++            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
++            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT |
++            VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT |
++            VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
++    bool ignore_layouts = list->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK;
++    VkAccessFlags2 before_access, after_access;
++    VkPipelineStageFlags2 stages;
++    UINT i;
++
++    if (!barrier_count || list->type == D3D12_COMMAND_LIST_TYPE_COPY)
++        return false;
++
++    for (i = 0; i < barrier_count; i++)
++    {
++        const D3D12_RESOURCE_BARRIER *barrier = &barriers[i];
++        const D3D12_RESOURCE_TRANSITION_BARRIER *transition = &barrier->Transition;
++        struct d3d12_resource *resource;
++
++        if (barrier->Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barrier->Flags)
++            return false;
++        if (!(resource = impl_from_ID3D12Resource(transition->pResource)) || !d3d12_resource_is_texture(resource))
++            return false;
++        if (!is_valid_resource_state(transition->StateBefore) || !is_valid_resource_state(transition->StateAfter))
++            return false;
++        if (transition->StateBefore == D3D12_RESOURCE_STATE_COMMON || transition->StateAfter == D3D12_RESOURCE_STATE_COMMON ||
++                (transition->StateAfter & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT))
++            return false;
++        if ((resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
++                (resource->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY))
++            return false;
++
++        before_access = after_access = 0;
++        stages = 0;
++        vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateBefore,
++                list->vk_queue_flags, &stages, &before_access);
++        vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateAfter,
++                list->vk_queue_flags, &stages, &after_access);
++        if ((before_access | after_access) & write_access)
++            return false;
++        if (!ignore_layouts && vk_image_layout_from_d3d12_resource_state(list, resource, transition->StateBefore) !=
++                vk_image_layout_from_d3d12_resource_state(list, resource, transition->StateAfter))
++            return false;
++    }
++
++    for (i = 0; i < barrier_count; i++)
++        d3d12_command_list_track_resource_usage(list, impl_from_ID3D12Resource(barriers[i].Transition.pResource), true);
++    return true;
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
+         UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+ {
+@@ -13963,6 +14021,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+      * so keep it as simple as it can be for now. */
+     if (d3d12_command_list_check_resource_barrier_trivial_copy_resource(list, barrier_count, barriers))
+         return;
++    if (d3d12_command_list_check_resource_barrier_read_only_noop(list, barrier_count, barriers))
++        return;
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_end_current_render_pass(list, false);
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 3c3cac1647e5e38c062e00a1a41e5d5b996bf343 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sat, 24 Oct 2026 09:00:57 -0600
+Subject: [PATCH 13/13] MoltenVK: keep render passes open across UAV barriers
+ while the pass draws without UAVs; shaders record UAV use
+ (VKD3D_SHADER_META_FLAG_USES_UAV)
+
+---
+ include/vkd3d_shader.h                |  3 +-
+ libs/vkd3d-shader/dxil.c              | 18 +++++-
+ libs/vkd3d-shader/vkd3d_shader_main.c |  3 +-
+ libs/vkd3d/command.c                  | 91 +++++++++++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h            |  2 +
+ 5 files changed, 112 insertions(+), 5 deletions(-)
+
+diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
+index 994902a7..21dfc735 100644
+--- a/include/vkd3d_shader.h
++++ b/include/vkd3d_shader.h
+@@ -87,7 +87,8 @@ enum vkd3d_shader_meta_flags
+     VKD3D_SHADER_META_FLAG_FORCE_GRAPHICS_BARRIER_BEFORE_RENDER_PASS = 1 << 26,
+     VKD3D_SHADER_META_FLAG_FORCE_GRAPHICS_BARRIER_BEFORE_DRAW = 1 << 27,
+     VKD3D_SHADER_META_FLAG_FEEDBACK_LOOP = 1 << 28,
+-    VKD3D_SHADER_META_FLAG_ALLOW_WAVE32 = 1 << 29
++    VKD3D_SHADER_META_FLAG_ALLOW_WAVE32 = 1 << 29,
++    VKD3D_SHADER_META_FLAG_USES_UAV = 1 << 30
+ };
+ 
+ struct vkd3d_shader_meta
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index 6c7dfcb9..e44e74d4 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -145,6 +145,7 @@ struct vkd3d_dxil_remap_userdata
+     vkd3d_shader_quirks_t quirks;
+     unsigned int num_root_descriptors;
+     bool skip_heap_lowering;
++    bool *uses_uav; /* Set when the shader declares or reaches any UAV. */
+ };
+ 
+ struct vkd3d_dxil_remap_info
+@@ -505,6 +506,9 @@ static dxil_spv_bool dxil_uav_remap(void *userdata, const dxil_spv_uav_d3d_bindi
+     struct vkd3d_dxil_remap_userdata tmp_remap;
+     bool use_ssbo;
+ 
++    if (remap->uses_uav)
++        *remap->uses_uav = true;
++
+     shader_interface_info = remap->shader_interface_info;
+     resource_flags_ssbo = dxil_resource_flags_from_kind(d3d_binding->d3d_binding.kind, true);
+     resource_flags = dxil_resource_flags_from_kind(d3d_binding->d3d_binding.kind, false);
+@@ -1484,6 +1488,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+ {
+     uint32_t wave_size_min, wave_size_max, wave_size_preferred;
+     struct vkd3d_dxil_remap_userdata remap_userdata;
++    bool uses_uav = false;
+     unsigned int raw_va_binding_count = 0;
+     unsigned int num_root_descriptors = 0;
+     unsigned int root_constant_words = 0;
+@@ -1510,7 +1515,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     if (shader_interface_info->stage != VK_SHADER_STAGE_MESH_BIT_EXT &&
+             vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
+     {
+-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED | VKD3D_SHADER_META_FLAG_USES_UAV;
+         return ret;
+     }
+ 
+@@ -1602,6 +1607,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     remap_userdata.num_root_descriptors = num_root_descriptors;
+     remap_userdata.quirks = quirks;
+     remap_userdata.skip_heap_lowering = false;
++    remap_userdata.uses_uav = &uses_uav;
+ 
+     dxil_spv_converter_set_root_constant_word_count(converter, root_constant_words);
+     dxil_spv_converter_set_root_descriptor_count(converter, num_root_descriptors);
+@@ -1648,12 +1654,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+         ret = VKD3D_ERROR_INVALID_ARGUMENT;
+         goto end;
+     }
++    if (uses_uav)
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_UAV;
+ 
+     /* Late replacement for mesh shaders. */
+     if (shader_interface_info->stage == VK_SHADER_STAGE_MESH_BIT_EXT &&
+             vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
+     {
+-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED | VKD3D_SHADER_META_FLAG_USES_UAV;
+     }
+     else
+     {
+@@ -1765,6 +1773,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+     const struct vkd3d_shader_resource_binding *resource_binding;
+     const struct vkd3d_shader_root_parameter *root_parameter;
+     struct vkd3d_dxil_remap_userdata remap_userdata;
++    bool uses_uav = false;
+     unsigned int num_root_descriptors = 0;
+     unsigned int root_constant_words = 0;
+     dxil_spv_converter converter = NULL;
+@@ -1790,7 +1799,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+ 
+     if (demangled_export && vkd3d_shader_replace_export(hash, &spirv->code, &spirv->size, demangled_export))
+     {
+-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED | VKD3D_SHADER_META_FLAG_USES_UAV;
+         return ret;
+     }
+ 
+@@ -2006,6 +2015,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+     remap_userdata.num_root_descriptors = num_root_descriptors;
+     remap_userdata.quirks = quirks;
+     remap_userdata.skip_heap_lowering = false;
++    remap_userdata.uses_uav = &uses_uav;
+ 
+     dxil_spv_converter_set_root_constant_word_count(converter, root_constant_words);
+     dxil_spv_converter_set_root_descriptor_count(converter, num_root_descriptors);
+@@ -2025,6 +2035,8 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+         ret = VKD3D_ERROR_INVALID_ARGUMENT;
+         goto end;
+     }
++    if (uses_uav)
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_UAV;
+ 
+     if (!(code = vkd3d_malloc(compiled.size)))
+     {
+diff --git a/libs/vkd3d-shader/vkd3d_shader_main.c b/libs/vkd3d-shader/vkd3d_shader_main.c
+index a4c19d1a..9531ded3 100644
+--- a/libs/vkd3d-shader/vkd3d_shader_main.c
++++ b/libs/vkd3d-shader/vkd3d_shader_main.c
+@@ -545,7 +545,8 @@ uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
+     if (aux_quirks)
+         *aux_quirks = quirks;
+ 
+-    return quirk_hash ^ 1;
++    /* 2: graphics shaders record whether they use UAVs (VKD3D_SHADER_META_FLAG_USES_UAV). */
++    return quirk_hash ^ 2;
+ }
+ 
+ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b0aec561..77488785 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6107,6 +6107,51 @@ static void d3d12_command_list_end_rendering(struct d3d12_command_list *list)
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_NEW_INSTANCE_ON_END_RENDERING;
+ }
+ 
++static bool d3d12_command_list_graphics_pipeline_uses_uavs(const struct d3d12_command_list *list)
++{
++    const struct d3d12_pipeline_state *state = list->state;
++    size_t i;
++
++    if (!state || !d3d12_pipeline_state_is_graphics(state))
++        return false;
++    for (i = 0; i < state->graphics.stage_count; i++)
++    {
++        if (state->graphics.code[i].meta.flags &
++                (VKD3D_SHADER_META_FLAG_USES_UAV | VKD3D_SHADER_META_FLAG_USES_RASTERIZER_ORDERED_VIEWS))
++            return true;
++    }
++    return false;
++}
++
++static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d12_command_list *list,
++        const struct d3d12_resource *resource, uint32_t state_mask, VkQueueFlags vk_queue_flags,
++        VkPipelineStageFlags2 *stages, VkAccessFlags2 *access);
++
++/* The UAV barrier d3d12_command_list_defer_uav_barrier_in_render_pass() kept out of a render pass. */
++static void d3d12_command_list_emit_pending_render_pass_uav_barrier(struct d3d12_command_list *list)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++
++    if (!list->cmd.pending_render_pass_uav_barrier)
++        return;
++    list->cmd.pending_render_pass_uav_barrier = false;
++
++    memset(&vk_barrier, 0, sizeof(vk_barrier));
++    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    vk_access_and_stage_flags_from_d3d12_resource_state(list, NULL, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            list->vk_queue_flags, &vk_barrier.srcStageMask, &vk_barrier.srcAccessMask);
++    vk_access_and_stage_flags_from_d3d12_resource_state(list, NULL, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            list->vk_queue_flags, &vk_barrier.dstStageMask, &vk_barrier.dstAccessMask);
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &vk_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++}
++
+ void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+@@ -6146,6 +6191,7 @@ void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list,
+         list->rendering_info.state_flags &= ~VKD3D_RENDERING_SUSPENDED;
+ 
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_ACTIVE;
++    d3d12_command_list_emit_pending_render_pass_uav_barrier(list);
+ 
+     if (list->xfb_buffer_count)
+     {
+@@ -6821,6 +6867,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
+     }
+ 
+     d3d12_command_list_flush_dgc_batch(list);
++    /* A render pass may stay open past Close() (suspend and resume across command lists), with
++     * nothing recorded in between: a UAV barrier kept out of it has to end it here. */
++    if (list->cmd.pending_render_pass_uav_barrier)
++        d3d12_command_list_end_current_render_pass(list, false);
+     d3d12_command_list_update_conditional_rendering_state(list, true);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+@@ -8859,6 +8909,11 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     if (pipeline_type != VKD3D_PIPELINE_TYPE_NONE && !d3d12_command_list_update_graphics_pipeline(list, pipeline_type))
+         return false;
+ 
++    /* A draw with UAVs must see the UAV barrier kept out of the open pass: end the pass, which emits it. */
++    if (list->cmd.pending_render_pass_uav_barrier && (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE) &&
++            d3d12_command_list_graphics_pipeline_uses_uavs(list))
++        d3d12_command_list_end_current_render_pass(list, false);
++
+     /* It's not possible to modify rendering info while a render pass is in flight. */
+     if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
+         if (!d3d12_command_list_update_rendering_info(list))
+@@ -14006,6 +14061,40 @@ static bool d3d12_command_list_check_resource_barrier_read_only_noop(
+     return true;
+ }
+ 
++/* On MoltenVK every split render pass costs a new Metal render encoder, its load and store actions and
++ * one more encoder for the driver to submit, and Apple GPUs can't place a memory barrier inside a render
++ * pass. A D3D12 UAV barrier only orders UAV accesses, so draws that use no UAVs can't observe it: while
++ * the open pass draws without UAVs, keep it open and emit the barrier when it ends, or before the first
++ * draw whose pipeline uses UAVs (d3d12_command_list_begin_render_pass()). Engines put UAV barriers for
++ * their compute work between draws of a pass. */
++static bool d3d12_command_list_defer_uav_barrier_in_render_pass(
++    struct d3d12_command_list *list, UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
++{
++    struct d3d12_resource *resource;
++    UINT i;
++
++    if (!barrier_count || list->device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK)
++        return false;
++    if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE) || d3d12_command_list_graphics_pipeline_uses_uavs(list))
++        return false;
++
++    for (i = 0; i < barrier_count; i++)
++    {
++        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_UAV || barriers[i].Flags)
++            return false;
++        /* Acceleration structures and their scratch buffers go through the RTAS batch. */
++        resource = impl_from_ID3D12Resource(barriers[i].UAV.pResource);
++        if (!resource || d3d12_resource_is_acceleration_structure(resource))
++            return false;
++        if (d3d12_resource_is_buffer(resource) && list->rtas_batch.pending_rtas_work)
++            return false;
++    }
++
++    list->cmd.pending_render_pass_uav_barrier = true;
++    list->cmd.clear_uav_pending = false;
++    return true;
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
+         UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+ {
+@@ -14023,6 +14112,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+         return;
+     if (d3d12_command_list_check_resource_barrier_read_only_noop(list, barrier_count, barriers))
+         return;
++    if (d3d12_command_list_defer_uav_barrier_in_render_pass(list, barrier_count, barriers))
++        return;
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_end_current_render_pass(list, false);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3e71f89c..ff94f06d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3320,6 +3320,8 @@ struct d3d12_command_list_sequence
+     bool uses_dgc_compute_in_async_compute;
+     bool clear_uav_pending;
+     bool observes_indirect_argument_barrier;
++    /* A UAV barrier kept out of the open render pass (MoltenVK), emitted when it ends. */
++    bool pending_render_pass_uav_barrier;
+     bool has_post_indirect_barrier_work;
+ 
+     /* Number of draws, dispatches, copies etc. Used to fuse barrier-only
+-- 
+2.54.0 (Apple Git-157)
+

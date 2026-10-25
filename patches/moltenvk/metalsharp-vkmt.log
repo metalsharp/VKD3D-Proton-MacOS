@@ -1,0 +1,100 @@
+ef956862 The binary archive has a queue of its own: its adds (a compile each) ran on the implicit pipeline cache's queue, and a game's thousands of them kept the cache from being written for as long as it compiled (God of War Ragnarok: nothing in 3 minutes); adds still waiting when the device goes are dropped instead of holding up its destruction
+a0fa30f5 Pipeline caches keep their work across launches and rebuilds: the implicit cache is also written once a minute while pipelines keep arriving (a game closed, crashed or killed during a long precompile saved nothing, and the next launch compiled every shader again; MVK_CONFIG_PIPELINE_CACHE_SAVE_INTERVAL), it and the pipeline cache UUID are keyed on a hash of the sources that decide what a cache holds when the build gives one (MVK_PIPELINE_CACHE_SOURCES_HASH, scripts/moltenvk-cache-key.sh) instead of the build UUID that every rebuild changed, each library keeps its compiled metallib next to its MSL (Metal's private libraryDataContents), loaded instead of running Metal's front end (God of War Ragnarok's kernels: 187 ms from MSL, 0.03 ms from the metallib; MVK_CONFIG_CACHE_COMPILED_SHADERS=0 keeps only the MSL), and compiled pipelines go into a device-wide MTLBinaryArchive next to the cache, looked up first with MTLPipelineOptionFailOnBinaryArchiveMiss so a relaunch skips Metal's back end (MVK_CONFIG_BINARY_ARCHIVE=0 disables it)
+37499e09 The Cereal size check expects the padding CompilerMSL::Options and the structs holding it have now (3 bytes more), so it no longer reports them incomplete at every start
+900cb052 MVK_CONFIG_DGC_STATS=1 logs, every 2000 vkCmdExecuteGeneratedCommandsEXT() calls, how many sequences they allowed and whether a count buffer limited them: what an application's GPU-driven work looks like
+0824f472 The application's dispatches run concurrently, as Vulkan lets them: a pipeline barrier between dispatches is already a memory barrier in the compute encoder and any other ends it, and in a serial encoder each dispatch waited for the previous one, leaving the GPU idle between small dispatches (d3d12_perf_probe, 20 compute ExecuteIndirects a frame: GPU 38.4 -> 5.8 ms at 1024 allowed, 64 counted; 4.5 -> 2.1 ms at 64). MVK_CONFIG_CONCURRENT_DISPATCH=0 makes them serial
+67a03435 Fragment outputs are converted to their color attachment's kind of number (SPIRV-Cross frag_output_base_types, from the rendering formats): a float output to an integer attachment failed pipeline creation ("output of type float4 is not compatible with a MTLPixelFormatR32Uint color attachment"; VKD3D-Proton's test_render_target_support_validation, an R32_TYPELESS render target)
+593fa2cc An image view made through a memory alias (a 2D view of a 3D texture, a block texel view) remembers the image texture it was made from: it is a view of the alias, so its parents never matched the image's texture and the view was released and made again at every use (each render pass's attachments), Metal's texture release waiting on its resource list lock: 38% of God of War Ragnarok's queue encoding time
+fbbc4f52 A graphics pipeline's fragment shader library compiles on another thread while its vertex shader converts and compiles: its configuration is made by the same steps (setVertexShaderConfig(), setFragmentShaderConfig(), split out of the add*ShaderToPipeline() functions) and the fragment stage then finds it in the pipeline cache; not for caches the application synchronizes itself. MVK_CONFIG_PARALLEL_STAGE_COMPILE=0 compiles the stages one after the other
+f207ae66 Emulated depth bounds tests take their depth snapshot texture from the device, one per queue and kind of depth attachment, which Metal orders between the queue's command buffers: a texture made at every command buffer and every change of depth target took a third of the queue's encoding time in God of War Ragnarok (Metal's resource list lock)
+9d3ab08a Shaders are compiled optimized for size (MVK_CONFIG_SHADER_OPTIMIZATION=0 restores Metal's default level): the Metal front end takes about half the time on large shaders (God of War Ragnarok's 1472-line compute shader: 1.07 s, 0.49 s), with the GPU compiler still optimizing behind it; GPU times in the D3D12 probe's shader-heavy scenes are the same
+4374d987 The implicit pipeline cache is saved once pipelines stop arriving, in one pass under one hold of the cache's lock: it was rewritten every 3 s while a game compiled (200 MB, a core, and the compile threads waiting on the lock), and a library added between taking the size and writing left the size 0 (VK_INCOMPLETE, "Failed to write 4 bytes to output stream"), also for vkGetPipelineCacheData
+8f7f440b Variable-count uniform and storage buffer bindings (BufferAuxSize, sizes kept by binding in the auxiliary buffer) are declared open-ended too: Metal walked VKD3D-Proton's 1,000,000-element SSBO and CBV heap arrays at every pipeline creation, most of its cost in God of War Ragnarok
+d8746a56 Texel buffer alignment of a format Metal has no pixel format for (VK_FORMAT_R32G32B32_SFLOAT, D3D12 typed buffers) is the device's limit: Metal asserted and ended the process (God of War Ragnarok on VKD3D-Proton); the view is refused with VK_ERROR_FORMAT_NOT_SUPPORTED as before
+7189d350 Variable-count argument buffer bindings are declared open-ended in shaders (one element, indexed past, same layout), so Metal doesn't walk 1,000,000-element arrays at every pipeline creation (~200 ms per pipeline with VKD3D-Proton's descriptor heaps)
+7afa2158 Push descriptors keep descriptor info copies in the command (no allocation per push) and recording leaves shared pipeline layout reference counts alone when unchanged; optional parallel encoding of a submission's command buffers (MVK_CONFIG_PARALLEL_SUBMIT_ENCODING, off: slower in the D3D12 probe)
+939d8d02 Graphics pipelines: reflect shaders through the resolved modules, so stages with an inline VkShaderModuleCreateInfo (maintenance5, as DXVK 2.7 passes them) don't dereference a null module
+333fd01f pipelineCacheUUID: last 4 bytes from the binary's build UUID, so caches kept by apps don't outlive a build
+20d2a897 Default floating-point functions for NaN-preserving shaders (every DXBC shader from VKD3D-Proton) unless fast math is off
+4fb7fb4f Keep dispatch-to-dispatch memory barriers inside the compute encoder; flush timestamps before copying query results
+67f3e719 Performance: persistent device-wide pipeline cache, push descriptor implicit buffers, fewer encoder splits
+d41acb85 shaderCullDistance (as clip distances), VK_KHR_pipeline_library without ray tracing pipelines, descriptor pool sizing for samplers
+42b646c1 Multiview with geometry, tessellation and mesh shaders
+ca04666d VK_EXT_device_generated_commands: vertex and index buffer tokens
+de01a6fd VK_EXT_device_generated_commands (push constants, sequence index, draws, dispatches, mesh tasks)
+cd29a087 Tessellation pipelines: compile them again
+d9435523 Mesh pipelines: don't reflect the mesh shader as a vertex shader
+55ee5e2b shaderSharedInt64Atomics (emulated like buffer 64-bit atomics)
+77fa1dfc FP16 denormals are preserved on Apple GPUs (shaderDenormPreserveFloat16)
+b5014e64 VK_EXT_dynamic_rendering_unused_attachments
+6fcbe5d9 Transform feedback from geometry shaders; attachment-less passes; rasterizer discard for geometry pipelines
+05c01a65 Indirect draws with geometry and conservative rasterization pipelines
+659fafbe Geometry pipelines: every input topology, instancing; triangle fan pipelines
+513bccb3 Transform feedback: dynamic topology, indirect draws, vkCmdDrawIndirectByteCountEXT
+0410ae56 VK_EXT_transform_feedback: capture through a compute copy of the vertex shader
+49556f9f 3D sparse images (Metal's one-slice tiles, nonstandard block shape)
+2626a7c5 Depth bounds without Metal depth bounds (snapshot + fragment test); barrier execution dependencies chain across stages
+96dd6906 Conservative rasterization: degenerate triangles, inner coverage, 1/256 pixel overestimation
+b083446f VK_EXT_shader_image_atomic_int64: R64 images on RG32Uint with emulated atomics
+0dfca519 Acceleration structures: DXR 1.1 vertex formats (unorm/snorm 8/16, 10:10:10:2)
+b7854760 VK_EXT_conservative_rasterization (overestimate) via a generated mesh stage; geometry pipelines: bind VS/GS resources to object/mesh stages, indexed draws, base vertex/instance, dynamic strides
+52cb09ac SM 6.2-6.7: FP32 FTZ denorms, 32-wide subgroups, quad control, compute derivatives, emulated 64-bit buffer atomics
+6ec626e8 Merge KhronosGroup/MoltenVK PR #2786 (geometry shaders through object/mesh stages, transform feedback)
+0132c006 Support samplerFilterMinmax on Apple GPUs without Metal sampler reduction
+3d159cbb Support sparse buffers and images on Apple GPUs (macOS 26)
+3b86120e Support logicOp on Apple GPUs through framebuffer fetch; 64 storage buffers/images per stage with Tier 2 argument buffers
+6f415acf Write buffer descriptor sizes at the descriptor's array element
+34038767 Advertise robustBufferAccess2 and nullDescriptor on Apple GPUs
+c377e7cf Merge fixes: newFunctionNamed overloads, task shader acceleration structure addresses, object/mesh acceleration structure binders
+eb29de6c Merge remote-tracking branch 'dttdrv/fix/tessellation-patch-counts' into metalsharp-vkmt
+9900c337 Merge remote-tracking branch 'dttdrv/fix/specialization-array-sizes' into metalsharp-vkmt
+26d6f12e Merge remote-tracking branch 'dttdrv/mesh/native' into metalsharp-vkmt
+2f5abcf9 Merge remote-tracking branch 'dttdrv/macgaming/ray-query-pr' into metalsharp-vkmt
+176926b4 Give each any-hit candidate its own invocation in the traversal loop
+a14131cf Merge branch 'main' into macgaming/ray-query-pr
+05e7a16e Keep the stable acceleration structure reference alive for command buffers
+c516eb42 Add VK_EXT_mesh_shader support
+cae05219 Use specialization constant values for array sizes in shader interfaces
+1c466b08 Restore compute bindings after ray tracing and streamline native traversal
+7e5c9b44 Merge commit '4aaf714aa1b3e78e26ecfcefa9c75e9a576c500b' into fix/tessellation-patch-counts
+cf5a66ea Merge commit '02a6dc34f70e393777d07fdfa0bd0ab247125846' into fix/tessellation-patch-counts
+f0fff496 Correct indirect tessellation record stride and index copies
+3dbe1bca Correct tessellation patch counts and indexed-indirect command layout
+d5e50321 Correct RT serialization and reduce repeated resource tracking
+ba3eb389 Keep the experimental RT notes when listing 1.4.3 extensions.
+4f1a22a9 Fix descriptor set layout lifetime
+68671684 Update SPIRV-Cross ray tracing revision
+3fc00744 Address ray tracing review feedback
+b6e0765b Guard Metal 4 ray tracing on supported SDKs
+a5dc1e41 Update SPIRV-Cross ray tracing revision
+4d81a4f7 Complete experimental Vulkan ray tracing pipeline support
+d30b81b1 Add ray tracing maintenance1 support
+ccdd328e Narrow experimental ray compiler integration
+bd7b22c5 Simplify ray tracing synchronization
+8f07ca96 Correct ray tracing storage and serialization
+f736be29 Allow ray tracing without placement heaps
+54ca5d3e Saturate variable descriptor buffer counts
+30e70b96 Update SPIRV-Cross revision
+78ea77d9 Account for acceleration structure variable descriptors
+3e73ec4f Update SPIRV-Cross revision
+a5f4167c Update SPIRV-Cross ray tracing revision
+b0a19c72 Add ray tracing position fetch
+76219007 Bind transform conversion buffer argument
+fa68f79c Update SPIRV-Cross ray tracing revision
+7bf6935e Add Metal ray query and ray tracing support
+479c9306 Merge upstream main into research/gs-readback
+567e0b1f Serialize geometry and transform-feedback shader options
+0c93f0de Correct feature reporting and private mesh pipeline builds
+3c065c19 Report unsupported geometry streams
+a18ad26b Report unsupported shader cull distance
+ace275cc Fetch draft SPIRV-Cross dependency from fork
+9772e561 Update rebased SPIRV-Cross dependency
+582a7dbd Fix geometry and transform-feedback execution
+8e12e54d XFB compute-vertex path: set xfb_primitive_type, don't claim tessellation
+b1abdc78 GS pipeline: set vertex format + GS-input base type, guard nil MTLFunctions
+0a5fe386 shaderCullDistance = true: the last feature DXVK's vkCreateDevice needed
+f3eace82 Clear the FL_11_1 vkCreateDevice failures: geometryStreams + logicOp + variableMultisampleRate + a fallthrough
+6fd3eca8 Merge transform-feedback (PR #1943, gpx1000) onto the GS-on-1.4.1 branch
+054c104b Port the GS mesh path onto the 1.4.x pipeline code — builds, reports geometryShader=true
+be057299 MVKPipeline: GS declarations restored; mesh path itself still unported
+4d682159 WIP: rebase MoltenVK PR #1815 (geometry shaders) onto v1.4.1 — 10/13 conflicts resolved

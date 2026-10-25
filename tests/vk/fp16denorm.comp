@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+/* FP16 denormals: arithmetic that produces and consumes them, and 16-bit storage of them. */
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer B { float in_f[4]; float16_t in_h[4]; float out_f[8]; float16_t out_h[4]; };
+void main()
+{
+    float16_t smallest_normal = in_h[0];     /* 2^-14 */
+    float16_t scale = in_h[1];               /* 2^-10 */
+    float16_t sub = smallest_normal * scale; /* 2^-24, the smallest denormal */
+    out_f[0] = float(sub);
+    out_f[1] = float(sub * float16_t(2.0));  /* 2^-23 */
+    out_f[2] = float(in_h[2] + in_h[2]);     /* a stored denormal doubled */
+    out_f[3] = float(float16_t(in_f[0]));    /* FP32 to FP16 conversion of 2^-20 */
+    out_h[0] = sub;
+    out_h[1] = in_h[2] * float16_t(1.0);
+}

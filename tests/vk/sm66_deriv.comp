@@ -1,0 +1,17 @@
+#version 450
+#extension GL_KHR_compute_shader_derivatives : require
+/* Compute shader derivatives (linear): quads are lanes 0 1 / 2 3. */
+layout(derivative_group_linearKHR) in;
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 1) buffer O { vec4 o[]; };
+layout(push_constant) uniform P { float k; };
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    float x = float(i & 1u), y = float((i >> 1) & 1u), quad = float(i >> 2);
+    float f = x * 3.0 + y * 5.0 + quad * x * 7.0;
+    float g = x * y * 11.0 + x * 2.0;
+    o[i * 2u] = vec4(dFdxFine(f), dFdyFine(f), dFdxCoarse(g), dFdyCoarse(g));
+    o[i * 2u + 1u] = vec4(dFdxFine(g), dFdyFine(g), fwidth(f), texture(tex, vec2(x, y) * (exp2(k) / 8.0) + 0.03125).x);
+}
