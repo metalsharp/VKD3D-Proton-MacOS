@@ -138,7 +138,7 @@ jobs:
           cp artifacts/mvk-new/libMoltenVK.dylib artifacts/mvk-new/MoltenVK_icd.json "$ROOT/"
           cp sources/MoltenVK/LICENSE "$ROOT/LICENSE.MoltenVK"
           codesign -f -s - "$ROOT/libMoltenVK.dylib"
-          lipo -verify_arch arm64 x86_64 "$ROOT/libMoltenVK.dylib"
+          lipo "$ROOT/libMoltenVK.dylib" -verify_arch arm64 x86_64
           lipo -info "$ROOT/libMoltenVK.dylib"
           (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
           mkdir -p dist
