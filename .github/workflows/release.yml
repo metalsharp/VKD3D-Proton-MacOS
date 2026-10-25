@@ -2,7 +2,9 @@ name: Release
 
 # Builds the runtime's three parts from the pinned sources and this repository's patches:
 #   x86_64    VKD3D-Proton's d3d12.dll + d3d12core.dll, and DXVK's dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows)
-#   arm64     VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows)
+#   arm64     VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows), which x86_64 programs load as
+#             ARM64EC under FEX, with DXVK's x86_64 dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows), as
+#             MetalSharp Wine's VKD3D-Proton lane runs them
 #   moltenvk  the universal libMoltenVK.dylib and its ICD file
 # A pushed tag vX.Y publishes them as one release, vX.Y, with each part a package of its own.
 # main and pull requests that change the build only build them (the archives are the run's artifacts).
@@ -53,20 +55,16 @@ jobs:
 
       - name: Sources
         run: |
-          if [ "${{ matrix.lane }}" = x86_64 ]; then
-            bash scripts/fetch-sources.sh vkd3d-proton dxvk
-          else
-            bash scripts/fetch-sources.sh vkd3d-proton
-          fi
+          bash scripts/fetch-sources.sh vkd3d-proton dxvk
 
       - name: Build
         run: |
           if [ "${{ matrix.lane }}" = x86_64 ]; then
             bash scripts/build-vkd3d-proton.sh
-            bash scripts/build-dxvk.sh
           else
             bash scripts/build-vkd3d-proton-arm64x.sh
           fi
+          bash scripts/build-dxvk.sh
 
       - name: Package
         run: |
@@ -75,20 +73,24 @@ jobs:
           [ "$GITHUB_REF_TYPE" = tag ] || VERSION="$(git rev-parse --short HEAD)"
           NAME="vkd3d-proton-$VERSION-${{ matrix.lane }}"
           ROOT="$RUNNER_TEMP/$NAME"
+          # DXVK's x86_64 DXGI and D3D10/11 in both lanes: x86_64 programs present VKD3D-Proton's swap chains with them
+          mkdir -p "$ROOT/x86_64-windows"
+          cp artifacts/build/dxvk/x86_64-windows/dxgi.dll artifacts/build/dxvk/x86_64-windows/d3d11.dll \
+             artifacts/build/dxvk/x86_64-windows/d3d10core.dll "$ROOT/x86_64-windows/"
           if [ "${{ matrix.lane }}" = x86_64 ]; then
             DIR="$ROOT/x86_64-windows"
-            mkdir -p "$DIR"
             cp artifacts/build/vkd3d-proton/x86_64-windows/d3d12.dll artifacts/build/vkd3d-proton/x86_64-windows/d3d12core.dll "$DIR/"
-            cp artifacts/build/dxvk/x86_64-windows/dxgi.dll artifacts/build/dxvk/x86_64-windows/d3d11.dll \
-               artifacts/build/dxvk/x86_64-windows/d3d10core.dll "$DIR/"
-            cp sources/dxvk/LICENSE "$ROOT/LICENSE.dxvk"
           else
             DIR="$ROOT/aarch64-windows"
             mkdir -p "$DIR"
             cp artifacts/build/vkd3d-proton/aarch64-windows/d3d12.dll artifacts/build/vkd3d-proton/aarch64-windows/d3d12core.dll "$DIR/"
           fi
+          cp sources/dxvk/LICENSE "$ROOT/LICENSE.dxvk"
           cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.vkd3d-proton"
-          file "$DIR"/*.dll
+          cp LICENSE "$ROOT/LICENSE"
+          # the lane's installer, run from the extracted package next to the extracted MoltenVK package
+          cp install/install-common.sh "install/install-${{ matrix.lane }}-wine.sh" "$ROOT/"
+          file "$ROOT"/*-windows/*.dll
           (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
           mkdir -p dist
           tar -C "$RUNNER_TEMP" -cf - "$NAME" | zstd -19 -q -o "dist/$NAME.tar.zst"
@@ -171,7 +173,7 @@ jobs:
           Built from $GITHUB_SHA. Each package holds its files, their licenses and SHA256SUMS.
 
           - **vkd3d-proton-$TAG-x86_64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\`, with DXVK's \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\`, for x86_64 Windows programs (\`x86_64-windows\`). Stage them together.
-          - **vkd3d-proton-$TAG-arm64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`): native arm64 programs, and x86_64 programs as ARM64EC under FEX.
+          - **vkd3d-proton-$TAG-arm64**: for an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine): VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`, loaded by x86_64 programs as ARM64EC), with DXVK's x86_64 \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\` (\`x86_64-windows\`).
           - **moltenvk-$TAG-universal**: the universal (arm64 + x86_64), ad-hoc signed \`libMoltenVK.dylib\` and \`MoltenVK_icd.json\` both lanes run on.
           EOF
           gh release create "$TAG" dist/x86_64/*.tar.zst dist/arm64/*.tar.zst dist/moltenvk/*.tar.zst \

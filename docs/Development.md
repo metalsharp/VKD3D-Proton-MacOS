@@ -314,22 +314,17 @@ loaded module paths and hashes of the staged DLLs.
 
 ## Package and publish
 
-After promotion and validation, create the deterministic runtime archive:
+Releases are built by CI, not locally: pushing a tag `vX.Y` builds the x86_64 and arm64 VKD3D-Proton packages and
+the universal MoltenVK package, and publishes them as one release (`.github/workflows/release.yml`). Pull requests
+that change the build build the same packages as artifacts, so a change is checked before it reaches a tag.
 
 ```bash
-make package PACKAGE=./vkd3d-proton-macos.tar.zst
+git tag v2.0
+git push origin v2.0
 ```
 
-The archive contains the bundled native DXVK-macOS `dxgi.dll`, the two D3D12
-DLLs, universal MoltenVK, ICD manifest, README, and SHA-256 checksums. Publish
-it as a GitHub release asset rather than committing generated binaries:
-
-```bash
-gh release upload v1.0 ./vkd3d-proton-macos.tar.zst --clobber
-```
-
-See [release.md](release.md) for the runtime layout and installation
-environment.
+See [release.md](release.md) for the packages' contents and [install.md](install.md) for installing them. The older
+single-archive target, `make package`, still builds the v1.0-style x86_64 archive locally.
 
 ## Debugging
 

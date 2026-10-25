@@ -12,7 +12,8 @@ final-state record for the shipped runtime.
 | [Development.md](Development.md) | Prerequisites, setup, Make targets, builds, debugging, and release workflow |
 | [features.md](features.md) | D3D12 feature-level ladder and validated capability matrix |
 | [validation.md](validation.md) | Probe staging, runtime environment, and regression gate |
-| [release.md](release.md) | Runtime archive contents and installation instructions |
+| [install.md](install.md) | Installing a release into an x86_64 or arm64 Wine prefix |
+| [release.md](release.md) | Release packages, how CI builds them, and publishing |
 
 ## Project policies
 

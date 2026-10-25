@@ -1,70 +1,54 @@
-# Runtime release archive
+# Releases
 
-The public runtime is distributed through the GitHub release asset
-[`vkd3d-proton-macos.tar.zst`](https://github.com/metalsharp/vkd3d-proton-macos/releases/tag/v1.0).
-
-## Archive contents
+A release is one GitHub release, `vX.Y`, with three packages. Each package carries the licenses of what it contains
+and a `SHA256SUMS` file.
 
 ```text
-vkd3d-proton-macos/
-├── dxgi.dll
-├── d3d12.dll
-├── d3d12core.dll
-├── libMoltenVK.dylib
+vkd3d-proton-vX.Y-x86_64/            for an x86_64 Wine
+├── x86_64-windows/                  d3d12.dll d3d12core.dll (VKD3D-Proton), dxgi.dll d3d11.dll d3d10core.dll (DXVK)
+├── install-x86_64-wine.sh, install-common.sh
+└── LICENSE (AGPL-3.0), LICENSE.vkd3d-proton (LGPL-2.1), LICENSE.dxvk (zlib), SHA256SUMS
+
+vkd3d-proton-vX.Y-arm64/             for an arm64 Wine that runs x86_64 programs with FEX
+├── aarch64-windows/                 d3d12.dll d3d12core.dll as ARM64X (VKD3D-Proton)
+├── x86_64-windows/                  dxgi.dll d3d11.dll d3d10core.dll (DXVK)
+├── install-arm64-wine.sh, install-common.sh
+└── LICENSE, LICENSE.vkd3d-proton, LICENSE.dxvk, SHA256SUMS
+
+moltenvk-vX.Y-universal/             for both
+├── libMoltenVK.dylib                arm64 + x86_64, ad-hoc signed
 ├── MoltenVK_icd.json
-├── README.md
-└── SHA256SUMS
+└── LICENSE.MoltenVK (Apache-2.0), SHA256SUMS
 ```
 
-`dxgi.dll` is the native x86_64 DXGI provider built from the pinned
-DXVK-macOS lane and is bundled with the matched D3D12 runtime. The DLLs are
-x86_64 PE files for Wine/Rosetta. MoltenVK is universal
-x86_64/arm64 and adhoc codesigned for the isolated runtime override path.
+[install.md](install.md) covers installing them into a prefix.
 
-## macOS 14 / Metal 3 compatibility
+## How CI builds them
 
-The bundled `libMoltenVK.dylib` is built with the current Xcode beta and
-`MACOSX_DEPLOYMENT_TARGET=14.0`. Its Mach-O `LC_BUILD_VERSION` reports
-`minos 14.0` for both architectures, so the native runtime has a macOS 14
-deployment floor. The D3D12 DLLs remain x86_64 Windows binaries and run
-through a compatible Wine/Rosetta environment.
+`.github/workflows/release.yml` builds the three packages on `macos-26` runners from the pinned sources and this
+repository's patches:
 
-The packaged candidate passed the complete regression suite on Apple GPU.
-That host is newer than macOS 14/Metal 3; functional execution specifically
-on Metal 3 still requires a macOS 14 host.
+- **Sources:** `scripts/fetch-sources.sh`.
+- **Toolchain:** llvm-mingw, plus meson, ninja and glslang from Homebrew.
+- **Build scripts:**
+  - `scripts/build-vkd3d-proton.sh` for x86_64, `scripts/build-vkd3d-proton-arm64x.sh` for ARM64X;
+  - `scripts/build-dxvk.sh` for DXGI and D3D10/11;
+  - `scripts/build-moltenvk.sh --externals` for MoltenVK, with the newest Xcode on the runner. It needs the macOS 26
+    SDK or later.
 
-## Install/use
+It runs:
 
-Extract the archive and keep the ICD manifest beside the dylib:
-
-```bash
-tar --use-compress-program=zstd -xf vkd3d-proton-macos.tar.zst
-cd vkd3d-proton-macos
-shasum -a 256 -c SHA256SUMS
-```
-
-Stage `dxgi.dll`, `d3d12.dll`, and `d3d12core.dll` in the Wine application or
-runtime DLL directory. Launch with the MoltenVK directory in the
-dynamic-library path:
-
-```bash
-export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"
-export DYLD_LIBRARY_PATH="$PWD"
-export VK_ICD_FILENAMES="$PWD/MoltenVK_icd.json"
-```
-
-The package is a runtime artifact, not a complete source/build environment.
-To rebuild it, clone this repository, install
-[requirements.md](requirements.md), and use the root Makefile.
+- **On a tag `v*`:** builds the packages and publishes them as the release for that tag.
+- **On pushes to `main`, and on pull requests that change the workflow, `scripts/` or `patches/`:** builds the
+  packages as the run's artifacts, without releasing.
 
 ## Publishing
 
-After the validation gate passes:
+Merge to `main`, then push a tag:
 
 ```bash
-make package PACKAGE=./vkd3d-proton-macos.tar.zst
-gh release upload v1.0 ./vkd3d-proton-macos.tar.zst --clobber
+git tag v2.0
+git push origin v2.0
 ```
 
-Do not commit generated release archives or the large local source/build
-trees. Keep them as GitHub release assets.
+Keep generated packages and the local source and build trees out of commits. The releases hold the packages.

@@ -7,16 +7,16 @@
 </p>
 
 <p>
-  <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/tag/v1.0"><img src="https://img.shields.io/github/v/release/metalsharp/vkd3d-proton-macos?filter=v1.0&style=for-the-badge" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="MIT License"></a>
+  <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/latest"><img src="https://img.shields.io/github/v/release/metalsharp/vkd3d-proton-macos?style=for-the-badge" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg?style=for-the-badge" alt="AGPL-3.0 License"></a>
   <a href="https://github.com/metalsharp/vkd3d-proton-macos/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/metalsharp/vkd3d-proton-macos/build.yml?branch=main&style=for-the-badge&label=Build" alt="Build"></a>
 </p>
 
 <pre>D3D12 application → vkd3d-proton → Vulkan → custom MoltenVK → Metal</pre>
 
 <p>
-  The public <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/tag/v1.0">release</a>
-  contains the tested x86_64 Wine D3D12 runtime pair and universal MoltenVK runtime.
+  Each <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/latest">release</a> has a package for
+  x86_64 Wine, one for arm64 Wine with FEX, and the universal MoltenVK, with install scripts for both kinds of Wine.
 </p>
 
 </div>
@@ -39,7 +39,21 @@ All six feature-level ladder rungs create successfully. The companion
 regression gate covers CR InnerCoverage, sampler feedback, mesh dispatch,
 CORE_1_0 corpus, geometry-shader corpus, and the compute matrix.
 
-## Quick start
+## Install
+
+Download a VKD3D-Proton package and the MoltenVK package from the latest release, extract them side by side, and run
+the package's installer on your Wine prefix:
+
+```bash
+tar -xf vkd3d-proton-<tag>-x86_64.tar.zst      # or -arm64 for an arm64 Wine with FEX
+tar -xf moltenvk-<tag>-universal.tar.zst
+./vkd3d-proton-<tag>-x86_64/install-x86_64-wine.sh --prefix ~/my-prefix --wine /path/to/wine
+~/my-prefix/vkd3d-proton-macos/wine game.exe
+```
+
+[docs/install.md](docs/install.md) covers both packages, the options, running programs and uninstalling.
+
+## Build from source
 
 ```bash
 git clone https://github.com/metalsharp/vkd3d-proton-macos.git
@@ -48,7 +62,7 @@ make help
 make docs-check
 ```
 
-For a complete local build, clone the required source trees into `sources/`,
+For a complete local build, fetch the sources with `scripts/fetch-sources.sh`,
 install the toolchain described in [the requirements guide](docs/requirements.md),
 then run:
 
@@ -68,6 +82,8 @@ mix `d3d12.dll` and `d3d12core.dll` from different builds.
 .
 ├── Makefile                         # build, probe, package, and doc targets
 ├── docs/                            # current guides plus dated evidence
+├── install/                         # install scripts for x86_64 and arm64 Wine prefixes
+├── patches/                         # this project's changes to VKD3D-Proton, MoltenVK, SPIRV-Cross, DXVK
 ├── scripts/                         # environment, build, probe, and recovery tools
 ├── sources/                         # local source clones (intentionally ignored)
 ├── toolchain/                       # local llvm-mingw/toolchain assets
@@ -78,6 +94,7 @@ mix `d3d12.dll` and `d3d12core.dll` from different builds.
 
 Start at [docs/README.md](docs/README.md), then see:
 
+- [Installing into a Wine prefix](docs/install.md)
 - [Requirements](docs/requirements.md)
 - [Development and Make targets](docs/Development.md)
 - [Feature-level matrix](docs/features.md)
@@ -93,6 +110,9 @@ Start at [docs/README.md](docs/README.md), then see:
 
 ## License
 
-Workspace code and documentation are MIT licensed. The vkd3d-proton,
-MoltenVK, SPIRV-Cross, Wine, and other vendored/upstream components retain
-their own licenses; consult their source trees and license files.
+This repository's own code, scripts and documentation are licensed under the
+[GNU Affero General Public License v3.0](LICENSE).
+
+The projects it builds keep their own licenses, and so do this repository's changes to them in `patches/`:
+VKD3D-Proton is LGPL-2.1, DXVK is zlib, and MoltenVK and SPIRV-Cross are Apache-2.0. Each release package carries
+the licenses of what it contains.
