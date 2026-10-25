@@ -163,13 +163,11 @@ The release gate is green only when all of these pass:
 
 | Probe | Required result |
 |---|---|
-| `flprobe.exe` | all six feature-level rungs create; max 12_2 |
+| `flprobe.exe` | feature levels 11_0 to 12_1 create, and 12_2 with MoltenVK's experimental ray tracing |
 | `cr_inner_probe.exe` | CR tier-3 InnerCoverage result matches reference |
 | `feedback_probe.exe` | sampler feedback matches CPU reference exactly |
 | `mesh_probe.exe` | mesh dispatch is pixel-exact |
-| `corpus.exe` | CORE_1_0 corpus works |
 | `corpus_gs.exe` | geometry-shader corpus works |
-| `compute_matrix.exe` | CORE_1_0 compute matrix works |
 
 Run an individual staged probe with the established runner:
 

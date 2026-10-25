@@ -2,19 +2,18 @@
 
 ## D3D12 ladder
 
-The release Apple GPU validation run used `scripts/flprobe.c` against the staged
-runtime pair. Every requested minimum level created a device:
+`scripts/flprobe.c` against VKD3D-Proton and this MoltenVK on an Apple M4 (macOS 27.2):
 
 | Minimum level | Result |
 |---|---|
-| D3D_FEATURE_LEVEL_12_2 | `S_OK`, device created |
+| D3D_FEATURE_LEVEL_12_2 | device created with `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`; without it, `E_INVALIDARG` (no ray tracing) |
 | D3D_FEATURE_LEVEL_12_1 | `S_OK`, device created |
 | D3D_FEATURE_LEVEL_12_0 | `S_OK`, device created |
 | D3D_FEATURE_LEVEL_11_1 | `S_OK`, device created |
 | D3D_FEATURE_LEVEL_11_0 | `S_OK`, device created |
-| D3D_FEATURE_LEVEL_1_0_CORE | `S_OK`, device created |
 
-`CheckFeatureSupport(FEATURE_LEVELS)` reports **12_2** as the maximum.
+`CheckFeatureSupport(FEATURE_LEVELS)` reports **12_1** as the maximum, and **12_2** with ray tracing on. The highest
+shader model is **6.8**.
 The complete captured result is
 [`artifacts/evidence/rung-ladder-2026-08-16.txt`](../artifacts/evidence/rung-ladder-2026-08-16.txt).
 
