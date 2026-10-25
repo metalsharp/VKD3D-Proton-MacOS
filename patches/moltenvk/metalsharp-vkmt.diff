@@ -11693,7 +11693,7 @@ index 3cdc6234..b433bf76 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..9228d7bc 100644
+index 534a414f..2fe9c101 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,10 @@
@@ -11992,7 +11992,7 @@ index 534a414f..9228d7bc 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1250,37 @@ protected:
+@@ -1105,16 +1250,41 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -12014,7 +12014,11 @@ index 534a414f..9228d7bc 100644
 +	uint64_t _implicitPipelineCacheChangesSeen = 0;
 +	id<MTLBinaryArchive> _binaryArchive = nil;
 +	std::string _binaryArchivePath;
++	// adds (each a compile) and writes of the archive, apart from the implicit cache's queue so its writes keep up
++	dispatch_queue_t _binaryArchiveQueue = nullptr;
 +	std::atomic<bool> _binaryArchiveDirty = false;
++	std::atomic<bool> _binaryArchiveSaveQueued = false;
++	std::atomic<bool> _binaryArchiveClosing = false;
 +	void initBinaryArchive(const std::string& basePath);
 +	void saveBinaryArchive();
  	id<MTLSamplerState> _defaultMTLSamplerState = nil;
@@ -12030,7 +12034,7 @@ index 534a414f..9228d7bc 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1331,15 @@ public:
+@@ -1165,12 +1335,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -12048,7 +12052,7 @@ index 534a414f..9228d7bc 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1444,50 @@ protected:
+@@ -1275,6 +1448,50 @@ protected:
  };
  
  
@@ -12100,7 +12104,7 @@ index 534a414f..9228d7bc 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..93faee87 100644
+index 359f8a2b..721425cc 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -21,6 +21,7 @@
@@ -13051,9 +13055,7 @@ index 359f8a2b..93faee87 100644
  
 -void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
 +void MVKDevice::invalidateGPUAddressableBufferIndex() {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	_gpuAddressableBufferIndexDirty = true;
 +}
 +
@@ -13071,7 +13073,9 @@ index 359f8a2b..93faee87 100644
 +											bool write,
 +											MVKSmallVector<id<MTLBuffer>, 16>* retainedBuffers) {
 +	if (hasResidencySet()) { return; }
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	for (auto* buffer : _gpuAddressableBuffers) {
 +		id<MTLBuffer> mtlBuffer = buffer->getMTLBuffer();
 +		if (!mtlBuffer) { continue; }
@@ -13505,7 +13509,7 @@ index 359f8a2b..93faee87 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6138,169 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6138,177 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -13589,8 +13593,12 @@ index 359f8a2b..93faee87 100644
 +			saveImplicitPipelineCache();
 +			lastSave = mvkGetTimestamp();
 +		}
-+		if (_binaryArchiveDirty && (quiet || mvkGetElapsedMilliseconds(lastArchiveSave) >= 5 * saveInterval)) {
-+			saveBinaryArchive();
++		if (_binaryArchiveDirty && !_binaryArchiveSaveQueued && (quiet || mvkGetElapsedMilliseconds(lastArchiveSave) >= 5 * saveInterval)) {
++			_binaryArchiveSaveQueued = true;
++			dispatch_async(_binaryArchiveQueue, ^{
++				saveBinaryArchive();
++				_binaryArchiveSaveQueued = false;
++			});
 +			lastArchiveSave = mvkGetTimestamp();
 +		}
 +	});
@@ -13602,6 +13610,7 @@ index 359f8a2b..93faee87 100644
 +// The archive is per OS build and GPU as well: Metal refuses one another compiler or GPU made.
 +void MVKDevice::initBinaryArchive(const std::string& basePath) {
 +	if ( !mvkGetEnvVarNumber("MVK_CONFIG_BINARY_ARCHIVE", 1) ) { return; }
++	_binaryArchiveQueue = dispatch_queue_create("MoltenVK binary archive", DISPATCH_QUEUE_SERIAL);
 +	char build[64] = {};
 +	size_t size = sizeof(build) - 1;
 +	sysctlbyname("kern.osversion", build, &size, nullptr, 0);
@@ -13629,10 +13638,13 @@ index 359f8a2b..93faee87 100644
 +	if ( !_binaryArchive ) { return; }
 +	id<MTLBinaryArchive> archive = [_binaryArchive retain];
 +	BOOL (^work)(id<MTLBinaryArchive>, NSError**) = [add copy];
-+	dispatch_async(_implicitPipelineCacheQueue, ^{
-+		@autoreleasepool {
-+			NSError* err = nil;
-+			if (work(archive, &err)) { _binaryArchiveDirty = true; }
++	dispatch_async(_binaryArchiveQueue, ^{
++		// adds still waiting when the device goes are dropped: its pipelines are added at a later launch instead
++		if ( !_binaryArchiveClosing ) {
++			@autoreleasepool {
++				NSError* err = nil;
++				if (work(archive, &err)) { _binaryArchiveDirty = true; }
++			}
 +		}
 +		[work release];
 +		[archive release];
@@ -13675,7 +13687,7 @@ index 359f8a2b..93faee87 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6312,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6320,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -13688,7 +13700,7 @@ index 359f8a2b..93faee87 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5592,6 +6641,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5592,6 +6649,24 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mvkDestroyContainerContents(queues);
  	}
  
@@ -13698,7 +13710,12 @@ index 359f8a2b..93faee87 100644
 +		dispatch_source_cancel(_implicitPipelineCacheTimer);
 +		dispatch_sync(_implicitPipelineCacheQueue, ^{});
 +		if (_implicitPipelineCacheDirty) { saveImplicitPipelineCache(); }
-+		if (_binaryArchiveDirty) { saveBinaryArchive(); }
++		if (_binaryArchiveQueue) {
++			_binaryArchiveClosing = true;
++			dispatch_sync(_binaryArchiveQueue, ^{});
++			if (_binaryArchiveDirty) { saveBinaryArchive(); }
++			dispatch_release(_binaryArchiveQueue);
++		}
 +		[_binaryArchive release];
 +		_implicitPipelineCache->destroy();
 +		dispatch_release(_implicitPipelineCacheTimer);
@@ -13708,7 +13725,7 @@ index 359f8a2b..93faee87 100644
  	if (_commandResourceFactory) { _commandResourceFactory->destroy(); }
  
  	for (auto &fences: _barrierFences) for (auto fence: fences) [fence release];
-@@ -5601,6 +6663,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5601,6 +6676,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  #endif
  	[_defaultMTLSamplerState release];
  	[_dummyBlitMTLBuffer release];
