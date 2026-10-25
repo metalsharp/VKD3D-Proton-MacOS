@@ -13780,7 +13780,7 @@ index 00b182b8..de0fbcf7 100644
  	_mtlHeap = nil;
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-index 45ddd3a4..4453aff9 100644
+index 45ddd3a4..54ff7a75 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 @@ -152,6 +152,19 @@ protected:
@@ -13846,7 +13846,17 @@ index 45ddd3a4..4453aff9 100644
  	bool _hasExtendedUsage;
  	bool _hasMutableFormat;
  	bool _shouldSupportAtomics;
-@@ -733,6 +768,12 @@ public:
+@@ -570,6 +605,9 @@ protected:
+     friend MVKImageView;
+     MVKImageView* _imageView;
+ 	id<MTLTexture> _mtlTexture;
++	// the image texture the view was made from: a 2D view of a 3D texture or a block texel view is a view of a
++	// texture aliasing its memory, not of it, so it can't be told from the view's parents (retained)
++	id<MTLTexture> _mtlTextureViewBase = nil;
+ 	VkComponentMapping _componentSwizzle;
+     MTLPixelFormat _mtlPixFmt;
+ 	uint8_t _planeIndex;
+@@ -733,6 +771,12 @@ public:
  	/** Returns whether this sampler must be implemented as a hardcoded constant sampler in the shader MSL code. */
  	inline 	bool getRequiresConstExprSampler() { return _requiresConstExprSampler; }
  
@@ -13859,7 +13869,7 @@ index 45ddd3a4..4453aff9 100644
  	/** Returns the Metal MTLSamplerAddressMode corresponding to the specified Vulkan VkSamplerAddressMode. */
  	MTLSamplerAddressMode getMTLSamplerAddressMode(VkSamplerAddressMode vkMode);
  
-@@ -751,5 +792,6 @@ protected:
+@@ -751,5 +795,6 @@ protected:
  	id<MTLSamplerState> _mtlSamplerState;
  	SPIRV_CROSS_NAMESPACE::MSLConstexprSampler _constExprSampler;
  	MVKSamplerYcbcrConversion* _ycbcrConversion;
@@ -13867,7 +13877,7 @@ index 45ddd3a4..4453aff9 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..0bb68ef6 100644
+index 2b394922..2e3ccef5 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -14094,7 +14104,34 @@ index 2b394922..0bb68ef6 100644
  	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
  
  	// Setting Metal objects directly will override Vulkan settings.
-@@ -2570,6 +2749,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -1903,6 +2082,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+             MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
+             initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
++            if (_mtlTexture) { _mtlTextureViewBase = [baseMTLTexture retain]; }
+         }
+         return _mtlTexture;
+     } else {
+@@ -1911,6 +2091,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ }
+ 
+ bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
++    // A view made through a memory alias was made from this base, though it is no view of it: without this it was
++    // made again at every use (a render pass's attachments, a descriptor), and Metal's texture release takes a lock
++    if (_mtlTextureViewBase && _mtlTextureViewBase == mtlTexture) { return true; }
+     id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
+     if (cachedBaseMTLTexture == mtlTexture) { return true; }
+ 
+@@ -2202,6 +2385,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		[tex release];
+ 		_mtlTexture = nil;
+ 	}
++	[_mtlTextureViewBase release];
++	_mtlTextureViewBase = nil;
+ }
+ 
+ MVKImageViewPlane::~MVKImageViewPlane() {
+@@ -2570,6 +2755,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
