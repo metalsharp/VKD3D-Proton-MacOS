@@ -23,21 +23,20 @@
 
 ## Capabilities
 
-The Apple validation lane reports and exercises:
+Measured on an Apple M4 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
 
-- D3D12 feature levels **12_2, 12_1, 12_0, 11_1, 11_0**, and **CORE_1_0**
-- Shader Model **6.5**
-- DXR **1.1** / ray-tracing tier 1.1
-- Variable-rate shading tier 2
-- Mesh-shader tier 1 and pixel-exact mesh dispatch
-- Sampler-feedback tier 0_9 with 64-bit image-atomic lowering
-- Tiled resources tier 4, conservative rasterization tier 3, ROVs, depth
-  bounds, barycentrics, typed-format casting, copy-queue timestamps, and
-  output-merger logical operations
+- Shader Model **6.8**
+- D3D12 feature levels **12_1, 12_0, 11_1, 11_0** by default, and **12_2** with
+  `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`, which turns on MoltenVK's ray tracing pipelines
+- DXR **1.1** (ray tracing tier 1.1) with that setting; none without it
+- Variable-rate shading tier 2 (16-pixel shading-rate tiles)
+- Mesh shader tier 1, sampler feedback tier 0.9
+- Tiled resources tier 4, conservative rasterization tier 3, resource binding tier 3
+- ROVs, depth bounds, barycentrics, fully typed format casting, copy-queue timestamps, and output-merger logic
+  operations
 
-All six feature-level ladder rungs create successfully. The companion
-regression gate covers CR InnerCoverage, sampler feedback, mesh dispatch,
-CORE_1_0 corpus, geometry-shader corpus, and the compute matrix.
+[docs/features.md](docs/features.md) has the full matrix and [docs/validation.md](docs/validation.md) the regression
+gate.
 
 ## Install
 
