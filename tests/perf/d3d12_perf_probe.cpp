@@ -3079,6 +3079,8 @@ RWByteAddressBuffer args : register(u2);
     args.Store4(slot * 32 + 16, uint4(3, 1, 0, 0));
 }
 [numthreads(1, 1, 1)] void cs_reset(uint t : SV_DispatchThreadID) { args.Store(4000 * 32, 0); }
+// A small GPU-driven dispatch: its root constants say where it writes.
+[numthreads(64, 1, 1)] void cs_small(uint t : SV_DispatchThreadID) { args.Store((rc.x * 64 + t) % 8192 * 4, t + rc.y); }
 // Plain ALU work for the async compute queue.
 [numthreads(64, 1, 1)] void cs_alu(uint t : SV_DispatchThreadID)
 {
@@ -3123,6 +3125,36 @@ static std::vector<Scene> engine_scenes()
         rp[1].DescriptorTable = { 1, &uavs };
         D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
         cs_rs = serialize_root_signature(rsd);
+    };
+    // Compute ExecuteIndirect: the signature (4 root constants and a dispatch, 32 bytes), the commands in an upload
+    // buffer (res_b, each a dispatch of one group, enough for 20 calls 64 commands apart), a count buffer (res_c)
+    // and the UAV the dispatches write (res_a).
+    auto make_dispatch_args = [](UINT commands, UINT count) {
+        res_a = create_buffer(8192 * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer = { 0, 8192, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW };
+        p.device->CreateUnorderedAccessView(res_a, nullptr, &ud, srv_cpu(UAV_ENGINE + 2));
+        D3D12_INDIRECT_ARGUMENT_DESC a[2] = {};
+        a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        a[0].Constant = { 0, 0, 4 };
+        a[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 2, a, 0 };
+        CHECK(p.device->CreateCommandSignature(&cs, cs_rs, IID_PPV_ARGS(&sig)));
+        UINT total = commands + 20 * 64;
+        res_b = create_buffer(total * 32, D3D12_HEAP_TYPE_UPLOAD);
+        uint32_t *v; CHECK(res_b->Map(0, nullptr, (void **)&v));
+        for (UINT i = 0; i < total; i++)
+        {
+            uint32_t command[8] = { i, i * 7, 0, 0, 1, 1, 1, 0 };
+            memcpy(v + i * 8, command, 32);
+        }
+        res_b->Unmap(0, nullptr);
+        res_c = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+        uint32_t *c; CHECK(res_c->Map(0, nullptr, (void **)&c));
+        *c = count;
+        res_c->Unmap(0, nullptr);
     };
     // A second queue (compute or copy) with its own allocators, list and fence.
     auto make_other_queue = [](D3D12_COMMAND_LIST_TYPE type) {
@@ -3294,6 +3326,28 @@ static std::vector<Scene> engine_scenes()
             set_quad_state(p.list, pso_b);
             p.list->ExecuteIndirect(sig, 4000, res_a, 0, res_a, 4000 * 32);
             barrier(p.list, res_a, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        } },
+        { "execute_indirect_dispatch", "20 compute ExecuteIndirects of root constants + dispatch: up to 1024 each, 64 counted", [make_cs_rs, make_dispatch_args] {
+            make_cs_rs();
+            pso_a = compute_pso_from(cs_rs, shader_code(engine_cs_hlsl, "cs_small", "cs_5_0"));
+            make_dispatch_args(1024, 64);
+        }, [](UINT) {
+            p.list->SetComputeRootSignature(cs_rs);
+            p.list->SetComputeRootDescriptorTable(1, srv_gpu(UAV_ENGINE));
+            p.list->SetPipelineState(pso_a);
+            for (UINT i = 0; i < 20; i++)
+                p.list->ExecuteIndirect(sig, 1024, res_b, i * 64 * 32, res_c, 0);
+        } },
+        { "execute_indirect_dispatch_exact", "20 compute ExecuteIndirects of 64 root constants + dispatch each, no count buffer (compare execute_indirect_dispatch)", [make_cs_rs, make_dispatch_args] {
+            make_cs_rs();
+            pso_a = compute_pso_from(cs_rs, shader_code(engine_cs_hlsl, "cs_small", "cs_5_0"));
+            make_dispatch_args(1024, 64);
+        }, [](UINT) {
+            p.list->SetComputeRootSignature(cs_rs);
+            p.list->SetComputeRootDescriptorTable(1, srv_gpu(UAV_ENGINE));
+            p.list->SetPipelineState(pso_a);
+            for (UINT i = 0; i < 20; i++)
+                p.list->ExecuteIndirect(sig, 64, res_b, i * 64 * 32, nullptr, 0);
         } },
         { "predication", "100 occlusion-tested proxies, then 100 groups of 20 draws predicated on their results", [] {
             pso_a = create_pso({});
