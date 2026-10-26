@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 01/13] vkd3d: Run on MoltenVK: optional transform feedback,
+Subject: [PATCH 01/14] vkd3d: Run on MoltenVK: optional transform feedback,
  VKMT texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 02/13] Keep the transform feedback structures linked when
+Subject: [PATCH 02/14] Keep the transform feedback structures linked when
  stream output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 03/13] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 03/14] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 04/13] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+Subject: [PATCH 04/14] MoltenVK: emulated VRS tier 2 (full-rate shading) with
  a 16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 05/13] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 05/14] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,7 +329,7 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 06/13] MoltenVK: typed buffer views start at aligned offsets
+Subject: [PATCH 06/14] MoltenVK: typed buffer views start at aligned offsets
  via the typed offset buffer (no env bypass)
 
 ---
@@ -392,7 +392,7 @@ index a8fc26b1..bf474e86 100644
 From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 19:03:16 -0600
-Subject: [PATCH 07/13] MoltenVK: require transform feedback again
+Subject: [PATCH 07/14] MoltenVK: require transform feedback again
 
 The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
 copy of the vertex shader, counter buffers, overflow and stream queries), so
@@ -500,7 +500,7 @@ index 9c6839ea..4717e179 100644
 From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 23:25:55 -0600
-Subject: [PATCH 08/13] vkd3d: Typed resources that aren't UAVs only take views
+Subject: [PATCH 08/14] vkd3d: Typed resources that aren't UAVs only take views
  of their format or its sRGB one.
 
 The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
@@ -574,7 +574,7 @@ index bf474e86..56118e03 100644
 From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 23:52:01 -0600
-Subject: [PATCH 09/13] MoltenVK: root CBVs as push descriptors, no staggered
+Subject: [PATCH 09/14] MoltenVK: root CBVs as push descriptors, no staggered
  submits; fix EndRenderPass state tracking
 
 ---
@@ -650,7 +650,7 @@ index 1945f15a..b2e27034 100644
 From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:34:44 -0600
-Subject: [PATCH 10/13] swapchain: on MoltenVK, release the frame latency
+Subject: [PATCH 10/14] swapchain: on MoltenVK, release the frame latency
  waitable at GPU completion instead of present wait
 
 MoltenVK completes present waits once the frame is on screen, which serialized
@@ -712,7 +712,7 @@ index 4d3e1bf4..6b0639ba 100644
 From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:47:45 -0600
-Subject: [PATCH 11/13] swapchain: log the app's frame latency;
+Subject: [PATCH 11/14] swapchain: log the app's frame latency;
  VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
 
 ---
@@ -775,7 +775,7 @@ index 6b0639ba..382c7b4d 100644
 From 864bb1e06c9b2fb4eb9eb5bb4f60ac72bb66187b Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 03:33:43 -0600
-Subject: [PATCH 12/13] command: keep render passes open across read-only
+Subject: [PATCH 12/14] command: keep render passes open across read-only
  texture transitions
 
 Read-after-read needs no synchronization; on MoltenVK image layouts don't exist either.
@@ -869,7 +869,7 @@ index 373cd989..b0aec561 100644
 From 3c3cac1647e5e38c062e00a1a41e5d5b996bf343 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 09:00:57 -0600
-Subject: [PATCH 13/13] MoltenVK: keep render passes open across UAV barriers
+Subject: [PATCH 13/14] MoltenVK: keep render passes open across UAV barriers
  while the pass draws without UAVs; shaders record UAV use
  (VKD3D_SHADER_META_FLAG_USES_UAV)
 
@@ -1156,6 +1156,1054 @@ index 3e71f89c..ff94f06d 100644
      bool has_post_indirect_barrier_work;
  
      /* Number of draws, dispatches, copies etc. Used to fuse barrier-only
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9e8789bd2c3c89ed144b53e1a4b0c1aff0497996 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 12:28:26 -0600
+Subject: [PATCH 14/14] MoltenVK: fewer render pass ends and cheaper per-draw
+ root state
+
+- Buffer transitions between read-only states no longer end the render pass on MoltenVK (COMMON,
+  INDIRECT_ARGUMENT, acceleration structures and buffers with pending RTAS work still do).
+- CopyDescriptors on the vkUpdateDescriptorSets path copies only the runs of descriptors each set uses, and a
+  whole call goes out as one vkUpdateDescriptorSets.
+- Root addresses, dirty root constants and table offsets are gathered into one shadow block and pushed with one
+  vkCmdPushConstants per draw/dispatch; runs of adjacent dirty descriptor sets bind with one call.
+- CopyBufferRegion from an UPLOAD-heap buffer on a direct list goes into a per-list command buffer submitted just
+  before the list (with a barrier at its end) instead of ending the render pass, and consecutive copies between
+  the same buffers merge into one multi-region copy (on by default on MoltenVK; VKD3D_CONFIG=no_hoist_upload_copies
+  turns it off, hoist_upload_copies turns it on elsewhere).
+- Static descriptor-table CBVs are hoisted to push descriptors on MoltenVK, where Metal's constant buffers read
+  1.5-1.7x faster, capped at 8 per root signature (VKD3D_CONFIG=no_hoist_table_cbv / hoist_table_cbv).
+- New allocations on MoltenVK count as already zeroed, so no GPU clear submit is made for them.
+
+Measured on an M4 MacBook Air with the matching MoltenVK changes: God of War Ragnarok 25-30 -> a steady 40 fps
+(its frame limit). Targeted d3d12 tests (64) match the unmodified build.
+---
+ include/private/config_flag_decl.h |   4 +
+ include/private/config_flags.h     |   2 +-
+ libs/vkd3d/command.c               | 462 +++++++++++++++++++++++++++--
+ libs/vkd3d/device.c                |  10 +-
+ libs/vkd3d/memory.c                |   4 +
+ libs/vkd3d/resource.c              |  77 +++--
+ libs/vkd3d/state.c                 |  12 +
+ libs/vkd3d/vkd3d_private.h         |  47 ++-
+ 8 files changed, 568 insertions(+), 50 deletions(-)
+
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index f318bbc5..cffd2cc6 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -75,3 +75,7 @@ VKD3D_DECL_CONFIG("fail_unsupported_state_template", FAIL_UNSUPPORTED_STATE_TEMP
+ VKD3D_DECL_CONFIG("ignore_shared_fence", IGNORE_SHARED_FENCE)
+ VKD3D_DECL_CONFIG("adreno_7xx_extra_compat", ADRENO_7XX_EXTRA_COMPAT)
+ VKD3D_DECL_CONFIG("descriptor_heap_robustness", DESCRIPTOR_HEAP_ROBUSTNESS)
++VKD3D_DECL_CONFIG("hoist_table_cbv", HOIST_TABLE_CBV)
++VKD3D_DECL_CONFIG("no_hoist_table_cbv", NO_HOIST_TABLE_CBV)
++VKD3D_DECL_CONFIG("hoist_upload_copies", HOIST_UPLOAD_COPIES)
++VKD3D_DECL_CONFIG("no_hoist_upload_copies", NO_HOIST_UPLOAD_COPIES)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index d44e0f16..bd72b3cf 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 21;
++	uint32_t reserved0 : 17;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 77488785..ba0bb2dc 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2579,6 +2579,9 @@ static void d3d12_command_allocator_free_command_buffer(struct d3d12_command_all
+     d3d12_command_allocator_free_vk_command_buffer(allocator,
+             &allocator->primary_pool,
+             list->cmd.vk_cleanup_commands);
++    d3d12_command_allocator_free_vk_command_buffer(allocator,
++            &allocator->primary_pool,
++            list->cmd.vk_init_copy_commands);
+ 
+     for (i = 0; i < list->cmd.iteration_count; i++)
+     {
+@@ -3777,6 +3780,243 @@ static void d3d12_command_list_resolve_transfer_waw(struct d3d12_command_list *l
+     }
+ }
+ 
++#define VKD3D_UPLOAD_COPY_HOIST_MAX_RANGES 256
++
++static bool d3d12_device_hoists_upload_copies(const struct d3d12_device *device)
++{
++    if (VKD3D_CONFIG_FLAG_IS_SET(NO_HOIST_UPLOAD_COPIES))
++        return false;
++    return VKD3D_CONFIG_FLAG_IS_SET(HOIST_UPLOAD_COPIES) ||
++            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK;
++}
++
++static bool d3d12_buffer_ranges_overlap(const struct d3d12_buffer_range *ranges, size_t count,
++        VkBuffer vk_buffer, VkDeviceSize begin, VkDeviceSize end)
++{
++    size_t i;
++
++    for (i = 0; i < count; i++)
++    {
++        if (ranges[i].vk_buffer == vk_buffer && begin < ranges[i].end && end > ranges[i].begin)
++            return true;
++    }
++    return false;
++}
++
++static void d3d12_command_list_add_upload_copy_hoist_range(struct d3d12_command_list *list,
++        struct d3d12_buffer_range **ranges, size_t *ranges_size, size_t *count,
++        VkBuffer vk_buffer, VkDeviceSize begin, VkDeviceSize end)
++{
++    struct d3d12_upload_copy_hoist *hoist = &list->upload_copy_hoist;
++    struct d3d12_buffer_range *last;
++
++    if (hoist->disabled)
++        return;
++
++    /* Grow the last range for sequential patterns, e.g. one copy per object into one buffer. */
++    if (*count)
++    {
++        last = &(*ranges)[*count - 1];
++        if (last->vk_buffer == vk_buffer && begin <= last->end && end >= last->begin)
++        {
++            last->begin = min(last->begin, begin);
++            last->end = max(last->end, end);
++            return;
++        }
++    }
++
++    if (*count == VKD3D_UPLOAD_COPY_HOIST_MAX_RANGES ||
++            !vkd3d_array_reserve((void **)ranges, ranges_size, *count + 1, sizeof(**ranges)))
++    {
++        hoist->disabled = true;
++        return;
++    }
++
++    last = &(*ranges)[(*count)++];
++    last->vk_buffer = vk_buffer;
++    last->begin = begin;
++    last->end = end;
++}
++
++static void d3d12_command_list_block_upload_copy_range(struct d3d12_command_list *list,
++        VkBuffer vk_buffer, VkDeviceSize begin, VkDeviceSize end)
++{
++    struct d3d12_upload_copy_hoist *hoist = &list->upload_copy_hoist;
++
++    d3d12_command_list_add_upload_copy_hoist_range(list, &hoist->blocked, &hoist->blocked_size,
++            &hoist->blocked_count, vk_buffer, begin, end);
++}
++
++static void d3d12_command_list_block_upload_copy_resource(struct d3d12_command_list *list,
++        const struct d3d12_resource *resource)
++{
++    /* A barrier on all resources orders everything. */
++    if (!resource)
++    {
++        list->upload_copy_hoist.disabled = true;
++        return;
++    }
++
++    if (d3d12_resource_is_buffer(resource))
++    {
++        d3d12_command_list_block_upload_copy_range(list, resource->res.vk_buffer,
++                resource->mem.offset, resource->mem.offset + resource->desc.Width);
++    }
++}
++
++static void d3d12_command_list_track_upload_copy_hoist_barriers(struct d3d12_command_list *list,
++        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
++{
++    UINT i;
++
++    if (list->upload_copy_hoist.disabled)
++        return;
++
++    for (i = 0; i < barrier_count; i++)
++    {
++        switch (barriers[i].Type)
++        {
++            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
++                d3d12_command_list_block_upload_copy_resource(list,
++                        impl_from_ID3D12Resource(barriers[i].Transition.pResource));
++                break;
++            case D3D12_RESOURCE_BARRIER_TYPE_UAV:
++                d3d12_command_list_block_upload_copy_resource(list,
++                        impl_from_ID3D12Resource(barriers[i].UAV.pResource));
++                break;
++            case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
++                d3d12_command_list_block_upload_copy_resource(list,
++                        impl_from_ID3D12Resource(barriers[i].Aliasing.pResourceBefore));
++                d3d12_command_list_block_upload_copy_resource(list,
++                        impl_from_ID3D12Resource(barriers[i].Aliasing.pResourceAfter));
++                break;
++            default:
++                list->upload_copy_hoist.disabled = true;
++                break;
++        }
++    }
++}
++
++/* Whether all writes to the buffer in this command list so far were hoisted copies. */
++static bool d3d12_command_list_upload_copy_hoist_wrote_buffer(struct d3d12_command_list *list,
++        const struct d3d12_resource *resource)
++{
++    const struct d3d12_upload_copy_hoist *hoist = &list->upload_copy_hoist;
++    VkDeviceSize begin, end;
++    size_t i;
++
++    if (hoist->disabled || !hoist->written_count)
++        return false;
++
++    begin = resource->mem.offset;
++    end = begin + resource->desc.Width;
++
++    if (d3d12_buffer_ranges_overlap(hoist->blocked, hoist->blocked_count, resource->res.vk_buffer, begin, end))
++        return false;
++
++    for (i = 0; i < hoist->written_count; i++)
++    {
++        if (hoist->written[i].vk_buffer == resource->res.vk_buffer &&
++                hoist->written[i].begin <= begin && hoist->written[i].end >= end)
++            return true;
++    }
++    return false;
++}
++
++static void d3d12_command_list_flush_hoisted_upload_copies(struct d3d12_command_list *list)
++{
++    struct d3d12_upload_copy_hoist *hoist = &list->upload_copy_hoist;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkCopyBufferInfo2 copy_info;
++
++    if (!hoist->region_count)
++        return;
++
++    copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
++    copy_info.pNext = NULL;
++    copy_info.srcBuffer = hoist->src_buffer;
++    copy_info.dstBuffer = hoist->dst_buffer;
++    copy_info.regionCount = hoist->region_count;
++    copy_info.pRegions = hoist->regions;
++    VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_init_copy_commands, &copy_info));
++
++    hoist->region_count = 0;
++}
++
++static bool d3d12_command_list_hoist_upload_copy(struct d3d12_command_list *list,
++        struct d3d12_resource *dst_resource, UINT64 dst_offset,
++        struct d3d12_resource *src_resource, UINT64 src_offset, UINT64 byte_count)
++{
++    struct d3d12_upload_copy_hoist *hoist = &list->upload_copy_hoist;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkDeviceSize dst_begin, dst_end;
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++    VkBufferCopy2 *region;
++
++    if (hoist->disabled)
++        return false;
++
++    if (src_resource->heap_properties.Type != D3D12_HEAP_TYPE_UPLOAD ||
++            ((src_resource->flags | dst_resource->flags) & VKD3D_RESOURCE_RESERVED))
++        return false;
++
++    dst_begin = dst_offset + dst_resource->mem.offset;
++    dst_end = dst_begin + byte_count;
++
++    if (d3d12_buffer_ranges_overlap(hoist->blocked, hoist->blocked_count,
++            dst_resource->res.vk_buffer, dst_begin, dst_end))
++        return false;
++
++    if (FAILED(d3d12_command_allocator_allocate_fixup_command_buffer(list->allocator, list,
++            &list->cmd.vk_init_copy_commands, "Hoisted upload copies")))
++        return false;
++
++    if (hoist->region_count && (hoist->src_buffer != src_resource->res.vk_buffer ||
++            hoist->dst_buffer != dst_resource->res.vk_buffer))
++        d3d12_command_list_flush_hoisted_upload_copies(list);
++
++    /* Copies into overlapping ranges are not ordered without a barrier. */
++    if (d3d12_buffer_ranges_overlap(hoist->written, hoist->written_count,
++            dst_resource->res.vk_buffer, dst_begin, dst_end))
++    {
++        d3d12_command_list_flush_hoisted_upload_copies(list);
++
++        memset(&vk_barrier, 0, sizeof(vk_barrier));
++        vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++        vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++        vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++        vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++        vk_barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++
++        memset(&dep_info, 0, sizeof(dep_info));
++        dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++        dep_info.memoryBarrierCount = 1;
++        dep_info.pMemoryBarriers = &vk_barrier;
++        VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_init_copy_commands, &dep_info));
++    }
++
++    d3d12_command_list_add_upload_copy_hoist_range(list, &hoist->written, &hoist->written_size,
++            &hoist->written_count, dst_resource->res.vk_buffer, dst_begin, dst_end);
++    if (hoist->disabled || !vkd3d_array_reserve((void **)&hoist->regions, &hoist->regions_size,
++            hoist->region_count + 1, sizeof(*hoist->regions)))
++    {
++        /* The range could not be tracked: record this copy normally and stop hoisting. */
++        hoist->disabled = true;
++        return false;
++    }
++
++    hoist->src_buffer = src_resource->res.vk_buffer;
++    hoist->dst_buffer = dst_resource->res.vk_buffer;
++    region = &hoist->regions[hoist->region_count++];
++    region->sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
++    region->pNext = NULL;
++    region->srcOffset = src_offset + src_resource->mem.offset;
++    region->dstOffset = dst_begin;
++    region->size = byte_count;
++    return true;
++}
++
+ static void d3d12_command_list_mark_copy_buffer_write(struct d3d12_command_list *list, VkBuffer vk_buffer,
+         VkDeviceSize offset, VkDeviceSize size, bool sparse)
+ {
+@@ -3784,6 +4024,12 @@ static void d3d12_command_list_mark_copy_buffer_write(struct d3d12_command_list
+     VkDeviceSize range_end;
+     unsigned int i;
+ 
++    /* Not hoisted: later hoisted copies into this range would run before it. */
++    if (sparse)
++        list->upload_copy_hoist.disabled = true;
++    else
++        d3d12_command_list_block_upload_copy_range(list, vk_buffer, offset, offset + size);
++
+     if (sparse)
+     {
+         vk_buffer = VK_NULL_HANDLE;
+@@ -6644,6 +6890,9 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
+         vkd3d_free(list->subresource_tracking);
+         vkd3d_free(list->query_resolves);
+         vkd3d_free(list->dgc_batch.draws);
++        vkd3d_free(list->upload_copy_hoist.blocked);
++        vkd3d_free(list->upload_copy_hoist.written);
++        vkd3d_free(list->upload_copy_hoist.regions);
+         hash_map_free(&list->query_resolve_lut);
+         d3d12_command_list_free_rtas_batch(list);
+ 
+@@ -6764,6 +7013,32 @@ static HRESULT d3d12_command_list_build_init_commands(struct d3d12_command_list
+     if (FAILED(hr = d3d12_command_list_batch_reset_query_pools(list)))
+         return hr;
+ 
++    if (list->cmd.vk_init_copy_commands)
++    {
++        d3d12_command_list_flush_hoisted_upload_copies(list);
++
++        /* The command list may read the copied buffers anywhere, or copy into them again. */
++        memset(&barrier, 0, sizeof(barrier));
++        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++        barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++        barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++
++        memset(&dep_info, 0, sizeof(dep_info));
++        dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++        dep_info.memoryBarrierCount = 1;
++        dep_info.pMemoryBarriers = &barrier;
++
++        VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_init_copy_commands, &dep_info));
++        d3d12_command_list_debug_mark_end_region_cmd(list, list->cmd.vk_init_copy_commands);
++        if ((vr = VK_CALL(vkEndCommandBuffer(list->cmd.vk_init_copy_commands))) < 0)
++        {
++            WARN("Failed to end command buffer, vr %d.\n", vr);
++            return hresult_from_vk_result(vr);
++        }
++    }
++
+     for (i = 0; i < list->cmd.iteration_count; i++)
+     {
+         iteration = &list->cmd.iterations[i];
+@@ -7234,6 +7509,12 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
+     list->transfer_batch.read_after_write_hazard_stages = VK_PIPELINE_STAGE_NONE;
+     list->transfer_batch.shader_resource_execution_stages_are_idle = VK_PIPELINE_STAGE_NONE;
+     list->wbi_batch.batch_len = 0;
++    /* No tracking where nothing is hoisted. */
++    list->upload_copy_hoist.disabled = list->type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
++            !d3d12_device_hoists_upload_copies(list->device);
++    list->upload_copy_hoist.blocked_count = 0;
++    list->upload_copy_hoist.written_count = 0;
++    list->upload_copy_hoist.region_count = 0;
+     list->query_resolve_count = 0;
+     list->submit_allocator = NULL;
+     list->dgc_batch.draws_count = 0;
+@@ -7747,8 +8028,28 @@ static void d3d12_command_list_update_inline_redzone(struct d3d12_command_list *
+     bindings->dirty_flags &= ~VKD3D_PIPELINE_DIRTY_INLINE_REDZONE;
+ }
+ 
++/* Root descriptor VAs, root constants and descriptor table offsets share one push constant block
++ * (VAs first, then constants, then table offsets). On the vkCmdPushConstants path, gather what is
++ * dirty for a draw or dispatch into a shadow of that block and push its dirty range with one call
++ * instead of one call per kind and per root constant parameter: every call costs a driver
++ * round trip, and MoltenVK re-encodes the whole block for each. */
++struct vkd3d_push_constant_shadow
++{
++    union vkd3d_root_parameter_data data;
++    uint32_t begin;
++    uint32_t end;
++};
++
++static void vkd3d_push_constant_shadow_mark(struct vkd3d_push_constant_shadow *shadow,
++        uint32_t offset, uint32_t size)
++{
++    shadow->begin = min(shadow->begin, offset);
++    shadow->end = max(shadow->end, offset + size);
++}
++
+ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_command_list *list,
+-        struct vkd3d_pipeline_bindings *bindings, VkPipelineLayout layout, VkShaderStageFlags push_stages)
++        struct vkd3d_pipeline_bindings *bindings, VkPipelineLayout layout, VkShaderStageFlags push_stages,
++        struct vkd3d_push_constant_shadow *shadow)
+ {
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+@@ -7797,7 +8098,14 @@ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_comm
+     }
+ 
+     /* Set descriptor offsets */
+-    if (d3d12_device_use_descriptor_heap(list->device))
++    if (shadow)
++    {
++        memcpy(&shadow->data.root_constants[root_signature->descriptor_table_offset / sizeof(uint32_t)],
++                table_offsets, root_signature->descriptor_table_count * sizeof(uint32_t));
++        vkd3d_push_constant_shadow_mark(shadow, root_signature->descriptor_table_offset,
++                root_signature->descriptor_table_count * sizeof(uint32_t));
++    }
++    else if (d3d12_device_use_descriptor_heap(list->device))
+     {
+         VkPushDataInfoEXT info;
+         memset(&info, 0, sizeof(info));
+@@ -7963,16 +8271,26 @@ static void d3d12_command_list_update_descriptor_heaps(struct d3d12_command_list
+     }
+     else
+     {
++        /* Bind each run of contiguous dirty, non-null sets with one call. */
+         while (bindings->legacy_descriptor_set_dirty_mask)
+         {
+             unsigned int heap_index = vkd3d_bitmask_iter64(&bindings->legacy_descriptor_set_dirty_mask);
++            unsigned int set_count = 1;
++
++            if (!list->descriptor_heap.sets.vk_sets[heap_index])
++                continue;
+ 
+-            if (list->descriptor_heap.sets.vk_sets[heap_index])
++            while (heap_index + set_count < VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS &&
++                    (bindings->legacy_descriptor_set_dirty_mask & (1ull << (heap_index + set_count))) &&
++                    list->descriptor_heap.sets.vk_sets[heap_index + set_count])
+             {
+-                VK_CALL(vkCmdBindDescriptorSets(list->cmd.vk_command_buffer, vk_bind_point,
+-                        layout, heap_index, 1,
+-                        &list->descriptor_heap.sets.vk_sets[heap_index], 0, NULL));
++                bindings->legacy_descriptor_set_dirty_mask &= ~(1ull << (heap_index + set_count));
++                set_count++;
+             }
++
++            VK_CALL(vkCmdBindDescriptorSets(list->cmd.vk_command_buffer, vk_bind_point,
++                    layout, heap_index, set_count,
++                    &list->descriptor_heap.sets.vk_sets[heap_index], 0, NULL));
+         }
+     }
+ }
+@@ -8002,7 +8320,8 @@ static void d3d12_command_list_update_static_samplers(struct d3d12_command_list
+ 
+ static void d3d12_command_list_update_root_constants(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings,
+-        VkPipelineLayout layout, VkShaderStageFlags push_stages)
++        VkPipelineLayout layout, VkShaderStageFlags push_stages,
++        struct vkd3d_push_constant_shadow *shadow)
+ {
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+@@ -8015,7 +8334,18 @@ static void d3d12_command_list_update_root_constants(struct d3d12_command_list *
+         return;
+     }
+ 
+-    if (d3d12_device_use_descriptor_heap(list->device))
++    if (shadow)
++    {
++        /* The shadow is filled from all root constants when it is pushed; only track the range. */
++        while (bindings->root_constant_dirty_mask)
++        {
++            root_parameter_index = vkd3d_bitmask_iter64(&bindings->root_constant_dirty_mask);
++            root_constant = root_signature_get_32bit_constants(root_signature, root_parameter_index);
++            vkd3d_push_constant_shadow_mark(shadow, root_constant->constant_index * sizeof(uint32_t),
++                    root_constant->constant_count * sizeof(uint32_t));
++        }
++    }
++    else if (d3d12_device_use_descriptor_heap(list->device))
+     {
+         VkPushDataInfoEXT info;
+         memset(&info, 0, sizeof(info));
+@@ -8110,7 +8440,8 @@ void d3d12_command_list_fetch_root_parameter_data(struct d3d12_command_list *lis
+ 
+ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings, VkPipelineBindPoint vk_bind_point,
+-        VkPipelineLayout layout, VkShaderStageFlags push_stages, uint32_t root_signature_flags)
++        VkPipelineLayout layout, VkShaderStageFlags push_stages, uint32_t root_signature_flags,
++        struct vkd3d_push_constant_shadow *shadow)
+ {
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+@@ -8137,6 +8468,8 @@ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list
+          * Root constants and tables are always considered dirty here, so omit that. */
+         bindings->root_descriptor_dirty_mask |= root_signature->root_descriptor_raw_va_mask;
+     }
++    else if (shadow)
++        ptr_root_parameter_data = &shadow->data;
+     else
+         ptr_root_parameter_data = &root_parameter_data;
+ 
+@@ -8184,7 +8517,11 @@ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list
+     }
+     else if (va_count)
+     {
+-        if (d3d12_device_use_descriptor_heap(list->device))
++        if (shadow)
++        {
++            vkd3d_push_constant_shadow_mark(shadow, 0, va_count * sizeof(*shadow->data.root_descriptor_vas));
++        }
++        else if (d3d12_device_use_descriptor_heap(list->device))
+         {
+             VkPushDataInfoEXT info;
+             memset(&info, 0, sizeof(info));
+@@ -8291,7 +8628,9 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+ {
+     struct vkd3d_pipeline_bindings *bindings = d3d12_command_list_get_bindings(list, list->active_pipeline_type);
+     const struct d3d12_root_signature *rs = bindings->root_signature;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     const struct d3d12_bind_point_layout *bind_point_layout;
++    struct vkd3d_push_constant_shadow push_shadow, *shadow;
+     VkPipelineBindPoint vk_bind_point;
+     VkShaderStageFlags push_stages;
+     VkPipelineLayout layout;
+@@ -8321,22 +8660,40 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+                 || (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS))
+         {
+             d3d12_command_list_update_root_descriptors(list, bindings, vk_bind_point, layout, push_stages,
+-                    bind_point_layout->flags);
++                    bind_point_layout->flags, NULL);
+         }
+     }
+     else
+     {
++        shadow = NULL;
++        if (push_stages && !d3d12_device_use_descriptor_heap(list->device))
++        {
++            shadow = &push_shadow;
++            shadow->begin = UINT32_MAX;
++            shadow->end = 0;
++        }
++
+         if (bindings->root_descriptor_dirty_mask)
+         {
+             d3d12_command_list_update_root_descriptors(list, bindings, vk_bind_point, layout, push_stages,
+-                    bind_point_layout->flags);
++                    bind_point_layout->flags, shadow);
+         }
+ 
+         if (bindings->root_constant_dirty_mask)
+-            d3d12_command_list_update_root_constants(list, bindings, layout, push_stages);
++            d3d12_command_list_update_root_constants(list, bindings, layout, push_stages, shadow);
+ 
+         if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS)
+-            d3d12_command_list_update_descriptor_table_offsets(list, bindings, layout, push_stages);
++            d3d12_command_list_update_descriptor_table_offsets(list, bindings, layout, push_stages, shadow);
++
++        if (shadow && shadow->begin < shadow->end)
++        {
++            /* Bytes between dirty parts are pushed too, so take every root constant and table
++             * offset from the current bindings. VAs are only in range when they were fetched. */
++            d3d12_command_list_fetch_root_parameter_uniform_block_data(list, bindings, &shadow->data);
++            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, layout, push_stages,
++                    shadow->begin, shadow->end - shadow->begin,
++                    (const uint8_t *)&shadow->data + shadow->begin));
++        }
+ 
+         if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_INLINE_REDZONE)
+             d3d12_command_list_update_inline_redzone(list, bindings);
+@@ -8785,6 +9142,9 @@ static bool d3d12_command_list_render_pass_suspend_resume_avoids_fixup(
+      * If we cannot hoist the post-indirect work in second before first, we have to split. */
+     if (second->cmd.has_post_indirect_barrier_work && !hoistable_post_indirect)
+         return false;
++    /* Hoisted copies run between the two command lists. */
++    if (second->cmd.vk_init_copy_commands)
++        return false;
+ 
+     if (!suspend->vk_fixup_cmd_buffer || !resume->vk_fixup_cmd_buffer)
+         return false;
+@@ -9471,10 +9831,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+             iface, dst, dst_offset, src, src_offset, byte_count);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
+-    d3d12_command_list_flush_dgc_batch(list);
+-    d3d12_command_list_begin_transfer(list);
+-
+-    list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
+ 
+     vk_procs = &list->device->vk_procs;
+ 
+@@ -9486,6 +9842,18 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+     d3d12_command_list_track_resource_usage(list, dst_resource, true);
+     d3d12_command_list_track_resource_usage(list, src_resource, true);
+ 
++    /* Runs before the command list: leaves the render pass and transfer batch alone. */
++    if (d3d12_command_list_hoist_upload_copy(list, dst_resource, dst_offset, src_resource, src_offset, byte_count))
++    {
++        VKD3D_BREADCRUMB_TAG("Buffer -> Buffer (hoisted)");
++        return;
++    }
++
++    d3d12_command_list_flush_dgc_batch(list);
++    d3d12_command_list_begin_transfer(list);
++
++    list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
++
+     d3d12_command_list_end_current_render_pass(list, true);
+     d3d12_command_list_end_transfer_batch(list, false);
+ 
+@@ -14007,7 +14375,9 @@ static bool d3d12_command_list_check_resource_barrier_trivial_copy_resource(
+  * read). Recognizing it before the barrier code ends the render pass keeps the pass open: Unity
+  * and other engines transition textures between shader stages between draws, and every split
+  * render pass reloads and stores its attachments. MoltenVK has no image layouts, so a layout
+- * change between read-only states needs nothing there either. */
++ * change between read-only states needs nothing there either. On MoltenVK the same holds for
++ * buffers (e.g. VERTEX_AND_CONSTANT_BUFFER <-> NON_PIXEL_SHADER_RESOURCE): Metal has no per-access
++ * visibility to chain through, so a read-to-read buffer barrier only costs the pass split. */
+ static bool d3d12_command_list_check_resource_barrier_read_only_noop(
+     struct d3d12_command_list *list, UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+ {
+@@ -14028,11 +14398,27 @@ static bool d3d12_command_list_check_resource_barrier_read_only_noop(
+     {
+         const D3D12_RESOURCE_BARRIER *barrier = &barriers[i];
+         const D3D12_RESOURCE_TRANSITION_BARRIER *transition = &barrier->Transition;
++        bool skip_before_access = false;
+         struct d3d12_resource *resource;
+ 
+         if (barrier->Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barrier->Flags)
+             return false;
+-        if (!(resource = impl_from_ID3D12Resource(transition->pResource)) || !d3d12_resource_is_texture(resource))
++        if (!(resource = impl_from_ID3D12Resource(transition->pResource)))
++            return false;
++        if (d3d12_resource_is_buffer(resource))
++        {
++            if (!ignore_layouts || d3d12_resource_is_acceleration_structure(resource))
++                return false;
++            /* RTAS inputs: the full path flushes pending RTAS builds on these. */
++            if (list->rtas_batch.pending_rtas_work &&
++                    transition->StateBefore == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
++                return false;
++            /* Only hoisted copies wrote it in this list; their command buffer ends with a barrier. */
++            if (transition->StateBefore == D3D12_RESOURCE_STATE_COPY_DEST &&
++                    d3d12_command_list_upload_copy_hoist_wrote_buffer(list, resource))
++                skip_before_access = true;
++        }
++        else if (!d3d12_resource_is_texture(resource))
+             return false;
+         if (!is_valid_resource_state(transition->StateBefore) || !is_valid_resource_state(transition->StateAfter))
+             return false;
+@@ -14045,8 +14431,11 @@ static bool d3d12_command_list_check_resource_barrier_read_only_noop(
+ 
+         before_access = after_access = 0;
+         stages = 0;
+-        vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateBefore,
+-                list->vk_queue_flags, &stages, &before_access);
++        if (!skip_before_access)
++        {
++            vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateBefore,
++                    list->vk_queue_flags, &stages, &before_access);
++        }
+         vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateAfter,
+                 list->vk_queue_flags, &stages, &after_access);
+         if ((before_access | after_access) & write_access)
+@@ -14108,12 +14497,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+     /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
+      * barriers. This is more or less just a workaround too for terribly written games,
+      * so keep it as simple as it can be for now. */
+-    if (d3d12_command_list_check_resource_barrier_trivial_copy_resource(list, barrier_count, barriers))
+-        return;
+-    if (d3d12_command_list_check_resource_barrier_read_only_noop(list, barrier_count, barriers))
+-        return;
+-    if (d3d12_command_list_defer_uav_barrier_in_render_pass(list, barrier_count, barriers))
++    if (d3d12_command_list_check_resource_barrier_trivial_copy_resource(list, barrier_count, barriers) ||
++            d3d12_command_list_check_resource_barrier_read_only_noop(list, barrier_count, barriers) ||
++            d3d12_command_list_defer_uav_barrier_in_render_pass(list, barrier_count, barriers))
++    {
++        d3d12_command_list_track_upload_copy_hoist_barriers(list, barrier_count, barriers);
+         return;
++    }
++    d3d12_command_list_track_upload_copy_hoist_barriers(list, barrier_count, barriers);
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_end_current_render_pass(list, false);
+@@ -20113,6 +20504,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_WriteBufferImmediate(d3d12_comm
+ 
+     TRACE("iface %p, count %u, parameters %p, modes %p.\n", iface, count, parameters, modes);
+ 
++    /* Writes in COPY_DEST state that hoisted copies would overtake; VAs are not tracked. */
++    list->upload_copy_hoist.disabled = true;
++
+     /* Always flush WBI batch if we're outside a render pass instance, since
+      * otherwise we're only calling end_wbi_batch in end_current_render_pass. */
+     do_flush = !(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE);
+@@ -22869,6 +23263,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
+     TRACE("iface %p, NumBarrierGroups %u, D3D12_BARRIER_GROUP %p\n",
+             iface, NumBarrierGroups, pBarrierGroups);
+ 
++    /* Enhanced barriers are not tracked for hoisted upload copies. */
++    list->upload_copy_hoist.disabled = true;
++
+     if (d3d12_command_list_barrier_is_noop(list, NumBarrierGroups, pBarrierGroups))
+     {
+         d3d12_command_list_debug_mark_label(list, "Noop Barrier", 1.0f, 0.0f, 0.0f, 1.0f);
+@@ -23954,6 +24351,8 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+             num_command_buffers++;
+         if (cmd_list->cmd.vk_cleanup_commands)
+             num_command_buffers++;
++        if (cmd_list->cmd.vk_init_copy_commands)
++            num_command_buffers++;
+ 
+         if (cmd_list->cmd.suspend_resume.resume.vk_fixup_cmd_buffer && (i == 0 ||
+                 !d3d12_command_list_render_pass_suspend_resume_avoids_fixup(
+@@ -24120,6 +24519,15 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+                 fixup_sink_begin_index = UINT32_MAX;
+             }
+ 
++            /* Hoisted CopyBufferRegion from UPLOAD heaps. Only reorderable within this command list. */
++            if (iter == 0 && cmd_list->cmd.vk_init_copy_commands)
++            {
++                cmd_cost[cmd_submit_count] = VKD3D_COMMAND_COST_LOW;
++                buffer = &buffers[cmd_submit_count++];
++                buffer->sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++                buffer->commandBuffer = cmd_list->cmd.vk_init_copy_commands;
++            }
++
+             /* Emit non-hoistable post-indirect work here. */
+             if (i < indirect_barrier_hoist_index && cmd_list->cmd.iterations[iter].vk_post_indirect_barrier_commands)
+             {
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 4717e179..72b5e25b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -5941,7 +5941,7 @@ static inline void d3d12_device_copy_descriptors_cbv_srv_uav_sampler(struct d3d1
+     else
+ #endif
+     {
+-        d3d12_desc_copy(dst.ptr, src.ptr, descriptor_count, heap_type, device);
++        d3d12_desc_copy(dst.ptr, src.ptr, descriptor_count, heap_type, device, NULL);
+     }
+ }
+ 
+@@ -5955,9 +5955,11 @@ static inline void d3d12_device_copy_descriptors(struct d3d12_device *device,
+     unsigned int dst_range_idx, dst_idx, src_range_idx, src_idx;
+     D3D12_CPU_DESCRIPTOR_HANDLE dst, src, dst_start, src_start;
+     unsigned int dst_range_size, src_range_size, copy_count;
++    struct d3d12_desc_copy_batch batch;
+     unsigned int increment;
+ 
+     increment = d3d12_device_get_descriptor_handle_increment_size(device, descriptor_heap_type);
++    batch.copy_count = 0;
+ 
+     dst_range_idx = dst_idx = 0;
+     src_range_idx = src_idx = 0;
+@@ -5979,7 +5981,7 @@ static inline void d3d12_device_copy_descriptors(struct d3d12_device *device,
+             case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+             case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+                 d3d12_desc_copy(dst.ptr, src.ptr, copy_count,
+-                        descriptor_heap_type, device);
++                        descriptor_heap_type, device, &batch);
+                 break;
+             case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+             case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
+@@ -5988,6 +5990,7 @@ static inline void d3d12_device_copy_descriptors(struct d3d12_device *device,
+                 break;
+             default:
+                 ERR("Unhandled descriptor heap type %u.\n", descriptor_heap_type);
++                d3d12_desc_copy_batch_flush(&batch, device);
+                 return;
+         }
+ 
+@@ -6005,6 +6008,9 @@ static inline void d3d12_device_copy_descriptors(struct d3d12_device *device,
+             src_idx = 0;
+         }
+     }
++
++    /* One vkUpdateDescriptorSets for the whole call instead of one per range. */
++    d3d12_desc_copy_batch_flush(&batch, device);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(d3d12_device_iface *iface,
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 3928991d..002afbca 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -2164,6 +2164,10 @@ static inline bool vkd3d_driver_can_zero_clear_alloc(struct d3d12_device *device
+         case VK_DRIVER_ID_MESA_TURNIP:
+         case VK_DRIVER_ID_AMD_PROPRIETARY:
+         case VK_DRIVER_ID_AMD_OPEN_SOURCE:
++        /* MoltenVK backs each VkDeviceMemory with a new MTLHeap or MTLBuffer, which Metal zero-fills.
++         * Skips a clear submit (and the queue wait on it) per committed resource and heap.
++         * Host-visible sub-allocations are cleared with memset on the CPU. */
++        case VK_DRIVER_ID_MOLTENVK:
+             return true;
+ 
+         default:
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 56118e03..a0252cf6 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -5158,19 +5158,35 @@ void d3d12_desc_copy_single(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descript
+     *dst.view = *src.view;
+ }
+ 
+-void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t src_va,
+-        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device)
++void d3d12_desc_copy_batch_flush(struct d3d12_desc_copy_batch *batch, struct d3d12_device *device)
+ {
+-    VkCopyDescriptorSet vk_copies[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++
++    if (batch->copy_count)
++        VK_CALL(vkUpdateDescriptorSets(device->vk_device, 0, NULL, batch->copy_count, batch->vk_copies));
++    batch->copy_count = 0;
++}
++
++static VkCopyDescriptorSet *d3d12_desc_copy_batch_add(struct d3d12_desc_copy_batch *batch,
++        struct d3d12_device *device)
++{
++    if (batch->copy_count == ARRAY_SIZE(batch->vk_copies))
++        d3d12_desc_copy_batch_flush(batch, device);
++    return &batch->vk_copies[batch->copy_count++];
++}
++
++void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t src_va,
++        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device,
++        struct d3d12_desc_copy_batch *batch)
++{
+     const struct vkd3d_bindless_set_info *set_info;
++    struct d3d12_desc_copy_batch local_batch;
+     struct vkd3d_descriptor_binding binding;
+     struct d3d12_desc_split src, dst;
+     VkCopyDescriptorSet *vk_copy;
+     uint32_t set_info_mask = 0;
+-    uint32_t copy_count = 0;
+     uint32_t set_info_index;
+-    unsigned int i;
++    unsigned int i, run;
+ 
+     src = d3d12_desc_decode_va(src_va);
+     dst = d3d12_desc_decode_va(dst_va);
+@@ -5195,18 +5211,40 @@ void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descripto
+         }
+         else
+         {
++            if (!batch)
++            {
++                local_batch.copy_count = 0;
++                batch = &local_batch;
++            }
++
+             binding = vkd3d_bindless_state_binding_from_info_index(&device->bindless_state, set_info_index);
+ 
+-            vk_copy = &vk_copies[copy_count++];
+-            vk_copy->sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+-            vk_copy->pNext = NULL;
+-            vk_copy->srcSet = src.heap->sets[binding.set].vk_descriptor_set;
+-            vk_copy->srcBinding = binding.binding;
+-            vk_copy->srcArrayElement = src.offset;
+-            vk_copy->dstSet = dst.heap->sets[binding.set].vk_descriptor_set;
+-            vk_copy->dstBinding = binding.binding;
+-            vk_copy->dstArrayElement = dst.offset;
+-            vk_copy->descriptorCount = count;
++            /* Copy only the descriptors that use this set, as runs. Copying the whole range into
++             * every set any of its descriptors uses multiplies the work for mixed ranges (CBV, SRV
++             * and UAV tables), and vkUpdateDescriptorSets copies are per descriptor on MoltenVK.
++             * Slots of a set that the new descriptor type doesn't use are never read. */
++            for (i = 0; i < count; i += run)
++            {
++                if (!(src.types[i].set_info_mask & (1u << set_info_index)))
++                {
++                    run = 1;
++                    continue;
++                }
++
++                for (run = 1; i + run < count && (src.types[i + run].set_info_mask & (1u << set_info_index)); run++)
++                    ;
++
++                vk_copy = d3d12_desc_copy_batch_add(batch, device);
++                vk_copy->sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
++                vk_copy->pNext = NULL;
++                vk_copy->srcSet = src.heap->sets[binding.set].vk_descriptor_set;
++                vk_copy->srcBinding = binding.binding;
++                vk_copy->srcArrayElement = src.offset + i;
++                vk_copy->dstSet = dst.heap->sets[binding.set].vk_descriptor_set;
++                vk_copy->dstBinding = binding.binding;
++                vk_copy->dstArrayElement = dst.offset + i;
++                vk_copy->descriptorCount = run;
++            }
+         }
+     }
+ 
+@@ -5224,12 +5262,13 @@ void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descripto
+         }
+     }
+ 
+-    if (copy_count)
+-        VK_CALL(vkUpdateDescriptorSets(device->vk_device, 0, NULL, copy_count, vk_copies));
++    if (batch == &local_batch)
++        d3d12_desc_copy_batch_flush(batch, device);
+ }
+ 
+ void d3d12_desc_copy(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t src_va,
+-        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device)
++        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device,
++        struct d3d12_desc_copy_batch *batch)
+ {
+ #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+     if (!d3d12_device_use_embedded_mutable_descriptors(device))
+@@ -5264,7 +5303,7 @@ void d3d12_desc_copy(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t
+         }
+     }
+     else
+-        d3d12_desc_copy_range(dst_va, src_va, count, heap_type, device);
++        d3d12_desc_copy_range(dst_va, src_va, count, heap_type, device, batch);
+ }
+ 
+ bool vkd3d_create_raw_r32ui_vk_buffer_view(struct d3d12_device *device,
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index b2e27034..9a9453aa 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -573,6 +573,10 @@ static HRESULT d3d12_root_signature_info_from_desc(struct d3d12_root_signature_i
+          * Just base the amount of descriptors we can hoist on the root signature cost. This is simple and is trivially correct. */
+         info->hoist_descriptor_count = min(info->hoist_descriptor_count, VKD3D_MAX_HOISTED_DESCRIPTORS);
+         info->hoist_descriptor_count = min(info->hoist_descriptor_count, (D3D12_MAX_ROOT_COST - info->cost) / 2);
++        /* MoltenVK gives every push descriptor its own Metal buffer index in each stage it is visible to,
++         * next to vertex buffers and its own internal buffers (31 per stage), so hoist fewer there. */
++        if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
++            info->hoist_descriptor_count = min(info->hoist_descriptor_count, VKD3D_MAX_HOISTED_DESCRIPTORS_MOLTENVK);
+ 
+         info->push_descriptor_count += info->hoist_descriptor_count;
+         info->binding_count += info->hoist_descriptor_count;
+@@ -7884,6 +7888,14 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
+         flags |= VKD3D_HOIST_STATIC_TABLE_CBV;
+     }
+ 
++    /* On MoltenVK, hoisted CBVs become push descriptors and Metal constant buffers too (see above), instead
++     * of reads through the bindless heap's argument buffer. VKD3D_CONFIG=no_hoist_table_cbv disables it,
++     * hoist_table_cbv enables it on other drivers that take root CBVs as push descriptors. */
++    if (!(flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV) && !VKD3D_CONFIG_FLAG_IS_SET(NO_HOIST_TABLE_CBV) &&
++            (VKD3D_CONFIG_FLAG_IS_SET(HOIST_TABLE_CBV) ||
++             device_info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK))
++        flags |= VKD3D_HOIST_STATIC_TABLE_CBV;
++
+     if (device->device_info.device_generated_commands_features.deviceGeneratedCommands)
+         INFO("Enabling fast paths for advanced ExecuteIndirect() graphics and compute (EXT_dgc).\n");
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ff94f06d..33c6efc0 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1499,8 +1499,18 @@ STATIC_ASSERT(sizeof(struct vkd3d_descriptor_metadata_view) == 16);
+ 
+ typedef uintptr_t vkd3d_cpu_descriptor_va_t;
+ 
++/* Collects the vkUpdateDescriptorSets copies of one CopyDescriptors call. */
++struct d3d12_desc_copy_batch
++{
++    VkCopyDescriptorSet vk_copies[64];
++    uint32_t copy_count;
++};
++
++void d3d12_desc_copy_batch_flush(struct d3d12_desc_copy_batch *batch, struct d3d12_device *device);
++/* batch may be NULL: the copies are then submitted before returning. */
+ void d3d12_desc_copy(vkd3d_cpu_descriptor_va_t dst, vkd3d_cpu_descriptor_va_t src,
+-        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device);
++        unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device,
++        struct d3d12_desc_copy_batch *batch);
+ void d3d12_desc_copy_single(vkd3d_cpu_descriptor_va_t dst,
+         vkd3d_cpu_descriptor_va_t src, struct d3d12_device *device);
+ 
+@@ -1987,6 +1997,7 @@ struct d3d12_bind_point_layout
+ };
+ 
+ #define VKD3D_MAX_HOISTED_DESCRIPTORS 16
++#define VKD3D_MAX_HOISTED_DESCRIPTORS_MOLTENVK 8
+ struct vkd3d_descriptor_hoist_desc
+ {
+     uint32_t table_index;
+@@ -3342,6 +3353,9 @@ struct d3d12_command_list_sequence
+      * For suspend resume, this can be sunk to after the first iteration of the final resuming pass.
+      * A split point is conveniently set-up just for this purpose. */
+     VkCommandBuffer vk_cleanup_commands;
++    /* CopyBufferRegion from UPLOAD heaps hoisted ahead of the command list (d3d12_upload_copy_hoist).
++     * Submitted right before the list's first command buffer. */
++    VkCommandBuffer vk_init_copy_commands;
+ 
+     struct d3d12_command_list_render_pass_suspend_resume suspend_resume;
+ 
+@@ -3410,6 +3424,36 @@ struct vkd3d_dgc_batch
+     size_t draws_count;
+ };
+ 
++struct d3d12_buffer_range
++{
++    VkBuffer vk_buffer;
++    VkDeviceSize begin;
++    VkDeviceSize end;
++};
++
++/* MoltenVK: a CopyBufferRegion between draws ends the render pass. When the source is an UPLOAD buffer
++ * (only the CPU writes it) and nothing earlier in the command list is ordered against the destination,
++ * the copy is recorded into vk_init_copy_commands instead, which runs before the list. D3D12 only orders
++ * a copy after earlier accesses of its destination through a barrier on it (reads must be transitioned
++ * to COPY_DEST) or, for other copies into COPY_DEST, implicitly: both kinds of buffer ranges are blocked.
++ * A COPY_DEST -> read-only transition of a range only hoisted copies wrote needs no barrier either. */
++struct d3d12_upload_copy_hoist
++{
++    bool disabled;
++    struct d3d12_buffer_range *blocked;
++    size_t blocked_size;
++    size_t blocked_count;
++    struct d3d12_buffer_range *written;
++    size_t written_size;
++    size_t written_count;
++    /* Consecutive copies between the same buffers become one multi-region copy. */
++    VkBuffer src_buffer;
++    VkBuffer dst_buffer;
++    VkBufferCopy2 *regions;
++    size_t regions_size;
++    size_t region_count;
++};
++
+ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+@@ -3530,6 +3574,7 @@ struct d3d12_command_list
+     struct hash_map query_resolve_lut;
+ 
+     struct d3d12_transfer_batch_state transfer_batch;
++    struct d3d12_upload_copy_hoist upload_copy_hoist;
+     struct d3d12_wbi_batch_state wbi_batch;
+     struct d3d12_rtas_batch_state rtas_batch;
+     struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
 -- 
 2.54.0 (Apple Git-157)
 
