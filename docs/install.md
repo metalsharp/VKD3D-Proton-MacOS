@@ -42,8 +42,8 @@ The installer:
 - copies the DLLs into the prefix's `system32`, keeping the ones they replace in `<prefix>/vkd3d-proton-macos/backup`;
 - sets `native` DLL overrides for them;
 - installs MoltenVK into `<prefix>/vkd3d-proton-macos/moltenvk`, with Apple's Metal Shader Converter library beside
-  it. VKD3D-Proton hands eligible DXIL compute shaders to the converter instead of compiling them through SPIR-V and
-  Metal source, which cuts their compile time. `METALSHARP_MSC=0` turns this off.
+  it. VKD3D-Proton hands eligible DXIL compute, vertex and pixel shaders to the converter instead of compiling
+  them through SPIR-V and Metal source, which cuts their compile time. `METALSHARP_MSC=0` turns this off.
 
 ## Run
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fetch Apple's Metal Shader Converter runtime library into artifacts/metal-shaderconverter/, for the MoltenVK
-# package. MoltenVK loads it (from next to libMoltenVK.dylib) to convert DXIL compute shaders for VKD3D-Proton
+# package. MoltenVK loads it (from next to libMoltenVK.dylib) to convert DXIL compute, vertex and pixel shaders for VKD3D-Proton
 # (on by default; METALSHARP_MSC=0 turns it off). Apple's own download needs an Apple ID, so this repository hosts the unmodified,
 # Apple-signed files as the release "deps-metal-shaderconverter-4.0b3", which Apple's license allows
 # (section 2B: "install, use, test, and distribute the Dynamic Libraries for the sole purpose of shader

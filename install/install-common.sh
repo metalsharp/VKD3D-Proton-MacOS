@@ -135,7 +135,7 @@ done
 overrides add
 
 cp -f "$MVK_ROOT/libMoltenVK.dylib" "$HOME_DIR/moltenvk/"
-# Apple's Metal Shader Converter, which MoltenVK loads from beside itself to convert DXIL compute shaders for
+# Apple's Metal Shader Converter, which MoltenVK loads from beside itself to convert DXIL compute, vertex and pixel shaders for
 # VKD3D-Proton (on by default, METALSHARP_MSC=0 turns it off; packages before it was added don't carry it)
 if [ -f "$MVK_ROOT/libmetalirconverter.dylib" ]; then
     cp -f "$MVK_ROOT/libmetalirconverter.dylib" "$HOME_DIR/moltenvk/"
