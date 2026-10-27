@@ -7,7 +7,7 @@ package.
 |---|---|---|
 | `vkd3d-proton-<tag>-x86_64.tar.zst` | an x86_64 Wine (on Intel, or under Rosetta 2) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, all x86_64 |
 | `vkd3d-proton-<tag>-arm64.tar.zst` | an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine) | `d3d12`, `d3d12core` as ARM64X; `dxgi`, `d3d11`, `d3d10core` as x86_64 |
-| `moltenvk-<tag>-universal.tar.zst` | both | `libMoltenVK.dylib` (arm64 + x86_64) and `MoltenVK_icd.json` |
+| `moltenvk-<tag>-universal.tar.zst` | both | `libMoltenVK.dylib` (arm64 + x86_64), `MoltenVK_icd.json`, and Apple's Metal Shader Converter library `libmetalirconverter.dylib` |
 
 The arm64 package is the VKD3D-Proton lane MetalSharp Wine runs games with. x86_64 programs load its ARM64X D3D12 DLLs
 as ARM64EC code under FEX, and present with DXVK's x86_64 DXGI. It is for x86_64 programs: native arm64 programs in
@@ -41,7 +41,9 @@ The installer:
 - checks that the prefix's own DLLs match the package: x86-64 for the x86_64 package, Aarch64 for the arm64 one;
 - copies the DLLs into the prefix's `system32`, keeping the ones they replace in `<prefix>/vkd3d-proton-macos/backup`;
 - sets `native` DLL overrides for them;
-- installs MoltenVK into `<prefix>/vkd3d-proton-macos/moltenvk`.
+- installs MoltenVK into `<prefix>/vkd3d-proton-macos/moltenvk`, with Apple's Metal Shader Converter library beside
+  it. VKD3D-Proton hands eligible DXIL compute, vertex and pixel shaders to the converter instead of compiling
+  them through SPIR-V and Metal source, which cuts their compile time. `METALSHARP_MSC=0` turns this off.
 
 ## Run
 

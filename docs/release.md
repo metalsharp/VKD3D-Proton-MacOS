@@ -18,7 +18,9 @@ vkd3d-proton-vX.Y-arm64/             for an arm64 Wine that runs x86_64 programs
 moltenvk-vX.Y-universal/             for both
 ├── libMoltenVK.dylib                arm64 + x86_64, ad-hoc signed
 ├── MoltenVK_icd.json
-└── LICENSE.MoltenVK (Apache-2.0), SHA256SUMS
+├── libmetalirconverter.dylib        Apple's Metal Shader Converter, arm64 + x86_64, unmodified and Apple-signed
+└── LICENSE.MoltenVK (Apache-2.0), LICENSE.metal-shaderconverter.rtf,
+    ACKNOWLEDGEMENTS.metal-shaderconverter.rtf, SHA256SUMS
 ```
 
 [install.md](install.md) covers installing them into a prefix.
@@ -35,6 +37,14 @@ repository's patches:
   - `scripts/build-dxvk.sh` for DXGI and D3D10/11;
   - `scripts/build-moltenvk.sh --externals` for MoltenVK, with the newest Xcode on the runner. It needs the macOS 26
     SDK or later.
+- **Metal Shader Converter:** `scripts/fetch-metal-shaderconverter.sh` downloads Apple's `libmetalirconverter.dylib`,
+  its license and acknowledgements from this repository's `deps-metal-shaderconverter-4.0b3` release, and checks
+  each against the SHA-256 in the script. Apple's own download needs an Apple ID, so the repository hosts the
+  unmodified files, which Apple's Metal Shader Converter license allows (section 2B: "install, use, test, and
+  distribute the Dynamic Libraries for the sole purpose of shader conversion"). The dylib is never re-signed: the
+  license forbids modifying it, and it already carries Apple's signature. To move to a new converter version,
+  publish its files as a new `deps-metal-shaderconverter-<version>` release and update the URL and checksums in
+  the script.
 
 It runs:
 

@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 01/14] vkd3d: Run on MoltenVK: optional transform feedback,
+Subject: [PATCH 01/30] vkd3d: Run on MoltenVK: optional transform feedback,
  VKMT texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 02/14] Keep the transform feedback structures linked when
+Subject: [PATCH 02/30] Keep the transform feedback structures linked when
  stream output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 03/14] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 03/30] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 04/14] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+Subject: [PATCH 04/30] MoltenVK: emulated VRS tier 2 (full-rate shading) with
  a 16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 05/14] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 05/30] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,7 +329,7 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 06/14] MoltenVK: typed buffer views start at aligned offsets
+Subject: [PATCH 06/30] MoltenVK: typed buffer views start at aligned offsets
  via the typed offset buffer (no env bypass)
 
 ---
@@ -392,7 +392,7 @@ index a8fc26b1..bf474e86 100644
 From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 19:03:16 -0600
-Subject: [PATCH 07/14] MoltenVK: require transform feedback again
+Subject: [PATCH 07/30] MoltenVK: require transform feedback again
 
 The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
 copy of the vertex shader, counter buffers, overflow and stream queries), so
@@ -500,7 +500,7 @@ index 9c6839ea..4717e179 100644
 From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 23:25:55 -0600
-Subject: [PATCH 08/14] vkd3d: Typed resources that aren't UAVs only take views
+Subject: [PATCH 08/30] vkd3d: Typed resources that aren't UAVs only take views
  of their format or its sRGB one.
 
 The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
@@ -574,7 +574,7 @@ index bf474e86..56118e03 100644
 From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 23:52:01 -0600
-Subject: [PATCH 09/14] MoltenVK: root CBVs as push descriptors, no staggered
+Subject: [PATCH 09/30] MoltenVK: root CBVs as push descriptors, no staggered
  submits; fix EndRenderPass state tracking
 
 ---
@@ -650,7 +650,7 @@ index 1945f15a..b2e27034 100644
 From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:34:44 -0600
-Subject: [PATCH 10/14] swapchain: on MoltenVK, release the frame latency
+Subject: [PATCH 10/30] swapchain: on MoltenVK, release the frame latency
  waitable at GPU completion instead of present wait
 
 MoltenVK completes present waits once the frame is on screen, which serialized
@@ -712,7 +712,7 @@ index 4d3e1bf4..6b0639ba 100644
 From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:47:45 -0600
-Subject: [PATCH 11/14] swapchain: log the app's frame latency;
+Subject: [PATCH 11/30] swapchain: log the app's frame latency;
  VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
 
 ---
@@ -775,7 +775,7 @@ index 6b0639ba..382c7b4d 100644
 From 864bb1e06c9b2fb4eb9eb5bb4f60ac72bb66187b Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 03:33:43 -0600
-Subject: [PATCH 12/14] command: keep render passes open across read-only
+Subject: [PATCH 12/30] command: keep render passes open across read-only
  texture transitions
 
 Read-after-read needs no synchronization; on MoltenVK image layouts don't exist either.
@@ -869,7 +869,7 @@ index 373cd989..b0aec561 100644
 From 3c3cac1647e5e38c062e00a1a41e5d5b996bf343 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 09:00:57 -0600
-Subject: [PATCH 13/14] MoltenVK: keep render passes open across UAV barriers
+Subject: [PATCH 13/30] MoltenVK: keep render passes open across UAV barriers
  while the pass draws without UAVs; shaders record UAV use
  (VKD3D_SHADER_META_FLAG_USES_UAV)
 
@@ -1163,7 +1163,7 @@ index 3e71f89c..ff94f06d 100644
 From 9e8789bd2c3c89ed144b53e1a4b0c1aff0497996 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Mon, 26 Oct 2026 12:28:26 -0600
-Subject: [PATCH 14/14] MoltenVK: fewer render pass ends and cheaper per-draw
+Subject: [PATCH 14/30] MoltenVK: fewer render pass ends and cheaper per-draw
  root state
 
 - Buffer transitions between read-only states no longer end the render pass on MoltenVK (COMMON,
@@ -2204,6 +2204,4163 @@ index ff94f06d..33c6efc0 100644
      struct d3d12_wbi_batch_state wbi_batch;
      struct d3d12_rtas_batch_state rtas_batch;
      struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From fd83df895d5162f615925c7a37feaeee5496a768 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 20:17:21 -0600
+Subject: [PATCH 15/30] swapchain: report the device's feature level in the
+ Metal HUD, through winemetal.dll
+
+---
+ libs/vkd3d/swapchain.c | 56 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 382c7b4d..8401a239 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -3905,6 +3905,58 @@ static HRESULT dxgi_vk_swap_chain_init_frame_rate_limiter(struct dxgi_vk_swap_ch
+     return hr;
+ }
+ 
++#if defined(_WIN32)
++static const char *dxgi_vk_feature_level_name(D3D_FEATURE_LEVEL level)
++{
++    switch (level)
++    {
++        case D3D_FEATURE_LEVEL_11_0: return "11_0";
++        case D3D_FEATURE_LEVEL_11_1: return "11_1";
++        case D3D_FEATURE_LEVEL_12_0: return "12_0";
++        case D3D_FEATURE_LEVEL_12_1: return "12_1";
++        case D3D_FEATURE_LEVEL_12_2: return "12_2";
++        default: return "UNKNOWN";
++    }
++}
++
++/* The Metal HUD heading Mullion shows, through Mullion's winemetal.dll (ARM64X, so x86_64 programs load it too):
++ * the device's highest feature level, which is 12_2 only with MoltenVK's ray tracing. */
++static void dxgi_vk_swap_chain_report_hud(struct d3d12_device *device)
++{
++    static LONG reported;
++    uint64_t (*string_alloc_init)(const char *data, unsigned int encoding);
++    void (*hud_update_label)(uint64_t hud, uint64_t label, uint64_t value);
++    bool (*hud_add_label)(uint64_t hud, uint64_t label, uint64_t after);
++    void (*object_release)(uint64_t object);
++    uint64_t (*hud_instance)(void);
++    uint64_t hud, label, after, value;
++    HMODULE winemetal;
++    char text[96];
++
++    if (InterlockedCompareExchange(&reported, 1, 0) || !(winemetal = LoadLibraryA("winemetal.dll")))
++        return;
++    string_alloc_init = (void *)GetProcAddress(winemetal, "NSString_alloc_init");
++    hud_update_label = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_updateLabel");
++    hud_add_label = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_addLabel");
++    object_release = (void *)GetProcAddress(winemetal, "NSObject_release");
++    hud_instance = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_instance");
++    if (!string_alloc_init || !hud_update_label || !hud_add_label || !object_release || !hud_instance ||
++            !(hud = hud_instance()))
++        return;
++
++    /* 4 is NSUTF8StringEncoding; the HUD keeps the label for the life of the process. */
++    snprintf(text, sizeof(text), "VKD3D-Proton D3D12 FL_%s %s",
++            dxgi_vk_feature_level_name(device->d3d12_caps.max_feature_level), vkd3d_version);
++    label = string_alloc_init("com.github.metalsharp.vkd3d-proton-version", 4);
++    after = string_alloc_init("com.apple.hud-graph.default", 4);
++    value = string_alloc_init(text, 4);
++    hud_add_label(hud, label, after);
++    hud_update_label(hud, label, value);
++    object_release(after);
++    object_release(value);
++}
++#endif
++
+ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVkSurfaceFactory *pFactory,
+         const DXGI_SWAP_CHAIN_DESC1 *pDesc, struct d3d12_command_queue *queue)
+ {
+@@ -3940,6 +3992,10 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
+     if (FAILED(hr = dxgi_vk_swap_chain_init_frame_rate_limiter(chain)))
+         goto cleanup_low_latency;
+ 
++#if defined(_WIN32)
++    dxgi_vk_swap_chain_report_hud(queue->device);
++#endif
++
+     ID3D12CommandQueue_AddRef(&queue->ID3D12CommandQueue_iface);
+     return S_OK;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f6bb93d7e5a4735c0364fe53c5459898aa3e56a6 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 20:44:16 -0600
+Subject: [PATCH 16/30] device: only take a layered implementation's driver ID
+ when the driver names itself; set the layered properties' sType
+
+---
+ libs/vkd3d/device.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 72b5e25b..a76bc70b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1491,6 +1491,7 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_layered_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR;
+         vk_prepend_struct(&layered_props, &vk_layered_props);
+ 
++        vk_layered_props.properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+         real_driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR;
+         vk_prepend_struct(&vk_layered_props.properties, &real_driver_props);
+     }
+@@ -1861,8 +1862,10 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+ 
+     info->supports_opacity_micromap = info->opacity_micromap_features.micromap;
+ 
+-    /* if nonzero, this is a layered implementation */
+-    if (real_driver_props.driverID)
++    /* if nonzero, this is a layered implementation. A driver that fills these in names itself too: MoltenVK
++     * (not layered) under Wine has left a pointer in real_driver_props.driverID and no name, which then hid
++     * VK_DRIVER_ID_MOLTENVK from everything below and failed every D3D12CreateDevice. */
++    if (real_driver_props.driverID && real_driver_props.driverName[0])
+     {
+         /* store the layer ID here in case it's needed */
+         info->layer_driver_id = info->vulkan_1_2_properties.driverID;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 26f24b9dbbaa052ce35f1daee089e6acbb4fe877 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 21:15:15 -0600
+Subject: [PATCH 17/30] query: pipeline statistics heaps on devices without
+ pipelineStatisticsQuery record nothing and resolve to zeros instead of
+ failing
+
+---
+ libs/vkd3d/command.c  | 18 ++++++++++++++++++
+ libs/vkd3d/resource.c | 18 ++++++++++++++++--
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ba0bb2dc..59045527 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -17971,6 +17971,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+         if (!d3d12_command_list_enable_query(list, query_heap, index, type))
+             d3d12_command_list_mark_as_invalid(list, "Failed to enable virtual query.\n");
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support: nothing to record. */
++    }
+     else
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+@@ -18010,6 +18014,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+             d3d12_command_list_mark_as_invalid(list, "Failed to disable virtual query.\n");
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support: nothing to record. */
++    }
+     else if (d3d12_query_type_is_scoped(type))
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+@@ -18151,6 +18159,16 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveQueryData(d3d12_command_
+         else
+             d3d12_command_list_execute_query_resolve(list, &entry);
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support resolve to zeros. */
++        d3d12_command_list_end_current_render_pass(list, true);
++        d3d12_command_list_mark_copy_buffer_write(list, buffer->res.vk_buffer,
++                buffer->mem.offset + aligned_dst_buffer_offset, stride * query_count,
++                !!(buffer->flags & VKD3D_RESOURCE_RESERVED));
++        VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, buffer->res.vk_buffer,
++                buffer->mem.offset + aligned_dst_buffer_offset, stride * query_count, 0));
++    }
+     else
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a0252cf6..c4b07d84 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -10821,7 +10821,13 @@ HRESULT d3d12_query_heap_resolve_cpu(struct d3d12_query_heap *heap, D3D12_QUERY_
+     if (index + count > heap->desc.Count)
+         return E_INVALIDARG;
+ 
+-    if (!d3d12_query_heap_type_is_inline(heap->desc.Type))
++    if (!d3d12_query_heap_type_is_inline(heap->desc.Type) && !heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support. */
++        memset(data, 0, query_size * count);
++        return S_OK;
++    }
++    else if (!d3d12_query_heap_type_is_inline(heap->desc.Type))
+     {
+         /* If the query is backed by query pool as-is, then we just read that. */
+         vr = VK_CALL(vkGetQueryPoolResults(heap->device->vk_device,
+@@ -10919,7 +10925,15 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
+                 return E_INVALIDARG;
+         }
+ 
+-        if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
++        /* A device without pipeline statistics queries (MoltenVK) still gets a heap: its queries record
++         * nothing and resolve to zeros. Failing the heap leaves games that don't check with a NULL heap. */
++        if (desc->Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
++                !device->device_info.features2.features.pipelineStatisticsQuery)
++        {
++            FIXME_ONCE("Pipeline statistics queries are not supported, they will read as zero.\n");
++            object->initialized = 1;
++        }
++        else if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
+         {
+             WARN("Failed to create Vulkan query pool, vr %d.\n", vr);
+             vkd3d_free(object);
+-- 
+2.54.0 (Apple Git-157)
+
+
+From a2a5bf84a1c920ba850c5a0632b34af4710c12bc Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 23:12:24 -0600
+Subject: [PATCH 18/30] raytracing: name the export, its state object's type
+ and flags, and its export and collection counts when a shader identifier
+ isn't found
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 6f4eec9f..66415f09 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -321,7 +321,9 @@ static void * STDMETHODCALLTYPE d3d12_state_object_properties_GetShaderIdentifie
+     }
+     else
+     {
+-        ERR("Could not find entry point.\n");
++        ERR("Could not find entry point %s (subtype %s, state object type %u, flags %#x, %zu exports, %zu collections).\n",
++                debugstr_w(export_name), debugstr_w(subtype), object->type, object->flags,
++                object->exports_count, object->collections_count);
+         return NULL;
+     }
+ }
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 648466c654d0622e6f369e4c83338b7b812a4546 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 23:54:11 -0600
+Subject: [PATCH 19/30] raytracing: log each state object's exports, variants
+ and collections, and every hit group, collection or collection export a
+ pipeline leaves out, with the reason
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 66415f09..9a3da859 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -2274,6 +2274,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+                 (hit_group->IntersectionShaderImport && export->intersection_stage_index == VK_SHADER_UNUSED_KHR) ||
+                 (hit_group->AnyHitShaderImport && export->anyhit_stage_index == VK_SHADER_UNUSED_KHR))
+         {
++            INFO("RT: hit group %s left out of variant %u (closest %s %u, any %s %u, intersection %s %u).\n",
++                    debugstr_w(hit_group->HitGroupExport), pipeline_variant_index,
++                    debugstr_w(hit_group->ClosestHitShaderImport), export->closest_stage_index,
++                    debugstr_w(hit_group->AnyHitShaderImport), export->anyhit_stage_index,
++                    debugstr_w(hit_group->IntersectionShaderImport), export->intersection_stage_index);
+             continue;
+         }
+ 
+@@ -2312,13 +2317,23 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+         /* Only include pipeline libraries which are compatible with current global root signature. */
+         collection_variant_index = d3d12_state_object_find_collection_variant(variant, collection->object);
+         if (collection_variant_index == UINT32_MAX)
++        {
++            INFO("RT: collection %zu (type %u, %zu exports, %zu variants) has no variant for variant %u.\n",
++                    i, collection->object->type, collection->object->exports_count,
++                    collection->object->pipelines_count, pipeline_variant_index);
+             continue;
++        }
+ 
+         collection_variant = &collection->object->pipelines[collection_variant_index];
+ 
+         /* Skip degenerates. */
+         if (!collection_variant->pipeline_library)
++        {
++            INFO("RT: collection %zu (type %u, %zu exports) variant %u has no pipeline library (pipeline %s).\n",
++                    i, collection->object->type, collection->object->exports_count, collection_variant_index,
++                    collection_variant->pipeline ? "yes" : "no");
+             continue;
++        }
+ 
+         if (collection->num_exports)
+             num_groups_to_export = collection->num_exports;
+@@ -2364,6 +2379,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+                 if (subtype || input_index == UINT32_MAX)
+                 {
+                     /* If we import things, but don't use them, this can happen. Just ignore it. */
++                    INFO("RT: collection %zu has no export %s.\n", i, debugstr_w(original_export));
+                     continue;
+                 }
+ 
+@@ -2371,7 +2387,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+ 
+                 /* An export might not be compatible with this global root signature. */
+                 if (input_export->pipeline_variant_index != collection_variant_index)
++                {
++                    INFO("RT: collection %zu export %s is in variant %u, not %u.\n", i, debugstr_w(original_export),
++                            input_export->pipeline_variant_index, collection_variant_index);
+                     continue;
++                }
+ 
+                 vkd3d_array_reserve((void **)&data->exports, &data->exports_size,
+                         data->exports_count + 1, sizeof(*data->exports));
+@@ -2748,6 +2768,7 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+     if (FAILED(hr = d3d12_state_object_get_group_handles(object, &data)))
+         goto fail;
+ 
++
+     if (object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
+     {
+         object->pipeline_stack_size = d3d12_state_object_pipeline_data_compute_default_stack_size(&data,
+@@ -2786,6 +2807,8 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+     object->exports = data.exports;
+     object->exports_size = data.exports_size;
+     object->exports_count = data.exports_count;
++    INFO("RT: state object %p type %u flags %#x: %zu exports, %zu variants, %zu collections.\n", object,
++            object->type, object->flags, object->exports_count, object->pipelines_count, object->collections_count);
+     data.exports = NULL;
+     data.exports_size = 0;
+     data.exports_count = 0;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 525b85639508cfd59800fcb04278ebbbb716add4 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 06:34:35 -0600
+Subject: [PATCH 20/30] raytracing: INFO which variant each entry point lands
+ in, and each variant's pipeline, stage and group counts
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 9a3da859..9fef930b 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -2005,7 +2005,8 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+         if (!d3d12_root_signature_is_layout_compatible(variant->global_root_signature, per_entry_global_signature))
+             continue;
+ 
+-        RT_TRACE("Compiling entry point: %s (stage = #%x).\n", debugstr_w(entry->plain_entry_point), entry->stage);
++        INFO("RT: entry point %s (stage %#x) goes in variant %u (global root signature %p).\n",
++                debugstr_w(entry->plain_entry_point), entry->stage, pipeline_variant_index, per_entry_global_signature);
+ 
+         local_signature = d3d12_state_object_pipeline_data_get_root_signature(
+                 VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE, data, entry);
+@@ -2760,6 +2761,11 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+         if (FAILED(hr = d3d12_state_object_compile_pipeline_variant(object, i, &data)))
+             goto fail;
+ 
++        INFO("RT: variant %u: pipeline %p, library %p, %u stages, %u groups, global root signature %p.\n", i,
++                object->pipelines[i].pipeline, object->pipelines[i].pipeline_library,
++                object->pipelines[i].stages_count, object->pipelines[i].groups_count,
++                object->pipelines[i].global_root_signature);
++
+         d3d12_state_object_pipeline_data_cleanup_modules(&data, object->device);
+         data.groups_count = 0;
+         data.vk_libraries_count = 0;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 6207943641ccf9d5a7c8241e4913d4036c6b0cdc Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 09:27:37 -0600
+Subject: [PATCH 21/30] MetalSharp trace flag:
+ METALSHARP_TRACE=<category>[+heavy] sets up the diagnostics for shader,
+ present, memory, resource, sync, gpu and cpu problems, with logs in one
+ folder per game; per-present, sync, resource, memory and pipeline compile
+ trace lines; breadcrumbs as a build option of their own
+
+---
+ include/private/vkd3d_metalsharp_trace.h |  58 ++++
+ libs/vkd3d-common/meson.build            |   1 +
+ libs/vkd3d-common/metalsharp_trace.c     | 332 +++++++++++++++++++++++
+ libs/vkd3d-common/platform.c             |   8 +-
+ libs/vkd3d/command.c                     |   6 +
+ libs/vkd3d/device.c                      |   3 +
+ libs/vkd3d/heap.c                        |   4 +
+ libs/vkd3d/memory.c                      |   5 +
+ libs/vkd3d/resource.c                    |  17 ++
+ libs/vkd3d/state.c                       |  35 +++
+ libs/vkd3d/swapchain.c                   |  22 ++
+ libs/vkd3d/vkd3d_private.h               |   1 +
+ meson.build                              |   8 +-
+ meson_options.txt                        |   1 +
+ 14 files changed, 499 insertions(+), 2 deletions(-)
+ create mode 100644 include/private/vkd3d_metalsharp_trace.h
+ create mode 100644 libs/vkd3d-common/metalsharp_trace.c
+
+diff --git a/include/private/vkd3d_metalsharp_trace.h b/include/private/vkd3d_metalsharp_trace.h
+new file mode 100644
+index 00000000..f8a4e51b
+--- /dev/null
++++ b/include/private/vkd3d_metalsharp_trace.h
+@@ -0,0 +1,58 @@
++/*
++ * MetalSharp trace flag: METALSHARP_TRACE=<category>[+heavy][,...] turns on the diagnostics a problem needs.
++ *
++ *   shader    shader and pipeline compiles: dumps, pipeline library hits, per-pipeline compile times
++ *   present   swap chain: one line per Present (frame, interval, time in Present), latency markers
++ *   memory    memory budget and every device memory allocation and free
++ *   resource  resource and heap creation; +heavy adds GPU descriptor validation
++ *   sync      fence signals and waits, queue Signal/Wait
++ *   gpu       device-lost diagnostics: breadcrumbs and device faults; +heavy synchronizes every submission
++ *   cpu       queue timeline (Chrome trace JSON); +heavy adds extra timeline events
++ *   api       (Vulkan call trace, in MoltenVK)
++ *   pass      (render passes, in MoltenVK)
++ *   all       every category; all+heavy adds every heavy mode
++ *
++ * Logs go to METALSHARP_TRACE_DIR, or <METALSHARP_HOME or ~/.metalsharp>/logs/trace/<exe>/: vkd3d.log here,
++ * moltenvk.log from MoltenVK, with the previous launch's kept as *.prev.log. A setting already present in the
++ * environment (VKD3D_CONFIG, VKD3D_SHADER_DUMP_PATH, ...) is never overridden; VKD3D_CONFIG flags are appended.
++ */
++
++#ifndef __VKD3D_METALSHARP_TRACE_H
++#define __VKD3D_METALSHARP_TRACE_H
++
++#include <stdint.h>
++
++#define VKD3D_MS_TRACE_SHADER   (1u << 0)
++#define VKD3D_MS_TRACE_PRESENT  (1u << 1)
++#define VKD3D_MS_TRACE_MEMORY   (1u << 2)
++#define VKD3D_MS_TRACE_RESOURCE (1u << 3)
++#define VKD3D_MS_TRACE_SYNC     (1u << 4)
++#define VKD3D_MS_TRACE_GPU      (1u << 5)
++#define VKD3D_MS_TRACE_CPU      (1u << 6)
++#define VKD3D_MS_TRACE_API      (1u << 7)
++#define VKD3D_MS_TRACE_PASS     (1u << 8)
++
++/* Expands METALSHARP_TRACE into the environment once; vkd3d_get_env_var() calls it before any lookup. */
++void vkd3d_metalsharp_trace_init(void);
++
++/* Categories turned on, and those turned on with +heavy. */
++uint32_t vkd3d_metalsharp_trace_mask(void);
++uint32_t vkd3d_metalsharp_trace_heavy_mask(void);
++
++/* The directory the logs go to (a DOS path), or "" when tracing is off. */
++const char *vkd3d_metalsharp_trace_dir(void);
++
++/* Milliseconds since the trace started. */
++double vkd3d_metalsharp_trace_time_ms(void);
++
++void vkd3d_metalsharp_trace_printf(uint32_t category, const char *fmt, ...);
++
++#define VKD3D_MS_TRACE(cat, ...) \
++    do { \
++        if (vkd3d_metalsharp_trace_mask() & VKD3D_MS_TRACE_##cat) \
++            vkd3d_metalsharp_trace_printf(VKD3D_MS_TRACE_##cat, __VA_ARGS__); \
++    } while (0)
++
++#define VKD3D_MS_TRACE_ON(cat) (!!(vkd3d_metalsharp_trace_mask() & VKD3D_MS_TRACE_##cat))
++
++#endif
+diff --git a/libs/vkd3d-common/meson.build b/libs/vkd3d-common/meson.build
+index c3c22abf..972dfe28 100644
+--- a/libs/vkd3d-common/meson.build
++++ b/libs/vkd3d-common/meson.build
+@@ -6,6 +6,7 @@ vkd3d_common_src = [
+   'string.c',
+   'file_utils.c',
+   'platform.c',
++  'metalsharp_trace.c',
+ ]
+ 
+ vkd3d_common_lib = static_library('vkd3d_common', vkd3d_common_src, vkd3d_header_files,
+diff --git a/libs/vkd3d-common/metalsharp_trace.c b/libs/vkd3d-common/metalsharp_trace.c
+new file mode 100644
+index 00000000..97a8c9e3
+--- /dev/null
++++ b/libs/vkd3d-common/metalsharp_trace.c
+@@ -0,0 +1,332 @@
++/*
++ * MetalSharp trace flag (see vkd3d_metalsharp_trace.h).
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++#include "vkd3d_debug.h"
++#include "vkd3d_threads.h"
++#include "vkd3d_common.h"
++#include "vkd3d_platform.h"
++#include "vkd3d_metalsharp_trace.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++static pthread_once_t ms_trace_once = PTHREAD_ONCE_INIT;
++static uint32_t ms_trace_mask;
++static uint32_t ms_trace_heavy;
++static char ms_trace_dir[VKD3D_PATH_MAX];
++static uint64_t ms_trace_start_ns;
++
++static const struct
++{
++    const char *name;
++    uint32_t mask;
++}
++ms_trace_categories[] =
++{
++    {"shader",   VKD3D_MS_TRACE_SHADER},
++    {"present",  VKD3D_MS_TRACE_PRESENT},
++    {"memory",   VKD3D_MS_TRACE_MEMORY},
++    {"resource", VKD3D_MS_TRACE_RESOURCE},
++    {"sync",     VKD3D_MS_TRACE_SYNC},
++    {"gpu",      VKD3D_MS_TRACE_GPU},
++    {"cpu",      VKD3D_MS_TRACE_CPU},
++    {"api",      VKD3D_MS_TRACE_API},
++    {"pass",     VKD3D_MS_TRACE_PASS},
++    {"all",      ~0u},
++};
++
++/* Raw environment access: vkd3d_get_env_var() itself waits for this initialization. */
++static bool ms_getenv(const char *name, char *value, size_t size)
++{
++#ifdef _WIN32
++    DWORD len = GetEnvironmentVariableA(name, value, size);
++    if (len > 0 && len < size)
++        return true;
++#else
++    const char *env = getenv(name);
++    if (env && strlen(env) < size)
++    {
++        strcpy(value, env);
++        return true;
++    }
++#endif
++    value[0] = '\0';
++    return false;
++}
++
++static void ms_setenv(const char *name, const char *value)
++{
++#ifdef _WIN32
++    SetEnvironmentVariableA(name, value);
++#else
++    setenv(name, value, 1);
++#endif
++}
++
++/* Sets name to value unless the environment already has it. */
++static void ms_default_env(const char *name, const char *value)
++{
++    char current[16];
++
++    if (!ms_getenv(name, current, sizeof(current)) && !current[0])
++        ms_setenv(name, value);
++}
++
++/* Appends a flag to VKD3D_CONFIG. */
++static void ms_add_config_flag(const char *flag)
++{
++    char config[1024];
++    size_t len;
++
++    ms_getenv("VKD3D_CONFIG", config, sizeof(config));
++    if (strstr(config, flag))
++        return;
++    len = strlen(config);
++    if (len + strlen(flag) + 2 >= sizeof(config))
++        return;
++    if (len)
++        config[len++] = ',';
++    strcpy(config + len, flag);
++    ms_setenv("VKD3D_CONFIG", config);
++}
++
++static void ms_parse_categories(const char *spec)
++{
++    const char *p = spec;
++
++    while (*p)
++    {
++        char token[32];
++        size_t len = strcspn(p, ",; ");
++        bool heavy = false;
++        char *plus;
++        size_t i;
++
++        if (len && len < sizeof(token))
++        {
++            memcpy(token, p, len);
++            token[len] = '\0';
++            if ((plus = strchr(token, '+')))
++            {
++                heavy = !strcmp(plus + 1, "heavy");
++                *plus = '\0';
++            }
++            for (i = 0; i < ARRAY_SIZE(ms_trace_categories); i++)
++            {
++                if (!strcmp(token, ms_trace_categories[i].name))
++                {
++                    ms_trace_mask |= ms_trace_categories[i].mask;
++                    if (heavy)
++                        ms_trace_heavy |= ms_trace_categories[i].mask;
++                }
++            }
++            /* "heavy" alone makes every requested category heavy. */
++            if (!strcmp(token, "heavy"))
++                ms_trace_heavy = ~0u;
++        }
++        p += len;
++        p += strspn(p, ",; ");
++    }
++    ms_trace_heavy &= ms_trace_mask;
++}
++
++/* A Unix path (/Users/...) as the DOS path Wine maps it to (Z:\Users\...); others are kept. */
++static void ms_to_dos_path(const char *path, char *out, size_t size)
++{
++    size_t i, j = 0;
++
++    if (path[0] == '/' && size > 3)
++    {
++        out[j++] = 'Z';
++        out[j++] = ':';
++    }
++    for (i = 0; path[i] && j + 1 < size; i++)
++        out[j++] = path[i] == '/' ? '\\' : path[i];
++    out[j] = '\0';
++}
++
++static void ms_exe_name(char *out, size_t size)
++{
++    char path[VKD3D_PATH_MAX];
++    const char *name;
++
++#ifdef _WIN32
++    if (!GetModuleFileNameA(NULL, path, sizeof(path)))
++        strcpy(path, "unknown");
++#else
++    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
++    path[len > 0 ? len : 0] = '\0';
++    if (!path[0])
++        strcpy(path, "unknown");
++#endif
++    name = strrchr(path, '\\');
++    if (!name)
++        name = strrchr(path, '/');
++    snprintf(out, size, "%s", name ? name + 1 : path);
++}
++
++static void ms_mkdirs(const char *dir)
++{
++    char path[VKD3D_PATH_MAX];
++    size_t i;
++
++    snprintf(path, sizeof(path), "%s", dir);
++    for (i = 1; path[i]; i++)
++    {
++        if (path[i] != '\\' && path[i] != '/')
++            continue;
++        if (i == 2 && path[1] == ':')
++            continue;
++        path[i] = '\0';
++#ifdef _WIN32
++        CreateDirectoryA(path, NULL);
++#else
++        mkdir(path, 0755);
++#endif
++        path[i] = dir[i];
++    }
++#ifdef _WIN32
++    CreateDirectoryA(path, NULL);
++#else
++    mkdir(path, 0755);
++#endif
++}
++
++/* Keeps the previous launch's log as <name>.prev.log. */
++static void ms_rotate(const char *path)
++{
++    char prev[VKD3D_PATH_MAX];
++    size_t len = strlen(path);
++
++    if (len < 4 || len + 6 >= sizeof(prev))
++        return;
++    snprintf(prev, sizeof(prev), "%.*s.prev.log", (int)(len - 4), path);
++#ifdef _WIN32
++    MoveFileExA(path, prev, MOVEFILE_REPLACE_EXISTING);
++#else
++    rename(path, prev);
++#endif
++}
++
++static void ms_trace_init_once(void)
++{
++    char spec[256], home[VKD3D_PATH_MAX], exe[256], path[VKD3D_PATH_MAX];
++
++    if (!ms_getenv("METALSHARP_TRACE", spec, sizeof(spec)) || !spec[0])
++        return;
++    ms_parse_categories(spec);
++    if (!ms_trace_mask)
++        return;
++
++    ms_trace_start_ns = vkd3d_get_current_time_ns();
++
++    if (ms_getenv("METALSHARP_TRACE_DIR", path, sizeof(path)) && path[0])
++    {
++        ms_to_dos_path(path, ms_trace_dir, sizeof(ms_trace_dir));
++    }
++    else
++    {
++        ms_exe_name(exe, sizeof(exe));
++        if (ms_getenv("METALSHARP_HOME", home, sizeof(home)) && home[0])
++            snprintf(path, sizeof(path), "%s/logs/trace/%s", home, exe);
++        else if (ms_getenv("HOME", home, sizeof(home)) && home[0])
++            snprintf(path, sizeof(path), "%s/.metalsharp/logs/trace/%s", home, exe);
++        else
++            snprintf(path, sizeof(path), "metalsharp-trace/%s", exe);
++        ms_to_dos_path(path, ms_trace_dir, sizeof(ms_trace_dir));
++    }
++    ms_mkdirs(ms_trace_dir);
++
++    snprintf(path, sizeof(path), "%s\\vkd3d.log", ms_trace_dir);
++    ms_rotate(path);
++    ms_default_env("VKD3D_LOG_FILE", path);
++
++    if (ms_trace_mask & VKD3D_MS_TRACE_SHADER)
++    {
++        snprintf(path, sizeof(path), "%s\\shaders", ms_trace_dir);
++        ms_mkdirs(path);
++        ms_default_env("VKD3D_SHADER_DUMP_PATH", path);
++        ms_add_config_flag("pipeline_library_log");
++    }
++    if (ms_trace_mask & VKD3D_MS_TRACE_PRESENT)
++        ms_default_env("VKD3D_SWAPCHAIN_DEBUG_LATENCY", "1");
++    if (ms_trace_mask & VKD3D_MS_TRACE_MEMORY)
++        ms_add_config_flag("log_memory_budget");
++    if (ms_trace_heavy & VKD3D_MS_TRACE_RESOURCE)
++        ms_add_config_flag("descriptor_qa_checks");
++    if (ms_trace_mask & VKD3D_MS_TRACE_GPU)
++    {
++        ms_add_config_flag("fault");
++        ms_add_config_flag("breadcrumbs");
++        if (ms_trace_heavy & VKD3D_MS_TRACE_GPU)
++            ms_add_config_flag("breadcrumbs_sync");
++    }
++    if (ms_trace_mask & VKD3D_MS_TRACE_CPU)
++    {
++        snprintf(path, sizeof(path), "%s\\queue-profile.json", ms_trace_dir);
++        ms_default_env("VKD3D_QUEUE_PROFILE", path);
++        if (ms_trace_heavy & VKD3D_MS_TRACE_CPU)
++            ms_add_config_flag("queue_profile_extra");
++    }
++}
++
++void vkd3d_metalsharp_trace_init(void)
++{
++    pthread_once(&ms_trace_once, ms_trace_init_once);
++}
++
++uint32_t vkd3d_metalsharp_trace_mask(void)
++{
++    vkd3d_metalsharp_trace_init();
++    return ms_trace_mask;
++}
++
++uint32_t vkd3d_metalsharp_trace_heavy_mask(void)
++{
++    vkd3d_metalsharp_trace_init();
++    return ms_trace_heavy;
++}
++
++const char *vkd3d_metalsharp_trace_dir(void)
++{
++    vkd3d_metalsharp_trace_init();
++    return ms_trace_dir;
++}
++
++double vkd3d_metalsharp_trace_time_ms(void)
++{
++    return (double)(vkd3d_get_current_time_ns() - ms_trace_start_ns) / 1.0e6;
++}
++
++void vkd3d_metalsharp_trace_printf(uint32_t category, const char *fmt, ...)
++{
++    char message[1024], function[32];
++    const char *name = "trace";
++    va_list args;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(ms_trace_categories); i++)
++    {
++        if (ms_trace_categories[i].mask == category)
++            name = ms_trace_categories[i].name;
++    }
++    snprintf(function, sizeof(function), "trace.%s", name);
++
++    va_start(args, fmt);
++    vsnprintf(message, sizeof(message), fmt, args);
++    va_end(args);
++
++    vkd3d_dbg_printf(VKD3D_DBG_CHANNEL_API, VKD3D_DBG_LEVEL_INFO, function, "%.3f ms %s\n",
++            vkd3d_metalsharp_trace_time_ms(), message);
++}
+diff --git a/libs/vkd3d-common/platform.c b/libs/vkd3d-common/platform.c
+index d000e880..4f89e843 100644
+--- a/libs/vkd3d-common/platform.c
++++ b/libs/vkd3d-common/platform.c
+@@ -20,6 +20,7 @@
+ #include "vkd3d_debug.h"
+ 
+ #include "vkd3d_platform.h"
++#include "vkd3d_metalsharp_trace.h"
+ 
+ #include <assert.h>
+ #include <stdio.h>
+@@ -389,7 +390,10 @@ enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, ui
+ bool vkd3d_get_env_var(const char *name, char *value, size_t value_size)
+ {
+     DWORD len;
+-    
++
++    /* METALSHARP_TRACE expands into the settings below before any of them is read. */
++    vkd3d_metalsharp_trace_init();
++
+     assert(value);
+     assert(value_size > 0);
+ 
+@@ -409,6 +413,8 @@ bool vkd3d_get_env_var(const char *name, char *value, size_t value_size)
+ {
+     const char *env_value;
+ 
++    vkd3d_metalsharp_trace_init();
++
+     assert(value);
+     assert(value_size > 0);
+ 
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 59045527..d95d2f57 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -1506,6 +1506,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_fence_SetEventOnCompletion(d3d12_fence_if
+     struct d3d12_fence *fence = impl_from_ID3D12Fence1(iface);
+ 
+     TRACE("iface %p, value %#"PRIx64", event %p.\n", iface, value, event);
++    VKD3D_MS_TRACE(SYNC, "Fence %p SetEventOnCompletion value %"PRIu64" event %p.", fence, value, event);
+ 
+     return d3d12_fence_set_event_on_completion(fence, value, event);
+ }
+@@ -1515,6 +1516,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_fence_Signal(d3d12_fence_iface *iface, UI
+     struct d3d12_fence *fence = impl_from_ID3D12Fence1(iface);
+ 
+     TRACE("iface %p, value %#"PRIx64".\n", iface, value);
++    VKD3D_MS_TRACE(SYNC, "Fence %p CPU Signal value %"PRIu64".", fence, value);
+ 
+     return d3d12_fence_signal_cpu_timeline_semaphore(fence, value);
+ }
+@@ -24323,6 +24325,8 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+     if (!command_list_count)
+         return;
+ 
++    VKD3D_MS_TRACE(SYNC, "Queue %p ExecuteCommandLists %u lists.", command_queue, command_list_count);
++
+     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
+     {
+         d3d12_device_mark_as_removed(command_queue->device, hr,
+@@ -24739,6 +24743,7 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Signal(ID3D12CommandQueue *iface,
+     struct d3d12_command_queue_submission sub;
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
++    VKD3D_MS_TRACE(SYNC, "Queue %p Signal fence %p value %"PRIu64".", command_queue, fence_iface, value);
+ 
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+@@ -24757,6 +24762,7 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Wait(ID3D12CommandQueue *iface,
+     uint64_t ticket = 0;
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
++    VKD3D_MS_TRACE(SYNC, "Queue %p Wait fence %p value %"PRIu64".", command_queue, fence_iface, value);
+ 
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index a76bc70b..d2699f8c 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -699,6 +699,9 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
+         INFO("vkd3d-proton - build: %015"PRIx64"+.\n", vkd3d_build >> 4);
+     else
+         INFO("vkd3d-proton - build: %015"PRIx64".\n", vkd3d_build);
++    if (vkd3d_metalsharp_trace_mask())
++        INFO("METALSHARP_TRACE categories %#x (heavy %#x), logs in %s.\n", vkd3d_metalsharp_trace_mask(),
++                vkd3d_metalsharp_trace_heavy_mask(), vkd3d_metalsharp_trace_dir());
+ 
+     if (vkd3d_get_program_name(application_name))
+         application_info.pApplicationName = application_name;
+diff --git a/libs/vkd3d/heap.c b/libs/vkd3d/heap.c
+index 341e3e5f..1a2e2457 100644
+--- a/libs/vkd3d/heap.c
++++ b/libs/vkd3d/heap.c
+@@ -414,11 +414,15 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
+ 
+     if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address)))
+     {
++        VKD3D_MS_TRACE(RESOURCE, "Heap size %#"PRIx64" type %u align %#"PRIx64" flags %#x -> %#x.", desc->SizeInBytes,
++                desc->Properties.Type, desc->Alignment, desc->Flags, hr);
+         vkd3d_free(object);
+         return hr;
+     }
+ 
+     TRACE("Created heap %p.\n", object);
++    VKD3D_MS_TRACE(RESOURCE, "Heap %p size %#"PRIx64" type %u align %#"PRIx64" flags %#x.", object, desc->SizeInBytes,
++            desc->Properties.Type, desc->Alignment, desc->Flags);
+ 
+     *heap = object;
+     return S_OK;
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 002afbca..0e976220 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -923,6 +923,8 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
+     }
+ 
+     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
++    VKD3D_MS_TRACE(MEMORY, "Free device memory %#"PRIx64" (%#"PRIx64" bytes, type %u).", (uint64_t)allocation->vk_memory,
++            allocation->size, allocation->vk_memory_type);
+     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
+ 
+     if (rebar_budget || VKD3D_CONFIG_FLAG_IS_SET(LOG_MEMORY_BUDGET))
+@@ -1206,6 +1208,9 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
+                 size, type_flags, type_mask);
+     }
+ 
++    VKD3D_MS_TRACE(MEMORY, "Allocate device memory %#"PRIx64" bytes flags %#x types %#x -> %#x memory %#"PRIx64" type %u.",
++            size, type_flags, type_mask, hr, FAILED(hr) ? 0 : (uint64_t)allocation->vk_memory,
++            FAILED(hr) ? 0 : allocation->vk_memory_type);
+     return hr;
+ }
+ 
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index c4b07d84..512f3ec4 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4409,6 +4409,17 @@ HRESULT d3d12_resource_create_borrowed(struct d3d12_device *device, const D3D12_
+     return hr;
+ }
+ 
++/* METALSHARP_TRACE=resource: one line per resource created, or failed. */
++static void ms_trace_resource(const char *kind, const D3D12_RESOURCE_DESC1 *desc, int heap_type, uint64_t heap_offset,
++        HRESULT hr)
++{
++    if (!VKD3D_MS_TRACE_ON(RESOURCE))
++        return;
++    VKD3D_MS_TRACE(RESOURCE, "%s resource dim %u %"PRIu64"x%ux%u mips %u format %u samples %u flags %#x heap type %d offset %#"
++            PRIx64" -> %#x.", kind, desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels,
++            desc->Format, desc->SampleDesc.Count, desc->Flags, heap_type, heap_offset, hr);
++}
++
+ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4637,10 +4648,12 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+     vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,
+             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMITTED_RESOURCE_ALLOCATION, object->res.cookie.index);
+ 
++    ms_trace_resource("Committed", desc, heap_properties->Type, 0, S_OK);
+     *resource = object;
+     return S_OK;
+ 
+ fail:
++    ms_trace_resource("Committed", desc, heap_properties->Type, 0, hr);
+     d3d12_resource_destroy_and_release_device(object, device);
+     return hr;
+ }
+@@ -4883,10 +4896,12 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
+         vkd3d_breadcrumb_tracer_register_placed_resource(heap, object, heap_offset, required_size);
+ #endif
+ 
++    ms_trace_resource("Placed", desc, heap->desc.Properties.Type, heap_offset, S_OK);
+     *resource = object;
+     return S_OK;
+ 
+ fail:
++    ms_trace_resource("Placed", desc, heap->desc.Properties.Type, heap_offset, hr);
+     d3d12_resource_destroy_and_release_device(object, device);
+     return hr;
+ }
+@@ -4983,10 +4998,12 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+     if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
+         d3d12_resource_tag_debug_name(object, device, "Reserved Resource");
+ 
++    ms_trace_resource("Reserved", desc, -1, 0, S_OK);
+     *resource = object;
+     return S_OK;
+ 
+ fail:
++    ms_trace_resource("Reserved", desc, -1, 0, hr);
+     d3d12_resource_destroy_and_release_device(object, device);
+     return hr;
+ }
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 9a9453aa..71f05715 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -6385,8 +6385,43 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device
+     return S_OK;
+ }
+ 
++static HRESULT d3d12_pipeline_state_create_internal(struct d3d12_device *device, VkPipelineBindPoint bind_point,
++        const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state);
++
++/* METALSHARP_TRACE=shader: each pipeline state with its shader hashes and how long it took to create. */
+ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
+         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
++{
++    uint64_t start_ns = VKD3D_MS_TRACE_ON(SHADER) ? vkd3d_get_current_time_ns() : 0;
++    char hashes[256] = "";
++    size_t len = 0;
++    unsigned int i;
++    HRESULT hr;
++
++    hr = d3d12_pipeline_state_create_internal(device, bind_point, desc, state);
++    if (!start_ns)
++        return hr;
++
++    if (SUCCEEDED(hr) && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
++    {
++        const struct d3d12_graphics_pipeline_state *graphics = &(*state)->graphics;
++
++        for (i = 0; i < graphics->stage_count && len < sizeof(hashes) - 32; i++)
++            len += snprintf(hashes + len, sizeof(hashes) - len, " %#x:%016"PRIx64, graphics->stages[i].stage,
++                    graphics->code[i].meta.hash);
++    }
++    else if (SUCCEEDED(hr) && bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
++        snprintf(hashes, sizeof(hashes), " cs:%016"PRIx64, (*state)->compute.code.meta.hash);
++
++    VKD3D_MS_TRACE(SHADER, "%s pipeline state %p%s: %.2f ms%s -> %#x.",
++            bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? "Compute" : "Graphics",
++            SUCCEEDED(hr) ? (void *)*state : NULL, hashes, (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6,
++            SUCCEEDED(hr) && (*state)->pso_is_loaded_from_cached_blob ? " (from cached blob)" : "", hr);
++    return hr;
++}
++
++static HRESULT d3d12_pipeline_state_create_internal(struct d3d12_device *device, VkPipelineBindPoint bind_point,
++        const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     const struct d3d12_cached_pipeline_state *desc_cached_pso;
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 8401a239..d2966351 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1140,10 +1140,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     struct dxgi_vk_swap_chain_present_request *request;
+     struct vkd3d_queue_timeline_trace_cookie cookie;
++    static uint64_t ms_trace_last_present_ns;
++    uint64_t ms_trace_present_ns = 0;
+     bool low_latency_enable;
+ 
+     TRACE("iface %p, SyncInterval %u, PresentFlags #%x, pPresentParameters %p.\n",
+             iface, SyncInterval, PresentFlags, pPresentParameters);
++    if (VKD3D_MS_TRACE_ON(PRESENT))
++        ms_trace_present_ns = vkd3d_get_current_time_ns();
+     (void)pPresentParameters;
+ 
+     if (dxgi_vk_swap_chain_present_is_occluded(chain))
+@@ -1254,6 +1258,18 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     vkd3d_queue_timeline_trace_complete_present_block(
+             &chain->queue->device->queue_timeline_trace, cookie);
+ 
++    if (ms_trace_present_ns)
++    {
++        uint64_t now = vkd3d_get_current_time_ns();
++
++        VKD3D_MS_TRACE(PRESENT, "Present frame %"PRIu64" sync %u flags %#x buffer %u/%u: %.2f ms since the last Present, "
++                "%.2f ms in Present.", chain->user.present_count, SyncInterval, PresentFlags, request->user_index,
++                chain->desc.BufferCount,
++                ms_trace_last_present_ns ? (double)(ms_trace_present_ns - ms_trace_last_present_ns) / 1.0e6 : 0.0,
++                (double)(now - ms_trace_present_ns) / 1.0e6);
++        ms_trace_last_present_ns = ms_trace_present_ns;
++    }
++
+     return S_OK;
+ }
+ 
+@@ -2983,6 +2999,7 @@ static bool dxgi_vk_swap_chain_setup_present_timing_request(
+ 
+ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
+ {
++    uint64_t ms_trace_start_ns = 0;
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     VkSwapchainPresentFenceInfoKHR present_fence_info;
+     VkSwapchainPresentModeInfoKHR present_mode_info;
+@@ -3124,11 +3141,16 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+             vk_prepend_struct(&present_info, &timings_info);
+     }
+ 
++    if (VKD3D_MS_TRACE_ON(PRESENT))
++        ms_trace_start_ns = vkd3d_get_current_time_ns();
+     vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+     VKD3D_REGION_BEGIN(queue_present);
+     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
+     VKD3D_REGION_END(queue_present);
+     vkd3d_queue_release(chain->queue->vkd3d_queue);
++    VKD3D_MS_TRACE(PRESENT, "vkQueuePresentKHR present %"PRIu64" id %"PRIu64" image %u -> %d, %.2f ms.", present_count,
++            use_present_id ? chain->present.present_id : 0, chain->present.current_backbuffer_index, vr,
++            (double)(vkd3d_get_current_time_ns() - ms_trace_start_ns) / 1.0e6);
+ 
+     if (chain->queue->device->vk_info.NV_low_latency2 && chain->request.low_latency_frame_id)
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 33c6efc0..ca842d4d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -34,6 +34,7 @@
+ #include "vkd3d_version.h"
+ #include "vkd3d_shader.h"
+ #include "vkd3d_threads.h"
++#include "vkd3d_metalsharp_trace.h"
+ #include "vkd3d_platform.h"
+ #include "vkd3d_swapchain_factory.h"
+ #include "vkd3d_command_list_vkd3d_ext.h"
+diff --git a/meson.build b/meson.build
+index 2f7dbcc8..78e98558 100644
+--- a/meson.build
++++ b/meson.build
+@@ -54,7 +54,13 @@ if not enable_trace
+   add_project_arguments('-DVKD3D_NO_TRACE_MESSAGES', language : 'c')
+ endif
+ 
+-enable_breadcrumbs = enable_trace
++# Breadcrumbs (VKD3D_CONFIG=breadcrumbs) cost a branch per command when off; they can be built without trace messages.
++enable_breadcrumbs = get_option('enable_breadcrumbs')
++if enable_breadcrumbs == 'auto'
++  enable_breadcrumbs = enable_trace
++else
++  enable_breadcrumbs = enable_breadcrumbs == 'true'
++endif
+ if enable_breadcrumbs
+   add_project_arguments('-DVKD3D_ENABLE_BREADCRUMBS', language : 'c')
+ endif
+diff --git a/meson_options.txt b/meson_options.txt
+index bac0610d..1de0e7de 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -5,3 +5,4 @@ option('enable_renderdoc',          type : 'boolean', value : false)
+ option('enable_descriptor_qa',      type : 'boolean', value : false)
+ option('enable_extended_emulation', type : 'boolean', value : 'false')
+ option('enable_trace',              type : 'combo',   value : 'auto', choices : ['false', 'true', 'auto'])
++option('enable_breadcrumbs',        type : 'combo',   value : 'auto', choices : ['false', 'true', 'auto'])
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 3e5f20c676308d69594413da2f46e9806086d03f Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 09:47:35 -0600
+Subject: [PATCH 22/30] MetalSharp trace flag: gpu no longer turns on
+ breadcrumbs, which need AMD_buffer_marker or
+ NV_device_diagnostic_checkpoints; on MoltenVK the device then failed to
+ create (games reported no D3D12 support)
+
+---
+ include/private/vkd3d_metalsharp_trace.h | 2 +-
+ libs/vkd3d-common/metalsharp_trace.c     | 7 ++-----
+ 2 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/include/private/vkd3d_metalsharp_trace.h b/include/private/vkd3d_metalsharp_trace.h
+index f8a4e51b..f5e0dced 100644
+--- a/include/private/vkd3d_metalsharp_trace.h
++++ b/include/private/vkd3d_metalsharp_trace.h
+@@ -6,7 +6,7 @@
+  *   memory    memory budget and every device memory allocation and free
+  *   resource  resource and heap creation; +heavy adds GPU descriptor validation
+  *   sync      fence signals and waits, queue Signal/Wait
+- *   gpu       device-lost diagnostics: breadcrumbs and device faults; +heavy synchronizes every submission
++ *   gpu       device fault reports (MoltenVK adds its command buffer hang watchdog)
+  *   cpu       queue timeline (Chrome trace JSON); +heavy adds extra timeline events
+  *   api       (Vulkan call trace, in MoltenVK)
+  *   pass      (render passes, in MoltenVK)
+diff --git a/libs/vkd3d-common/metalsharp_trace.c b/libs/vkd3d-common/metalsharp_trace.c
+index 97a8c9e3..7f6cc5db 100644
+--- a/libs/vkd3d-common/metalsharp_trace.c
++++ b/libs/vkd3d-common/metalsharp_trace.c
+@@ -265,13 +265,10 @@ static void ms_trace_init_once(void)
+         ms_add_config_flag("log_memory_budget");
+     if (ms_trace_heavy & VKD3D_MS_TRACE_RESOURCE)
+         ms_add_config_flag("descriptor_qa_checks");
++    /* No breadcrumbs: they need AMD_buffer_marker or NV_device_diagnostic_checkpoints, which MoltenVK lacks,
++     * and device creation fails without them. MoltenVK's command buffer watchdog covers GPU hangs instead. */
+     if (ms_trace_mask & VKD3D_MS_TRACE_GPU)
+-    {
+         ms_add_config_flag("fault");
+-        ms_add_config_flag("breadcrumbs");
+-        if (ms_trace_heavy & VKD3D_MS_TRACE_GPU)
+-            ms_add_config_flag("breadcrumbs_sync");
+-    }
+     if (ms_trace_mask & VKD3D_MS_TRACE_CPU)
+     {
+         snprintf(path, sizeof(path), "%s\\queue-profile.json", ms_trace_dir);
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 81d9242e9067bd26a7f7c9730d80264953909eb3 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 12:54:31 -0600
+Subject: [PATCH 23/30] Rendering without render targets uses one layer, not
+ the device maximum: Metal sized the pass's tile memory to 16384x16384 by its
+ layers, 17 GiB, and every frame failed out of memory (The Witcher 3);
+ pipeline caches are keyed on the sources that decide what a cached pipeline
+ holds (scripts/cache-key.sh), not the git build, so unrelated commits keep
+ each game's cache
+
+---
+ libs/vkd3d/cache.c     | 17 +++++++++--------
+ libs/vkd3d/command.c   | 12 +++++++++++-
+ libs/vkd3d/meson.build |  2 +-
+ meson.build            |  6 ++++++
+ scripts/cache-key.sh   | 18 ++++++++++++++++++
+ vkd3d_cache_key.h.in   |  4 ++++
+ 6 files changed, 49 insertions(+), 10 deletions(-)
+ create mode 100755 scripts/cache-key.sh
+ create mode 100644 vkd3d_cache_key.h.in
+
+diff --git a/libs/vkd3d/cache.c b/libs/vkd3d/cache.c
+index 14a57556..c25fcce1 100644
+--- a/libs/vkd3d/cache.c
++++ b/libs/vkd3d/cache.c
+@@ -20,6 +20,7 @@
+ #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
+ 
+ #include "vkd3d_private.h"
++#include "vkd3d_cache_key.h"
+ #include "vkd3d_shader.h"
+ 
+ struct vkd3d_cached_pipeline_key
+@@ -381,15 +382,15 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+      * and the driver since that will affect the generated pipeline cache.
+      * Based on global configuration flags, which extensions are available, etc,
+      * the generated shaders may also change, so key on that as well. */
+-    if (blob->vkd3d_build != vkd3d_build ||
++    if (blob->vkd3d_build != vkd3d_cache_build ||
+             blob->vkd3d_shader_interface_key != device->shader_interface_key)
+     {
+         if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
+         {
+-            if (blob->vkd3d_build != vkd3d_build)
++            if (blob->vkd3d_build != vkd3d_cache_build)
+             {
+                 INFO("Unexpected build version (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
+-                        blob->vkd3d_build, vkd3d_build);
++                        blob->vkd3d_build, vkd3d_cache_build);
+             }
+ 
+             if (blob->vkd3d_shader_interface_key != device->shader_interface_key)
+@@ -1224,7 +1225,7 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
+         blob->vendor_id = device_properties->vendorID;
+         blob->device_id = device_properties->deviceID;
+         blob->vkd3d_shader_interface_key = state->device->shader_interface_key;
+-        blob->vkd3d_build = vkd3d_build;
++        blob->vkd3d_build = vkd3d_cache_build;
+ 
+         if (pipeline_library && (pipeline_library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER))
+         {
+@@ -1936,7 +1937,7 @@ static void d3d12_pipeline_library_serialize_stream_archive_header(struct d3d12_
+     header->vendor_id = device_properties->vendorID;
+     header->device_id = device_properties->deviceID;
+     header->reserved = 0;
+-    header->vkd3d_build = vkd3d_build;
++    header->vkd3d_build = vkd3d_cache_build;
+     header->vkd3d_shader_interface_key = pipeline_library->device->shader_interface_key;
+ 
+     if (pipeline_library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)
+@@ -2017,7 +2018,7 @@ static HRESULT d3d12_pipeline_library_serialize(struct d3d12_pipeline_library *p
+     header->pipeline_count = pipeline_library->pso_map.used_count;
+     header->spirv_count = pipeline_library->spirv_cache_map.used_count;
+     header->driver_cache_count = pipeline_library->driver_cache_map.used_count;
+-    header->vkd3d_build = vkd3d_build;
++    header->vkd3d_build = vkd3d_cache_build;
+     header->vkd3d_shader_interface_key = pipeline_library->device->shader_interface_key;
+ 
+     if (pipeline_library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)
+@@ -2223,7 +2224,7 @@ static HRESULT d3d12_pipeline_library_validate_stream_format_header(struct d3d12
+     if (header->device_id != device_properties->deviceID || header->vendor_id != device_properties->vendorID)
+         return D3D12_ERROR_ADAPTER_NOT_FOUND;
+ 
+-    if (header->vkd3d_build != vkd3d_build)
++    if (header->vkd3d_build != vkd3d_cache_build)
+         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+ 
+     if (header->vkd3d_shader_interface_key != device->shader_interface_key)
+@@ -2405,7 +2406,7 @@ static HRESULT d3d12_pipeline_library_read_blob_toc_format(struct d3d12_pipeline
+         return D3D12_ERROR_ADAPTER_NOT_FOUND;
+     }
+ 
+-    if (header->vkd3d_build != vkd3d_build)
++    if (header->vkd3d_build != vkd3d_cache_build)
+     {
+         if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
+             INFO("Rejecting pipeline library due to vkd3d-proton build mismatch.\n");
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index d95d2f57..9b929838 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7426,7 +7426,9 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     list->rendering_info.state_flags = 0;
+     list->fb_width = limits->maxFramebufferWidth;
+     list->fb_height = limits->maxFramebufferHeight;
+-    list->fb_layer_count = limits->maxFramebufferLayers;
++    /* Without render targets there is nothing for a layer index to write into: one layer. A pass as large as
++     * possible and deep needed 17 GiB of tile memory on Metal, and failed every frame (The Witcher 3). */
++    list->fb_layer_count = 1;
+ 
+     list->xfb_buffer_count = 0u;
+ 
+@@ -15677,6 +15679,7 @@ static void d3d12_command_list_recompute_fb_size(struct d3d12_command_list *list
+     const VkPhysicalDeviceLimits *limits = &list->device->vk_info.device_limits;
+     const struct d3d12_rtv_desc *rtv_desc;
+     VkSampleCountFlagBits sample_count;
++    bool has_targets;
+     unsigned int i;
+ 
+     /* Honor PSO sample count if no render targets are bound */
+@@ -15685,6 +15688,7 @@ static void d3d12_command_list_recompute_fb_size(struct d3d12_command_list *list
+     list->fb_width = limits->maxFramebufferWidth;
+     list->fb_height = limits->maxFramebufferHeight;
+     list->fb_layer_count = limits->maxFramebufferLayers;
++    has_targets = false;
+ 
+     for (i = 0; i < ARRAY_SIZE(list->rtvs); i++)
+     {
+@@ -15697,6 +15701,7 @@ static void d3d12_command_list_recompute_fb_size(struct d3d12_command_list *list
+             list->fb_layer_count = min(list->fb_layer_count, rtv_desc->layer_count);
+ 
+             sample_count = rtv_desc->sample_count;
++            has_targets = true;
+         }
+     }
+ 
+@@ -15709,8 +15714,13 @@ static void d3d12_command_list_recompute_fb_size(struct d3d12_command_list *list
+         list->fb_layer_count = min(list->fb_layer_count, rtv_desc->layer_count);
+ 
+         sample_count = rtv_desc->sample_count;
++        has_targets = true;
+     }
+ 
++    /* Without render targets, one layer (see d3d12_command_list_reset_api_state()). */
++    if (!has_targets)
++        list->fb_layer_count = 1;
++
+     if (list->dynamic_state.rasterization_samples != sample_count)
+     {
+         list->dynamic_state.rasterization_samples = sample_count;
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 873a89fb..5d323f7c 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -120,7 +120,7 @@ if enable_profiling
+   vkd3d_src += ['timestamp_profiler.c']
+ endif
+ 
+-vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
++vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_cache_key, vkd3d_version,
+   dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+   include_directories : vkd3d_private_includes)
+ 
+diff --git a/meson.build b/meson.build
+index 78e98558..2169ef94 100644
+--- a/meson.build
++++ b/meson.build
+@@ -179,6 +179,12 @@ vkd3d_build = vcs_tag(
+   input   : 'vkd3d_build.h.in',
+   output  : 'vkd3d_build.h', fallback : '12345678')
+ 
++# The pipeline caches' key: the sources that decide what a cached pipeline holds, not the whole build.
++vkd3d_cache_key = vcs_tag(
++  command : ['sh', meson.current_source_dir() / 'scripts' / 'cache-key.sh'],
++  input   : 'vkd3d_cache_key.h.in',
++  output  : 'vkd3d_cache_key.h', fallback : '12345678')
++
+ vkd3d_version = vcs_tag(
+   command : ['git', 'describe', '--always', '--tags', '--dirty=+'],
+   input   : 'vkd3d_version.h.in',
+diff --git a/scripts/cache-key.sh b/scripts/cache-key.sh
+new file mode 100755
+index 00000000..fb61358c
+--- /dev/null
++++ b/scripts/cache-key.sh
+@@ -0,0 +1,18 @@
++#!/bin/sh
++# Prints the key VKD3D-Proton's pipeline caches are kept under (15 hex digits, like the build tag it replaces
++# there): a hash of the sources that decide what a cached pipeline holds, so a rebuild that changes none of them
++# keeps the caches games built. Keyed on the git build instead, every commit (a swap chain or trace change too)
++# threw each game's cache away, and the next launch compiled every pipeline again.
++# The sources: the shader compiler (libs/vkd3d-shader and dxil-spirv with its SPIRV-Cross-free submodules), the
++# pipeline state, root signature, state object and cache code, the per-game workarounds, and the headers.
++# The cache's own checks still key on the device's shader interface (config flags and features) and the
++# Vulkan driver's pipelineCacheUUID.
++cd "$(dirname "$0")/.." || exit 1
++{
++    find libs/vkd3d-shader include -type f \( -name '*.c' -o -name '*.h' -o -name '*.idl' -o -name '*.in' \) | LC_ALL=C sort | xargs shasum
++    shasum libs/vkd3d/cache.c libs/vkd3d/state.c libs/vkd3d/state_object_common.c libs/vkd3d/raytracing_pipeline.c \
++        libs/vkd3d/workgraphs.c libs/vkd3d/device_workarounds.c libs/vkd3d/vkd3d_private.h
++    git -C subprojects/dxil-spirv rev-parse HEAD 2>/dev/null
++    git -C subprojects/dxil-spirv diff --no-ext-diff 2>/dev/null | shasum
++    git -C subprojects/dxil-spirv submodule status --recursive 2>/dev/null
++} | sed 's#  .*/#  #' | shasum | cut -c1-15
+diff --git a/vkd3d_cache_key.h.in b/vkd3d_cache_key.h.in
+new file mode 100644
+index 00000000..a82672bf
+--- /dev/null
++++ b/vkd3d_cache_key.h.in
+@@ -0,0 +1,4 @@
++#include <stdint.h>
++
++/* Hash of the sources that decide what a cached pipeline holds (scripts/cache-key.sh). */
++static const uint64_t vkd3d_cache_build = 0x@VCS_TAG@;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 62753ab90400dafaf3a3f5f9c802bc919bd01fd4 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 14:12:39 -0600
+Subject: [PATCH 24/30] Metal Shader Converter bridge for compute
+ (METALSHARP_MSC=1; MetalSharp-Wine docs/MSC-BRIDGE-CONTRACT.md): eligible
+ DXIL compute PSOs are handed to MoltenVK as a blob of DXIL plus the flattened
+ root signature, which Apple's converter turns into a Metal library without
+ the MSL front-end compile; every descriptor heap keeps a shadow of 24-byte
+ converter entries (exact buffer VAs and ranges, Metal resource IDs from
+ VK_NVX_image_view_handle, UAV counters as R32_UINT texel views), and each
+ dispatch pushes the converter's top-level argument buffer; ExecuteIndirect
+ with root argument changes uses a SPIR-V pipeline created on first need;
+ anything not eligible stays on SPIR-V
+
+---
+ libs/vkd3d/command.c       | 108 ++++++++-
+ libs/vkd3d/device.c        |  10 +
+ libs/vkd3d/meson.build     |   1 +
+ libs/vkd3d/msc_bridge.c    | 486 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/resource.c      | 121 +++++++++
+ libs/vkd3d/state.c         | 151 ++++++++++--
+ libs/vkd3d/vkd3d_private.h | 113 +++++++++
+ 7 files changed, 963 insertions(+), 27 deletions(-)
+ create mode 100644 libs/vkd3d/msc_bridge.c
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 9b929838..cfe58f6f 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7459,6 +7459,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(&list->graphics_bindings, 0, sizeof(list->graphics_bindings));
+     memset(&list->compute_bindings, 0, sizeof(list->compute_bindings));
+     memset(&list->descriptor_heap, 0, sizeof(list->descriptor_heap));
++    memset(&list->msc, 0, sizeof(list->msc));
+ 
+     if (vkd3d_descriptor_debug_active_instruction_qa_checks())
+     {
+@@ -7746,6 +7747,7 @@ static bool d3d12_command_list_update_rendering_info(struct d3d12_command_list *
+ static bool d3d12_command_list_update_compute_pipeline(struct d3d12_command_list *list)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkPipeline vk_pipeline;
+ 
+     if (list->current_pipeline != VK_NULL_HANDLE)
+         return true;
+@@ -7756,14 +7758,22 @@ static bool d3d12_command_list_update_compute_pipeline(struct d3d12_command_list
+         return false;
+     }
+ 
+-    if (list->command_buffer_pipeline != list->state->compute.vk_pipeline)
++    vk_pipeline = list->state->compute.vk_pipeline;
++
++    /* ExecuteIndirect writes root arguments in VKD3D-Proton's own layout, which a Metal Shader Converter
++     * bridge pipeline can't read: it gets the PSO's SPIR-V pipeline. */
++    if (list->msc.use_spirv && d3d12_pipeline_state_is_msc_bridge(list->state) &&
++            !(vk_pipeline = d3d12_pipeline_state_get_msc_spirv_pipeline(list->state)))
++        return false;
++
++    if (list->command_buffer_pipeline != vk_pipeline)
+     {
+         VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer,
+                 vk_bind_point_from_pipeline_type(list->state->pipeline_type),
+-                list->state->compute.vk_pipeline));
+-        list->command_buffer_pipeline = list->state->compute.vk_pipeline;
++                vk_pipeline));
++        list->command_buffer_pipeline = vk_pipeline;
+     }
+-    list->current_pipeline = list->state->compute.vk_pipeline;
++    list->current_pipeline = vk_pipeline;
+     list->dynamic_state.active_flags = 0;
+ 
+     return true;
+@@ -8707,6 +8717,66 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+ static void d3d12_command_list_check_pre_compute_barrier(
+         struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage);
+ 
++/* Builds the Metal Shader Converter's top-level argument buffer (contract section 2) from the compute
++ * bindings and pushes all of it with the bridge layout. */
++static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *list)
++{
++    const struct d3d12_root_signature *root_signature = list->state->root_signature;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct vkd3d_pipeline_bindings *bindings = &list->compute_bindings;
++    const struct d3d12_root_signature *bound = bindings->root_signature;
++    DECLSPEC_ALIGN(8) uint8_t data[4096];
++    const struct vkd3d_msc_root_parameter *p;
++    VkDeviceAddress va, heap_va;
++    uint32_t count;
++    unsigned int i;
++
++    if (!root_signature->msc.top_level_size)
++        return;
++
++    memset(data, 0, root_signature->msc.top_level_size);
++
++    for (i = 0; i < root_signature->msc.parameter_count; i++)
++    {
++        p = &root_signature->msc.parameters[i];
++
++        switch (p->type)
++        {
++            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
++                /* Values are stored by the bound root signature's push constant layout. */
++                if (bound && i < bound->parameter_count &&
++                        bound->parameters[i].parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++                {
++                    count = min(p->constant_count, bound->parameters[i].constant.constant_count);
++                    memcpy(data + p->offset, &bindings->root_constants[bound->parameters[i].constant.constant_index],
++                            count * sizeof(uint32_t));
++                }
++                break;
++
++            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
++                heap_va = p->sampler_table ? list->msc.shadow_va_sampler : list->msc.shadow_va_resource;
++                va = heap_va ? heap_va + (VkDeviceAddress)bindings->descriptor_tables[i] *
++                        sizeof(struct vkd3d_msc_descriptor) : 0;
++                memcpy(data + p->offset, &va, sizeof(va));
++                break;
++
++            default:
++                memcpy(data + p->offset, &list->msc.root_descriptor_vas[i], sizeof(VkDeviceAddress));
++                break;
++        }
++    }
++
++    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, root_signature->msc.vk_pipeline_layout,
++            VK_SHADER_STAGE_COMPUTE_BIT, 0, root_signature->msc.top_level_size, data));
++
++    /* Like a meta shader's push: the bytes the root signature layouts pushed are gone, so the next
++     * flush pushes them again. */
++    if (bound)
++        d3d12_command_list_invalidate_push_constants(bindings);
++    if (list->graphics_bindings.root_signature)
++        d3d12_command_list_invalidate_push_constants(&list->graphics_bindings);
++}
++
+ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
+ {
+     d3d12_command_list_end_current_render_pass(list, false);
+@@ -8717,6 +8787,10 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
+     d3d12_command_list_check_pre_compute_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+     d3d12_command_list_update_descriptors(list);
+ 
++    /* Every dispatch with the bridge pipeline bound pushes the whole top-level argument buffer. */
++    if (d3d12_pipeline_state_is_msc_bridge(list->state) && list->current_pipeline == list->state->compute.vk_pipeline)
++        d3d12_command_list_push_msc_arguments(list);
++
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
+ #endif
+@@ -14978,6 +15052,14 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+             d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+             list->cbv_srv_uav_descriptors_view = d.view;
+         }
++
++        if (heap->msc.entries)
++        {
++            if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++                list->msc.shadow_va_resource = heap->msc.va;
++            else
++                list->msc.shadow_va_sampler = heap->msc.va;
++        }
+     }
+ 
+     vkd3d_pipeline_bindings_set_dirty_sets(&list->graphics_bindings, dirty_mask);
+@@ -15380,6 +15462,10 @@ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *li
+ {
+     struct vkd3d_root_descriptor_info *descriptor = &bindings->root_descriptors[index];
+ 
++    /* A root CBV's VA doesn't survive in its push descriptor; the bridge needs every VA. */
++    if (bindings == &list->compute_bindings)
++        list->msc.root_descriptor_vas[index] = gpu_address;
++
+     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
+         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
+     else
+@@ -19151,11 +19237,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+     if (sig_impl->requires_state_template)
+     {
++        /* Root arguments written on the GPU need the SPIR-V pipeline of a bridge PSO.
++         * Rebind on both sides so the next plain dispatch gets the bridge pipeline again. */
++        if (sig_impl->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE && d3d12_pipeline_state_is_msc_bridge(list->state))
++        {
++            list->msc.use_spirv = true;
++            d3d12_command_list_invalidate_current_pipeline(list, false);
++        }
++
+         d3d12_command_list_execute_indirect_state_template_dgc(list, sig_impl,
+                 max_command_count,
+                 arg_impl, arg_buffer_offset,
+                 count_impl, count_buffer_offset, VKD3D_DGC_MODE_APPLICATION_CALL, 0, 0);
+         VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_TEMPLATE);
++
++        if (list->msc.use_spirv)
++        {
++            list->msc.use_spirv = false;
++            d3d12_command_list_invalidate_current_pipeline(list, false);
++        }
+         return;
+     }
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index d2699f8c..c9ebe4ab 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2472,6 +2472,14 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     vkd3d_trace_physical_device_features(physical_device_info);
+     vkd3d_trace_physical_device_limits(physical_device_info);
+ 
++    /* MoltenVK exposes VK_NVX_image_view_handle for the Metal Shader Converter bridge only:
++     * without METALSHARP_MSC=1, leave it off so nothing else picks it up. */
++    if (physical_device_info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK && !vkd3d_msc_requested())
++    {
++        vulkan_info->NVX_image_view_handle = false;
++        vulkan_info->supports_cubin_64bit = false;
++    }
++
+     features = &physical_device_info->features2.features;
+ 
+     if (!features->sparseResidencyBuffer || !features->sparseResidencyImage2D)
+@@ -10638,6 +10646,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     if (FAILED(hr = vkd3d_bindless_state_init(&device->bindless_state, device)))
+         goto out_cleanup_global_descriptor_buffer;
+ 
++    vkd3d_msc_bridge_init(device);
++
+     if (FAILED(hr = vkd3d_view_map_init(&device->sampler_map.map)))
+         goto out_cleanup_bindless_state;
+ 
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 5d323f7c..98cf1434 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -80,6 +80,7 @@ vkd3d_src = [
+   'memory.c',
+   'meta.c',
+   'meta_commands.c',
++  'msc_bridge.c',
+   'resource.c',
+   'state.c',
+   'utils.c',
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+new file mode 100644
+index 00000000..1da79506
+--- /dev/null
++++ b/libs/vkd3d/msc_bridge.c
+@@ -0,0 +1,486 @@
++/*
++ * Metal Shader Converter bridge, VKD3D-Proton side (docs/MSC-BRIDGE-CONTRACT.md in MetalSharp Wine).
++ *
++ * With METALSHARP_MSC=1, compute PSOs whose shader is DXIL are handed to MoltenVK as a blob of DXIL plus the
++ * flattened root signature, which MoltenVK converts with Apple's Metal Shader Converter. The converted shader
++ * reads its resources through the converter's top-level argument buffer, which VKD3D-Proton pushes as push
++ * constants, and through shadow descriptor heaps of 24-byte entries that VKD3D-Proton keeps next to every
++ * descriptor heap.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include "vkd3d_debug.h"
++#include "vkd3d_common.h"
++
++#define VKD3D_MSC_BLOB_MAGIC 0x4d534358u /* "XCSM" in memory */
++#define VKD3D_MSC_BLOB_VERSION 1u
++#define VKD3D_MSC_STAGE_COMPUTE 0u
++#define VKD3D_MSC_MAX_TOP_LEVEL_SIZE 4096u
++
++struct vkd3d_msc_blob_header
++{
++    uint32_t magic;
++    uint32_t version;
++    uint32_t stage;
++    uint32_t dxil_offset;
++    uint32_t dxil_size;
++    uint32_t root_sig_offset;
++    uint32_t root_sig_size;
++    uint32_t reserved;
++};
++
++/* Words per entry of the flattened root signature. */
++#define VKD3D_MSC_ROOT_SIG_HEADER_WORDS 4u
++#define VKD3D_MSC_ROOT_PARAM_WORDS 7u
++#define VKD3D_MSC_RANGE_WORDS 6u
++#define VKD3D_MSC_STATIC_SAMPLER_WORDS 13u
++
++bool vkd3d_msc_requested(void)
++{
++    char value[8];
++    return vkd3d_get_env_var("METALSHARP_MSC", value, sizeof(value)) && !strcmp(value, "1");
++}
++
++void vkd3d_msc_bridge_init(struct d3d12_device *device)
++{
++    device->msc.enabled = false;
++
++    if (!vkd3d_msc_requested())
++        return;
++
++    if (!device->vk_info.NVX_image_view_handle || !device->vk_procs.vkGetImageViewHandle64NVX)
++    {
++        INFO("METALSHARP_MSC=1, but VK_NVX_image_view_handle is unavailable; compute stays on SPIR-V.\n");
++        return;
++    }
++
++    if (!device->device_info.vulkan_1_2_features.bufferDeviceAddress)
++    {
++        INFO("METALSHARP_MSC=1, but buffer device address is unavailable; compute stays on SPIR-V.\n");
++        return;
++    }
++
++    /* Shadow heaps are only kept by the descriptor set model's write and copy paths. */
++    if (d3d12_device_use_descriptor_heap(device) || d3d12_device_uses_descriptor_buffers(device) ||
++            d3d12_device_use_embedded_mutable_descriptors(device))
++    {
++        INFO("METALSHARP_MSC=1, but the device does not use descriptor sets; compute stays on SPIR-V.\n");
++        return;
++    }
++
++    device->msc.enabled = true;
++    INFO("Metal Shader Converter bridge enabled for compute pipelines.\n");
++}
++
++uint64_t vkd3d_msc_get_view_handle(struct d3d12_device *device, struct vkd3d_view *view,
++        VkDescriptorType vk_descriptor_type)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkImageViewHandleInfoNVX info;
++    uint64_t handle;
++
++    if (!view)
++        return 0;
++
++    if ((handle = vkd3d_atomic_uint64_load_explicit(&view->msc_handle, vkd3d_memory_order_relaxed)))
++        return handle;
++
++    info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX;
++    info.pNext = NULL;
++    info.imageView = VK_NULL_HANDLE;
++    info.descriptorType = vk_descriptor_type;
++    info.sampler = VK_NULL_HANDLE;
++
++    switch (view->type)
++    {
++        case VKD3D_VIEW_TYPE_IMAGE:
++            info.imageView = view->vk_image_view;
++            break;
++        case VKD3D_VIEW_TYPE_BUFFER:
++            /* Private to the bridge: with a texel buffer type, imageView carries a VkBufferView. */
++            info.imageView = (VkImageView)(uint64_t)view->vk_buffer_view;
++            break;
++        case VKD3D_VIEW_TYPE_SAMPLER:
++            info.sampler = view->vk_sampler;
++            break;
++        default:
++            return 0;
++    }
++
++    handle = VK_CALL(vkGetImageViewHandle64NVX(device->vk_device, &info));
++    vkd3d_atomic_uint64_store_explicit(&view->msc_handle, handle, vkd3d_memory_order_relaxed);
++    return handle;
++}
++
++uint64_t vkd3d_msc_buffer_metadata(uint32_t range, uint32_t element_offset, bool typed)
++{
++    if (element_offset > 0xff)
++    {
++        FIXME_ONCE("Typed buffer element offset %u does not fit the converter's buffer metadata, using 255.\n",
++                element_offset);
++        element_offset = 0xff;
++    }
++
++    return range | ((uint64_t)element_offset << 32) | (typed ? (1ull << 63) : 0);
++}
++
++HRESULT d3d12_descriptor_heap_init_msc(struct d3d12_descriptor_heap *descriptor_heap)
++{
++    const D3D12_DESCRIPTOR_HEAP_DESC *desc = &descriptor_heap->desc;
++    struct d3d12_device *device = descriptor_heap->device;
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkDeviceSize size;
++    void *mapped;
++    VkResult vr;
++    HRESULT hr;
++
++    if (!device->msc.enabled ||
++            (desc->Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && desc->Type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
++        return S_OK;
++
++    size = max(1u, desc->NumDescriptors) * sizeof(struct vkd3d_msc_descriptor);
++
++    /* CPU heaps only need the entries for copies. */
++    if (!(desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
++    {
++        if (!(descriptor_heap->msc.entries = vkd3d_calloc(1, size)))
++            return E_OUTOFMEMORY;
++        return S_OK;
++    }
++
++    if (FAILED(hr = vkd3d_create_buffer_explicit_usage(device,
++            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++            size, "msc-shadow-heap", &descriptor_heap->msc.vk_buffer)))
++        return hr;
++
++    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, descriptor_heap->msc.vk_buffer,
++            device->memory_info.descriptor_heap_memory_properties, 0, &descriptor_heap->msc.device_allocation)))
++        return hr;
++
++    if ((vr = VK_CALL(vkMapMemory(device->vk_device, descriptor_heap->msc.device_allocation.vk_memory,
++            0, VK_WHOLE_SIZE, 0, &mapped))))
++    {
++        ERR("Failed to map shadow heap, vr %d.\n", vr);
++        return hresult_from_vk_result(vr);
++    }
++
++    memset(mapped, 0, size);
++    descriptor_heap->msc.va = vkd3d_get_buffer_device_address(device, descriptor_heap->msc.vk_buffer);
++    descriptor_heap->msc.entries = mapped;
++    return S_OK;
++}
++
++void d3d12_descriptor_heap_cleanup_msc(struct d3d12_descriptor_heap *descriptor_heap)
++{
++    struct d3d12_device *device = descriptor_heap->device;
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++
++    if (descriptor_heap->msc.vk_buffer)
++    {
++        VK_CALL(vkDestroyBuffer(device->vk_device, descriptor_heap->msc.vk_buffer, NULL));
++        vkd3d_free_device_memory(device, &descriptor_heap->msc.device_allocation);
++    }
++    else
++        vkd3d_free(descriptor_heap->msc.entries);
++
++    memset(&descriptor_heap->msc, 0, sizeof(descriptor_heap->msc));
++}
++
++static uint32_t vkd3d_msc_float_bits(float f)
++{
++    uint32_t u;
++    memcpy(&u, &f, sizeof(u));
++    return u;
++}
++
++void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
++        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_msc_root_parameter *parameters = NULL;
++    VkPipelineLayoutCreateInfo layout_info;
++    VkPushConstantRange push_range;
++    uint32_t *words, *param, *range, *sampler;
++    unsigned int range_count = 0;
++    uint64_t offset = 0;
++    size_t word_count;
++    unsigned int i, j;
++    VkResult vr;
++
++    if (!device->msc.enabled)
++        return;
++
++    /* SM 6.6 heap indexing is out of scope for version 1 of the bridge. */
++    if (desc->Flags & (D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE |
++            D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
++            D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))
++        return;
++
++    if (desc->NumParameters && !(parameters = vkd3d_calloc(desc->NumParameters, sizeof(*parameters))))
++        return;
++
++    /* Top-level argument buffer layout ("Explicit layout via Root Signatures" in the converter's manual):
++     * constants are 4-byte aligned, root descriptors and tables are 8-byte aligned and 8 bytes. */
++    for (i = 0; i < desc->NumParameters; i++)
++    {
++        const D3D12_ROOT_PARAMETER1 *p = &desc->pParameters[i];
++
++        parameters[i].type = p->ParameterType;
++
++        if (p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++        {
++            offset = align(offset, sizeof(uint32_t));
++            parameters[i].offset = min(offset, UINT16_MAX);
++            parameters[i].constant_count = p->Constants.Num32BitValues;
++            offset += (uint64_t)p->Constants.Num32BitValues * sizeof(uint32_t);
++        }
++        else
++        {
++            offset = align(offset, sizeof(uint64_t));
++            parameters[i].offset = min(offset, UINT16_MAX);
++            offset += sizeof(uint64_t);
++
++            if (p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++            {
++                range_count += p->DescriptorTable.NumDescriptorRanges;
++                /* A table holds samplers only or no samplers. */
++                parameters[i].sampler_table = p->DescriptorTable.NumDescriptorRanges &&
++                        p->DescriptorTable.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
++            }
++        }
++    }
++
++    offset = align(offset, sizeof(uint64_t));
++    if (offset > VKD3D_MSC_MAX_TOP_LEVEL_SIZE)
++    {
++        TRACE("Top-level argument buffer of %"PRIu64" bytes is too large for the bridge.\n", offset);
++        vkd3d_free(parameters);
++        return;
++    }
++
++    word_count = VKD3D_MSC_ROOT_SIG_HEADER_WORDS +
++            desc->NumParameters * VKD3D_MSC_ROOT_PARAM_WORDS +
++            range_count * VKD3D_MSC_RANGE_WORDS +
++            desc->NumStaticSamplers * VKD3D_MSC_STATIC_SAMPLER_WORDS;
++
++    if (!(words = vkd3d_calloc(word_count, sizeof(*words))))
++    {
++        vkd3d_free(parameters);
++        return;
++    }
++
++    words[0] = desc->NumParameters;
++    words[1] = range_count;
++    words[2] = desc->NumStaticSamplers;
++    words[3] = desc->Flags;
++
++    param = words + VKD3D_MSC_ROOT_SIG_HEADER_WORDS;
++    range = param + desc->NumParameters * VKD3D_MSC_ROOT_PARAM_WORDS;
++    range_count = 0;
++
++    for (i = 0; i < desc->NumParameters; i++, param += VKD3D_MSC_ROOT_PARAM_WORDS)
++    {
++        const D3D12_ROOT_PARAMETER1 *p = &desc->pParameters[i];
++
++        param[0] = p->ParameterType;
++        param[1] = p->ShaderVisibility;
++
++        switch (p->ParameterType)
++        {
++            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
++                param[2] = range_count;
++                param[3] = p->DescriptorTable.NumDescriptorRanges;
++
++                for (j = 0; j < p->DescriptorTable.NumDescriptorRanges; j++, range += VKD3D_MSC_RANGE_WORDS)
++                {
++                    const D3D12_DESCRIPTOR_RANGE1 *r = &p->DescriptorTable.pDescriptorRanges[j];
++                    range[0] = r->RangeType;
++                    range[1] = r->NumDescriptors;
++                    range[2] = r->BaseShaderRegister;
++                    range[3] = r->RegisterSpace;
++                    range[4] = r->Flags;
++                    range[5] = r->OffsetInDescriptorsFromTableStart;
++                }
++
++                range_count += p->DescriptorTable.NumDescriptorRanges;
++                break;
++
++            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
++                param[2] = p->Constants.ShaderRegister;
++                param[3] = p->Constants.RegisterSpace;
++                param[4] = p->Constants.Num32BitValues;
++                break;
++
++            default:
++                param[2] = p->Descriptor.ShaderRegister;
++                param[3] = p->Descriptor.RegisterSpace;
++                param[4] = p->Descriptor.Flags;
++                break;
++        }
++    }
++
++    /* Static samplers as D3D12_STATIC_SAMPLER_DESC (1.1): the 1.2 Flags are dropped. */
++    sampler = range;
++    for (i = 0; i < desc->NumStaticSamplers; i++, sampler += VKD3D_MSC_STATIC_SAMPLER_WORDS)
++    {
++        const D3D12_STATIC_SAMPLER_DESC1 *s = &desc->pStaticSamplers[i];
++        sampler[0] = s->Filter;
++        sampler[1] = s->AddressU;
++        sampler[2] = s->AddressV;
++        sampler[3] = s->AddressW;
++        sampler[4] = vkd3d_msc_float_bits(s->MipLODBias);
++        sampler[5] = s->MaxAnisotropy;
++        sampler[6] = s->ComparisonFunc;
++        sampler[7] = s->BorderColor;
++        sampler[8] = vkd3d_msc_float_bits(s->MinLOD);
++        sampler[9] = vkd3d_msc_float_bits(s->MaxLOD);
++        sampler[10] = s->ShaderRegister;
++        sampler[11] = s->RegisterSpace;
++        sampler[12] = s->ShaderVisibility;
++    }
++
++    /* No descriptor sets, one compute push-constant range covering the top-level argument buffer. */
++    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    push_range.offset = 0;
++    push_range.size = offset;
++
++    memset(&layout_info, 0, sizeof(layout_info));
++    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    layout_info.pushConstantRangeCount = offset ? 1 : 0;
++    layout_info.pPushConstantRanges = &push_range;
++
++    if ((vr = VK_CALL(vkCreatePipelineLayout(device->vk_device, &layout_info, NULL,
++            &root_signature->msc.vk_pipeline_layout))) < 0)
++    {
++        WARN("Failed to create bridge pipeline layout, vr %d.\n", vr);
++        vkd3d_free(parameters);
++        vkd3d_free(words);
++        return;
++    }
++
++    root_signature->msc.root_sig = words;
++    root_signature->msc.root_sig_size = word_count * sizeof(*words);
++    root_signature->msc.parameters = parameters;
++    root_signature->msc.parameter_count = desc->NumParameters;
++    root_signature->msc.top_level_size = offset;
++}
++
++void d3d12_root_signature_cleanup_msc(struct d3d12_root_signature *root_signature,
++        struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++
++    VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->msc.vk_pipeline_layout, NULL));
++    vkd3d_free(root_signature->msc.root_sig);
++    vkd3d_free(root_signature->msc.parameters);
++}
++
++bool vkd3d_msc_shader_is_dxil(const D3D12_SHADER_BYTECODE *code)
++{
++    const uint8_t *data = code->pShaderBytecode;
++    size_t size = code->BytecodeLength;
++    uint32_t chunk_count, chunk_offset;
++    uint32_t i;
++
++    /* DXBC container: "DXBC", checksum[16], version, total size, chunk count, chunk offsets[];
++     * each chunk starts with its FourCC. DXIL lives in a "DXIL" chunk. */
++    if (!data || size < 32 || memcmp(data, "DXBC", 4))
++        return false;
++
++    memcpy(&chunk_count, data + 28, sizeof(chunk_count));
++    if (chunk_count > (size - 32) / sizeof(uint32_t))
++        return false;
++
++    for (i = 0; i < chunk_count; i++)
++    {
++        memcpy(&chunk_offset, data + 32 + i * sizeof(uint32_t), sizeof(chunk_offset));
++        if (chunk_offset <= size - 8 && !memcmp(data + chunk_offset, "DXIL", 4))
++            return true;
++    }
++
++    return false;
++}
++
++HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
++        const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code,
++        VkPipeline *vk_pipeline)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkComputePipelineCreateInfo pipeline_info;
++    VkShaderModuleCreateInfo module_info;
++    struct vkd3d_msc_blob_header *header;
++    VkShaderModule vk_module;
++    size_t blob_size;
++    uint8_t *blob;
++    VkResult vr;
++
++    if (code->BytecodeLength > UINT32_MAX - sizeof(*header) - 3 - root_signature->msc.root_sig_size)
++        return E_INVALIDARG;
++
++    /* Header, DXIL container, flattened root signature; every section 4-byte aligned. */
++    blob_size = align(sizeof(*header) + code->BytecodeLength, sizeof(uint32_t));
++    blob_size += root_signature->msc.root_sig_size;
++
++    if (!(blob = vkd3d_calloc(1, blob_size)))
++        return E_OUTOFMEMORY;
++
++    header = (struct vkd3d_msc_blob_header *)blob;
++    header->magic = VKD3D_MSC_BLOB_MAGIC;
++    header->version = VKD3D_MSC_BLOB_VERSION;
++    header->stage = VKD3D_MSC_STAGE_COMPUTE;
++    header->dxil_offset = sizeof(*header);
++    header->dxil_size = code->BytecodeLength;
++    header->root_sig_offset = align(sizeof(*header) + code->BytecodeLength, sizeof(uint32_t));
++    header->root_sig_size = root_signature->msc.root_sig_size;
++    header->reserved = 0;
++    memcpy(blob + header->dxil_offset, code->pShaderBytecode, code->BytecodeLength);
++    memcpy(blob + header->root_sig_offset, root_signature->msc.root_sig, root_signature->msc.root_sig_size);
++
++    memset(&module_info, 0, sizeof(module_info));
++    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    module_info.codeSize = blob_size;
++    module_info.pCode = (const uint32_t *)blob;
++
++    vr = VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &vk_module));
++    vkd3d_free(blob);
++    if (vr < 0)
++        return hresult_from_vk_result(vr);
++
++    memset(&pipeline_info, 0, sizeof(pipeline_info));
++    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
++    pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++    pipeline_info.stage.module = vk_module;
++    /* MoltenVK takes the entry point from the converter's reflection. */
++    pipeline_info.stage.pName = "main";
++    pipeline_info.layout = root_signature->msc.vk_pipeline_layout;
++    pipeline_info.basePipelineIndex = -1;
++
++    /* No pipeline cache: MoltenVK keeps bridge pipelines out of it. */
++    vr = VK_CALL(vkCreateComputePipelines(device->vk_device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, vk_pipeline));
++    VK_CALL(vkDestroyShaderModule(device->vk_device, vk_module, NULL));
++
++    if (vr < 0)
++    {
++        *vk_pipeline = VK_NULL_HANDLE;
++        return hresult_from_vk_result(vr);
++    }
++
++    return S_OK;
++}
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 512f3ec4..bd9f9c76 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -5030,6 +5030,7 @@ static struct vkd3d_view *vkd3d_view_create(enum vkd3d_view_type type)
+         view->refcount = 1;
+         view->type = type;
+         view->cookie = vkd3d_allocate_cookie();
++        view->msc_handle = 0;
+     }
+     return view;
+ }
+@@ -5173,6 +5174,9 @@ void d3d12_desc_copy_single(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descript
+ 
+     *dst.types = *src.types;
+     *dst.view = *src.view;
++
++    if (dst.heap->msc.entries && src.heap->msc.entries)
++        dst.heap->msc.entries[dst.offset] = src.heap->msc.entries[src.offset];
+ }
+ 
+ void d3d12_desc_copy_batch_flush(struct d3d12_desc_copy_batch *batch, struct d3d12_device *device)
+@@ -5214,6 +5218,12 @@ void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descripto
+     memcpy(dst.view, src.view, sizeof(*dst.view) * count);
+     memcpy(dst.types, src.types, sizeof(*dst.types) * count);
+ 
++    if (dst.heap->msc.entries && src.heap->msc.entries)
++    {
++        memcpy(dst.heap->msc.entries + dst.offset, src.heap->msc.entries + src.offset,
++                sizeof(*dst.heap->msc.entries) * count);
++    }
++
+     while (set_info_mask)
+     {
+         set_info_index = vkd3d_bitmask_iter32(&set_info_mask);
+@@ -6042,6 +6052,8 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
+ 
+     desc = d3d12_desc_decode_va(desc_va);
+ 
++    d3d12_desc_msc_write(&desc, 0, 0, 0);
++
+     null_descriptor_template = &desc.heap->null_descriptor_template;
+ 
+     /* When mutable descriptors are not supported, set a dummy type.
+@@ -6308,6 +6320,8 @@ void d3d12_desc_create_cbv(vkd3d_cpu_descriptor_va_t desc_va,
+         vkd3d_init_write_descriptor_set(&vk_writes[vk_write_count++], &d, binding, vk_descriptor_type, &descriptor_info);
+     }
+ 
++    d3d12_desc_msc_write(&d, desc->BufferLocation, 0, desc->SizeInBytes);
++
+     /* Clear out sibling typed descriptor if appropriate.
+      * Native drivers are robust against scenarios like these, and so we need to be too. */
+     if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_TYPE_SPLIT_RAW_TYPED)
+@@ -6822,6 +6836,8 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
+         else
+             WARN("Using CreateSRV for RTAS without RT support?\n");
+ 
++        d3d12_desc_msc_write(&d, 0, 0, 0);
++
+         vkd3d_descriptor_debug_write_descriptor(d.heap->descriptor_heap_info.host_ptr,
+                 d.heap->cookie, d.offset,
+                 VKD3D_DESCRIPTOR_QA_TYPE_RT_ACCELERATION_STRUCTURE_BIT | VKD3D_DESCRIPTOR_QA_TYPE_RAW_VA_BIT,
+@@ -7009,6 +7025,14 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
+     if (mutable_uses_single_descriptor)
+         d.view->info.buffer.flags |= VKD3D_DESCRIPTOR_FLAG_SINGLE_DESCRIPTOR;
+ 
++    /* Exact VA and range of the view, not the aligned SSBO range; the texel view for typed access. */
++    if (d.heap->msc.entries)
++    {
++        d3d12_desc_msc_write(&d, d.view->info.buffer.va,
++                vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER),
++                vkd3d_msc_buffer_metadata(d.view->info.buffer.range, bound_range.element_offset, !desc_is_raw));
++    }
++
+ #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+     if (VKD3D_CONFIG_FLAG_IS_SET(INSTRUCTION_QA_CHECKS))
+     {
+@@ -7353,6 +7377,32 @@ static void vkd3d_create_texture_srv_heap(vkd3d_cpu_descriptor_va_t desc_va,
+     memcpy(d.payload, stack_payload, device->bindless_state.cbv_srv_uav_size);
+ }
+ 
++static float vkd3d_texture_srv_min_lod_clamp(const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
++{
++    if (!desc)
++        return 0.0f;
++
++    switch (desc->ViewDimension)
++    {
++        case D3D12_SRV_DIMENSION_TEXTURE1D:
++            return desc->Texture1D.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
++            return desc->Texture1DArray.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURE2D:
++            return desc->Texture2D.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
++            return desc->Texture2DArray.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURE3D:
++            return desc->Texture3D.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURECUBE:
++            return desc->TextureCube.ResourceMinLODClamp;
++        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
++            return desc->TextureCubeArray.ResourceMinLODClamp;
++        default:
++            return 0.0f;
++    }
++}
++
+ static void vkd3d_create_texture_srv(vkd3d_cpu_descriptor_va_t desc_va,
+         struct d3d12_device *device, struct d3d12_resource *resource,
+         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
+@@ -7411,6 +7461,13 @@ static void vkd3d_create_texture_srv(vkd3d_cpu_descriptor_va_t desc_va,
+                 VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &descriptor_info);
+     }
+ 
++    /* Metal texture views have no min LOD clamp: the converted shader applies it from the metadata. */
++    if (d.heap->msc.entries)
++    {
++        d3d12_desc_msc_write(&d, 0, vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
++                view ? float_bits_to_uint32(vkd3d_texture_srv_min_lod_clamp(desc)) : 0);
++    }
++
+     /* Clear out sibling typed descriptor if appropriate.
+      * Native drivers are robust against scenarios like these, and so we need to be too. */
+     if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_TYPE_SPLIT_RAW_TYPED)
+@@ -7868,6 +7925,34 @@ static void vkd3d_create_buffer_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va,
+             d.payload));
+ }
+ 
++/* Metal Shader Converter bridge: an R32_UINT storage texel view over a UAV counter, starting at the counter
++ * offset aligned down to the texel buffer alignment. The view lives in the counter resource's view map,
++ * so it is shared and released with the resource, and caches its Metal resource ID. */
++static bool vkd3d_msc_create_counter_view(struct d3d12_device *device, struct d3d12_resource *counter_resource,
++        uint32_t counter_offset, struct vkd3d_view **view, uint32_t *element_offset)
++{
++    VkDeviceSize alignment, aligned_offset, size;
++
++    alignment = max(16, device->device_info.properties2.properties.limits.minTexelBufferOffsetAlignment);
++    aligned_offset = counter_offset & ~(alignment - 1);
++    size = align(counter_offset - aligned_offset + sizeof(uint32_t), 16);
++    size = min(size, counter_resource->desc.Width - aligned_offset);
++
++    if (!d3d12_resource_is_buffer(counter_resource) ||
++            (uint64_t)counter_offset + sizeof(uint32_t) > counter_resource->desc.Width ||
++            ((counter_resource->mem.offset + aligned_offset) & (alignment - 1)) ||
++            !vkd3d_create_buffer_view_for_resource(device, counter_resource, DXGI_FORMAT_R32_UINT,
++                    aligned_offset / sizeof(uint32_t), size / sizeof(uint32_t), 0, 0, view) || !*view)
++    {
++        FIXME_ONCE("Failed to create counter view for the bridge, offset %u; writing UAVs without counters.\n",
++                counter_offset);
++        return false;
++    }
++
++    *element_offset = (counter_offset - aligned_offset) / sizeof(uint32_t);
++    return true;
++}
++
+ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_device *device,
+         struct d3d12_resource *resource, struct d3d12_resource *counter_resource,
+         const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
+@@ -8092,6 +8177,29 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
+     if (mutable_uses_single_descriptor)
+         d.view->info.buffer.flags |= VKD3D_DESCRIPTOR_FLAG_SINGLE_DESCRIPTOR;
+ 
++    /* Exact VA and range of the view, not the aligned SSBO range; the texel view for typed access.
++     * With a counter, the texel view is an R32_UINT one over the counter instead, and the element offset
++     * locates the counter in it (as IRRuntimeCreateAppendBufferView does). */
++    if (d.heap->msc.entries)
++    {
++        struct vkd3d_view *counter_view;
++        uint32_t counter_element;
++
++        if (counter_resource && vkd3d_msc_create_counter_view(device, counter_resource, counter_offset,
++                &counter_view, &counter_element))
++        {
++            d3d12_desc_msc_write(&d, d.view->info.buffer.va,
++                    vkd3d_msc_get_view_handle(device, counter_view, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
++                    vkd3d_msc_buffer_metadata(d.view->info.buffer.range, counter_element, false));
++        }
++        else
++        {
++            d3d12_desc_msc_write(&d, d.view->info.buffer.va,
++                    vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
++                    vkd3d_msc_buffer_metadata(d.view->info.buffer.range, bound_range.element_offset, !desc_is_raw));
++        }
++    }
++
+     /* Handle UAV counter */
+     uav_counter_address = 0;
+ 
+@@ -8341,6 +8449,9 @@ static void vkd3d_create_texture_uav(vkd3d_cpu_descriptor_va_t desc_va,
+                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &descriptor_info);
+     }
+ 
++    if (d.heap->msc.entries)
++        d3d12_desc_msc_write(&d, 0, vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE), 0);
++
+     /* Clear out sibling typed descriptor if appropriate.
+      * Native drivers are robust against scenarios like these, and so we need to be too. */
+     if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_TYPE_SPLIT_RAW_TYPED)
+@@ -8934,6 +9045,11 @@ void d3d12_desc_create_sampler(vkd3d_cpu_descriptor_va_t desc_va,
+         VK_CALL(vkUpdateDescriptorSets(device->vk_device, 1, &vk_write, 0, NULL));
+     }
+ 
++    /* As IRDescriptorTableSetSampler: the sampler's resource ID goes in gpuVA. Metadata (LOD bias) stays 0,
++     * MoltenVK applies the bias in the sampler itself. */
++    if (d.heap->msc.entries)
++        d3d12_desc_msc_write(&d, vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_SAMPLER), 0, 0);
++
+     vkd3d_descriptor_metadata_view_set_qa_cookie(d.view, view->cookie);
+     vkd3d_descriptor_debug_write_descriptor(d.heap->descriptor_heap_info.host_ptr,
+             d.heap->cookie, d.offset,
+@@ -10354,6 +10470,9 @@ static HRESULT d3d12_descriptor_heap_init(struct d3d12_descriptor_heap *descript
+         d3d12_descriptor_heap_write_redzone_descriptors(descriptor_heap, device);
+     }
+ 
++    if (FAILED(hr = d3d12_descriptor_heap_init_msc(descriptor_heap)))
++        goto fail;
++
+     if (FAILED(hr = vkd3d_private_store_init(&descriptor_heap->private_store)))
+         goto fail;
+ 
+@@ -10627,6 +10746,8 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
+ 
+     VK_CALL(vkDestroyDescriptorPool(device->vk_device, descriptor_heap->vk_descriptor_pool, NULL));
+ 
++    d3d12_descriptor_heap_cleanup_msc(descriptor_heap);
++
+     if (!descriptor_heap->descriptor_buffer.device_allocation.vk_memory)
+         vkd3d_free_aligned(descriptor_heap->descriptor_buffer.host_allocation);
+     vkd3d_free_device_memory(device, &descriptor_heap->descriptor_buffer.device_allocation);
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 71f05715..a8ce44be 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -96,6 +96,8 @@ static void d3d12_root_signature_cleanup(struct d3d12_root_signature *root_signa
+     vkd3d_free(root_signature->root_signature_blob);
+     vkd3d_free(root_signature->heap.mappings);
+     vkd3d_free(root_signature->heap.vk_static_samplers_desc);
++
++    d3d12_root_signature_cleanup_msc(root_signature, device);
+ }
+ 
+ void d3d12_root_signature_inc_ref(struct d3d12_root_signature *root_signature)
+@@ -2084,6 +2086,8 @@ static HRESULT d3d12_root_signature_init(struct d3d12_root_signature *root_signa
+     if (FAILED(hr))
+         goto fail;
+ 
++    d3d12_root_signature_init_msc(root_signature, device, desc);
++
+     if (FAILED(hr = vkd3d_private_store_init(&root_signature->private_store)))
+         goto fail;
+ 
+@@ -2902,7 +2906,11 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
+         if (d3d12_pipeline_state_is_graphics(state))
+             d3d12_pipeline_state_destroy_graphics(state, device);
+         else if (d3d12_pipeline_state_is_compute(state))
++        {
+             VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.vk_pipeline, NULL));
++            VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.msc_spirv_pipeline, NULL));
++            vkd3d_free(state->compute.msc_dxil);
++        }
+ 
+         VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
+ 
+@@ -3512,9 +3520,13 @@ static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCrea
+     }
+ }
+ 
++/* spirv_code, identifier_create_info and vk_pipeline are the PSO's own, except for the lazily created
++ * SPIR-V pipeline of a Metal Shader Converter bridge PSO (no identifier, no pipeline cache). */
+ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device,
+-        const D3D12_SHADER_BYTECODE *code)
++        const D3D12_SHADER_BYTECODE *code, struct vkd3d_shader_code *spirv_code,
++        VkPipelineShaderStageModuleIdentifierCreateInfoEXT *identifier_create_info,
++        VkPipelineCache vk_cache, VkPipeline *vk_pipeline)
+ {
+     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_subgroup_size_info;
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+@@ -3526,15 +3538,10 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     VkPipelineCreateFlags2CreateInfo flags2;
+     struct vkd3d_shader_spec_info spec_info;
+     VkPipelineCreationFeedbackEXT feedback;
+-    struct vkd3d_shader_code *spirv_code;
+-    VkPipelineCache vk_cache;
+     VkResult vr;
+     HRESULT hr;
+ 
+-    vk_cache = state->vk_pso_cache;
+-    spirv_code = &state->compute.code;
+-
+-    if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
++    if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS) && spirv_code == &state->compute.code)
+         spirv_code_debug = &state->compute.code_debug;
+     else
+         spirv_code_debug = NULL;
+@@ -3545,7 +3552,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     memset(&pipeline_info, 0, sizeof(pipeline_info));
+     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+ 
+-    if (state->compute.identifier_create_info.identifierSize == 0)
++    if (!identifier_create_info || identifier_create_info->identifierSize == 0)
+     {
+         if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
+                 VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code, spirv_code_debug)))
+@@ -3555,11 +3562,11 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
+             &pipeline_info.stage, VK_SHADER_STAGE_COMPUTE_BIT,
+             &required_subgroup_size_info,
+-            &state->compute.identifier_create_info,
++            identifier_create_info,
+             spirv_code)))
+         return hr;
+ 
+-    if (pipeline_info.stage.module != VK_NULL_HANDLE &&
++    if (pipeline_info.stage.module != VK_NULL_HANDLE && identifier_create_info &&
+             device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
+     {
+         state->compute.identifier.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT;
+@@ -3594,7 +3601,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     if (pipeline_info.stage.module == VK_NULL_HANDLE)
+         flags2.flags |= VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+ 
+-    if (state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_DISABLE_OPTIMIZATIONS)
++    if (spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_DISABLE_OPTIMIZATIONS)
+         flags2.flags |= VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT;
+ 
+     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+@@ -3608,7 +3615,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+         vk_prepend_struct(&pipeline_info, &flags2);
+ 
+     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
+-            vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
++            vk_cache, 1, &pipeline_info, NULL, vk_pipeline));
+ 
+     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+     {
+@@ -3666,7 +3673,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+ 
+         vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
+-                vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
++                vk_cache, 1, &pipeline_info, NULL, vk_pipeline));
+ 
+         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+         {
+@@ -3682,7 +3689,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     {
+         ERR("Failed to create Vulkan compute pipeline, hr %#x.\n", (int)hr);
+         ERR("  Root signature: %"PRIx64"\n", state->root_signature->pso_compatibility_hash);
+-        ERR("  Shader: %"PRIx64".\n", state->compute.code.meta.hash);
++        ERR("  Shader: %"PRIx64".\n", spirv_code->meta.hash);
+         return hresult_from_vk_result(vr);
+     }
+ 
+@@ -3692,6 +3699,53 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     return S_OK;
+ }
+ 
++/* Metal Shader Converter bridge: a DXIL compute shader goes to MoltenVK with its flattened root signature
++ * (docs/MSC-BRIDGE-CONTRACT.md). Returns false, with nothing left behind, when the PSO stays on SPIR-V. */
++static bool d3d12_pipeline_state_init_compute_msc(struct d3d12_pipeline_state *state,
++        struct d3d12_device *device, const D3D12_SHADER_BYTECODE *code)
++{
++    const struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
++    const struct d3d12_root_signature *root_signature = state->root_signature;
++    uint64_t start_ns = vkd3d_get_current_time_ns();
++    const char *reason = NULL;
++    vkd3d_shader_hash_t hash;
++    HRESULT hr = S_OK;
++
++    hash = vkd3d_shader_hash(&dxbc);
++
++    if (!root_signature || !root_signature->msc.root_sig)
++        reason = "root signature not supported";
++    else if (!vkd3d_msc_shader_is_dxil(code))
++        reason = "not DXIL";
++    else if (!(state->compute.msc_dxil = vkd3d_malloc(code->BytecodeLength)))
++        reason = "out of memory";
++    else if (FAILED(hr = vkd3d_msc_create_compute_pipeline(device, root_signature, code,
++            &state->compute.vk_pipeline)))
++        reason = "pipeline creation failed";
++
++    if (reason)
++    {
++        vkd3d_free(state->compute.msc_dxil);
++        state->compute.msc_dxil = NULL;
++        INFO("Compute PSO cs %016"PRIx64": SPIR-V (%s, hr %#x).\n", hash, reason, (int)hr);
++        VKD3D_MS_TRACE(SHADER, "MSC bridge: cs %016"PRIx64" -> SPIR-V (%s, hr %#x).", hash, reason, (int)hr);
++        return false;
++    }
++
++    /* Kept for the SPIR-V pipeline ExecuteIndirect needs. */
++    memcpy(state->compute.msc_dxil, code->pShaderBytecode, code->BytecodeLength);
++    state->compute.msc_dxil_size = code->BytecodeLength;
++    state->compute.msc_bridge = true;
++    /* There is no SPIR-V: keep the hash that workarounds, profiling and tooling key on. */
++    state->compute.code.meta.hash = hash;
++
++    INFO("Compute PSO cs %016"PRIx64": Metal Shader Converter (%.2f ms).\n",
++            hash, (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6);
++    VKD3D_MS_TRACE(SHADER, "MSC bridge: cs %016"PRIx64" -> Metal Shader Converter, %.2f ms.",
++            hash, (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6);
++    return true;
++}
++
+ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+         const struct d3d12_cached_pipeline_state *cached_pso)
+@@ -3706,21 +3760,28 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+     shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
+             device->descriptor_qa_global_info, desc->cs.pShaderBytecode, desc->cs.BytecodeLength);
+ 
+-    vkd3d_load_spirv_from_cached_state(device, cached_pso,
+-            VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code,
+-            &state->compute.identifier_create_info);
++    if (!device->msc.enabled || !d3d12_pipeline_state_init_compute_msc(state, device, &desc->cs))
++    {
++        vkd3d_load_spirv_from_cached_state(device, cached_pso,
++                VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code,
++                &state->compute.identifier_create_info);
+ 
+-    hr = vkd3d_create_compute_pipeline(state, device, &desc->cs);
++        hr = vkd3d_create_compute_pipeline(state, device, &desc->cs, &state->compute.code,
++                &state->compute.identifier_create_info, state->vk_pso_cache, &state->compute.vk_pipeline);
+ 
+-    if (FAILED(hr))
+-    {
+-        WARN("Failed to create Vulkan compute pipeline, hr %#x.\n", (int)hr);
+-        return hr;
++        if (FAILED(hr))
++        {
++            WARN("Failed to create Vulkan compute pipeline, hr %#x.\n", (int)hr);
++            return hr;
++        }
+     }
+ 
+     if (FAILED(hr = vkd3d_private_store_init(&state->private_store)))
+     {
+         VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.vk_pipeline, NULL));
++        vkd3d_free(state->compute.msc_dxil);
++        state->compute.msc_dxil = NULL;
++        state->compute.msc_bridge = false;
+         return hr;
+     }
+ 
+@@ -3730,6 +3791,49 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+     return S_OK;
+ }
+ 
++VkPipeline d3d12_pipeline_state_get_msc_spirv_pipeline(struct d3d12_pipeline_state *state)
++{
++    struct vkd3d_shader_code spirv_code;
++    D3D12_SHADER_BYTECODE code;
++    VkPipeline vk_pipeline;
++    HRESULT hr;
++
++    rwlock_lock_read(&state->lock);
++    vk_pipeline = state->compute.msc_spirv_pipeline;
++    rwlock_unlock_read(&state->lock);
++
++    if (vk_pipeline)
++        return vk_pipeline;
++
++    rwlock_lock_write(&state->lock);
++
++    if (!(vk_pipeline = state->compute.msc_spirv_pipeline))
++    {
++        code.pShaderBytecode = state->compute.msc_dxil;
++        code.BytecodeLength = state->compute.msc_dxil_size;
++        memset(&spirv_code, 0, sizeof(spirv_code));
++
++        if (SUCCEEDED(hr = vkd3d_create_compute_pipeline(state, state->device, &code, &spirv_code,
++                NULL, VK_NULL_HANDLE, &vk_pipeline)))
++        {
++            state->compute.msc_spirv_pipeline = vk_pipeline;
++            INFO("Compute PSO cs %016"PRIx64": SPIR-V pipeline for ExecuteIndirect.\n",
++                    state->compute.code.meta.hash);
++        }
++        else
++        {
++            ERR("Failed to create SPIR-V pipeline for bridge PSO cs %016"PRIx64", hr %#x.\n",
++                    state->compute.code.meta.hash, (int)hr);
++            vk_pipeline = VK_NULL_HANDLE;
++        }
++
++        vkd3d_shader_free_shader_code(&spirv_code);
++    }
++
++    rwlock_unlock_write(&state->lock);
++    return vk_pipeline;
++}
++
+ static enum VkPolygonMode vk_polygon_mode_from_d3d12(D3D12_FILL_MODE mode)
+ {
+     switch (mode)
+@@ -6612,10 +6716,11 @@ static HRESULT d3d12_pipeline_state_create_internal(struct d3d12_device *device,
+          * We are at risk of compiling code on the fly in some upcoming situations. */
+         object->pso_is_loaded_from_cached_blob = true;
+     }
+-    else if (device->disk_cache.library)
++    else if (device->disk_cache.library && !d3d12_pipeline_state_is_msc_bridge(object))
+     {
+         /* We compiled this PSO without any cache (internal or app-provided),
+          * so we should serialize this to internal disk cache.
++         * Bridge PSOs have no SPIR-V to store.
+          * Pushes work to disk$ thread. */
+         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
+     }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ca842d4d..9e7bcecb 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1368,6 +1368,8 @@ struct vkd3d_view
+             unsigned int w_size;
+         } texture;
+     } info;
++    /* Metal resource ID of this view for the Metal Shader Converter bridge, 0 until first queried. */
++    uint64_t msc_handle;
+ };
+ 
+ void vkd3d_view_decref(struct vkd3d_view *view, struct d3d12_device *device);
+@@ -1615,6 +1617,16 @@ union vkd3d_descriptor_info
+     VkDeviceAddress va;
+ };
+ 
++/* Metal Shader Converter bridge (docs/MSC-BRIDGE-CONTRACT.md): a shadow descriptor heap entry,
++ * the converter's IRDescriptorTableEntry. */
++struct vkd3d_msc_descriptor
++{
++    uint64_t gpu_va;
++    uint64_t texture_view_id;
++    uint64_t metadata;
++};
++STATIC_ASSERT(sizeof(struct vkd3d_msc_descriptor) == 24);
++
+ /* ID3D12DescriptorHeap */
+ struct d3d12_null_descriptor_template
+ {
+@@ -1698,6 +1710,16 @@ struct d3d12_descriptor_heap
+ 
+     struct d3d12_null_descriptor_template null_descriptor_template;
+ 
++    /* Shadow heap of the Metal Shader Converter bridge (METALSHARP_MSC), one entry per descriptor.
++     * entries is NULL unless the bridge is on. */
++    struct
++    {
++        struct vkd3d_msc_descriptor *entries;
++        VkBuffer vk_buffer;
++        struct vkd3d_device_memory_allocation device_allocation;
++        VkDeviceAddress va;
++    } msc;
++
+     struct d3d12_device *device;
+ 
+     struct vkd3d_private_store private_store;
+@@ -1870,6 +1892,29 @@ static inline struct d3d12_desc_split d3d12_desc_decode_va(vkd3d_cpu_descriptor_
+     return split;
+ }
+ 
++/* Metal Shader Converter bridge: updates the shadow entry of a descriptor. A no-op unless the bridge is on. */
++static inline void d3d12_desc_msc_write(const struct d3d12_desc_split *d,
++        uint64_t gpu_va, uint64_t texture_view_id, uint64_t metadata)
++{
++    struct vkd3d_msc_descriptor *entry;
++
++    if (VKD3D_EXPECT_TRUE(!d->heap->msc.entries))
++        return;
++
++    entry = &d->heap->msc.entries[d->offset];
++    entry->gpu_va = gpu_va;
++    entry->texture_view_id = texture_view_id;
++    entry->metadata = metadata;
++}
++
++/* Metal resource ID of a view (VK_NVX_image_view_handle), cached in the view. */
++uint64_t vkd3d_msc_get_view_handle(struct d3d12_device *device, struct vkd3d_view *view,
++        VkDescriptorType vk_descriptor_type);
++uint64_t vkd3d_msc_buffer_metadata(uint32_t range, uint32_t element_offset, bool typed);
++
++HRESULT d3d12_descriptor_heap_init_msc(struct d3d12_descriptor_heap *descriptor_heap);
++void d3d12_descriptor_heap_cleanup_msc(struct d3d12_descriptor_heap *descriptor_heap);
++
+ static inline uint32_t d3d12_desc_heap_offset_from_embedded_gpu_handle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
+         unsigned int cbv_srv_uav_size_log2, unsigned int sampler_size_log2)
+ {
+@@ -2012,6 +2057,14 @@ struct vkd3d_descriptor_hoist_info
+     unsigned int num_desc;
+ };
+ 
++struct vkd3d_msc_root_parameter
++{
++    uint16_t offset; /* in the top-level argument buffer */
++    uint8_t type; /* D3D12_ROOT_PARAMETER_TYPE */
++    uint8_t sampler_table;
++    uint32_t constant_count;
++};
++
+ enum vkd3d_root_signature_heap_redzone_style
+ {
+     VKD3D_ROOT_SIGNATURE_HEAP_REDZONE_STYLE_NONE = 0,
+@@ -2097,6 +2150,19 @@ struct d3d12_root_signature
+ 
+     struct vkd3d_descriptor_hoist_info hoist_info;
+ 
++    /* Metal Shader Converter bridge: the flattened root signature (contract section 1) and the top-level
++     * argument buffer layout (section 2). root_sig is NULL when the bridge is off or the root signature
++     * can't use it. */
++    struct
++    {
++        uint32_t *root_sig;
++        size_t root_sig_size;
++        struct vkd3d_msc_root_parameter *parameters;
++        unsigned int parameter_count;
++        uint32_t top_level_size;
++        VkPipelineLayout vk_pipeline_layout;
++    } msc;
++
+     struct d3d12_device *device;
+ 
+     struct vkd3d_private_store private_store;
+@@ -2407,8 +2473,20 @@ struct d3d12_compute_pipeline_state
+     struct vkd3d_shader_code_debug code_debug;
+     VkShaderModuleIdentifierEXT identifier;
+     VkPipelineShaderStageModuleIdentifierCreateInfoEXT identifier_create_info;
++
++    /* Metal Shader Converter bridge: vk_pipeline is the converter's pipeline. ExecuteIndirect can't
++     * feed it, and uses msc_spirv_pipeline instead, compiled on first need from the kept DXIL. */
++    bool msc_bridge;
++    void *msc_dxil;
++    size_t msc_dxil_size;
++    VkPipeline msc_spirv_pipeline;
+ };
+ 
++/* d3d12_pipeline_state_init_compile_arguments() reads graphics.cached_desc for compute PSOs too:
++ * the compute state must stay clear of it in the union. */
++STATIC_ASSERT(sizeof(struct d3d12_compute_pipeline_state) <=
++        offsetof(struct d3d12_graphics_pipeline_state, cached_desc));
++
+ /* To be able to load a pipeline from cache, this information must match exactly,
+  * otherwise, we must regard the PSO as incompatible (which is invalid usage and must be validated). */
+ struct vkd3d_pipeline_cache_compatibility
+@@ -2479,6 +2557,25 @@ ULONG d3d12_pipeline_state_inc_public_ref(struct d3d12_pipeline_state *state);
+ void d3d12_pipeline_state_inc_ref(struct d3d12_pipeline_state *state);
+ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state);
+ 
++static inline bool d3d12_pipeline_state_is_msc_bridge(const struct d3d12_pipeline_state *state)
++{
++    return d3d12_pipeline_state_is_compute(state) && state->compute.msc_bridge;
++}
++
++VkPipeline d3d12_pipeline_state_get_msc_spirv_pipeline(struct d3d12_pipeline_state *state);
++
++/* Metal Shader Converter bridge (docs/MSC-BRIDGE-CONTRACT.md). */
++bool vkd3d_msc_requested(void);
++void vkd3d_msc_bridge_init(struct d3d12_device *device);
++void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
++        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc);
++void d3d12_root_signature_cleanup_msc(struct d3d12_root_signature *root_signature,
++        struct d3d12_device *device);
++bool vkd3d_msc_shader_is_dxil(const D3D12_SHADER_BYTECODE *code);
++HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
++        const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code,
++        VkPipeline *vk_pipeline);
++
+ struct d3d12_cached_pipeline_state
+ {
+     D3D12_CACHED_PIPELINE_STATE blob;
+@@ -3526,6 +3623,17 @@ struct d3d12_command_list
+ 
+     union vkd3d_descriptor_heap_state descriptor_heap;
+ 
++    /* Metal Shader Converter bridge: what the compute top-level argument buffer needs and the
++     * bindings don't keep (a root CBV's VA is lost in its push descriptor). */
++    struct
++    {
++        VkDeviceAddress shadow_va_resource;
++        VkDeviceAddress shadow_va_sampler;
++        VkDeviceAddress root_descriptor_vas[D3D12_MAX_ROOT_COST];
++        /* Set around ExecuteIndirect: bind the SPIR-V pipeline of a bridge PSO. */
++        bool use_spirv;
++    } msc;
++
+     struct d3d12_pipeline_state *state;
+     struct d3d12_rt_state_object *rt_state;
+     D3D12_SET_WORK_GRAPH_DESC wg_state;
+@@ -5938,6 +6046,11 @@ struct d3d12_device
+     unsigned int format_compatibility_list_count;
+     const struct vkd3d_format_compatibility_list *format_compatibility_lists;
+     struct vkd3d_bindless_state bindless_state;
++    /* Metal Shader Converter bridge for compute pipelines (METALSHARP_MSC=1). */
++    struct
++    {
++        bool enabled;
++    } msc;
+     struct vkd3d_queue_timeline_trace queue_timeline_trace;
+     struct vkd3d_memory_info memory_info;
+     struct vkd3d_meta_ops meta_ops;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 79818bad2930ef73adb21f2638e80f3676b0cbc7 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 14:27:56 -0600
+Subject: [PATCH 25/30] vkd3d: Metal Shader Converter bridge on by default
+ (METALSHARP_MSC=0 turns it off)
+
+---
+ libs/vkd3d/device.c     |  2 +-
+ libs/vkd3d/msc_bridge.c | 11 ++++++-----
+ 2 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index c9ebe4ab..718482b8 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2473,7 +2473,7 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     vkd3d_trace_physical_device_limits(physical_device_info);
+ 
+     /* MoltenVK exposes VK_NVX_image_view_handle for the Metal Shader Converter bridge only:
+-     * without METALSHARP_MSC=1, leave it off so nothing else picks it up. */
++     * with METALSHARP_MSC=0, leave it off so nothing else picks it up. */
+     if (physical_device_info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK && !vkd3d_msc_requested())
+     {
+         vulkan_info->NVX_image_view_handle = false;
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+index 1da79506..501f716c 100644
+--- a/libs/vkd3d/msc_bridge.c
++++ b/libs/vkd3d/msc_bridge.c
+@@ -1,7 +1,7 @@
+ /*
+  * Metal Shader Converter bridge, VKD3D-Proton side (docs/MSC-BRIDGE-CONTRACT.md in MetalSharp Wine).
+  *
+- * With METALSHARP_MSC=1, compute PSOs whose shader is DXIL are handed to MoltenVK as a blob of DXIL plus the
++ * Unless METALSHARP_MSC=0, compute PSOs whose shader is DXIL are handed to MoltenVK as a blob of DXIL plus the
+  * flattened root signature, which MoltenVK converts with Apple's Metal Shader Converter. The converted shader
+  * reads its resources through the converter's top-level argument buffer, which VKD3D-Proton pushes as push
+  * constants, and through shadow descriptor heaps of 24-byte entries that VKD3D-Proton keeps next to every
+@@ -51,10 +51,11 @@ struct vkd3d_msc_blob_header
+ #define VKD3D_MSC_RANGE_WORDS 6u
+ #define VKD3D_MSC_STATIC_SAMPLER_WORDS 13u
+ 
++/* On by default: METALSHARP_MSC=0 keeps every compute PSO on SPIR-V. */
+ bool vkd3d_msc_requested(void)
+ {
+     char value[8];
+-    return vkd3d_get_env_var("METALSHARP_MSC", value, sizeof(value)) && !strcmp(value, "1");
++    return !vkd3d_get_env_var("METALSHARP_MSC", value, sizeof(value)) || strcmp(value, "0");
+ }
+ 
+ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+@@ -66,13 +67,13 @@ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+ 
+     if (!device->vk_info.NVX_image_view_handle || !device->vk_procs.vkGetImageViewHandle64NVX)
+     {
+-        INFO("METALSHARP_MSC=1, but VK_NVX_image_view_handle is unavailable; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: VK_NVX_image_view_handle is unavailable; compute stays on SPIR-V.\n");
+         return;
+     }
+ 
+     if (!device->device_info.vulkan_1_2_features.bufferDeviceAddress)
+     {
+-        INFO("METALSHARP_MSC=1, but buffer device address is unavailable; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: buffer device address is unavailable; compute stays on SPIR-V.\n");
+         return;
+     }
+ 
+@@ -80,7 +81,7 @@ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+     if (d3d12_device_use_descriptor_heap(device) || d3d12_device_uses_descriptor_buffers(device) ||
+             d3d12_device_use_embedded_mutable_descriptors(device))
+     {
+-        INFO("METALSHARP_MSC=1, but the device does not use descriptor sets; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: the device does not use descriptor sets; compute stays on SPIR-V.\n");
+         return;
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 958ca88538a84f01b3d64714b27a7bae1e7bfde0 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 14:41:56 -0600
+Subject: [PATCH 26/30] Metal Shader Converter bridge: SM 6.6 heap indexing;
+ root signatures with CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED or
+ SAMPLER_HEAP_DIRECTLY_INDEXED use the bridge, with the resource and sampler
+ shadow heaps' addresses pushed after the top-level argument buffer (blob
+ version 2)
+
+---
+ libs/vkd3d/command.c       | 13 ++++++++++---
+ libs/vkd3d/msc_bridge.c    | 35 ++++++++++++++++++++++++-----------
+ libs/vkd3d/vkd3d_private.h |  6 ++++++
+ 3 files changed, 40 insertions(+), 14 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index cfe58f6f..0f33ee7d 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8731,10 +8731,10 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+     uint32_t count;
+     unsigned int i;
+ 
+-    if (!root_signature->msc.top_level_size)
++    if (!root_signature->msc.push_size)
+         return;
+ 
+-    memset(data, 0, root_signature->msc.top_level_size);
++    memset(data, 0, root_signature->msc.push_size);
+ 
+     for (i = 0; i < root_signature->msc.parameter_count; i++)
+     {
+@@ -8766,8 +8766,15 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+         }
+     }
+ 
++    if (root_signature->msc.heaps_offset != VKD3D_MSC_NO_HEAPS)
++    {
++        memcpy(data + root_signature->msc.heaps_offset, &list->msc.shadow_va_resource, sizeof(VkDeviceAddress));
++        memcpy(data + root_signature->msc.heaps_offset + sizeof(VkDeviceAddress),
++                &list->msc.shadow_va_sampler, sizeof(VkDeviceAddress));
++    }
++
+     VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, root_signature->msc.vk_pipeline_layout,
+-            VK_SHADER_STAGE_COMPUTE_BIT, 0, root_signature->msc.top_level_size, data));
++            VK_SHADER_STAGE_COMPUTE_BIT, 0, root_signature->msc.push_size, data));
+ 
+     /* Like a meta shader's push: the bytes the root signature layouts pushed are gone, so the next
+      * flush pushes them again. */
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+index 501f716c..fb8df1b8 100644
+--- a/libs/vkd3d/msc_bridge.c
++++ b/libs/vkd3d/msc_bridge.c
+@@ -29,9 +29,9 @@
+ #include "vkd3d_common.h"
+ 
+ #define VKD3D_MSC_BLOB_MAGIC 0x4d534358u /* "XCSM" in memory */
+-#define VKD3D_MSC_BLOB_VERSION 1u
++#define VKD3D_MSC_BLOB_VERSION 2u
+ #define VKD3D_MSC_STAGE_COMPUTE 0u
+-#define VKD3D_MSC_MAX_TOP_LEVEL_SIZE 4096u
++#define VKD3D_MSC_MAX_PUSH_SIZE 4096u
+ 
+ struct vkd3d_msc_blob_header
+ {
+@@ -42,7 +42,9 @@ struct vkd3d_msc_blob_header
+     uint32_t dxil_size;
+     uint32_t root_sig_offset;
+     uint32_t root_sig_size;
+-    uint32_t reserved;
++    uint32_t heaps_offset;
++    uint32_t vertex_input_offset;
++    uint32_t vertex_input_count;
+ };
+ 
+ /* Words per entry of the flattened root signature. */
+@@ -227,10 +229,7 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+     if (!device->msc.enabled)
+         return;
+ 
+-    /* SM 6.6 heap indexing is out of scope for version 1 of the bridge. */
+-    if (desc->Flags & (D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE |
+-            D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+-            D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))
++    if (desc->Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE)
+         return;
+ 
+     if (desc->NumParameters && !(parameters = vkd3d_calloc(desc->NumParameters, sizeof(*parameters))))
+@@ -268,7 +267,19 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+     }
+ 
+     offset = align(offset, sizeof(uint64_t));
+-    if (offset > VKD3D_MSC_MAX_TOP_LEVEL_SIZE)
++    root_signature->msc.top_level_size = offset;
++
++    /* SM 6.6 shaders index the heaps directly; MoltenVK binds them from the two addresses after the
++     * top-level argument buffer. */
++    root_signature->msc.heaps_offset = VKD3D_MSC_NO_HEAPS;
++    if (desc->Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
++            D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))
++    {
++        root_signature->msc.heaps_offset = offset;
++        offset += 2 * sizeof(VkDeviceAddress);
++    }
++
++    if (offset > VKD3D_MSC_MAX_PUSH_SIZE)
+     {
+         TRACE("Top-level argument buffer of %"PRIu64" bytes is too large for the bridge.\n", offset);
+         vkd3d_free(parameters);
+@@ -356,7 +367,7 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+         sampler[12] = s->ShaderVisibility;
+     }
+ 
+-    /* No descriptor sets, one compute push-constant range covering the top-level argument buffer. */
++    /* No descriptor sets, one compute push-constant range covering the top-level argument buffer and heaps. */
+     push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+     push_range.offset = 0;
+     push_range.size = offset;
+@@ -379,7 +390,7 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+     root_signature->msc.root_sig_size = word_count * sizeof(*words);
+     root_signature->msc.parameters = parameters;
+     root_signature->msc.parameter_count = desc->NumParameters;
+-    root_signature->msc.top_level_size = offset;
++    root_signature->msc.push_size = offset;
+ }
+ 
+ void d3d12_root_signature_cleanup_msc(struct d3d12_root_signature *root_signature,
+@@ -449,7 +460,9 @@ HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
+     header->dxil_size = code->BytecodeLength;
+     header->root_sig_offset = align(sizeof(*header) + code->BytecodeLength, sizeof(uint32_t));
+     header->root_sig_size = root_signature->msc.root_sig_size;
+-    header->reserved = 0;
++    header->heaps_offset = root_signature->msc.heaps_offset;
++    header->vertex_input_offset = 0;
++    header->vertex_input_count = 0;
+     memcpy(blob + header->dxil_offset, code->pShaderBytecode, code->BytecodeLength);
+     memcpy(blob + header->root_sig_offset, root_signature->msc.root_sig, root_signature->msc.root_sig_size);
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 9e7bcecb..ad420a07 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2057,6 +2057,8 @@ struct vkd3d_descriptor_hoist_info
+     unsigned int num_desc;
+ };
+ 
++#define VKD3D_MSC_NO_HEAPS UINT32_MAX
++
+ struct vkd3d_msc_root_parameter
+ {
+     uint16_t offset; /* in the top-level argument buffer */
+@@ -2160,6 +2162,10 @@ struct d3d12_root_signature
+         struct vkd3d_msc_root_parameter *parameters;
+         unsigned int parameter_count;
+         uint32_t top_level_size;
++        /* SM 6.6 heap indexing: where the resource and sampler shadow heaps' addresses follow the top-level
++         * argument buffer in the push constants, or VKD3D_MSC_NO_HEAPS. */
++        uint32_t heaps_offset;
++        uint32_t push_size;
+         VkPipelineLayout vk_pipeline_layout;
+     } msc;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 7e788f1acd64dc45b2616afe7152f425a11184e7 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 15:28:26 -0600
+Subject: [PATCH 27/30] vkd3d-shader: VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER,
+ set when the DXIL shader declares or reaches (heap-indexed included) a typed
+ buffer SRV or UAV
+
+---
+ include/vkd3d_shader.h   |  4 +++-
+ libs/vkd3d-shader/dxil.c | 14 ++++++++++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
+index 21dfc735..c9d841ea 100644
+--- a/include/vkd3d_shader.h
++++ b/include/vkd3d_shader.h
+@@ -88,7 +88,9 @@ enum vkd3d_shader_meta_flags
+     VKD3D_SHADER_META_FLAG_FORCE_GRAPHICS_BARRIER_BEFORE_DRAW = 1 << 27,
+     VKD3D_SHADER_META_FLAG_FEEDBACK_LOOP = 1 << 28,
+     VKD3D_SHADER_META_FLAG_ALLOW_WAVE32 = 1 << 29,
+-    VKD3D_SHADER_META_FLAG_USES_UAV = 1 << 30
++    VKD3D_SHADER_META_FLAG_USES_UAV = 1 << 30,
++    /* The shader declares or reaches a typed buffer (Buffer<T>, RWBuffer<T>), from a table or the heap. */
++    VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER = (int)(1u << 31)
+ };
+ 
+ struct vkd3d_shader_meta
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index e44e74d4..bb82272e 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -146,6 +146,7 @@ struct vkd3d_dxil_remap_userdata
+     unsigned int num_root_descriptors;
+     bool skip_heap_lowering;
+     bool *uses_uav; /* Set when the shader declares or reaches any UAV. */
++    bool *uses_typed_buffer; /* Set when the shader declares or reaches a typed buffer SRV or UAV. */
+ };
+ 
+ struct vkd3d_dxil_remap_info
+@@ -350,6 +351,9 @@ static dxil_spv_bool dxil_srv_remap(void *userdata, const dxil_spv_d3d_binding *
+     unsigned int resource_flags, resource_flags_ssbo;
+     bool use_ssbo;
+ 
++    if (remap->uses_typed_buffer && d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER)
++        *remap->uses_typed_buffer = true;
++
+     shader_interface_info = remap->shader_interface_info;
+     resource_flags_ssbo = dxil_resource_flags_from_kind(d3d_binding->kind, true);
+     resource_flags = dxil_resource_flags_from_kind(d3d_binding->kind, false);
+@@ -508,6 +512,8 @@ static dxil_spv_bool dxil_uav_remap(void *userdata, const dxil_spv_uav_d3d_bindi
+ 
+     if (remap->uses_uav)
+         *remap->uses_uav = true;
++    if (remap->uses_typed_buffer && d3d_binding->d3d_binding.kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER)
++        *remap->uses_typed_buffer = true;
+ 
+     shader_interface_info = remap->shader_interface_info;
+     resource_flags_ssbo = dxil_resource_flags_from_kind(d3d_binding->d3d_binding.kind, true);
+@@ -1488,6 +1494,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+ {
+     uint32_t wave_size_min, wave_size_max, wave_size_preferred;
+     struct vkd3d_dxil_remap_userdata remap_userdata;
++    bool uses_typed_buffer = false;
+     bool uses_uav = false;
+     unsigned int raw_va_binding_count = 0;
+     unsigned int num_root_descriptors = 0;
+@@ -1608,6 +1615,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     remap_userdata.quirks = quirks;
+     remap_userdata.skip_heap_lowering = false;
+     remap_userdata.uses_uav = &uses_uav;
++    remap_userdata.uses_typed_buffer = &uses_typed_buffer;
+ 
+     dxil_spv_converter_set_root_constant_word_count(converter, root_constant_words);
+     dxil_spv_converter_set_root_descriptor_count(converter, num_root_descriptors);
+@@ -1656,6 +1664,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     }
+     if (uses_uav)
+         spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_UAV;
++    if (uses_typed_buffer)
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER;
+ 
+     /* Late replacement for mesh shaders. */
+     if (shader_interface_info->stage == VK_SHADER_STAGE_MESH_BIT_EXT &&
+@@ -1773,6 +1783,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+     const struct vkd3d_shader_resource_binding *resource_binding;
+     const struct vkd3d_shader_root_parameter *root_parameter;
+     struct vkd3d_dxil_remap_userdata remap_userdata;
++    bool uses_typed_buffer = false;
+     bool uses_uav = false;
+     unsigned int num_root_descriptors = 0;
+     unsigned int root_constant_words = 0;
+@@ -2016,6 +2027,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+     remap_userdata.quirks = quirks;
+     remap_userdata.skip_heap_lowering = false;
+     remap_userdata.uses_uav = &uses_uav;
++    remap_userdata.uses_typed_buffer = &uses_typed_buffer;
+ 
+     dxil_spv_converter_set_root_constant_word_count(converter, root_constant_words);
+     dxil_spv_converter_set_root_descriptor_count(converter, num_root_descriptors);
+@@ -2037,6 +2049,8 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
+     }
+     if (uses_uav)
+         spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_UAV;
++    if (uses_typed_buffer)
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER;
+ 
+     if (!(code = vkd3d_malloc(compiled.size)))
+     {
+-- 
+2.54.0 (Apple Git-157)
+
+
+From fd98ea9dd0808d30529659f2dc2b86a0eacdd294 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 15:28:26 -0600
+Subject: [PATCH 28/30] Metal Shader Converter bridge for graphics: PSOs of a
+ DXIL vertex and pixel shader (no stream output, dual-source blending or view
+ instancing) get the converter's modules, with the vertex inputs' semantics
+ and Vulkan locations in the vertex blob, and a vertex+fragment push-constant
+ layout; every draw with a bridge pipeline pushes the top-level argument
+ buffer from the graphics bindings; ExecuteIndirect uses SPIR-V variants
+ (msc_spirv key), so bridge PSOs are never fully dynamic. PSOs that reach
+ typed buffers stay on SPIR-V (the converter reads them only through texel
+ views from element 0, and Metal texel views start 16-byte aligned); compute
+ PSOs compile their SPIR-V first to know, and are stored to the disk cache
+ like others. Raw and structured UAVs without a counter have no texel view in
+ the shadow heap, so IncrementCounter() doesn't reach their data
+
+---
+ libs/vkd3d/command.c       |  41 +++++---
+ libs/vkd3d/msc_bridge.c    | 189 ++++++++++++++++++++++++++++++++-----
+ libs/vkd3d/resource.c      |   4 +-
+ libs/vkd3d/state.c         |  89 ++++++++++++++---
+ libs/vkd3d/vkd3d_private.h |  19 ++++
+ 5 files changed, 293 insertions(+), 49 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 0f33ee7d..dd2bddd0 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7937,6 +7937,10 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+         return false;
+     }
+ 
++    /* A bridge PSO's pipelines take the top-level argument buffer, except the SPIR-V variants ExecuteIndirect uses. */
++    list->dynamic_state.msc_spirv = list->msc.use_spirv;
++    list->msc.graphics_bridge = list->state->graphics.msc_bridge && !list->msc.use_spirv;
++
+     /* Try to grab the pipeline we compiled ahead of time. If we cannot do so, fall back. */
+     if (!(vk_pipeline = d3d12_pipeline_state_get_pipeline(list->state,
+             &list->dynamic_state, list->dsv.format, &new_active_flags)))
+@@ -8717,13 +8721,15 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+ static void d3d12_command_list_check_pre_compute_barrier(
+         struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage);
+ 
+-/* Builds the Metal Shader Converter's top-level argument buffer (contract section 2) from the compute
+- * bindings and pushes all of it with the bridge layout. */
+-static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *list)
++/* Builds the Metal Shader Converter's top-level argument buffer (contract section 2) from the compute or
++ * graphics bindings and pushes all of it with the bridge layout. */
++static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *list, bool graphics)
+ {
+     const struct d3d12_root_signature *root_signature = list->state->root_signature;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+-    struct vkd3d_pipeline_bindings *bindings = &list->compute_bindings;
++    struct vkd3d_pipeline_bindings *bindings = graphics ? &list->graphics_bindings : &list->compute_bindings;
++    const VkDeviceAddress *root_descriptor_vas = graphics ? list->msc.graphics_root_descriptor_vas :
++            list->msc.root_descriptor_vas;
+     const struct d3d12_root_signature *bound = bindings->root_signature;
+     DECLSPEC_ALIGN(8) uint8_t data[4096];
+     const struct vkd3d_msc_root_parameter *p;
+@@ -8761,7 +8767,7 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+                 break;
+ 
+             default:
+-                memcpy(data + p->offset, &list->msc.root_descriptor_vas[i], sizeof(VkDeviceAddress));
++                memcpy(data + p->offset, &root_descriptor_vas[i], sizeof(VkDeviceAddress));
+                 break;
+         }
+     }
+@@ -8773,13 +8779,17 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+                 &list->msc.shadow_va_sampler, sizeof(VkDeviceAddress));
+     }
+ 
+-    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, root_signature->msc.vk_pipeline_layout,
+-            VK_SHADER_STAGE_COMPUTE_BIT, 0, root_signature->msc.push_size, data));
++    if (graphics)
++        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, root_signature->msc.vk_graphics_pipeline_layout,
++                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, root_signature->msc.push_size, data));
++    else
++        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, root_signature->msc.vk_pipeline_layout,
++                VK_SHADER_STAGE_COMPUTE_BIT, 0, root_signature->msc.push_size, data));
+ 
+     /* Like a meta shader's push: the bytes the root signature layouts pushed are gone, so the next
+      * flush pushes them again. */
+-    if (bound)
+-        d3d12_command_list_invalidate_push_constants(bindings);
++    if (list->compute_bindings.root_signature)
++        d3d12_command_list_invalidate_push_constants(&list->compute_bindings);
+     if (list->graphics_bindings.root_signature)
+         d3d12_command_list_invalidate_push_constants(&list->graphics_bindings);
+ }
+@@ -8796,7 +8806,7 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
+ 
+     /* Every dispatch with the bridge pipeline bound pushes the whole top-level argument buffer. */
+     if (d3d12_pipeline_state_is_msc_bridge(list->state) && list->current_pipeline == list->state->compute.vk_pipeline)
+-        d3d12_command_list_push_msc_arguments(list);
++        d3d12_command_list_push_msc_arguments(list, false);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
+@@ -9370,6 +9380,10 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+             d3d12_command_list_update_dynamic_state(list);
+ 
+         d3d12_command_list_update_descriptors(list);
++
++        /* Every draw with a bridge pipeline bound pushes the whole top-level argument buffer. */
++        if (list->msc.graphics_bridge)
++            d3d12_command_list_push_msc_arguments(list, true);
+     }
+ 
+     if (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE)
+@@ -15472,6 +15486,8 @@ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *li
+     /* A root CBV's VA doesn't survive in its push descriptor; the bridge needs every VA. */
+     if (bindings == &list->compute_bindings)
+         list->msc.root_descriptor_vas[index] = gpu_address;
++    else
++        list->msc.graphics_root_descriptor_vas[index] = gpu_address;
+ 
+     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
+         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
+@@ -19245,8 +19261,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+     if (sig_impl->requires_state_template)
+     {
+         /* Root arguments written on the GPU need the SPIR-V pipeline of a bridge PSO.
+-         * Rebind on both sides so the next plain dispatch gets the bridge pipeline again. */
+-        if (sig_impl->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE && d3d12_pipeline_state_is_msc_bridge(list->state))
++         * Rebind on both sides so the next plain dispatch or draw gets the bridge pipeline again. */
++        if (list->state && (d3d12_pipeline_state_is_msc_bridge(list->state) ||
++                (d3d12_pipeline_state_is_graphics(list->state) && list->state->graphics.msc_bridge)))
+         {
+             list->msc.use_spirv = true;
+             d3d12_command_list_invalidate_current_pipeline(list, false);
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+index fb8df1b8..9a965bf6 100644
+--- a/libs/vkd3d/msc_bridge.c
++++ b/libs/vkd3d/msc_bridge.c
+@@ -1,11 +1,11 @@
+ /*
+  * Metal Shader Converter bridge, VKD3D-Proton side (docs/MSC-BRIDGE-CONTRACT.md in MetalSharp Wine).
+  *
+- * Unless METALSHARP_MSC=0, compute PSOs whose shader is DXIL are handed to MoltenVK as a blob of DXIL plus the
+- * flattened root signature, which MoltenVK converts with Apple's Metal Shader Converter. The converted shader
+- * reads its resources through the converter's top-level argument buffer, which VKD3D-Proton pushes as push
+- * constants, and through shadow descriptor heaps of 24-byte entries that VKD3D-Proton keeps next to every
+- * descriptor heap.
++ * Unless METALSHARP_MSC=0, compute PSOs whose shader is DXIL, and graphics PSOs of a DXIL vertex and pixel shader,
++ * are handed to MoltenVK as blobs of DXIL plus the flattened root signature, which MoltenVK converts with Apple's
++ * Metal Shader Converter. The converted shaders read their resources through the converter's top-level argument
++ * buffer, which VKD3D-Proton pushes as push constants, and through shadow descriptor heaps of 24-byte entries that
++ * VKD3D-Proton keeps next to every descriptor heap.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -31,8 +31,17 @@
+ #define VKD3D_MSC_BLOB_MAGIC 0x4d534358u /* "XCSM" in memory */
+ #define VKD3D_MSC_BLOB_VERSION 2u
+ #define VKD3D_MSC_STAGE_COMPUTE 0u
++#define VKD3D_MSC_STAGE_VERTEX 1u
++#define VKD3D_MSC_STAGE_FRAGMENT 2u
+ #define VKD3D_MSC_MAX_PUSH_SIZE 4096u
+ 
++/* A vertex blob's input table entry: the Vulkan attribute location of a semantic, NUL-terminated. */
++struct vkd3d_msc_vertex_input
++{
++    uint32_t location;
++    char name[60];
++};
++
+ struct vkd3d_msc_blob_header
+ {
+     uint32_t magic;
+@@ -69,13 +78,13 @@ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+ 
+     if (!device->vk_info.NVX_image_view_handle || !device->vk_procs.vkGetImageViewHandle64NVX)
+     {
+-        INFO("Metal Shader Converter bridge: VK_NVX_image_view_handle is unavailable; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: VK_NVX_image_view_handle is unavailable; shaders stay on SPIR-V.\n");
+         return;
+     }
+ 
+     if (!device->device_info.vulkan_1_2_features.bufferDeviceAddress)
+     {
+-        INFO("Metal Shader Converter bridge: buffer device address is unavailable; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: buffer device address is unavailable; shaders stay on SPIR-V.\n");
+         return;
+     }
+ 
+@@ -83,12 +92,12 @@ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+     if (d3d12_device_use_descriptor_heap(device) || d3d12_device_uses_descriptor_buffers(device) ||
+             d3d12_device_use_embedded_mutable_descriptors(device))
+     {
+-        INFO("Metal Shader Converter bridge: the device does not use descriptor sets; compute stays on SPIR-V.\n");
++        INFO("Metal Shader Converter bridge: the device does not use descriptor sets; shaders stay on SPIR-V.\n");
+         return;
+     }
+ 
+     device->msc.enabled = true;
+-    INFO("Metal Shader Converter bridge enabled for compute pipelines.\n");
++    INFO("Metal Shader Converter bridge enabled for compute and graphics pipelines.\n");
+ }
+ 
+ uint64_t vkd3d_msc_get_view_handle(struct d3d12_device *device, struct vkd3d_view *view,
+@@ -367,7 +376,8 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+         sampler[12] = s->ShaderVisibility;
+     }
+ 
+-    /* No descriptor sets, one compute push-constant range covering the top-level argument buffer and heaps. */
++    /* No descriptor sets, one push-constant range covering the top-level argument buffer and heaps: for compute,
++     * and for the vertex and fragment stages, which share it. */
+     push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+     push_range.offset = 0;
+     push_range.size = offset;
+@@ -386,6 +396,18 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+         return;
+     }
+ 
++    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    if ((vr = VK_CALL(vkCreatePipelineLayout(device->vk_device, &layout_info, NULL,
++            &root_signature->msc.vk_graphics_pipeline_layout))) < 0)
++    {
++        WARN("Failed to create bridge graphics pipeline layout, vr %d.\n", vr);
++        VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->msc.vk_pipeline_layout, NULL));
++        root_signature->msc.vk_pipeline_layout = VK_NULL_HANDLE;
++        vkd3d_free(parameters);
++        vkd3d_free(words);
++        return;
++    }
++
+     root_signature->msc.root_sig = words;
+     root_signature->msc.root_sig_size = word_count * sizeof(*words);
+     root_signature->msc.parameters = parameters;
+@@ -399,6 +421,7 @@ void d3d12_root_signature_cleanup_msc(struct d3d12_root_signature *root_signatur
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+ 
+     VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->msc.vk_pipeline_layout, NULL));
++    VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->msc.vk_graphics_pipeline_layout, NULL));
+     vkd3d_free(root_signature->msc.root_sig);
+     vkd3d_free(root_signature->msc.parameters);
+ }
+@@ -429,25 +452,25 @@ bool vkd3d_msc_shader_is_dxil(const D3D12_SHADER_BYTECODE *code)
+     return false;
+ }
+ 
+-HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
+-        const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code,
+-        VkPipeline *vk_pipeline)
++/* The blob (contract section 1): header, DXIL container, flattened root signature and, for a vertex shader, its
++ * input table; every section 4-byte aligned. */
++static HRESULT vkd3d_msc_create_shader_module(struct d3d12_device *device,
++        const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code, uint32_t stage,
++        const struct vkd3d_msc_vertex_input *vertex_inputs, uint32_t vertex_input_count, VkShaderModule *vk_module)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+-    VkComputePipelineCreateInfo pipeline_info;
+     VkShaderModuleCreateInfo module_info;
+     struct vkd3d_msc_blob_header *header;
+-    VkShaderModule vk_module;
+-    size_t blob_size;
++    size_t blob_size, inputs_size;
+     uint8_t *blob;
+     VkResult vr;
+ 
+-    if (code->BytecodeLength > UINT32_MAX - sizeof(*header) - 3 - root_signature->msc.root_sig_size)
++    inputs_size = vertex_input_count * sizeof(*vertex_inputs);
++    if (code->BytecodeLength > UINT32_MAX - sizeof(*header) - 3 - root_signature->msc.root_sig_size - inputs_size)
+         return E_INVALIDARG;
+ 
+-    /* Header, DXIL container, flattened root signature; every section 4-byte aligned. */
+     blob_size = align(sizeof(*header) + code->BytecodeLength, sizeof(uint32_t));
+-    blob_size += root_signature->msc.root_sig_size;
++    blob_size += root_signature->msc.root_sig_size + inputs_size;
+ 
+     if (!(blob = vkd3d_calloc(1, blob_size)))
+         return E_OUTOFMEMORY;
+@@ -455,26 +478,42 @@ HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
+     header = (struct vkd3d_msc_blob_header *)blob;
+     header->magic = VKD3D_MSC_BLOB_MAGIC;
+     header->version = VKD3D_MSC_BLOB_VERSION;
+-    header->stage = VKD3D_MSC_STAGE_COMPUTE;
++    header->stage = stage;
+     header->dxil_offset = sizeof(*header);
+     header->dxil_size = code->BytecodeLength;
+     header->root_sig_offset = align(sizeof(*header) + code->BytecodeLength, sizeof(uint32_t));
+     header->root_sig_size = root_signature->msc.root_sig_size;
+     header->heaps_offset = root_signature->msc.heaps_offset;
+-    header->vertex_input_offset = 0;
+-    header->vertex_input_count = 0;
++    header->vertex_input_offset = vertex_input_count ? header->root_sig_offset + header->root_sig_size : 0;
++    header->vertex_input_count = vertex_input_count;
+     memcpy(blob + header->dxil_offset, code->pShaderBytecode, code->BytecodeLength);
+     memcpy(blob + header->root_sig_offset, root_signature->msc.root_sig, root_signature->msc.root_sig_size);
++    if (vertex_input_count)
++        memcpy(blob + header->vertex_input_offset, vertex_inputs, inputs_size);
+ 
+     memset(&module_info, 0, sizeof(module_info));
+     module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+     module_info.codeSize = blob_size;
+     module_info.pCode = (const uint32_t *)blob;
+ 
+-    vr = VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &vk_module));
++    vr = VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, vk_module));
+     vkd3d_free(blob);
+-    if (vr < 0)
+-        return hresult_from_vk_result(vr);
++    return hresult_from_vk_result(vr);
++}
++
++HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
++        const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code,
++        VkPipeline *vk_pipeline)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkComputePipelineCreateInfo pipeline_info;
++    VkShaderModule vk_module;
++    VkResult vr;
++    HRESULT hr;
++
++    if (FAILED(hr = vkd3d_msc_create_shader_module(device, root_signature, code, VKD3D_MSC_STAGE_COMPUTE,
++            NULL, 0, &vk_module)))
++        return hr;
+ 
+     memset(&pipeline_info, 0, sizeof(pipeline_info));
+     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+@@ -498,3 +537,103 @@ HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
+ 
+     return S_OK;
+ }
++
++/* A graphics PSO of a DXIL vertex shader and a DXIL pixel shader, and nothing that only SPIR-V pipelines can do,
++ * gets the converter's modules for both. Returns false, with nothing left behind, when it stays on SPIR-V. */
++bool d3d12_pipeline_state_init_graphics_msc(struct d3d12_pipeline_state *state,
++        const struct d3d12_pipeline_state_desc *desc)
++{
++    const struct vkd3d_shader_code vs_dxbc = {desc->vs.pShaderBytecode, desc->vs.BytecodeLength};
++    const struct vkd3d_shader_code ps_dxbc = {desc->ps.pShaderBytecode, desc->ps.BytecodeLength};
++    const struct d3d12_root_signature *root_signature = state->root_signature;
++    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    struct vkd3d_msc_vertex_input *vertex_inputs = NULL;
++    struct d3d12_device *device = state->device;
++    struct vkd3d_shader_signature signature;
++    uint32_t vertex_input_count = 0;
++    const char *reason = NULL;
++    unsigned int i, len;
++    HRESULT hr = S_OK;
++
++    if (!device->msc.enabled)
++        return false;
++
++    memset(&signature, 0, sizeof(signature));
++
++    if (!root_signature || !root_signature->msc.root_sig)
++        reason = "root signature not supported";
++    else if (graphics->stage_flags != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) ||
++            !desc->ps.BytecodeLength)
++        reason = "not a vertex and pixel shader";
++    else if (!vkd3d_msc_shader_is_dxil(&desc->vs) || !vkd3d_msc_shader_is_dxil(&desc->ps))
++        reason = "not DXIL";
++    else if (graphics->xfb_buffer_count || graphics->cached_desc.xfb_info)
++        reason = "stream output";
++    else if (graphics->cached_desc.is_dual_source_blending)
++        reason = "dual-source blending";
++    else if (graphics->multiview.view_mask)
++        reason = "view instancing";
++    else if ((graphics->code[0].meta.flags | graphics->code[1].meta.flags) & VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER)
++        reason = "typed buffers";
++    else if (vkd3d_shader_parse_input_signature(&vs_dxbc, &signature) < 0)
++        reason = "vertex input signature";
++    else if (signature.element_count && !(vertex_inputs = vkd3d_calloc(signature.element_count, sizeof(*vertex_inputs))))
++        reason = "out of memory";
++
++    /* The Vulkan location of each vertex input (its register, as for SPIR-V), by semantic and index. */
++    for (i = 0; !reason && i < signature.element_count; i++)
++    {
++        const struct vkd3d_shader_signature_element *e = &signature.elements[i];
++
++        if (e->sysval_semantic != VKD3D_SV_NONE)
++            continue;
++
++        len = snprintf(vertex_inputs[vertex_input_count].name, sizeof(vertex_inputs[vertex_input_count].name),
++                "%s%u", e->semantic_name, e->semantic_index);
++        if (len >= sizeof(vertex_inputs[vertex_input_count].name))
++            reason = "vertex input semantic too long";
++        vertex_inputs[vertex_input_count++].location = e->register_index;
++    }
++
++    for (i = 0; !reason && i < graphics->stage_count; i++)
++    {
++        if (graphics->stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT)
++            hr = vkd3d_msc_create_shader_module(device, root_signature, &desc->vs, VKD3D_MSC_STAGE_VERTEX,
++                    vertex_inputs, vertex_input_count, &graphics->msc_modules[i]);
++        else
++            hr = vkd3d_msc_create_shader_module(device, root_signature, &desc->ps, VKD3D_MSC_STAGE_FRAGMENT,
++                    NULL, 0, &graphics->msc_modules[i]);
++        if (FAILED(hr))
++            reason = "shader module creation failed";
++    }
++
++    vkd3d_shader_free_shader_signature(&signature);
++    vkd3d_free(vertex_inputs);
++
++    if (reason)
++    {
++        d3d12_pipeline_state_cleanup_graphics_msc(state);
++        INFO("Graphics PSO vs %016"PRIx64" ps %016"PRIx64": SPIR-V (%s, hr %#x).\n",
++                vkd3d_shader_hash(&vs_dxbc), vkd3d_shader_hash(&ps_dxbc), reason, (int)hr);
++        VKD3D_MS_TRACE(SHADER, "MSC bridge: vs %016"PRIx64" ps %016"PRIx64" -> SPIR-V (%s, hr %#x).",
++                vkd3d_shader_hash(&vs_dxbc), vkd3d_shader_hash(&ps_dxbc), reason, (int)hr);
++        return false;
++    }
++
++    graphics->msc_bridge = true;
++    return true;
++}
++
++void d3d12_pipeline_state_cleanup_graphics_msc(struct d3d12_pipeline_state *state)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
++    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(graphics->msc_modules); i++)
++    {
++        VK_CALL(vkDestroyShaderModule(state->device->vk_device, graphics->msc_modules[i], NULL));
++        graphics->msc_modules[i] = VK_NULL_HANDLE;
++    }
++    graphics->msc_bridge = false;
++}
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index bd9f9c76..13cbb005 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -8194,8 +8194,10 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
+         }
+         else
+         {
++            /* Without a counter, a raw or structured UAV has no texel view, as IRDescriptorTableSetBufferView
++             * leaves it: IncrementCounter() must not reach the data. */
+             d3d12_desc_msc_write(&d, d.view->info.buffer.va,
+-                    vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
++                    desc_is_raw ? 0 : vkd3d_msc_get_view_handle(device, view, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
+                     vkd3d_msc_buffer_metadata(d.view->info.buffer.range, bound_range.element_offset, !desc_is_raw));
+         }
+     }
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index a8ce44be..875b8843 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2801,6 +2801,7 @@ static void d3d12_pipeline_state_destroy_graphics(struct d3d12_pipeline_state *s
+     struct vkd3d_compiled_pipeline *current, *e;
+ 
+     d3d12_pipeline_state_destroy_shader_modules(state, device);
++    d3d12_pipeline_state_cleanup_graphics_msc(state);
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(current, e, &graphics->compiled_fallback_pipelines, struct vkd3d_compiled_pipeline, entry)
+     {
+@@ -3717,6 +3718,10 @@ static bool d3d12_pipeline_state_init_compute_msc(struct d3d12_pipeline_state *s
+         reason = "root signature not supported";
+     else if (!vkd3d_msc_shader_is_dxil(code))
+         reason = "not DXIL";
++    /* The converter reads typed buffers through their texel views only, from element 0 and as long as the view,
++     * and Metal texel views start 16-byte aligned: typed views that start elsewhere can't be expressed. */
++    else if (state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER)
++        reason = "typed buffers";
+     else if (!(state->compute.msc_dxil = vkd3d_malloc(code->BytecodeLength)))
+         reason = "out of memory";
+     else if (FAILED(hr = vkd3d_msc_create_compute_pipeline(device, root_signature, code,
+@@ -3736,8 +3741,6 @@ static bool d3d12_pipeline_state_init_compute_msc(struct d3d12_pipeline_state *s
+     memcpy(state->compute.msc_dxil, code->pShaderBytecode, code->BytecodeLength);
+     state->compute.msc_dxil_size = code->BytecodeLength;
+     state->compute.msc_bridge = true;
+-    /* There is no SPIR-V: keep the hash that workarounds, profiling and tooling key on. */
+-    state->compute.code.meta.hash = hash;
+ 
+     INFO("Compute PSO cs %016"PRIx64": Metal Shader Converter (%.2f ms).\n",
+             hash, (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6);
+@@ -3760,12 +3763,17 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+     shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
+             device->descriptor_qa_global_info, desc->cs.pShaderBytecode, desc->cs.BytecodeLength);
+ 
+-    if (!device->msc.enabled || !d3d12_pipeline_state_init_compute_msc(state, device, &desc->cs))
+-    {
+-        vkd3d_load_spirv_from_cached_state(device, cached_pso,
+-                VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code,
+-                &state->compute.identifier_create_info);
++    vkd3d_load_spirv_from_cached_state(device, cached_pso,
++            VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code,
++            &state->compute.identifier_create_info);
+ 
++    /* The bridge decides from the shader's meta (typed buffers), which its SPIR-V compile provides; that SPIR-V
++     * is cached and serialized like any other. */
++    if (!device->msc.enabled || !vkd3d_msc_shader_is_dxil(&desc->cs) ||
++            FAILED(vkd3d_compile_shader_stage(state, device, VK_SHADER_STAGE_COMPUTE_BIT,
++                    &desc->cs, &state->compute.code, NULL)) ||
++            !d3d12_pipeline_state_init_compute_msc(state, device, &desc->cs))
++    {
+         hr = vkd3d_create_compute_pipeline(state, device, &desc->cs, &state->compute.code,
+                 &state->compute.identifier_create_info, state->vk_pso_cache, &state->compute.vk_pipeline);
+ 
+@@ -6324,7 +6332,29 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
+             return E_OUTOFMEMORY;
+     }
+ 
+-    if (can_compile_pipeline_early)
++    /* Metal Shader Converter bridge: the base pipeline and its variants use the converter's modules, unless the
++     * base pipeline fails with them; then the PSO is a SPIR-V one like any other. */
++    if (can_compile_pipeline_early && !graphics->library && d3d12_pipeline_state_init_graphics_msc(state, desc))
++    {
++        uint64_t start_ns = vkd3d_get_current_time_ns();
++
++        graphics->pipeline = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
++                state->vk_pso_cache, 0, &graphics->pipeline_dynamic_states);
++
++        INFO("Graphics PSO vs %016"PRIx64" ps %016"PRIx64": %s (%.2f ms).\n",
++                graphics->code[0].meta.hash, graphics->code[1].meta.hash,
++                graphics->pipeline ? "Metal Shader Converter" : "SPIR-V (bridge pipeline creation failed)",
++                (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6);
++        VKD3D_MS_TRACE(SHADER, "MSC bridge: graphics PSO vs %016"PRIx64" ps %016"PRIx64" -> %s, %.2f ms.",
++                graphics->code[0].meta.hash, graphics->code[1].meta.hash,
++                graphics->pipeline ? "Metal Shader Converter" : "SPIR-V (bridge pipeline creation failed)",
++                (double)(vkd3d_get_current_time_ns() - start_ns) / 1.0e6);
++
++        if (!graphics->pipeline)
++            d3d12_pipeline_state_cleanup_graphics_msc(state);
++    }
++
++    if (can_compile_pipeline_early && !graphics->pipeline)
+     {
+         if (!(graphics->pipeline = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
+                 state->vk_pso_cache, 0, &graphics->pipeline_dynamic_states)))
+@@ -6366,6 +6396,10 @@ static HRESULT d3d12_pipeline_state_finish_graphics(struct d3d12_pipeline_state
+     if (graphics->multiview.dynamic_mask)
+         state->pso_is_fully_dynamic = false;
+ 
++    /* A bridge PSO may need its SPIR-V variant for ExecuteIndirect. */
++    if (graphics->msc_bridge)
++        state->pso_is_fully_dynamic = false;
++
+     if (!state->pso_is_fully_dynamic)
+     {
+         /* If we got here successfully without SPIR-V code,
+@@ -6672,7 +6706,10 @@ static HRESULT d3d12_pipeline_state_create_internal(struct d3d12_device *device,
+         d3d12_pipeline_state_free_spirv_code_debug(object);
+         d3d12_pipeline_state_destroy_shader_modules(object, device);
+         if (object->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || object->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
++        {
+             d3d12_pipeline_state_free_cached_desc(&object->graphics.cached_desc);
++            d3d12_pipeline_state_cleanup_graphics_msc(object);
++        }
+         VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
+         rwlock_destroy(&object->lock);
+ 
+@@ -6716,11 +6753,10 @@ static HRESULT d3d12_pipeline_state_create_internal(struct d3d12_device *device,
+          * We are at risk of compiling code on the fly in some upcoming situations. */
+         object->pso_is_loaded_from_cached_blob = true;
+     }
+-    else if (device->disk_cache.library && !d3d12_pipeline_state_is_msc_bridge(object))
++    else if (device->disk_cache.library)
+     {
+         /* We compiled this PSO without any cache (internal or app-provided),
+          * so we should serialize this to internal disk cache.
+-         * Bridge PSOs have no SPIR-V to store.
+          * Pushes work to disk$ thread. */
+         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
+     }
+@@ -6985,6 +7021,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     VkPipelineCreationFeedbackEXT feedbacks[VKD3D_MAX_SHADER_STAGES];
+     struct vkd3d_fragment_output_pipeline_desc fragment_output_desc;
+     VkPipelineShaderStageCreateInfo stages[VKD3D_MAX_SHADER_STAGES];
++    VkPipelineShaderStageCreateInfo msc_stages[VKD3D_MAX_SHADER_STAGES];
+     VkGraphicsPipelineLibraryCreateInfoEXT library_create_info;
+     struct vkd3d_vertex_input_pipeline_desc vertex_input_desc;
+     VkPipelineTessellationStateCreateInfo tessellation_info;
+@@ -7001,9 +7038,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     uint32_t stages_module_dup_mask = 0;
+     VkPipeline vk_pipeline;
+     unsigned int i;
++    bool use_msc;
+     VkResult vr;
+     HRESULT hr;
+ 
++    use_msc = graphics->msc_bridge && !(key && key->msc_spirv);
++
+     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
+             dynamic_state_buffer, key);
+ 
+@@ -7105,7 +7145,21 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics) && dsv_format)
+         TRACE("Compiling %p with fallback DSV format %#x.\n", state, dsv_format->vk_format);
+ 
+-    if (key)
++    if (use_msc)
++    {
++        /* The converter's modules in place of the SPIR-V ones; their resources come from the push constants. */
++        memcpy(msc_stages, graphics->stages, graphics->stage_count * sizeof(msc_stages[0]));
++        for (i = 0; i < graphics->stage_count; i++)
++        {
++            msc_stages[i].pNext = NULL;
++            msc_stages[i].flags = 0;
++            msc_stages[i].module = graphics->msc_modules[i];
++            msc_stages[i].pSpecializationInfo = NULL;
++        }
++        pipeline_desc.pStages = msc_stages;
++        pipeline_desc.layout = state->root_signature->msc.vk_graphics_pipeline_layout;
++    }
++    else if (key)
+     {
+         /* Need a reader lock here since a concurrent vkd3d_late_compile_shader_stages can
+          * touch the VkShaderModule and/or code[] array. When late compile has been called once,
+@@ -7233,6 +7287,14 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+ 
+     TRACE("Completed vkCreateGraphicsPipelines.\n");
+ 
++    if (vr < 0 && use_msc)
++    {
++        /* The caller goes on with SPIR-V. */
++        WARN("Failed to create Metal Shader Converter graphics pipeline, vr %d.\n", vr);
++        vk_pipeline = VK_NULL_HANDLE;
++        goto err;
++    }
++
+     if (vr < 0)
+     {
+         ERR("Failed to create Vulkan graphics pipeline, vr %d.\n", vr);
+@@ -7268,6 +7330,10 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
+     if (!graphics->pipeline)
+         return VK_NULL_HANDLE;
+ 
++    /* The base pipeline of a bridge PSO is a bridge pipeline. */
++    if (graphics->msc_bridge && dyn_state->msc_spirv)
++        return VK_NULL_HANDLE;
++
+     if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics) && dsv_format)
+     {
+         TRACE("Applying unknown DSV workaround with format %u buggy application!\n", dsv_format->vk_format);
+@@ -7349,6 +7415,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
+ 
+     pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
+     pipeline_key.view_mask = graphics->multiview.dynamic_mask ? dyn_state->view_mask : 0;
++    pipeline_key.msc_spirv = graphics->msc_bridge && dyn_state->msc_spirv;
+ 
+     if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ad420a07..35c05657 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2167,6 +2167,7 @@ struct d3d12_root_signature
+         uint32_t heaps_offset;
+         uint32_t push_size;
+         VkPipelineLayout vk_pipeline_layout;
++        VkPipelineLayout vk_graphics_pipeline_layout;
+     } msc;
+ 
+     struct d3d12_device *device;
+@@ -2465,6 +2466,12 @@ struct d3d12_graphics_pipeline_state
+     } multiview;
+ 
+     bool disable_optimization;
++
++    /* Metal Shader Converter bridge: the converter's vertex and fragment modules, by stage index, which pipelines
++     * use in place of the SPIR-V ones with the root signature's bridge layout. Variants keyed with msc_spirv
++     * (ExecuteIndirect, which writes root arguments in VKD3D-Proton's own layout) use SPIR-V. */
++    bool msc_bridge;
++    VkShaderModule msc_modules[VKD3D_MAX_SHADER_STAGES];
+ };
+ 
+ static inline unsigned int dsv_attachment_mask(const struct d3d12_graphics_pipeline_state *graphics)
+@@ -2578,6 +2585,10 @@ void d3d12_root_signature_init_msc(struct d3d12_root_signature *root_signature,
+ void d3d12_root_signature_cleanup_msc(struct d3d12_root_signature *root_signature,
+         struct d3d12_device *device);
+ bool vkd3d_msc_shader_is_dxil(const D3D12_SHADER_BYTECODE *code);
++struct d3d12_pipeline_state_desc;
++bool d3d12_pipeline_state_init_graphics_msc(struct d3d12_pipeline_state *state,
++        const struct d3d12_pipeline_state_desc *desc);
++void d3d12_pipeline_state_cleanup_graphics_msc(struct d3d12_pipeline_state *state);
+ HRESULT vkd3d_msc_create_compute_pipeline(struct d3d12_device *device,
+         const struct d3d12_root_signature *root_signature, const D3D12_SHADER_BYTECODE *code,
+         VkPipeline *vk_pipeline);
+@@ -2648,6 +2659,8 @@ struct vkd3d_pipeline_key
+     uint32_t view_mask;
+ 
+     bool dynamic_topology;
++    /* A SPIR-V variant of a Metal Shader Converter bridge PSO. */
++    bool msc_spirv;
+ };
+ 
+ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
+@@ -3001,6 +3014,9 @@ struct vkd3d_dynamic_state
+     uint32_t dirty_flags; /* vkd3d_dynamic_state_flags */
+     uint32_t dirty_vbos;
+ 
++    /* A bridge PSO's pipeline must be its SPIR-V variant (around ExecuteIndirect). */
++    bool msc_spirv;
++
+     uint32_t viewport_count;
+     VkViewport viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+     VkRect2D scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+@@ -3636,8 +3652,11 @@ struct d3d12_command_list
+         VkDeviceAddress shadow_va_resource;
+         VkDeviceAddress shadow_va_sampler;
+         VkDeviceAddress root_descriptor_vas[D3D12_MAX_ROOT_COST];
++        VkDeviceAddress graphics_root_descriptor_vas[D3D12_MAX_ROOT_COST];
+         /* Set around ExecuteIndirect: bind the SPIR-V pipeline of a bridge PSO. */
+         bool use_spirv;
++        /* The bound graphics pipeline is a bridge pipeline: draws push its top-level argument buffer. */
++        bool graphics_bridge;
+     } msc;
+ 
+     struct d3d12_pipeline_state *state;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 0c1d61c16c700892a0781c800136cad6ba49983d Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 15:41:17 -0600
+Subject: [PATCH 29/30] Metal Shader Converter bridge: METALSHARP_MSC=compute
+ keeps graphics PSOs on SPIR-V; PSOs with the depth bounds test aren't tried
+ with the bridge (MoltenVK emulates it in the fragment shader, so it refused
+ them only after converting)
+
+---
+ libs/vkd3d/msc_bridge.c    | 12 +++++++++---
+ libs/vkd3d/vkd3d_private.h |  3 ++-
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+index 9a965bf6..948cd98f 100644
+--- a/libs/vkd3d/msc_bridge.c
++++ b/libs/vkd3d/msc_bridge.c
+@@ -62,7 +62,7 @@ struct vkd3d_msc_blob_header
+ #define VKD3D_MSC_RANGE_WORDS 6u
+ #define VKD3D_MSC_STATIC_SAMPLER_WORDS 13u
+ 
+-/* On by default: METALSHARP_MSC=0 keeps every compute PSO on SPIR-V. */
++/* On by default: METALSHARP_MSC=0 keeps every PSO on SPIR-V (METALSHARP_MSC=compute: graphics ones). */
+ bool vkd3d_msc_requested(void)
+ {
+     char value[8];
+@@ -71,6 +71,8 @@ bool vkd3d_msc_requested(void)
+ 
+ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+ {
++    char value[16];
++
+     device->msc.enabled = false;
+ 
+     if (!vkd3d_msc_requested())
+@@ -97,7 +99,8 @@ void vkd3d_msc_bridge_init(struct d3d12_device *device)
+     }
+ 
+     device->msc.enabled = true;
+-    INFO("Metal Shader Converter bridge enabled for compute and graphics pipelines.\n");
++    device->msc.graphics = !vkd3d_get_env_var("METALSHARP_MSC", value, sizeof(value)) || strcmp(value, "compute");
++    INFO("Metal Shader Converter bridge enabled for compute%s pipelines.\n", device->msc.graphics ? " and graphics" : "");
+ }
+ 
+ uint64_t vkd3d_msc_get_view_handle(struct d3d12_device *device, struct vkd3d_view *view,
+@@ -555,7 +558,7 @@ bool d3d12_pipeline_state_init_graphics_msc(struct d3d12_pipeline_state *state,
+     unsigned int i, len;
+     HRESULT hr = S_OK;
+ 
+-    if (!device->msc.enabled)
++    if (!device->msc.enabled || !device->msc.graphics)
+         return false;
+ 
+     memset(&signature, 0, sizeof(signature));
+@@ -573,6 +576,9 @@ bool d3d12_pipeline_state_init_graphics_msc(struct d3d12_pipeline_state *state,
+         reason = "dual-source blending";
+     else if (graphics->multiview.view_mask)
+         reason = "view instancing";
++    /* MoltenVK emulates the depth bounds test in the fragment shader, which a converted one can't do. */
++    else if (graphics->ds_desc.depthBoundsTestEnable)
++        reason = "depth bounds test";
+     else if ((graphics->code[0].meta.flags | graphics->code[1].meta.flags) & VKD3D_SHADER_META_FLAG_USES_TYPED_BUFFER)
+         reason = "typed buffers";
+     else if (vkd3d_shader_parse_input_signature(&vs_dxbc, &signature) < 0)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 35c05657..0d497ea2 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -6071,10 +6071,11 @@ struct d3d12_device
+     unsigned int format_compatibility_list_count;
+     const struct vkd3d_format_compatibility_list *format_compatibility_lists;
+     struct vkd3d_bindless_state bindless_state;
+-    /* Metal Shader Converter bridge for compute pipelines (METALSHARP_MSC=1). */
++    /* Metal Shader Converter bridge (on unless METALSHARP_MSC=0; METALSHARP_MSC=compute leaves graphics on SPIR-V). */
+     struct
+     {
+         bool enabled;
++        bool graphics;
+     } msc;
+     struct vkd3d_queue_timeline_trace queue_timeline_trace;
+     struct vkd3d_memory_info memory_info;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9dc54f2ea21292fd7389d5f44820913fb5da3f2f Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 16:14:03 -0600
+Subject: [PATCH 30/30] METALSHARP_TRACE=gpu: check a bridge pipeline's
+ arguments before each draw and dispatch (root descriptors without an address,
+ tables without a heap or past it, heap indexing without a heap) and log the
+ first 200 problems
+
+---
+ libs/vkd3d/command.c       | 65 ++++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h |  1 +
+ 2 files changed, 66 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index dd2bddd0..d97a47e8 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8723,6 +8723,62 @@ static void d3d12_command_list_check_pre_compute_barrier(
+ 
+ /* Builds the Metal Shader Converter's top-level argument buffer (contract section 2) from the compute or
+  * graphics bindings and pushes all of it with the bridge layout. */
++/* METALSHARP_TRACE=gpu: what in a bridge pipeline's arguments a converted shader can't read safely (no bounds on root
++ * descriptors and table bases), logged for the first draws and dispatches it affects. */
++static void d3d12_command_list_check_msc_arguments(struct d3d12_command_list *list, bool graphics,
++        const struct vkd3d_pipeline_bindings *bindings, const VkDeviceAddress *root_descriptor_vas)
++{
++    const struct d3d12_root_signature *root_signature = list->state->root_signature;
++    const struct vkd3d_msc_root_parameter *p;
++    static unsigned int reported;
++    uint64_t vs = 0, ps = 0;
++    const char *problem;
++    uint32_t count;
++    unsigned int i;
++
++    if (reported >= 200)
++        return;
++
++    if (graphics)
++    {
++        vs = list->state->graphics.code[0].meta.hash;
++        ps = list->state->graphics.code[1].meta.hash;
++    }
++    else
++        vs = list->state->compute.code.meta.hash;
++
++    if (root_signature->msc.heaps_offset != VKD3D_MSC_NO_HEAPS && !list->msc.shadow_va_resource && reported++ < 200)
++        VKD3D_MS_TRACE(GPU, "MSC check: %s %016"PRIx64" %016"PRIx64": heap-indexing root signature without a bound CBV/SRV/UAV heap.",
++                graphics ? "vs/ps" : "cs", vs, ps);
++
++    for (i = 0; i < root_signature->msc.parameter_count; i++)
++    {
++        p = &root_signature->msc.parameters[i];
++        problem = NULL;
++        switch (p->type)
++        {
++            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
++                break;
++            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
++                count = p->sampler_table ? list->msc.sampler_heap_count : list->msc.resource_heap_count;
++                if (!(p->sampler_table ? list->msc.shadow_va_sampler : list->msc.shadow_va_resource))
++                    problem = "table without a bound heap";
++                else if (bindings->descriptor_tables[i] >= count)
++                    problem = "table starting past the heap";
++                break;
++            default:
++                if (!root_descriptor_vas[i])
++                    problem = "root descriptor without an address";
++                break;
++        }
++        if (problem && reported++ < 200)
++            VKD3D_MS_TRACE(GPU, "MSC check: %s %016"PRIx64" %016"PRIx64": root parameter %u (type %u): %s (table start %u, heap size %u).",
++                    graphics ? "vs/ps" : "cs", vs, ps, i, p->type, problem,
++                    p->type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? bindings->descriptor_tables[i] : 0,
++                    p->sampler_table ? list->msc.sampler_heap_count : list->msc.resource_heap_count);
++    }
++}
++
+ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *list, bool graphics)
+ {
+     const struct d3d12_root_signature *root_signature = list->state->root_signature;
+@@ -8740,6 +8796,9 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+     if (!root_signature->msc.push_size)
+         return;
+ 
++    if (VKD3D_MS_TRACE_ON(GPU))
++        d3d12_command_list_check_msc_arguments(list, graphics, bindings, root_descriptor_vas);
++
+     memset(data, 0, root_signature->msc.push_size);
+ 
+     for (i = 0; i < root_signature->msc.parameter_count; i++)
+@@ -15077,9 +15136,15 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+         if (heap->msc.entries)
+         {
+             if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++            {
+                 list->msc.shadow_va_resource = heap->msc.va;
++                list->msc.resource_heap_count = heap->desc.NumDescriptors;
++            }
+             else
++            {
+                 list->msc.shadow_va_sampler = heap->msc.va;
++                list->msc.sampler_heap_count = heap->desc.NumDescriptors;
++            }
+         }
+     }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 0d497ea2..1d718b48 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3651,6 +3651,7 @@ struct d3d12_command_list
+     {
+         VkDeviceAddress shadow_va_resource;
+         VkDeviceAddress shadow_va_sampler;
++        uint32_t resource_heap_count, sampler_heap_count; /* For the checks METALSHARP_TRACE=gpu makes. */
+         VkDeviceAddress root_descriptor_vas[D3D12_MAX_ROOT_COST];
+         VkDeviceAddress graphics_root_descriptor_vas[D3D12_MAX_ROOT_COST];
+         /* Set around ExecuteIndirect: bind the SPIR-V pipeline of a bridge PSO. */
 -- 
 2.54.0 (Apple Git-157)
 
