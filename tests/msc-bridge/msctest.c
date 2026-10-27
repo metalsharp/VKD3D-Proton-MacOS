@@ -163,6 +163,180 @@ static void transitionImage9(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
 }
 
+// A graphics pipeline over one render target of fmt, viewport and scissor dynamic; with the vertex layout of test 4 or none.
+static VkPipeline makeGraphicsPipeline(VkShaderModule vs, VkShaderModule fs, VkPipelineLayout layout, VkFormat fmt, int vertexInput) {
+    DFN(vkCreateGraphicsPipelines);
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" } };
+    VkVertexInputBindingDescription vb = { 0, 24, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va[2] = { { 3, 0, VK_FORMAT_R32G32_SFLOAT, 0 }, { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 8 } };
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = vertexInput ? 1 : 0, .pVertexBindingDescriptions = &vb,
+        .vertexAttributeDescriptionCount = vertexInput ? 2 : 0, .pVertexAttributeDescriptions = va };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_CLOCKWISE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xF };
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt };
+    VkGraphicsPipelineCreateInfo gpci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, .stageCount = 2, .pStages = stages,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = layout };
+    VkPipeline pl = VK_NULL_HANDLE;
+    VkResult res = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pl);
+    if (res != VK_SUCCESS) { printf("FAIL vkCreateGraphicsPipelines = %d\n", res); exit(1); }
+    return pl;
+}
+
+// Test 10: SPIR-V and bridge draws in one render pass, as games mix them. A bridge draw binds its heaps at Metal
+// buffers 0 and 1 and its top-level argument buffer at 2, where SPIR-V pipelines bind descriptor sets 0 to 2: the
+// SPIR-V draw after it must bind its sets again. Its uniform buffer holds green; the bridge's "heaps" are filled with
+// the address of a blue one, so a SPIR-V draw that reads its set from a heap draws blue instead of faulting.
+static void testInterleave(const char* vsDxil, const char* psDxil, const char* spvDir) {
+    DFN(vkCreateShaderModule); DFN(vkCreatePipelineLayout); DFN(vkCreateImage); DFN(vkGetImageMemoryRequirements);
+    DFN(vkAllocateMemory); DFN(vkBindImageMemory); DFN(vkCreateImageView); DFN(vkCreateCommandPool);
+    DFN(vkAllocateCommandBuffers); DFN(vkBeginCommandBuffer); DFN(vkCmdBindPipeline); DFN(vkCmdPushConstants);
+    DFN(vkCmdDraw); DFN(vkEndCommandBuffer); DFN(vkQueueSubmit); DFN(vkQueueWaitIdle); DFN(vkCmdPipelineBarrier);
+    DFN(vkCmdBeginRendering); DFN(vkCmdEndRendering); DFN(vkCmdSetViewport); DFN(vkCmdSetScissor);
+    DFN(vkCmdBindVertexBuffers); DFN(vkCmdCopyImageToBuffer); DFN(vkCreateDescriptorSetLayout);
+    DFN(vkCreateDescriptorPool); DFN(vkAllocateDescriptorSets); DFN(vkUpdateDescriptorSets); DFN(vkCmdBindDescriptorSets);
+    const uint32_t W = 8, H = 8;
+    const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    printf("\n== Test 10: SPIR-V, bridge (%s + %s, with heaps), SPIR-V draws in one render pass ==\n", vsDxil, psDxil);
+
+    // The bridge pipeline: test 4's shaders, with heap addresses after the 16 bytes of constants.
+    MSCRootParam params[1] = { { 1, 0, 0, 0, 4 } };
+    static const VtxInput inputs[2] = { { 3, "POSITION0" }, { 0, "COLOR0" } };
+    VkShaderModule mscModules[2];
+    const char* paths[2] = { vsDxil, psDxil };
+    g_rsFlags = 0x1 | 0x400 | 0x800; g_heapsOffset = 16;	// ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, heaps directly indexed
+    for (int st = 0; st < 2; st++) {
+        g_stage = 1 + st; g_vtxInputs = st ? NULL : inputs; g_vtxInputCount = st ? 0 : 2;
+        size_t dxilSize, blobSize; void* dxil = readFile(paths[st], &dxilSize);
+        uint32_t* blob = buildBlob(dxil, dxilSize, params, 1, NULL, 0, &blobSize);
+        VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = blobSize, .pCode = blob };
+        CHECK(vkCreateShaderModule(dev, &smci, NULL, &mscModules[st]));
+        free(blob); free(dxil);
+    }
+    g_stage = 0; g_vtxInputs = NULL; g_vtxInputCount = 0; g_rsFlags = 0; g_heapsOffset = NO_HEAPS;
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32 };
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    VkPipelineLayout mscLayout; CHECK(vkCreatePipelineLayout(dev, &plci, NULL, &mscLayout));
+    VkPipeline mscPipeline = makeGraphicsPipeline(mscModules[0], mscModules[1], mscLayout, fmt, 1);
+
+    // The SPIR-V pipeline: a full-target triangle colored from a uniform buffer in set 0.
+    VkShaderModule spvModules[2];
+    const char* spvNames[2] = { "il_vs.spv", "il_fs.spv" };
+    for (int st = 0; st < 2; st++) {
+        char path[1024]; snprintf(path, sizeof(path), "%s/%s", spvDir, spvNames[st]);
+        size_t size; void* code = readFile(path, &size);
+        VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = code };
+        CHECK(vkCreateShaderModule(dev, &smci, NULL, &spvModules[st]));
+        free(code);
+    }
+    VkDescriptorSetLayoutBinding dslb = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT };
+    VkDescriptorSetLayoutCreateInfo dslci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &dslb };
+    VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dslci, NULL, &dsl));
+    VkPipelineLayoutCreateInfo splci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl };
+    VkPipelineLayout spvLayout; CHECK(vkCreatePipelineLayout(dev, &splci, NULL, &spvLayout));
+    VkPipeline spvPipeline = makeGraphicsPipeline(spvModules[0], spvModules[1], spvLayout, fmt, 0);
+    VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
+    VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &dps };
+    VkDescriptorPool dpool; CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool));
+    VkDescriptorSetAllocateInfo dsai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+    VkDescriptorSet set; CHECK(vkAllocateDescriptorSets(dev, &dsai, &set));
+    static const float green[4] = { 0, 1, 0, 1 }, blue[4] = { 0, 0, 1, 1 };
+    Buf ubo = makeBuf(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT); memcpy(ubo.map, green, sizeof(green));
+    Buf decoy = makeBuf(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT); memcpy(decoy.map, blue, sizeof(blue));
+    VkDescriptorBufferInfo dbi = { ubo.buf, 0, 16 };
+    VkWriteDescriptorSet wds = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi };
+    vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+
+    // Both "heaps": every 8 bytes the blue buffer's address, so whatever a misbound set reads is a valid pointer.
+    Buf heap = makeBuf(4096, 0);
+    for (uint32_t i = 0; i < 4096 / 8; i++) ((uint64_t*)heap.map)[i] = decoy.va;
+
+    VkImageCreateInfo imci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt, .extent = { W, H, 1 },
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
+    VkImage img; CHECK(vkCreateImage(dev, &imci, NULL, &img));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img, &mr);
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, findMemType(mr.memoryTypeBits, 0) };
+    VkDeviceMemory imem; CHECK(vkAllocateMemory(dev, &ai, NULL, &imem)); CHECK(vkBindImageMemory(dev, img, imem, 0));
+    VkImageViewCreateInfo ivci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkImageView iv; CHECK(vkCreateImageView(dev, &ivci, NULL, &iv));
+    float verts[3][6] = { { -1, 0, 1, 0, 0, 1 }, { 3, 0, 1, 0, 0, 1 }, { -1, 4, 1, 0, 0, 1 } };	// test 4's red top half
+    Buf vbuf = makeBuf(sizeof(verts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); memcpy(vbuf.map, verts, sizeof(verts));
+    Buf rb = makeBuf(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qfam };
+    VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpi, NULL, &pool));
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cbuf; CHECK(vkAllocateCommandBuffers(dev, &cai, &cbuf));
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    CHECK(vkBeginCommandBuffer(cbuf, &bi));
+    VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = iv, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
+    VkRenderingInfo rinfo = { VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { W, H } }, .layerCount = 1,
+        .colorAttachmentCount = 1, .pColorAttachments = &att };
+    vkCmdBeginRendering(cbuf, &rinfo);
+    VkViewport vpt = { 0, (float)H, (float)W, -(float)H, 0, 1 };
+    vkCmdSetViewport(cbuf, 0, 1, &vpt);
+    // Columns 0-2: SPIR-V. The set stays bound for the rest of the pass, as VKD3D-Proton leaves its sets bound.
+    vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, spvLayout, 0, 1, &set, 0, NULL);
+    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, spvPipeline);
+    VkRect2D sc = { { 0, 0 }, { 3, H } }; vkCmdSetScissor(cbuf, 0, 1, &sc);
+    vkCmdDraw(cbuf, 3, 1, 0, 0);
+    // Columns 3-4: the bridge, heaps bound.
+    struct { float offs[4]; uint64_t heaps[2]; } pc = { { 0, 0, 0, 1 }, { heap.va, heap.va } };
+    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, mscPipeline);
+    vkCmdPushConstants(cbuf, mscLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+    VkDeviceSize vbo = 0; vkCmdBindVertexBuffers(cbuf, 0, 1, &vbuf.buf, &vbo);
+    sc.offset.x = 3; sc.extent.width = 2; vkCmdSetScissor(cbuf, 0, 1, &sc);
+    vkCmdDraw(cbuf, 3, 1, 0, 0);
+    // Columns 5-7: SPIR-V again.
+    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, spvPipeline);
+    sc.offset.x = 5; sc.extent.width = 3; vkCmdSetScissor(cbuf, 0, 1, &sc);
+    vkCmdDraw(cbuf, 3, 1, 0, 0);
+    vkCmdEndRendering(cbuf);
+    ib.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkBufferImageCopy bic = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
+    vkCmdCopyImageToBuffer(cbuf, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buf, 1, &bic);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
+    vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    CHECK(vkEndCommandBuffer(cbuf));
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cbuf };
+    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(queue));
+
+    uint32_t* px = rb.map; uint32_t ok = 0;
+    for (uint32_t y = 0; y < H; y++) {
+        char row[16] = {0};
+        for (uint32_t x = 0; x < W; x++) {
+            uint32_t want = (x < 3 || x >= 5) ? 0xFF00FF00u : y < H / 2 ? 0xFF0000FFu : 0;	// green, red top half
+            uint32_t p = px[y * W + x];
+            row[x] = p == 0xFF00FF00u ? 'G' : p == 0xFF0000FFu ? 'R' : p == 0xFFFF0000u ? 'B' : p == 0 ? '.' : '?';
+            ok += p == want;
+        }
+        printf("  row %u: %s\n", y, row);
+    }
+    printf("test 10: %u/%u pixels as expected (G = SPIR-V read its own set, B = it read the bridge's heap as its set)\n", ok, W * H);
+    if (ok != W * H) failures++;
+}
+
 int main(int argc, char** argv) {
     if (argc < 7) { printf("usage: msctest libMoltenVK.dylib cs1.dxil cs2.dxil cs3.dxil vs.dxil ps.dxil\n"); return 2; }
     void* mvk = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -694,6 +868,9 @@ int main(int argc, char** argv) {
         printf("test 4: %u/%u pixels as expected (red top half: Y the way up D3D has it)\n", ok, W * H);
         if (ok != W * H) failures++;
     }
+
+    // MSCTEST_SPIRV: the directory of il_vs.spv and il_fs.spv (tests/msc-bridge/glsl, compiled by build.sh).
+    if (getenv("MSCTEST_SPIRV")) testInterleave(argv[5], argv[6], getenv("MSCTEST_SPIRV"));
 
     printf("\n%s\n", failures ? "SOME CHECKS FAILED" : "ALL CHECKS PASSED");
     return failures ? 1 : 0;
