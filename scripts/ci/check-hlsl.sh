@@ -42,6 +42,15 @@ while IFS= read -r source; do
             compile "$source" main ps_6_5 "$(basename "$source").dxil" ;;
         scripts/probes/core10/corpus/*.hlsl)
             compile "$source" main cs_6_0 "$(basename "$source").dxil" ;;
+        # Metal Shader Converter bridge tests, with tests/msc-bridge/build.sh's profiles
+        tests/msc-bridge/hlsl/cs3.hlsl)
+            compile "$source" main cs_6_6 "msc-$(basename "$source").dxil" ;;
+        tests/msc-bridge/hlsl/*cs*.hlsl)
+            compile "$source" main cs_6_0 "msc-$(basename "$source").dxil" ;;
+        tests/msc-bridge/hlsl/*vs.hlsl)
+            compile "$source" main vs_6_0 "msc-$(basename "$source").dxil" ;;
+        tests/msc-bridge/hlsl/*ps.hlsl)
+            compile "$source" main ps_6_0 "msc-$(basename "$source").dxil" ;;
         *)
             echo "No DXC profile mapping for $source" >&2
             exit 1 ;;
@@ -49,5 +58,5 @@ while IFS= read -r source; do
 done < <(cd "$ROOT" && git ls-files '*.hlsl' | sort)
 
 count=$(find "$OUT" -type f -name '*.dxil' | wc -l | tr -d ' ')
-[ "$count" -eq 11 ] || { echo "expected 11 DXIL outputs, found $count" >&2; exit 1; }
+[ "$count" -eq 23 ] || { echo "expected 23 DXIL outputs, found $count" >&2; exit 1; }
 echo "HLSL/DXIL source check: PASS ($count shaders)"
