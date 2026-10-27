@@ -19,7 +19,7 @@ METALSHARP_TRACE=present,sync wine game.exe
 | `memory` | out-of-memory, leaks, budget problems | memory budget, every device memory allocation and free | every `vkAllocateMemory`/`vkFreeMemory` and MTLHeap, texture debug output | |
 | `resource` | buffers and textures created wrong or failing | committed, placed and reserved resources, heaps | every buffer and image created and destroyed | GPU descriptor validation (`descriptor_qa_checks`) |
 | `sync` | hangs, deadlocks, CPU waits on the GPU | queue Signal/Wait, ExecuteCommandLists, fence waits and CPU signals | host waits on fences and timeline semaphores of 1 ms or more, and every timeout | every wait and every host signal |
-| `gpu` | device lost, GPU hangs, GPU errors | breadcrumbs and device fault reports | hang watchdog: a command buffer committed for 2 s is reported as waiting to be scheduled or running; command buffer errors | breadcrumbs synchronized after every submission; GPU time of every command buffer; Metal debug mode |
+| `gpu` | device lost, GPU hangs, GPU errors | device fault reports | hang watchdog: a command buffer committed for 2 s is reported as waiting to be scheduled or running; command buffer errors | GPU time of every command buffer; Metal debug mode |
 | `cpu` | low frame rate, CPU-bound frames | queue timeline as Chrome trace JSON (`queue-profile.json`) | MoltenVK performance statistics every 600 frames | extra timeline events |
 | `api` | finding the Vulkan call that misbehaves | | every Vulkan call with its duration | the calling thread's id |
 | `pass` | wrong render pass loads, stores, or attachments | | render pass and attachment debug output | |
@@ -49,8 +49,8 @@ Each launch moves the previous launch's logs to `vkd3d.prev.log` and `moltenvk.p
   flags to `VKD3D_CONFIG` instead of replacing it.
 - Shader dumps cover only shaders compiled in this launch. Shaders already in a pipeline cache are not
   converted again, so set `MVK_CONFIG_PIPELINE_CACHE_PATH=0` (and clear `vkd3d-proton.cache`) for a full capture.
-- Breadcrumbs are built into release builds (`-Denable_breadcrumbs=true`) so `gpu` works without a debug build.
-  They cost nothing until `gpu` turns them on.
+- `gpu` does not turn on VKD3D-Proton's breadcrumbs. They need `VK_AMD_buffer_marker` or
+  `VK_NV_device_diagnostic_checkpoints`, which MoltenVK lacks, and with them on the D3D12 device fails to create.
 
 ## Cost
 
