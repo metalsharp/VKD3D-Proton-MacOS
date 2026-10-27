@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 01/14] vkd3d: Run on MoltenVK: optional transform feedback,
+Subject: [PATCH 01/16] vkd3d: Run on MoltenVK: optional transform feedback,
  VKMT texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 02/14] Keep the transform feedback structures linked when
+Subject: [PATCH 02/16] Keep the transform feedback structures linked when
  stream output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 03/14] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 03/16] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 04/14] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+Subject: [PATCH 04/16] MoltenVK: emulated VRS tier 2 (full-rate shading) with
  a 16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 05/14] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 05/16] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,7 +329,7 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 06/14] MoltenVK: typed buffer views start at aligned offsets
+Subject: [PATCH 06/16] MoltenVK: typed buffer views start at aligned offsets
  via the typed offset buffer (no env bypass)
 
 ---
@@ -392,7 +392,7 @@ index a8fc26b1..bf474e86 100644
 From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 19:03:16 -0600
-Subject: [PATCH 07/14] MoltenVK: require transform feedback again
+Subject: [PATCH 07/16] MoltenVK: require transform feedback again
 
 The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
 copy of the vertex shader, counter buffers, overflow and stream queries), so
@@ -500,7 +500,7 @@ index 9c6839ea..4717e179 100644
 From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 23:25:55 -0600
-Subject: [PATCH 08/14] vkd3d: Typed resources that aren't UAVs only take views
+Subject: [PATCH 08/16] vkd3d: Typed resources that aren't UAVs only take views
  of their format or its sRGB one.
 
 The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
@@ -574,7 +574,7 @@ index bf474e86..56118e03 100644
 From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 23:52:01 -0600
-Subject: [PATCH 09/14] MoltenVK: root CBVs as push descriptors, no staggered
+Subject: [PATCH 09/16] MoltenVK: root CBVs as push descriptors, no staggered
  submits; fix EndRenderPass state tracking
 
 ---
@@ -650,7 +650,7 @@ index 1945f15a..b2e27034 100644
 From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:34:44 -0600
-Subject: [PATCH 10/14] swapchain: on MoltenVK, release the frame latency
+Subject: [PATCH 10/16] swapchain: on MoltenVK, release the frame latency
  waitable at GPU completion instead of present wait
 
 MoltenVK completes present waits once the frame is on screen, which serialized
@@ -712,7 +712,7 @@ index 4d3e1bf4..6b0639ba 100644
 From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:47:45 -0600
-Subject: [PATCH 11/14] swapchain: log the app's frame latency;
+Subject: [PATCH 11/16] swapchain: log the app's frame latency;
  VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
 
 ---
@@ -775,7 +775,7 @@ index 6b0639ba..382c7b4d 100644
 From 864bb1e06c9b2fb4eb9eb5bb4f60ac72bb66187b Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 03:33:43 -0600
-Subject: [PATCH 12/14] command: keep render passes open across read-only
+Subject: [PATCH 12/16] command: keep render passes open across read-only
  texture transitions
 
 Read-after-read needs no synchronization; on MoltenVK image layouts don't exist either.
@@ -869,7 +869,7 @@ index 373cd989..b0aec561 100644
 From 3c3cac1647e5e38c062e00a1a41e5d5b996bf343 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 09:00:57 -0600
-Subject: [PATCH 13/14] MoltenVK: keep render passes open across UAV barriers
+Subject: [PATCH 13/16] MoltenVK: keep render passes open across UAV barriers
  while the pass draws without UAVs; shaders record UAV use
  (VKD3D_SHADER_META_FLAG_USES_UAV)
 
@@ -1163,7 +1163,7 @@ index 3e71f89c..ff94f06d 100644
 From 9e8789bd2c3c89ed144b53e1a4b0c1aff0497996 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Mon, 26 Oct 2026 12:28:26 -0600
-Subject: [PATCH 14/14] MoltenVK: fewer render pass ends and cheaper per-draw
+Subject: [PATCH 14/16] MoltenVK: fewer render pass ends and cheaper per-draw
  root state
 
 - Buffer transitions between read-only states no longer end the render pass on MoltenVK (COMMON,
@@ -2204,6 +2204,133 @@ index ff94f06d..33c6efc0 100644
      struct d3d12_wbi_batch_state wbi_batch;
      struct d3d12_rtas_batch_state rtas_batch;
      struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From fd83df895d5162f615925c7a37feaeee5496a768 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 20:17:21 -0600
+Subject: [PATCH 15/16] swapchain: report the device's feature level in the
+ Metal HUD, through winemetal.dll
+
+---
+ libs/vkd3d/swapchain.c | 56 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 382c7b4d..8401a239 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -3905,6 +3905,58 @@ static HRESULT dxgi_vk_swap_chain_init_frame_rate_limiter(struct dxgi_vk_swap_ch
+     return hr;
+ }
+ 
++#if defined(_WIN32)
++static const char *dxgi_vk_feature_level_name(D3D_FEATURE_LEVEL level)
++{
++    switch (level)
++    {
++        case D3D_FEATURE_LEVEL_11_0: return "11_0";
++        case D3D_FEATURE_LEVEL_11_1: return "11_1";
++        case D3D_FEATURE_LEVEL_12_0: return "12_0";
++        case D3D_FEATURE_LEVEL_12_1: return "12_1";
++        case D3D_FEATURE_LEVEL_12_2: return "12_2";
++        default: return "UNKNOWN";
++    }
++}
++
++/* The Metal HUD heading Mullion shows, through Mullion's winemetal.dll (ARM64X, so x86_64 programs load it too):
++ * the device's highest feature level, which is 12_2 only with MoltenVK's ray tracing. */
++static void dxgi_vk_swap_chain_report_hud(struct d3d12_device *device)
++{
++    static LONG reported;
++    uint64_t (*string_alloc_init)(const char *data, unsigned int encoding);
++    void (*hud_update_label)(uint64_t hud, uint64_t label, uint64_t value);
++    bool (*hud_add_label)(uint64_t hud, uint64_t label, uint64_t after);
++    void (*object_release)(uint64_t object);
++    uint64_t (*hud_instance)(void);
++    uint64_t hud, label, after, value;
++    HMODULE winemetal;
++    char text[96];
++
++    if (InterlockedCompareExchange(&reported, 1, 0) || !(winemetal = LoadLibraryA("winemetal.dll")))
++        return;
++    string_alloc_init = (void *)GetProcAddress(winemetal, "NSString_alloc_init");
++    hud_update_label = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_updateLabel");
++    hud_add_label = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_addLabel");
++    object_release = (void *)GetProcAddress(winemetal, "NSObject_release");
++    hud_instance = (void *)GetProcAddress(winemetal, "DeveloperHUDProperties_instance");
++    if (!string_alloc_init || !hud_update_label || !hud_add_label || !object_release || !hud_instance ||
++            !(hud = hud_instance()))
++        return;
++
++    /* 4 is NSUTF8StringEncoding; the HUD keeps the label for the life of the process. */
++    snprintf(text, sizeof(text), "VKD3D-Proton D3D12 FL_%s %s",
++            dxgi_vk_feature_level_name(device->d3d12_caps.max_feature_level), vkd3d_version);
++    label = string_alloc_init("com.github.metalsharp.vkd3d-proton-version", 4);
++    after = string_alloc_init("com.apple.hud-graph.default", 4);
++    value = string_alloc_init(text, 4);
++    hud_add_label(hud, label, after);
++    hud_update_label(hud, label, value);
++    object_release(after);
++    object_release(value);
++}
++#endif
++
+ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVkSurfaceFactory *pFactory,
+         const DXGI_SWAP_CHAIN_DESC1 *pDesc, struct d3d12_command_queue *queue)
+ {
+@@ -3940,6 +3992,10 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
+     if (FAILED(hr = dxgi_vk_swap_chain_init_frame_rate_limiter(chain)))
+         goto cleanup_low_latency;
+ 
++#if defined(_WIN32)
++    dxgi_vk_swap_chain_report_hud(queue->device);
++#endif
++
+     ID3D12CommandQueue_AddRef(&queue->ID3D12CommandQueue_iface);
+     return S_OK;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f6bb93d7e5a4735c0364fe53c5459898aa3e56a6 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 20:44:16 -0600
+Subject: [PATCH 16/16] device: only take a layered implementation's driver ID
+ when the driver names itself; set the layered properties' sType
+
+---
+ libs/vkd3d/device.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 72b5e25b..a76bc70b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1491,6 +1491,7 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_layered_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR;
+         vk_prepend_struct(&layered_props, &vk_layered_props);
+ 
++        vk_layered_props.properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+         real_driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR;
+         vk_prepend_struct(&vk_layered_props.properties, &real_driver_props);
+     }
+@@ -1861,8 +1862,10 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+ 
+     info->supports_opacity_micromap = info->opacity_micromap_features.micromap;
+ 
+-    /* if nonzero, this is a layered implementation */
+-    if (real_driver_props.driverID)
++    /* if nonzero, this is a layered implementation. A driver that fills these in names itself too: MoltenVK
++     * (not layered) under Wine has left a pointer in real_driver_props.driverID and no name, which then hid
++     * VK_DRIVER_ID_MOLTENVK from everything below and failed every D3D12CreateDevice. */
++    if (real_driver_props.driverID && real_driver_props.driverName[0])
+     {
+         /* store the layer ID here in case it's needed */
+         info->layer_driver_id = info->vulkan_1_2_properties.driverID;
 -- 
 2.54.0 (Apple Git-157)
 
