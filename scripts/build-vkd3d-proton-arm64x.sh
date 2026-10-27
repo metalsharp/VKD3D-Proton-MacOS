@@ -67,7 +67,8 @@ needs_exe_wrapper = true
 EOF
 
 rm -rf "$OUT"
-meson setup --cross-file "$CROSS" --buildtype release --strip "$OUT" "$SRC"
+# Breadcrumbs in: METALSHARP_TRACE=gpu turns them on to name the command a lost device was on.
+meson setup --cross-file "$CROSS" --buildtype release --strip -Denable_breadcrumbs=true "$OUT" "$SRC"
 ninja -C "$OUT"
 
 mkdir -p "$STAGE"
