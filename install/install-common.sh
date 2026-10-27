@@ -135,6 +135,11 @@ done
 overrides add
 
 cp -f "$MVK_ROOT/libMoltenVK.dylib" "$HOME_DIR/moltenvk/"
+# Apple's Metal Shader Converter, which MoltenVK loads from beside itself to convert DXIL compute shaders for
+# VKD3D-Proton when METALSHARP_MSC=1 (packages before it was added don't carry it)
+if [ -f "$MVK_ROOT/libmetalirconverter.dylib" ]; then
+    cp -f "$MVK_ROOT/libmetalirconverter.dylib" "$HOME_DIR/moltenvk/"
+fi
 # Wines that load MoltenVK as libvulkan.dylib (no Vulkan loader) find this one first through DYLD_LIBRARY_PATH;
 # Wines with a loader find it through VK_DRIVER_FILES
 ln -sf libMoltenVK.dylib "$HOME_DIR/moltenvk/libvulkan.dylib"
