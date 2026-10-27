@@ -98,6 +98,7 @@ Start at [docs/README.md](docs/README.md), then see:
 - [Development and Make targets](docs/Development.md)
 - [Feature-level matrix](docs/features.md)
 - [Validation and regression](docs/validation.md)
+- [Tracing a problem with `METALSHARP_TRACE`](docs/tracing.md)
 - [Release and packaging](docs/release.md)
 - [Final state](docs/Final.md)
 
