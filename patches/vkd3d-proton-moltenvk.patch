@@ -1,7 +1,7 @@
 From f1b7b4907e816a25232ab85e2386b852c9645132 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 14:37:47 -0600
-Subject: [PATCH 01/16] vkd3d: Run on MoltenVK: optional transform feedback,
+Subject: [PATCH 01/20] vkd3d: Run on MoltenVK: optional transform feedback,
  VKMT texel alignment, Metal-safe decompression shaders.
 
 - Without VK_EXT_transform_feedback, stream output is disabled instead of failing
@@ -186,7 +186,7 @@ index aea1124c..3863eb42 100644
 From de2e937d0439d06102682972da294c516a3d7b46 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 16:36:29 -0600
-Subject: [PATCH 02/16] Keep the transform feedback structures linked when
+Subject: [PATCH 02/20] Keep the transform feedback structures linked when
  stream output is disabled
 
 Zeroing them cleared their sType and pNext while they were in the feature and property chains
@@ -221,7 +221,7 @@ index 8334e3b1..836a7441 100644
 From 7289d6b2db4462f97ba24265970ae8be6c334dab Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 16:59:26 -0600
-Subject: [PATCH 03/16] device: accept FTZ-only FP32 denorm control on MoltenVK
+Subject: [PATCH 03/20] device: accept FTZ-only FP32 denorm control on MoltenVK
  for SM 6.2
 
 ---
@@ -252,7 +252,7 @@ index 836a7441..e4eecfcf 100644
 From 996e2a83e56d1689899aa3c85b01f1ac1bdf5de2 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 17:51:33 -0600
-Subject: [PATCH 04/16] MoltenVK: emulated VRS tier 2 (full-rate shading) with
+Subject: [PATCH 04/20] MoltenVK: emulated VRS tier 2 (full-rate shading) with
  a 16-pixel shading rate tile
 
 ---
@@ -297,7 +297,7 @@ index 55e17c26..5a7f58e7 100644
 From 32a7456c0f3d8aacb8405103a6fd5e4d62d1ac4c Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:35:19 -0600
-Subject: [PATCH 05/16] MoltenVK: tiled resources tier 3+ with Metal's
+Subject: [PATCH 05/20] MoltenVK: tiled resources tier 3+ with Metal's
  nonstandard 3D tile shape
 
 ---
@@ -329,7 +329,7 @@ index 8ae68956..ea779aa9 100644
 From fa994db397d2184110fedacd75146efb478f21c7 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 18:43:10 -0600
-Subject: [PATCH 06/16] MoltenVK: typed buffer views start at aligned offsets
+Subject: [PATCH 06/20] MoltenVK: typed buffer views start at aligned offsets
  via the typed offset buffer (no env bypass)
 
 ---
@@ -392,7 +392,7 @@ index a8fc26b1..bf474e86 100644
 From 48c918c882a39f48f822b5f357883077a5f9a265 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 19:03:16 -0600
-Subject: [PATCH 07/16] MoltenVK: require transform feedback again
+Subject: [PATCH 07/20] MoltenVK: require transform feedback again
 
 The MoltenVK fork implements VK_EXT_transform_feedback (captures from a compute
 copy of the vertex shader, counter buffers, overflow and stream queries), so
@@ -500,7 +500,7 @@ index 9c6839ea..4717e179 100644
 From f2df34da8ff528cb4c5066e64b08e8cde17b6c45 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@aol.com>
 Date: Fri, 23 Oct 2026 23:25:55 -0600
-Subject: [PATCH 08/16] vkd3d: Typed resources that aren't UAVs only take views
+Subject: [PATCH 08/20] vkd3d: Typed resources that aren't UAVs only take views
  of their format or its sRGB one.
 
 The integer formats in their compatibility lists are for UAV clears. Listing them makes MoltenVK create render
@@ -574,7 +574,7 @@ index bf474e86..56118e03 100644
 From 6d21daedb8691d6f962d6db200784e995bba70e5 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Fri, 23 Oct 2026 23:52:01 -0600
-Subject: [PATCH 09/16] MoltenVK: root CBVs as push descriptors, no staggered
+Subject: [PATCH 09/20] MoltenVK: root CBVs as push descriptors, no staggered
  submits; fix EndRenderPass state tracking
 
 ---
@@ -650,7 +650,7 @@ index 1945f15a..b2e27034 100644
 From b30c003fe4265bb3a61033dcd3589488f2a1b89f Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:34:44 -0600
-Subject: [PATCH 10/16] swapchain: on MoltenVK, release the frame latency
+Subject: [PATCH 10/20] swapchain: on MoltenVK, release the frame latency
  waitable at GPU completion instead of present wait
 
 MoltenVK completes present waits once the frame is on screen, which serialized
@@ -712,7 +712,7 @@ index 4d3e1bf4..6b0639ba 100644
 From 8613e0782f9be82ae59aa5d4e3e9ce8ede189ddc Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 00:47:45 -0600
-Subject: [PATCH 11/16] swapchain: log the app's frame latency;
+Subject: [PATCH 11/20] swapchain: log the app's frame latency;
  VKD3D_SWAPCHAIN_MIN_FRAME_LATENCY raises its floor
 
 ---
@@ -775,7 +775,7 @@ index 6b0639ba..382c7b4d 100644
 From 864bb1e06c9b2fb4eb9eb5bb4f60ac72bb66187b Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 03:33:43 -0600
-Subject: [PATCH 12/16] command: keep render passes open across read-only
+Subject: [PATCH 12/20] command: keep render passes open across read-only
  texture transitions
 
 Read-after-read needs no synchronization; on MoltenVK image layouts don't exist either.
@@ -869,7 +869,7 @@ index 373cd989..b0aec561 100644
 From 3c3cac1647e5e38c062e00a1a41e5d5b996bf343 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Sat, 24 Oct 2026 09:00:57 -0600
-Subject: [PATCH 13/16] MoltenVK: keep render passes open across UAV barriers
+Subject: [PATCH 13/20] MoltenVK: keep render passes open across UAV barriers
  while the pass draws without UAVs; shaders record UAV use
  (VKD3D_SHADER_META_FLAG_USES_UAV)
 
@@ -1163,7 +1163,7 @@ index 3e71f89c..ff94f06d 100644
 From 9e8789bd2c3c89ed144b53e1a4b0c1aff0497996 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Mon, 26 Oct 2026 12:28:26 -0600
-Subject: [PATCH 14/16] MoltenVK: fewer render pass ends and cheaper per-draw
+Subject: [PATCH 14/20] MoltenVK: fewer render pass ends and cheaper per-draw
  root state
 
 - Buffer transitions between read-only states no longer end the render pass on MoltenVK (COMMON,
@@ -2211,7 +2211,7 @@ index ff94f06d..33c6efc0 100644
 From fd83df895d5162f615925c7a37feaeee5496a768 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Mon, 26 Oct 2026 20:17:21 -0600
-Subject: [PATCH 15/16] swapchain: report the device's feature level in the
+Subject: [PATCH 15/20] swapchain: report the device's feature level in the
  Metal HUD, through winemetal.dll
 
 ---
@@ -2299,7 +2299,7 @@ index 382c7b4d..8401a239 100644
 From f6bb93d7e5a4735c0364fe53c5459898aa3e56a6 Mon Sep 17 00:00:00 2001
 From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
 Date: Mon, 26 Oct 2026 20:44:16 -0600
-Subject: [PATCH 16/16] device: only take a layered implementation's driver ID
+Subject: [PATCH 16/20] device: only take a layered implementation's driver ID
  when the driver names itself; set the layered properties' sType
 
 ---
@@ -2331,6 +2331,263 @@ index 72b5e25b..a76bc70b 100644
      {
          /* store the layer ID here in case it's needed */
          info->layer_driver_id = info->vulkan_1_2_properties.driverID;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 26f24b9dbbaa052ce35f1daee089e6acbb4fe877 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 21:15:15 -0600
+Subject: [PATCH 17/20] query: pipeline statistics heaps on devices without
+ pipelineStatisticsQuery record nothing and resolve to zeros instead of
+ failing
+
+---
+ libs/vkd3d/command.c  | 18 ++++++++++++++++++
+ libs/vkd3d/resource.c | 18 ++++++++++++++++--
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ba0bb2dc..59045527 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -17971,6 +17971,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginQuery(d3d12_command_list_i
+         if (!d3d12_command_list_enable_query(list, query_heap, index, type))
+             d3d12_command_list_mark_as_invalid(list, "Failed to enable virtual query.\n");
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support: nothing to record. */
++    }
+     else
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+@@ -18010,6 +18014,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_EndQuery(d3d12_command_list_ifa
+         if (!d3d12_command_list_disable_query(list, query_heap, index))
+             d3d12_command_list_mark_as_invalid(list, "Failed to disable virtual query.\n");
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support: nothing to record. */
++    }
+     else if (d3d12_query_type_is_scoped(type))
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+@@ -18151,6 +18159,16 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveQueryData(d3d12_command_
+         else
+             d3d12_command_list_execute_query_resolve(list, &entry);
+     }
++    else if (!query_heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support resolve to zeros. */
++        d3d12_command_list_end_current_render_pass(list, true);
++        d3d12_command_list_mark_copy_buffer_write(list, buffer->res.vk_buffer,
++                buffer->mem.offset + aligned_dst_buffer_offset, stride * query_count,
++                !!(buffer->flags & VKD3D_RESOURCE_RESERVED));
++        VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, buffer->res.vk_buffer,
++                buffer->mem.offset + aligned_dst_buffer_offset, stride * query_count, 0));
++    }
+     else
+     {
+         d3d12_command_list_end_current_render_pass(list, true);
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a0252cf6..c4b07d84 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -10821,7 +10821,13 @@ HRESULT d3d12_query_heap_resolve_cpu(struct d3d12_query_heap *heap, D3D12_QUERY_
+     if (index + count > heap->desc.Count)
+         return E_INVALIDARG;
+ 
+-    if (!d3d12_query_heap_type_is_inline(heap->desc.Type))
++    if (!d3d12_query_heap_type_is_inline(heap->desc.Type) && !heap->vk_query_pool)
++    {
++        /* Pipeline statistics the device doesn't support. */
++        memset(data, 0, query_size * count);
++        return S_OK;
++    }
++    else if (!d3d12_query_heap_type_is_inline(heap->desc.Type))
+     {
+         /* If the query is backed by query pool as-is, then we just read that. */
+         vr = VK_CALL(vkGetQueryPoolResults(heap->device->vk_device,
+@@ -10919,7 +10925,15 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
+                 return E_INVALIDARG;
+         }
+ 
+-        if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
++        /* A device without pipeline statistics queries (MoltenVK) still gets a heap: its queries record
++         * nothing and resolve to zeros. Failing the heap leaves games that don't check with a NULL heap. */
++        if (desc->Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
++                !device->device_info.features2.features.pipelineStatisticsQuery)
++        {
++            FIXME_ONCE("Pipeline statistics queries are not supported, they will read as zero.\n");
++            object->initialized = 1;
++        }
++        else if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
+         {
+             WARN("Failed to create Vulkan query pool, vr %d.\n", vr);
+             vkd3d_free(object);
+-- 
+2.54.0 (Apple Git-157)
+
+
+From a2a5bf84a1c920ba850c5a0632b34af4710c12bc Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 23:12:24 -0600
+Subject: [PATCH 18/20] raytracing: name the export, its state object's type
+ and flags, and its export and collection counts when a shader identifier
+ isn't found
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 6f4eec9f..66415f09 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -321,7 +321,9 @@ static void * STDMETHODCALLTYPE d3d12_state_object_properties_GetShaderIdentifie
+     }
+     else
+     {
+-        ERR("Could not find entry point.\n");
++        ERR("Could not find entry point %s (subtype %s, state object type %u, flags %#x, %zu exports, %zu collections).\n",
++                debugstr_w(export_name), debugstr_w(subtype), object->type, object->flags,
++                object->exports_count, object->collections_count);
+         return NULL;
+     }
+ }
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 648466c654d0622e6f369e4c83338b7b812a4546 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 26 Oct 2026 23:54:11 -0600
+Subject: [PATCH 19/20] raytracing: log each state object's exports, variants
+ and collections, and every hit group, collection or collection export a
+ pipeline leaves out, with the reason
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 66415f09..9a3da859 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -2274,6 +2274,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+                 (hit_group->IntersectionShaderImport && export->intersection_stage_index == VK_SHADER_UNUSED_KHR) ||
+                 (hit_group->AnyHitShaderImport && export->anyhit_stage_index == VK_SHADER_UNUSED_KHR))
+         {
++            INFO("RT: hit group %s left out of variant %u (closest %s %u, any %s %u, intersection %s %u).\n",
++                    debugstr_w(hit_group->HitGroupExport), pipeline_variant_index,
++                    debugstr_w(hit_group->ClosestHitShaderImport), export->closest_stage_index,
++                    debugstr_w(hit_group->AnyHitShaderImport), export->anyhit_stage_index,
++                    debugstr_w(hit_group->IntersectionShaderImport), export->intersection_stage_index);
+             continue;
+         }
+ 
+@@ -2312,13 +2317,23 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+         /* Only include pipeline libraries which are compatible with current global root signature. */
+         collection_variant_index = d3d12_state_object_find_collection_variant(variant, collection->object);
+         if (collection_variant_index == UINT32_MAX)
++        {
++            INFO("RT: collection %zu (type %u, %zu exports, %zu variants) has no variant for variant %u.\n",
++                    i, collection->object->type, collection->object->exports_count,
++                    collection->object->pipelines_count, pipeline_variant_index);
+             continue;
++        }
+ 
+         collection_variant = &collection->object->pipelines[collection_variant_index];
+ 
+         /* Skip degenerates. */
+         if (!collection_variant->pipeline_library)
++        {
++            INFO("RT: collection %zu (type %u, %zu exports) variant %u has no pipeline library (pipeline %s).\n",
++                    i, collection->object->type, collection->object->exports_count, collection_variant_index,
++                    collection_variant->pipeline ? "yes" : "no");
+             continue;
++        }
+ 
+         if (collection->num_exports)
+             num_groups_to_export = collection->num_exports;
+@@ -2364,6 +2379,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+                 if (subtype || input_index == UINT32_MAX)
+                 {
+                     /* If we import things, but don't use them, this can happen. Just ignore it. */
++                    INFO("RT: collection %zu has no export %s.\n", i, debugstr_w(original_export));
+                     continue;
+                 }
+ 
+@@ -2371,7 +2387,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+ 
+                 /* An export might not be compatible with this global root signature. */
+                 if (input_export->pipeline_variant_index != collection_variant_index)
++                {
++                    INFO("RT: collection %zu export %s is in variant %u, not %u.\n", i, debugstr_w(original_export),
++                            input_export->pipeline_variant_index, collection_variant_index);
+                     continue;
++                }
+ 
+                 vkd3d_array_reserve((void **)&data->exports, &data->exports_size,
+                         data->exports_count + 1, sizeof(*data->exports));
+@@ -2748,6 +2768,7 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+     if (FAILED(hr = d3d12_state_object_get_group_handles(object, &data)))
+         goto fail;
+ 
++
+     if (object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
+     {
+         object->pipeline_stack_size = d3d12_state_object_pipeline_data_compute_default_stack_size(&data,
+@@ -2786,6 +2807,8 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+     object->exports = data.exports;
+     object->exports_size = data.exports_size;
+     object->exports_count = data.exports_count;
++    INFO("RT: state object %p type %u flags %#x: %zu exports, %zu variants, %zu collections.\n", object,
++            object->type, object->flags, object->exports_count, object->pipelines_count, object->collections_count);
+     data.exports = NULL;
+     data.exports_size = 0;
+     data.exports_count = 0;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 525b85639508cfd59800fcb04278ebbbb716add4 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 27 Oct 2026 06:34:35 -0600
+Subject: [PATCH 20/20] raytracing: INFO which variant each entry point lands
+ in, and each variant's pipeline, stage and group counts
+
+---
+ libs/vkd3d/raytracing_pipeline.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 9a3da859..9fef930b 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -2005,7 +2005,8 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
+         if (!d3d12_root_signature_is_layout_compatible(variant->global_root_signature, per_entry_global_signature))
+             continue;
+ 
+-        RT_TRACE("Compiling entry point: %s (stage = #%x).\n", debugstr_w(entry->plain_entry_point), entry->stage);
++        INFO("RT: entry point %s (stage %#x) goes in variant %u (global root signature %p).\n",
++                debugstr_w(entry->plain_entry_point), entry->stage, pipeline_variant_index, per_entry_global_signature);
+ 
+         local_signature = d3d12_state_object_pipeline_data_get_root_signature(
+                 VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE, data, entry);
+@@ -2760,6 +2761,11 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+         if (FAILED(hr = d3d12_state_object_compile_pipeline_variant(object, i, &data)))
+             goto fail;
+ 
++        INFO("RT: variant %u: pipeline %p, library %p, %u stages, %u groups, global root signature %p.\n", i,
++                object->pipelines[i].pipeline, object->pipelines[i].pipeline_library,
++                object->pipelines[i].stages_count, object->pipelines[i].groups_count,
++                object->pipelines[i].global_root_signature);
++
+         d3d12_state_object_pipeline_data_cleanup_modules(&data, object->device);
+         data.groups_count = 0;
+         data.vk_libraries_count = 0;
 -- 
 2.54.0 (Apple Git-157)
 

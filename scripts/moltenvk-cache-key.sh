@@ -12,8 +12,8 @@ cd "$SRC"
 {
     find External/SPIRV-Cross -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | LC_ALL=C sort | xargs shasum
     find MoltenVKShaderConverter/MoltenVKShaderConverter MoltenVKShaderConverter/include -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.mm' -o -name '*.def' \) | LC_ALL=C sort | xargs shasum
-    shasum MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-    awk '/^#pragma mark Streaming pipeline cache to and from offline memory/ {on = 1}
-         /^#pragma mark MVKRenderPipelineCompiler/ {on = 0}
-         on' MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | shasum
+    # All of MVKPipeline.mm: besides the cache's serialization, it sets the shader conversion options, and a
+    # cache kept across a change there hands back the old conversions.
+    shasum MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm \
+        MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 } | sed 's#  .*/#  #' | shasum | cut -c1-16
