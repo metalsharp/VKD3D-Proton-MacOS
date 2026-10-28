@@ -12829,14 +12829,15 @@ index 3cdc6234..e932be3b 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..a08bc2d9 100644
+index 534a414f..2bad2b16 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-@@ -27,8 +27,11 @@
+@@ -27,8 +27,12 @@
  #include "MVKPixelFormats.h"
  #include "MVKOSExtensions.h"
  #include "mvk_datatypes.hpp"
 +#include <algorithm>
++#include <unordered_map>
 +#include <unordered_set>
  #include <shared_mutex>
  #include <string>
@@ -12844,7 +12845,7 @@ index 534a414f..a08bc2d9 100644
  #include <mutex>
  #include <os/lock.h>
  
-@@ -71,8 +74,15 @@ class MVKCommandPool;
+@@ -71,8 +75,15 @@ class MVKCommandPool;
  class MVKCommandEncoder;
  class MVKCommandResourceFactory;
  class MVKPrivateDataSlot;
@@ -12860,7 +12861,7 @@ index 534a414f..a08bc2d9 100644
  
  
  /** The buffer index to use for vertex content. */
-@@ -85,9 +95,15 @@ static constexpr uint32_t   kMVKMinSwapchainImageCount = 2;
+@@ -85,9 +96,15 @@ static constexpr uint32_t   kMVKMinSwapchainImageCount = 2;
  static constexpr uint32_t   kMVKMaxSwapchainImageCount = 3;
  static constexpr uint32_t   kMVKMaxColorAttachmentCount = 8;
  static constexpr uint32_t   kMVKMaxViewportScissorCount = 16;
@@ -12877,7 +12878,7 @@ index 534a414f..a08bc2d9 100644
  static constexpr uint32_t   kMVKMaxSamplerCount = 16;
  static constexpr uint32_t   kMVKMaxSampleCount = 8;
  static constexpr uint32_t   kMVKSampleLocationCoordinateGridSize = 16;
-@@ -95,6 +111,7 @@ static constexpr float      kMVKMinSampleLocationCoordinate = 0.0;
+@@ -95,6 +112,7 @@ static constexpr float      kMVKMinSampleLocationCoordinate = 0.0;
  static constexpr float      kMVKMaxSampleLocationCoordinate = (float)(kMVKSampleLocationCoordinateGridSize - 1) / (float)kMVKSampleLocationCoordinateGridSize;
  static constexpr VkExtent2D kMVKSampleLocationPixelGridSize = { 1, 1 };
  static constexpr VkExtent2D kMVKSampleLocationPixelGridSizeNotSupported = { 0, 0 };
@@ -12885,7 +12886,7 @@ index 534a414f..a08bc2d9 100644
  
  
  
-@@ -124,6 +141,8 @@ typedef struct MVKMTLDeviceCapabilities {
+@@ -124,6 +142,8 @@ typedef struct MVKMTLDeviceCapabilities {
  	bool supports32BitMSAA;
  	bool supportsRenderLinearTextures;
  	bool supportsSamplerReduction;
@@ -12894,7 +12895,7 @@ index 534a414f..a08bc2d9 100644
  
  	uint8_t getHighestAppleGPU() const;
  	uint8_t getHighestMacGPU() const;
-@@ -426,6 +445,28 @@ public:
+@@ -426,6 +446,28 @@ public:
  	/** Returns whether argument buffers are in use. */
  	bool isUsingMetalArgumentBuffers() const { return _isUsingMetalArgumentBuffers; }
  
@@ -12923,7 +12924,7 @@ index 534a414f..a08bc2d9 100644
  	/** Returns whether or not vertex instancing can be used to implement multiview. */
  	bool canUseInstancingForMultiview() { return _metalFeatures.layeredRendering; }
  
-@@ -437,6 +478,7 @@ public:
+@@ -437,6 +479,7 @@ public:
  
  	/** Returns the MTLDevice capabilities. */
  	const MVKMTLDeviceCapabilities getMTLDeviceCapabilities() { return _gpuCapabilities; }
@@ -12931,7 +12932,7 @@ index 534a414f..a08bc2d9 100644
  
  	/** Returns info on the sizes of argument buffers. */
  	const MVKPhysicalDeviceArgumentBufferSizes& getArgumentBufferSizes() const { return _argumentBufferSizes; }
-@@ -486,6 +528,7 @@ protected:
+@@ -486,6 +529,7 @@ protected:
  	uint32_t getMaxPerSetDescriptorCount();
  	void initExternalMemoryProperties();
  	void initExtensions();
@@ -12939,7 +12940,7 @@ index 534a414f..a08bc2d9 100644
  	void initCounterSets();
  	bool needsCounterSetRetained();
  	void updateTimestampPeriod();
-@@ -498,6 +541,7 @@ protected:
+@@ -498,6 +542,7 @@ protected:
  	template<typename HostImageCopyProps> void populateHostImageCopyProperties(HostImageCopyProps* pHostImageCopyProps);
  	bool isTier2MetalArgumentBuffers();
  	void logGPUInfo();
@@ -12947,7 +12948,7 @@ index 534a414f..a08bc2d9 100644
  
  	MVKInstance* _mvkInstance;
  	id<MTLDevice> _mtlDevice;
-@@ -528,10 +572,16 @@ protected:
+@@ -528,10 +573,16 @@ protected:
  	uint32_t _lazilyAllocatedMemoryTypes;
  	MVKPhysicalDeviceArgumentBufferSizes _argumentBufferSizes;
  	bool _hasUnifiedMemory = true;
@@ -12964,7 +12965,7 @@ index 534a414f..a08bc2d9 100644
  #pragma mark -
  #pragma mark MVKDevice
  
-@@ -792,6 +842,14 @@ public:
+@@ -792,6 +843,14 @@ public:
  	void destroyPipelineLayout(MVKPipelineLayout* mvkPLL,
  							   const VkAllocationCallbacks* pAllocator);
  
@@ -12979,7 +12980,7 @@ index 534a414f..a08bc2d9 100644
      /**
       * Template function that creates count number of pipelines of type PipelineType,
       * using a collection of configuration information of type PipelineInfoType,
-@@ -857,6 +915,10 @@ public:
+@@ -857,6 +916,10 @@ public:
  	void freeMemory(MVKDeviceMemory* mvkDevMem,
  					const VkAllocationCallbacks* pAllocator);
  
@@ -12990,7 +12991,7 @@ index 534a414f..a08bc2d9 100644
  	VkResult createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  								   const VkAllocationCallbacks* pAllocator,
  								   VkPrivateDataSlot* pPrivateDataSlot);
-@@ -868,7 +930,39 @@ public:
+@@ -868,7 +931,39 @@ public:
  #pragma mark Operations
  
  	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
@@ -13031,7 +13032,7 @@ index 534a414f..a08bc2d9 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -925,6 +1019,13 @@ public:
+@@ -925,6 +1020,13 @@ public:
  	/** Fetches a visibility buffer from the shared pool. */
  	MVKVisibilityBuffer getVisibilityBuffer();
  
@@ -13045,7 +13046,7 @@ index 534a414f..a08bc2d9 100644
  	/** Returns a visibility buffer to the shared pool. */
  	void returnVisibilityBuffer(MVKVisibilityBuffer&& buffer);
  
-@@ -943,6 +1044,24 @@ public:
+@@ -943,6 +1045,24 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -13070,7 +13071,7 @@ index 534a414f..a08bc2d9 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -979,23 +1098,54 @@ public:
+@@ -979,23 +1099,57 @@ public:
  
  #if !MVK_XCODE_16
  	void makeResident(id allocation) {}
@@ -13080,18 +13081,20 @@ index 534a414f..a08bc2d9 100644
 +	/**
 +	 * Adds the allocation to the residency set, which takes effect at the next commitResidencySet().
 +	 * A resource placed in a heap that is itself in the set is already resident, and isn't added.
++	 * Adds are counted (aliased images share one texture), so the last removeResidency() removes it.
 +	 */
  	void makeResident(id<MTLAllocation> allocation) {
 -		@synchronized(_residencySet) {
 -			[_residencySet addAllocation: allocation];
 -			[_residencySet commit];
-+		if ( !_residencySet ) { return; }
++		if ( !_residencySet || !allocation ) { return; }
 +		std::lock_guard<std::mutex> lock(_residencyLock);
 +		if ( [allocation conformsToProtocol: @protocol(MTLHeap)] ) {
 +			_residentHeaps.insert(allocation);
 +		} else if ( isInResidentHeap(allocation) ) {
 +			return;
  		}
++		if (_residencyCounts[allocation]++) { return; }
 +		[_residencySet addAllocation: allocation];
 +		_isResidencySetDirty = true;
  	}
@@ -13101,19 +13104,20 @@ index 534a414f..a08bc2d9 100644
 -	void removeResidency(id allocation) {}
 -#else
 +	/**
-+	 * Removes the allocation from the residency set, which takes effect at the next commitResidencySet().
-+	 * The allocation is retained until then.
++	 * Removes the allocation from the residency set when its last add is removed, which takes effect at
++	 * the next commitResidencySet(); the allocation is retained until then. What was added decides,
++	 * not the heap it is placed in now: a resource added before its heap was, or whose heap left the
++	 * set first, is still removed exactly once, and one that was never added is not.
 +	 */
  	void removeResidency(id<MTLAllocation> allocation) {
 -		@synchronized(_residencySet) {
 -			[_residencySet removeAllocation:allocation];
 +		if ( !_residencySet || !allocation ) { return; }
 +		std::lock_guard<std::mutex> lock(_residencyLock);
-+		if ( [allocation conformsToProtocol: @protocol(MTLHeap)] ) {
-+			_residentHeaps.erase(allocation);
-+		} else if ( isInResidentHeap(allocation) ) {
-+			return;
-+		}
++		auto it = _residencyCounts.find(allocation);
++		if (it == _residencyCounts.end() || --it->second) { return; }
++		_residencyCounts.erase(it);
++		if ( [allocation conformsToProtocol: @protocol(MTLHeap)] ) { _residentHeaps.erase(allocation); }
 +		[_residencySet removeAllocation: allocation];
 +		_residencyRemovals.push_back([allocation retain]);
 +		_isResidencySetDirty = true;
@@ -13134,7 +13138,7 @@ index 534a414f..a08bc2d9 100644
  	}
  #endif
  
-@@ -1011,6 +1161,35 @@ public:
+@@ -1011,6 +1165,35 @@ public:
  #endif
  	}
  
@@ -13170,7 +13174,7 @@ index 534a414f..a08bc2d9 100644
  	bool hasResidencySet() {
  #if MVK_XCODE_16
  		return _residencySet != nil;
-@@ -1050,12 +1229,21 @@ public:
+@@ -1050,12 +1233,21 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -13192,7 +13196,7 @@ index 534a414f..a08bc2d9 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1076,6 +1264,8 @@ protected:
+@@ -1076,6 +1268,8 @@ protected:
  	void getDescriptorVariableDescriptorCountLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
@@ -13201,7 +13205,7 @@ index 534a414f..a08bc2d9 100644
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
-@@ -1097,7 +1287,16 @@ protected:
+@@ -1097,7 +1291,16 @@ protected:
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
  	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
  	MVKSmallVector<MVKResource*> _resources;
@@ -13218,7 +13222,7 @@ index 534a414f..a08bc2d9 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1304,57 @@ protected:
+@@ -1105,16 +1308,58 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -13267,6 +13271,7 @@ index 534a414f..a08bc2d9 100644
  	id<MTLResidencySet> _residencySet = nil;
 +	std::mutex _residencyLock;
 +	std::unordered_set<id> _residentHeaps;
++	std::unordered_map<id, uint32_t> _residencyCounts;	// the allocations added to the set, and how many times
 +	MVKSmallVector<id<MTLAllocation>, 16> _residencyRemovals;
 +	bool _isResidencySetDirty = false;
  #endif
@@ -13276,7 +13281,7 @@ index 534a414f..a08bc2d9 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1405,15 @@ public:
+@@ -1165,12 +1410,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -13294,7 +13299,7 @@ index 534a414f..a08bc2d9 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1518,50 @@ protected:
+@@ -1275,6 +1523,50 @@ protected:
  };
  
  
