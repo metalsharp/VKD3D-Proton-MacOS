@@ -20323,7 +20323,7 @@ index 47bbd4fc..db62b98b 100644
  	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
  	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
-index 51bd5412..e1f636f3 100644
+index 51bd5412..d2591843 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
 @@ -19,6 +19,7 @@
@@ -20347,7 +20347,20 @@ index 51bd5412..e1f636f3 100644
  	addVkFormatDesc( R64_SFLOAT, Invalid, Invalid, Invalid, Invalid, 1, 1, 8, ColorFloat );
  
  	addVkFormatDesc( R64G64_UINT, Invalid, Invalid, Invalid, Invalid, 1, 1, 16, ColorFloat );
-@@ -1587,7 +1590,7 @@
+@@ -1415,7 +1418,11 @@
+ 	// Blending is actually supported for RGB9E5Float, but format channels cannot
+ 	// be individually write-enabled during blending on macOS. Disabling blending
+ 	// on macOS is the least-intrusive way to handle this in a Vulkan-friendly way.
+-	disableMTLPixFmtCapsIfGPU( Mac2, RGB9E5Float, Blend);
++	// Apple GPUs blend it: an RGB9E5 attachment's write mask is all channels or none
++	// (MVKGraphicsPipeline), and additive draws into it add (an M4 measured 0.5 + 0.25
++	// as 0.75); with blending off, VKD3D-Proton warned at every D3D12 blend state
++	// on an RGB9E5 target and its additive draws overwrote instead (Dragon's Dogma 2).
++	disableMTLPixFmtCapsIf( gpuCaps.supportsMac2 && !gpuCaps.isAppleGPU, RGB9E5Float, Blend );
+ 
+ 	// RGB9E5Float cannot be used as a render target on the simulator
+ 	disableMTLPixFmtCapsIf( MVK_OS_SIMULATOR, RGB9E5Float, ColorAtt );
+@@ -1587,7 +1594,7 @@
  	// Optimal tiling features
  	enableFormatFeatures(Read, Tex, mtlPixFmtCaps, vkProps.optimalTilingFeatures);
  #if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
@@ -20356,7 +20369,7 @@ index 51bd5412..e1f636f3 100644
  		mvkIsAnyFlagEnabled(vkProps.optimalTilingFeatures, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
  		vkProps.optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
  	}
-@@ -1599,6 +1602,13 @@
+@@ -1599,6 +1606,13 @@
  	enableFormatFeatures(DSAtt, Tex, mtlPixFmtCaps, vkProps.optimalTilingFeatures);
  	enableFormatFeatures(Blend, Tex, mtlPixFmtCaps, vkProps.optimalTilingFeatures);
  
@@ -20370,7 +20383,7 @@ index 51bd5412..e1f636f3 100644
  	if (isDepthFormat(vkDesc.mtlPixelFormat) && mvkIsAnyFlagEnabled(vkProps.optimalTilingFeatures, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
  		vkProps.optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
  	}
-@@ -1641,5 +1651,8 @@
+@@ -1641,5 +1655,8 @@
  		enableFormatFeatures(Write, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
  		enableFormatFeatures(Atomic, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
  		enableFormatFeatures(Vertex, Buf, getMTLVertexFormatDesc(vkDesc.mtlVertexFormat).mtlFmtCaps, vkProps.bufferFeatures);
