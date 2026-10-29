@@ -6,7 +6,7 @@
 
 | Minimum level | Result |
 |---|---|
-| D3D_FEATURE_LEVEL_12_2 | device created with `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`; without it, `E_INVALIDARG` (no ray tracing) |
+| D3D_FEATURE_LEVEL_12_2 | `S_OK`, device created: MoltenVK's ray tracing is on by default; with `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=0`, `E_INVALIDARG` (no ray tracing) |
 | D3D_FEATURE_LEVEL_12_1 | `S_OK`, device created |
 | D3D_FEATURE_LEVEL_12_0 | `S_OK`, device created |
 | D3D_FEATURE_LEVEL_11_1 | `S_OK`, device created |

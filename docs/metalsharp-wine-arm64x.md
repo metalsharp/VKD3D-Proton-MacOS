@@ -65,7 +65,7 @@ Feature level and shader model gates are in `libs/vkd3d/device.c`
 | sparse binding/residency | tiled tier 2/3 | no | Metal sparse textures and placement heaps |
 | `shaderResourceResidency` | tiled tier 2 | no | residency feedback |
 | geometry shaders | D3D 11_0 content | no | dttdrv `geometry-shaders`, PR #2786 |
-| ray tracing pipelines | DXR 1.0/1.1 | yes (`MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`), 32-byte handles | validate |
+| ray tracing pipelines | DXR 1.0/1.1 | yes (on by default; `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=0` turns it off), 32-byte handles | validate |
 | fp32 denorm preserve/flush | SM 6.2 | no | hardware test, then float controls |
 | compute derivatives | SM 6.6 | no | quad shuffles in compute |
 | 64-bit buffer atomics | SM 6.6 | no (Metal has 64-bit min/max only) | emulation |

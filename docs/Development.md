@@ -307,9 +307,9 @@ The Wine runner is host-specific. The established validation runner is
 make ladder WINE_RUNNER=/tmp/run-probe.sh
 ```
 
-The ladder must create devices for 12_1, 12_0, 11_1 and 11_0, with `max=12_1`,
-and for 12_2 too, with `max=12_2`, when `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`
-turns on MoltenVK's ray tracing pipelines. The full regression gate is documented in
+The ladder must create devices for 12_2, 12_1, 12_0, 11_1 and 11_0, with `max=12_2`:
+MoltenVK's ray tracing pipelines are on by default. With
+`MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=0` it stops at 12_1, with `max=12_1`. The full regression gate is documented in
 [validation.md](validation.md). Do not accept a result without checking the
 loaded module paths and hashes of the staged DLLs.
 

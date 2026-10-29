@@ -17,7 +17,7 @@ index 886c8aee..df744d85 100644
  /**
   * Enable use of private Metal APIs.
 diff --git a/Docs/MoltenVK_Configuration_Parameters.md b/Docs/MoltenVK_Configuration_Parameters.md
-index fdb7b9fa..67ee6a25 100644
+index fdb7b9fa..d78f5aec 100644
 --- a/Docs/MoltenVK_Configuration_Parameters.md
 +++ b/Docs/MoltenVK_Configuration_Parameters.md
 @@ -81,6 +81,19 @@ Any prerequisite extensions are also advertised. If bit `1` is included, all sup
@@ -28,7 +28,7 @@ index fdb7b9fa..67ee6a25 100644
 +#### MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING
 +
 +##### Type: Boolean
-+##### Default: `0`
++##### Default: `1` (MetalSharp's MoltenVK; `0` upstream)
 +
 +Enables experimental support for `VK_KHR_acceleration_structure`, `VK_KHR_pipeline_library`,
 +`VK_KHR_ray_query`, `VK_KHR_ray_tracing_maintenance1`, and `VK_KHR_ray_tracing_pipeline`.
@@ -25978,7 +25978,7 @@ index 5c91403c..e3daf2ab 100644
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
-index e6d176c8..d5f4e8ed 100644
+index e6d176c8..5e42d33f 100644
 --- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
 +++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
 @@ -79,6 +79,56 @@ const MVKConfiguration& getGlobalMVKConfig();
@@ -26047,14 +26047,17 @@ index e6d176c8..d5f4e8ed 100644
  #endif
  
  /** Fill a Metal command buffer when each Vulkan command buffer is filled. */
-@@ -350,3 +400,8 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
+@@ -350,3 +400,11 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
  #ifndef MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES
  #   define MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES 0
  #endif
 +
-+/** Expose the experimental ray tracing extensions. Disabled by default. */
++/**
++ * Expose the experimental ray tracing extensions. Enabled by default in MetalSharp's MoltenVK, so VKD3D-Proton
++ * reports DXR 1.1 and feature level 12_2 without any setting; MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=0 hides them.
++ */
 +#ifndef MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING
-+#   define MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING 0
++#   define MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING 1
 +#endif
 diff --git a/MoltenVK/MoltenVK/Utility/MVKFoundation.cpp b/MoltenVK/MoltenVK/Utility/MVKFoundation.cpp
 index a3a039f0..fc7b0c68 100644

@@ -27,9 +27,9 @@ D3D8/9/10/11 application, D3D12 swap chains → DXVK (metalsharp/DXVK-MacOS) →
 Measured on an Apple M4 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
 
 - Shader Model **6.8**
-- D3D12 feature levels **12_1, 12_0, 11_1, 11_0** by default, and **12_2** with
-  `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`, which turns on MoltenVK's ray tracing pipelines
-- DXR **1.1** (ray tracing tier 1.1) with that setting; none without it
+- D3D12 feature levels **12_2, 12_1, 12_0, 11_1, 11_0**. 12_2 needs MoltenVK's ray tracing pipelines, which this
+  MoltenVK turns on by default; `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=0` turns them off, and the top level is then 12_1
+- DXR **1.1** (ray tracing tier 1.1); none with that setting at 0
 - Variable-rate shading tier 2 (16-pixel shading-rate tiles)
 - Mesh shader tier 1, sampler feedback tier 0.9
 - Tiled resources tier 4, conservative rasterization tier 3, resource binding tier 3
