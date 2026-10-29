@@ -191,7 +191,7 @@ index 90178875..17637e2f 100644
  	bool unroll_array_to_complex_store(uint32_t target_id, uint32_t source_id);
  	void convert_non_uniform_expression(std::string &expr, uint32_t ptr_id);
 diff --git a/spirv_msl.cpp b/spirv_msl.cpp
-index ff081182..57af698e 100644
+index ff081182..60b61770 100644
 --- a/spirv_msl.cpp
 +++ b/spirv_msl.cpp
 @@ -36,6 +36,21 @@ static const uint32_t k_unknown_location = ~0u;
@@ -504,7 +504,7 @@ index ff081182..57af698e 100644
  static string create_sampler_address(const char *prefix, MSLSamplerAddress addr)
  {
  	switch (addr)
-@@ -1631,9 +1845,22 @@ void CompilerMSL::emit_entry_point_declarations()
+@@ -1631,79 +1845,914 @@ void CompilerMSL::emit_entry_point_declarations()
  				statement("spvDescriptorArray<sampler> ", name, "Smplr {", resource_name, "Smplr};");
  				break;
  			case SPIRType::Struct:
@@ -529,10 +529,90 @@ index ff081182..57af698e 100644
  			default:
  				break;
  			}
-@@ -1701,9 +1928,831 @@ void CompilerMSL::emit_entry_point_declarations()
- 		statement("threadgroup uint2 spvMeshSizes;");
- }
- 
+-			has_runtime_array_declaration = true;
+-		}
+-		else if (!type.array.empty() &&
+-		         (type.basetype == SPIRType::Struct ||
+-		          (type.basetype == SPIRType::AccelerationStructure &&
+-		           msl_options.acceleration_structure_descriptor_as_address)))
+-		{
+-			if (type.basetype == SPIRType::AccelerationStructure)
+-				statement("device const ulong* ", to_restrict(var.self, true), name, "[] =");
+-			else
+-				statement(get_variable_address_space(var), " ", type_to_glsl(buffer_type), "* ",
+-				          to_restrict(var.self, true), name, "[] =");
+-			begin_scope();
+-			uint32_t array_size = get_resource_array_size(type, var.self);
+-			for (uint32_t i = 0; i < array_size; ++i)
+-				statement(name, "_", i, ",");
+-			end_scope_decl();
+-			statement_no_indent("");
+-		}
+-	}
++			has_runtime_array_declaration = true;
++		}
++		else if (!type.array.empty() &&
++		         (type.basetype == SPIRType::Struct ||
++		          (type.basetype == SPIRType::AccelerationStructure &&
++		           msl_options.acceleration_structure_descriptor_as_address)))
++		{
++			if (type.basetype == SPIRType::AccelerationStructure)
++				statement("device const ulong* ", to_restrict(var.self, true), name, "[] =");
++			else
++				statement(get_variable_address_space(var), " ", type_to_glsl(buffer_type), "* ",
++				          to_restrict(var.self, true), name, "[] =");
++			begin_scope();
++			uint32_t array_size = get_resource_array_size(type, var.self);
++			for (uint32_t i = 0; i < array_size; ++i)
++				statement(name, "_", i, ",");
++			end_scope_decl();
++			statement_no_indent("");
++		}
++	}
++
++	if (has_runtime_array_declaration)
++		statement_no_indent("");
++
++	// Emit buffer aliases here.
++	for (auto &var_id : buffer_aliases_discrete)
++	{
++		const auto &var = get<SPIRVariable>(var_id);
++
++		// We already declare this alias in a different way.
++		if (is_var_runtime_size_array(var))
++			continue;
++
++		const auto &type = get_variable_data_type(var);
++		auto addr_space = get_variable_address_space(var);
++		// This resource name has already been added.
++		auto name = to_name(var_id);
++
++		uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
++		uint32_t desc_binding = get_decoration(var_id, DecorationBinding);
++		auto alias_name = join("spvBufferAliasSet", desc_set, "Binding", desc_binding);
++
++		statement(addr_space, " auto& ", to_restrict(var_id, true),
++		          name,
++		          " = *(", addr_space, " ", type_to_glsl(type), "*)", alias_name, ";");
++	}
++	// Discrete descriptors are processed in entry point emission every compiler iteration.
++	buffer_aliases_discrete.clear();
++
++	// Emit disabled fragment outputs.
++	std::sort(disabled_frag_outputs.begin(), disabled_frag_outputs.end());
++	for (uint32_t var_id : disabled_frag_outputs)
++	{
++		auto &var = get<SPIRVariable>(var_id);
++		add_local_variable_name(var_id);
++		statement(CompilerGLSL::variable_decl(var), ";");
++		var.deferred_declaration = false;
++	}
++
++	// Holds SetMeshOutputsEXT information. Threadgroup since first thread wins.
++	if (processing_entry_point && is_mesh_shader())
++		statement("threadgroup uint2 spvMeshSizes;");
++}
++
 +static int vertex_count_in_primitive(CompilerMSL::Options::PrimitiveTopology top) {
 +	switch (top) {
 +	case CompilerMSL::Options::PrimitiveTopology::Points: return 1;
@@ -1284,15 +1364,28 @@ index ff081182..57af698e 100644
 +				}
 +				return;
 +			}
-+
+ 
+-	if (has_runtime_array_declaration)
+-		statement_no_indent("");
 +			if (!interface_variable_exists_in_entry_point(var.self))
 +				return;
-+
+ 
+-	// Emit buffer aliases here.
+-	for (auto &var_id : buffer_aliases_discrete)
+-	{
+-		const auto &var = get<SPIRVariable>(var_id);
 +			if (is_hidden_variable(var, true))
 +				return;
-+
+ 
+-		// We already declare this alias in a different way.
+-		if (is_var_runtime_size_array(var))
+-			continue;
 +			uint32_t location = get_decoration(id, DecorationLocation);
-+
+ 
+-		const auto &type = get_variable_data_type(var);
+-		auto addr_space = get_variable_address_space(var);
+-		// This resource name has already been added.
+-		auto name = to_name(var_id);
 +			bool is_builtin = is_builtin_variable(var);
 +			std::string name = to_name(id);
 +			MSLShaderInterfaceVariable variable;
@@ -1316,9 +1409,18 @@ index ff081182..57af698e 100644
 +				statement("\t", name, "[i] = out.in", std::to_string(variable.location), ";");
 +			}
 +		});
-+
+ 
+-		uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
+-		uint32_t desc_binding = get_decoration(var_id, DecorationBinding);
+-		auto alias_name = join("spvBufferAliasSet", desc_set, "Binding", desc_binding);
 +		end_scope();
-+
+ 
+-		statement(addr_space, " auto& ", to_restrict(var_id, true),
+-		          name,
+-		          " = *(", addr_space, " ", type_to_glsl(type), "*)", alias_name, ";");
+-	}
+-	// Discrete descriptors are processed in entry point emission every compiler iteration.
+-	buffer_aliases_discrete.clear();
 +		// Captures are ordered by instance, then input primitive, then invocation.
 +		string xfb_args;
 +		if (needs_geometry_transform_feedback())
@@ -1347,12 +1449,24 @@ index ff081182..57af698e 100644
 +			default: break;
 +			}
 +		});
-+
+ 
+-	// Emit disabled fragment outputs.
+-	std::sort(disabled_frag_outputs.begin(), disabled_frag_outputs.end());
+-	for (uint32_t var_id : disabled_frag_outputs)
+-	{
+-		auto &var = get<SPIRVariable>(var_id);
+-		add_local_variable_name(var_id);
+-		statement(CompilerGLSL::variable_decl(var), ";");
+-		var.deferred_declaration = false;
 +		statement(");");
 +		end_scope();
-+	}
-+}
-+
+ 	}
+-
+-	// Holds SetMeshOutputsEXT information. Threadgroup since first thread wins.
+-	if (processing_entry_point && is_mesh_shader())
+-		statement("threadgroup uint2 spvMeshSizes;");
+ }
+ 
 +
  string CompilerMSL::compile()
  {
@@ -1584,7 +1698,31 @@ index ff081182..57af698e 100644
  	    (is_sample_rate() && (active_input_builtins.get(BuiltInFragCoord) ||
  	                          (need_subpass_input_ms && !msl_options.use_framebuffer_fetch_subpasses))))
  		needs_sample_id = true;
-@@ -2235,6 +3403,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+@@ -2001,6 +3169,23 @@ void CompilerMSL::preprocess_op_codes()
+ 		add_header_line("#include <metal_simdgroup_matrix>");
+ 		validate_cooperative_matrix_types();
+ 	}
++
++	// Tiled cooperative matrices and FP8 values use the helpers of SPVFuncImplCooperativeMatrixTiled and
++	// SPVFuncImplFloat8, which go together.
++	bool tiled_or_fp8 = false;
++	ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &type) {
++		if (type.basetype == SPIRType::FloatE4M3 ||
++		    (type.op == OpTypeCooperativeMatrixKHR && cooperative_matrix_is_tiled(type)))
++			tiled_or_fp8 = true;
++	});
++	if (tiled_or_fp8)
++	{
++		if (!msl_options.supports_msl_version(3, 1))
++			SPIRV_CROSS_THROW("Cooperative matrices and FP8 require MSL 3.1 or later.");
++		add_header_line("#include <metal_simdgroup_matrix>");
++		spv_function_implementations.insert(SPVFuncImplFloat8);
++		spv_function_implementations.insert(SPVFuncImplCooperativeMatrixTiled);
++	}
+ }
+ 
+ uint32_t CompilerMSL::clone_ray_data_type(uint32_t type_id, bool force)
+@@ -2235,6 +3420,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
  
  			switch (op)
  			{
@@ -1598,7 +1736,7 @@ index ff081182..57af698e 100644
  			case OpCopyObject:
  			case OpLoad:
  			case OpInBoundsAccessChain:
-@@ -2348,6 +3523,8 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+@@ -2348,6 +3540,8 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
  			case OpAtomicXor:
  			case OpImageWrite:
  			{
@@ -1607,7 +1745,7 @@ index ff081182..57af698e 100644
  				if (needs_frag_discard_checks())
  					added_arg_ids.insert(builtin_helper_invocation_id);
  				uint32_t ptr = 0;
-@@ -2423,6 +3600,25 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+@@ -2423,6 +3617,25 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
  				break;
  			}
  
@@ -1633,7 +1771,7 @@ index ff081182..57af698e 100644
  			case OpGroupNonUniformBallotFindLSB:
  			case OpGroupNonUniformBallotFindMSB:
  			{
-@@ -2687,7 +3883,11 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+@@ -2687,7 +3900,11 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
  
  						func.add_parameter(mbr_type_id, var_id, true);
  						set<SPIRVariable>(var_id, ptr_type_id, StorageClassFunction);
@@ -1645,7 +1783,7 @@ index ff081182..57af698e 100644
  					}
  					mbr_idx++;
  				}
-@@ -2697,9 +3897,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+@@ -2697,9 +3914,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
  				uint32_t next_id = ir.increase_bound_by(1);
  				func.add_parameter(type_id, next_id, true);
  				set<SPIRVariable>(next_id, type_id, StorageClassFunction, 0, arg_id);
@@ -1659,7 +1797,7 @@ index ff081182..57af698e 100644
  			}
  		}
  	}
-@@ -3035,6 +4239,27 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+@@ -3035,6 +4256,27 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
  	                           msl_options.pad_fragment_output_components &&
  	                           get_entry_point().model == ExecutionModelFragment && storage == StorageClassOutput;
  
@@ -1687,7 +1825,7 @@ index ff081182..57af698e 100644
  	if (pad_fragment_output)
  	{
  		uint32_t locn = get_decoration(var.self, DecorationLocation);
-@@ -3042,10 +4267,36 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+@@ -3042,10 +4284,36 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
  		if (type_components < target_components)
  		{
  			// Make a new type here.
@@ -1725,7 +1863,7 @@ index ff081182..57af698e 100644
  
  	if (storage == StorageClassInput && pull_model_inputs.count(var.self))
  		ib_type.member_types.push_back(build_msl_interpolant_type(type_id, is_noperspective));
-@@ -3077,8 +4328,12 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+@@ -3077,8 +4345,12 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
  		if (padded_output)
  		{
  			entry_func.fixup_hooks_out.push_back([=, &var]() {
@@ -1740,7 +1878,7 @@ index ff081182..57af698e 100644
  			});
  		}
  		else
-@@ -4084,6 +5339,76 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+@@ -4084,6 +5356,76 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
  	auto builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
  	bool is_block = has_decoration(var_type.self, DecorationBlock);
  
@@ -1817,7 +1955,7 @@ index ff081182..57af698e 100644
  	// If stage variables are masked out, emit them as plain variables instead.
  	// For builtins, we query them one by one later.
  	// IO blocks are not masked here, we need to mask them per-member instead.
-@@ -4124,7 +5449,24 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+@@ -4124,7 +5466,24 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
  	{
  		bool block_requires_flattening =
  		    variable_storage_requires_stage_io(storage) || (is_block && var_type.array.empty());
@@ -1843,7 +1981,7 @@ index ff081182..57af698e 100644
  
  		if (needs_local_declaration)
  		{
-@@ -4292,7 +5634,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
+@@ -4292,7 +5651,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
  				is_builtin = false;
  
  			// MSL does not allow matrices or arrays in input or output variables, so need to handle it specially.
@@ -1852,7 +1990,7 @@ index ff081182..57af698e 100644
  			{
  				add_composite_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
  			}
-@@ -4389,12 +5731,13 @@ void CompilerMSL::fix_up_interface_member_indices(StorageClass storage, uint32_t
+@@ -4389,12 +5748,13 @@ void CompilerMSL::fix_up_interface_member_indices(StorageClass storage, uint32_t
  
  // Add an interface structure for the type of storage, which is either StorageClassInput or StorageClassOutput.
  // Returns the ID of the newly added variable, or zero if no variable was added.
@@ -1868,7 +2006,7 @@ index ff081182..57af698e 100644
  
  	InterfaceBlockMeta meta;
  
-@@ -4435,6 +5778,20 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4435,6 +5795,20 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  		                               bi_type == BuiltInFragDepth ||
  		                               bi_type == BuiltInFragStencilRefEXT || bi_type == BuiltInSampleMask;
  
@@ -1889,7 +2027,7 @@ index ff081182..57af698e 100644
  		// These builtins are part of the stage in/out structs.
  		bool is_interface_block_builtin =
  		    builtin_is_stage_in_out || (is_tese_shader() && !msl_options.raw_buffer_tese_input &&
-@@ -4459,12 +5816,40 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4459,12 +5833,40 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  
  		bool filter_patch_decoration = (has_decoration(var_id, DecorationPatch) || is_patch_block(type)) == patch;
  
@@ -1931,7 +2069,7 @@ index ff081182..57af698e 100644
  		// It's not enough to simply avoid marking fragment outputs if the pipeline won't
  		// accept them. We can't put them in the struct at all, or otherwise the compiler
  		// complains that the outputs weren't explicitly marked.
-@@ -4506,13 +5891,13 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4506,13 +5908,13 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  				// Multiple variables can alias the same Location, and try to make sure each location is declared only once.
  				// We will swizzle data in and out to make this work.
  				// This is only relevant for vertex inputs and fragment outputs.
@@ -1949,7 +2087,7 @@ index ff081182..57af698e 100644
  					{
  						uint32_t array_size = 1;
  						if (!type.array.empty())
-@@ -4555,7 +5940,7 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4555,7 +5957,7 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  	// If no variables qualify, leave.
  	// For patch input in a tessellation evaluation shader, the per-vertex stage inputs
  	// are included in a special patch control point array.
@@ -1958,7 +2096,7 @@ index ff081182..57af698e 100644
  	    !(!msl_options.raw_buffer_tese_input && storage == StorageClassInput && patch && stage_in_var_id))
  		return 0;
  
-@@ -4659,7 +6044,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4659,7 +6061,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  				auto &blk = get<SPIRBlock>(blk_id);
  				auto last_blk_return = blk.terminator == SPIRBlock::Kill || blk.terminator == SPIRBlock::Unreachable;
  				if (blk.terminator == SPIRBlock::Return || (last_blk_return && blk_id == entry_func.blocks.back()))
@@ -1971,7 +2109,7 @@ index ff081182..57af698e 100644
  			}
  			vars_needing_early_declaration.push_back(ib_var_id);
  		}
-@@ -4679,7 +6068,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4679,7 +6085,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  						// The first member of the indirect buffer is always the number of vertices
  						// to draw.
  						// We zero-base the InstanceID & VertexID variables for HLSL emulation elsewhere, so don't do it twice
@@ -1984,7 +2122,7 @@ index ff081182..57af698e 100644
  						{
  							statement("device ", to_name(ir.default_entry_point), "_", ib_var_ref, "& ", ib_var_ref,
  							          " = ", output_buffer_var_name, "[", to_expression(builtin_invocation_id_id),
-@@ -4776,9 +6169,27 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4776,9 +6186,27 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  	{
  		// For tessellation inputs, add all outputs from the previous stage to ensure
  		// the struct containing them is the correct size and layout.
@@ -2013,7 +2151,7 @@ index ff081182..57af698e 100644
  				continue;
  
  			if (patch != (input.second.rate == MSL_SHADER_VARIABLE_RATE_PER_PATCH))
-@@ -4800,11 +6211,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4800,11 +6228,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  			switch (input.second.format)
  			{
  			case MSL_SHADER_VARIABLE_FORMAT_UINT16:
@@ -2027,7 +2165,7 @@ index ff081182..57af698e 100644
  			default:
  				type.basetype = SPIRType::UInt;
  				type.width = 32;
-@@ -4868,11 +6279,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+@@ -4868,11 +6296,11 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
  			switch (output.second.format)
  			{
  			case MSL_SHADER_VARIABLE_FORMAT_UINT16:
@@ -2041,7 +2179,7 @@ index ff081182..57af698e 100644
  			default:
  				type.basetype = SPIRType::UInt;
  				type.width = 32;
-@@ -5032,6 +6443,66 @@ uint32_t CompilerMSL::add_interface_block_pointer(uint32_t ib_var_id, StorageCla
+@@ -5032,6 +6460,66 @@ uint32_t CompilerMSL::add_interface_block_pointer(uint32_t ib_var_id, StorageCla
  	return ib_ptr_var_id;
  }
  
@@ -2108,7 +2246,7 @@ index ff081182..57af698e 100644
  uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
  {
  	// Accumulate the variables that should appear in the interface struct.
-@@ -5127,6 +6598,11 @@ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t locat
+@@ -5127,6 +6615,11 @@ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t locat
  	if (num_components == 0)
  		num_components = p_va->second.vecsize;
  
@@ -2120,7 +2258,7 @@ index ff081182..57af698e 100644
  	switch (p_va->second.format)
  	{
  	case MSL_SHADER_VARIABLE_FORMAT_UINT8:
-@@ -5173,6 +6649,26 @@ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t locat
+@@ -5173,6 +6666,26 @@ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t locat
  		}
  	}
  
@@ -2147,7 +2285,7 @@ index ff081182..57af698e 100644
  	default:
  		if (num_components > type.vecsize)
  			type_id = build_extended_vector_type(type_id, num_components);
-@@ -6040,8 +7536,10 @@ void CompilerMSL::emit_header()
+@@ -6040,8 +7553,10 @@ void CompilerMSL::emit_header()
  	if (!pragma_lines.empty())
  		statement("");
  
@@ -2160,7 +2298,7 @@ index ff081182..57af698e 100644
  
  	for (auto &header : header_lines)
  		statement(header);
-@@ -6256,6 +7754,77 @@ void CompilerMSL::emit_custom_templates()
+@@ -6256,6 +7771,77 @@ void CompilerMSL::emit_custom_templates()
  			statement("");
  			break;
  
@@ -2238,7 +2376,7 @@ index ff081182..57af698e 100644
  		default:
  			break;
  		}
-@@ -6267,6 +7836,21 @@ void CompilerMSL::emit_custom_templates()
+@@ -6267,6 +7853,21 @@ void CompilerMSL::emit_custom_templates()
  // otherwise they will cause problems when linked together in a single Metallib.
  void CompilerMSL::emit_custom_functions()
  {
@@ -2260,7 +2398,7 @@ index ff081182..57af698e 100644
  	// Use when outputting overloaded functions to cover different address spaces.
  	static const char *texture_addr_spaces[] = { "device", "constant", "thread" };
  	static uint32_t texture_addr_space_count = sizeof(texture_addr_spaces) / sizeof(char*);
-@@ -6610,9 +8194,12 @@ void CompilerMSL::emit_custom_functions()
+@@ -6610,9 +8211,12 @@ void CompilerMSL::emit_custom_functions()
  			break;
  
  		// "fadd" intrinsic support
@@ -2274,7 +2412,7 @@ index ff081182..57af698e 100644
  			begin_scope();
  			statement("return fma(T(1), l, r);");
  			end_scope();
-@@ -6622,7 +8209,7 @@ void CompilerMSL::emit_custom_functions()
+@@ -6622,7 +8226,7 @@ void CompilerMSL::emit_custom_functions()
  		// "fsub" intrinsic support
  		case SPVFuncImplFSub:
  			statement("template<typename T>");
@@ -2283,7 +2421,7 @@ index ff081182..57af698e 100644
  			begin_scope();
  			statement("return fma(T(-1), r, l);");
  			end_scope();
-@@ -6632,14 +8219,14 @@ void CompilerMSL::emit_custom_functions()
+@@ -6632,14 +8236,14 @@ void CompilerMSL::emit_custom_functions()
  		// "fmul' intrinsic support
  		case SPVFuncImplFMul:
  			statement("template<typename T>");
@@ -2300,7 +2438,7 @@ index ff081182..57af698e 100644
  			begin_scope();
  			statement("vec<T, Cols> res = vec<T, Cols>(0);");
  			statement("for (uint i = Rows; i > 0; --i)");
-@@ -6656,7 +8243,7 @@ void CompilerMSL::emit_custom_functions()
+@@ -6656,7 +8260,7 @@ void CompilerMSL::emit_custom_functions()
  			statement("");
  
  			statement("template<typename T, int Cols, int Rows>");
@@ -2309,7 +2447,7 @@ index ff081182..57af698e 100644
  			begin_scope();
  			statement("vec<T, Rows> res = vec<T, Rows>(0);");
  			statement("for (uint i = Cols; i > 0; --i)");
-@@ -6668,7 +8255,7 @@ void CompilerMSL::emit_custom_functions()
+@@ -6668,7 +8272,7 @@ void CompilerMSL::emit_custom_functions()
  			statement("");
  
  			statement("template<typename T, int LCols, int LRows, int RCols, int RRows>");
@@ -2318,7 +2456,7 @@ index ff081182..57af698e 100644
  			begin_scope();
  			statement("static_assert(LCols == RRows, \"column-row configuration mismatch\");");
  			statement("matrix<T, RCols, LRows> res;");
-@@ -7077,6 +8664,57 @@ void CompilerMSL::emit_custom_functions()
+@@ -7077,6 +8681,57 @@ void CompilerMSL::emit_custom_functions()
  			}
  			break;
  
@@ -2376,7 +2514,7 @@ index ff081182..57af698e 100644
  		case SPVFuncImplSubgroupBroadcast:
  			// Metal doesn't allow broadcasting boolean values directly, but we can work around that by broadcasting
  			// them as integers.
-@@ -8431,6 +10069,17 @@ void CompilerMSL::emit_custom_functions()
+@@ -8431,6 +10086,17 @@ void CompilerMSL::emit_custom_functions()
  				statement("const device T* ptr;");
  				end_scope_decl();
  				statement("");
@@ -2394,7 +2532,248 @@ index ff081182..57af698e 100644
  			}
  			else
  			{
-@@ -8483,7 +10132,17 @@ void CompilerMSL::emit_custom_functions()
+@@ -8471,6 +10137,240 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplFloat8:
++			// FP8 E4M3 (OCP): sign, 4 exponent bits (bias 7), 3 mantissa bits; no infinities, S.1111.111 is NaN.
++			// Every value is exact in half. Converting rounds to nearest even; infinities and, saturated or not, finite
++			// values out of range become NaN or +-448, and every NaN 0xff, as AMD's conversions do. spvFP8Bits encodes
++			// a value that is already FP8, keeping its bits. Special values are told by their bits, which works under
++			// fast math and keeps the sign half to float conversions lose.
++			statement("static inline half spvDecodeFP8E4M3(uchar v)");
++			begin_scope();
++			statement("uint em = v & 0x7fu;");
++			statement("half mag = em >= 8u ? as_type<half>(ushort((em << 7) + 0x2000u)) : half(em) * 0.001953125h;");
++			statement("if (em == 0x7fu)");
++			statement("    mag = as_type<half>(ushort(0x7e00));");
++			statement("// The sign by its bit: negating would not keep the sign of NaN under fast math.");
++			statement("return as_type<half>(ushort(as_type<ushort>(mag) | (uint(v & 0x80u) << 8)));");
++			end_scope();
++			statement("");
++			statement("template <int N>");
++			statement("static inline vec<half, N> spvDecodeFP8E4M3(vec<uchar, N> v)");
++			begin_scope();
++			statement("vec<half, N> r;");
++			statement("for (int i = 0; i < N; i++)");
++			statement("    r[i] = spvDecodeFP8E4M3(v[i]);");
++			statement("return r;");
++			end_scope();
++			statement("");
++			statement("// Rounding works on the bits: adding just under half a step, plus the lowest kept bit for ties to even,");
++			statement("// then clearing the dropped bits. Below 2^-6, FP8 values are subnormal, multiples of 2^-9.");
++			statement("static inline half spvRoundFP8E4M3(float x, bool saturate)");
++			begin_scope();
++			statement("uint b = as_type<uint>(x), a = b & 0x7fffffffu;");
++			statement("ushort s = ushort((b >> 16) & 0x8000u);");
++			statement("if (a > 0x7f800000u)");
++			statement("    return as_type<half>(ushort(0xfe00));");
++			statement("// 448 is the largest; from 464, halfway to the next step, values round past it.");
++			statement("if (a >= 0x43e80000u)");
++			statement("    return as_type<half>(ushort(s | (saturate && a != 0x7f800000u ? 0x5f00u : 0x7e00u)));");
++			statement("if (a < 0x3c800000u)");
++			statement("    return as_type<half>(ushort(s | as_type<ushort>(half(rint(as_type<float>(a) * 512.0f) * 0.001953125f))));");
++			statement("return as_type<half>(ushort(s | as_type<ushort>(half(as_type<float>((a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u)))));");
++			end_scope();
++			statement("");
++			statement("static inline half spvRoundFP8E4M3(half x, bool saturate)");
++			begin_scope();
++			statement("ushort b = as_type<ushort>(x), a = b & 0x7fffu, s = b & 0x8000u;");
++			statement("if (a > 0x7c00u)");
++			statement("    return as_type<half>(ushort(0xfe00));");
++			statement("if (a >= 0x5f40u)");
++			statement("    return as_type<half>(ushort(s | (saturate && a != 0x7c00u ? 0x5f00u : 0x7e00u)));");
++			statement("if (a < 0x2400u)");
++			statement("    return as_type<half>(ushort(s | as_type<ushort>(half(rint(float(as_type<half>(a)) * 512.0f) * 0.001953125f))));");
++			statement("return as_type<half>(ushort(s | ((a + 0x3fu + ((a >> 7) & 1u)) & 0xff80u)));");
++			end_scope();
++			statement("");
++			statement("static inline uchar spvFP8Bits(half x)");
++			begin_scope();
++			statement("ushort b = as_type<ushort>(x), a = b & 0x7fffu;");
++			statement("uint s = (b >> 8) & 0x80u;");
++			statement("if (a >= 0x7c00u)");
++			statement("    return uchar(s | 0x7fu);");
++			statement("if (a < 0x2400u)");
++			statement("    return uchar(s | uint(float(as_type<half>(a)) * 512.0f));");
++			statement("return uchar(s | ((a >> 7) - 64u));");
++			end_scope();
++			statement("");
++			statement("static inline uchar spvEncodeFP8E4M3(float x, bool saturate) { return spvFP8Bits(spvRoundFP8E4M3(x, saturate)); }");
++			statement("static inline uchar spvEncodeFP8E4M3(half x, bool saturate) { return spvFP8Bits(spvRoundFP8E4M3(x, saturate)); }");
++			statement("");
++			statement("template <typename T, int N>");
++			statement("static inline vec<uchar, N> spvEncodeFP8E4M3(vec<T, N> x, bool saturate)");
++			begin_scope();
++			statement("vec<uchar, N> r;");
++			statement("for (int i = 0; i < N; i++)");
++			statement("    r[i] = spvEncodeFP8E4M3(x[i], saturate);");
++			statement("return r;");
++			end_scope();
++			statement("");
++			statement("template <typename T> static inline half spvRoundFP8E4M3(T x) { return spvRoundFP8E4M3(x, false); }");
++			statement("template <typename T> static inline half spvRoundFP8E4M3Sat(T x) { return spvRoundFP8E4M3(x, true); }");
++			statement("");
++			break;
++
++		case SPVFuncImplCooperativeMatrixTiled:
++		{
++			// Cooperative matrices of 8x8 tiles, e[row tile * C + column tile]: each tile is this invocation's two
++			// components of a simdgroup_matrix, kept as a vector. Writing components of a simdgroup_matrix itself (its
++			// thread_elements() is a 64-wide vector view) makes Metal keep matrices in memory, which made AMD FSR 4's
++			// networks run about ten times slower; tiles become simdgroup_matrix only for Metal's matrix operations.
++			statement("template <typename T, int R, int C>");
++			statement("struct spvCoopMatrix");
++			begin_scope();
++			statement("vec<T, 2> e[R * C];");
++			statement("spvCoopMatrix() thread = default;");
++			statement("explicit spvCoopMatrix(T v) thread");
++			begin_scope();
++			statement("for (int i = 0; i < R * C; i++)");
++			statement("    e[i] = vec<T, 2>(v);");
++			end_scope();
++			end_scope_decl();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline simdgroup_matrix<T, 8, 8> spvCoopMatTile(vec<T, 2> e)");
++			begin_scope();
++			statement("simdgroup_matrix<T, 8, 8> t;");
++			statement("t.thread_elements()[0] = e.x;");
++			statement("t.thread_elements()[1] = e.y;");
++			statement("return t;");
++			end_scope();
++			statement("");
++			statement("template <typename T>");
++			statement("static inline vec<T, 2> spvCoopMatElems(simdgroup_matrix<T, 8, 8> t)");
++			begin_scope();
++			statement("return vec<T, 2>(t.thread_elements()[0], t.thread_elements()[1]);");
++			end_scope();
++			statement("");
++			statement("// Metal's 8x8 layout: SIMD lane l holds row x, columns y and y + 1 of every tile.");
++			statement("static inline ushort2 spvCoopMatLaneCoord(ushort l) { ushort q = l >> 2; return ushort2((q & 4) + ((l >> 1) & 3), (q & 2) * 2 + (l & 1) * 2); }");
++			statement("static inline ushort spvCoopMatLaneOf(ushort r, ushort c) { return ((r & 4) << 2) + ((r & 3) << 1) + ((c & 4) << 1) + ((c >> 1) & 1); }");
++			statement("// The SIMD lane, for code that runs on the whole SIMD-group, as cooperative matrix operations must.");
++			statement("static inline ushort spvCoopMatLane() { return ushort(simd_prefix_exclusive_sum(ushort(1))); }");
++			statement("");
++			statement("// Components by index, as AMD RDNA 4's WMMA instructions order 16x16 matrices: lane l's component i is");
++			statement("// A[l % 16][(l / 16) * 8 + i] for use A (0), M[(l / 16) * 8 + i][l % 16] for B (1) and accumulators (2).");
++			statement("// D3D12 shaders written for AMD's WMMA intrinsics fill and read matrices by these indices.");
++			statement("template <int U> static inline ushort2 spvCoopMatRdnaCoord(ushort l, ushort i) { return U == 0 ? ushort2(l & 15, (l >> 4) * 8 + i) : ushort2((l >> 4) * 8 + i, l & 15); }");
++			statement("template <int U> static inline ushort2 spvCoopMatRdnaOwner(ushort r, ushort c) { return U == 0 ? ushort2(r + (c & 8) * 2, c & 7) : ushort2(c + (r & 8) * 2, r & 7); }");
++			statement("#define SPV_COOPMAT_COMPONENT(m, k) (m).e[(k) >> 1][(k) & 1]");
++			statement("// Selects rather than a dynamic vector index, which Metal would put in memory.");
++			statement("template <int U, typename T>");
++			statement("static inline T spvCoopMatGet(thread const spvCoopMatrix<T, 2, 2> &m, uint i)");
++			begin_scope();
++			statement("ushort2 rc = spvCoopMatRdnaCoord<U>(spvCoopMatLane(), ushort(i & 7));");
++			statement("ushort src = spvCoopMatLaneOf(rc.x & 7, rc.y & 7);");
++			statement("thread spvCoopMatrix<T, 2, 2> &w = const_cast<thread spvCoopMatrix<T, 2, 2> &>(m);");
++			statement("// For use A and the same i in every lane, every lane reads the same component of a tile: one exchange.");
++			statement("uint u = simd_broadcast_first(i);");
++			statement("if (U == 0 && simd_all(i == u))");
++			begin_scope();
++			statement("bool odd = (u & 1) != 0;");
++			statement("vec<T, 4> t = simd_shuffle(vec<T, 4>(odd ? SPV_COOPMAT_COMPONENT(w, 1) : SPV_COOPMAT_COMPONENT(w, 0), odd ? SPV_COOPMAT_COMPONENT(w, 3) : SPV_COOPMAT_COMPONENT(w, 2),");
++			statement("    odd ? SPV_COOPMAT_COMPONENT(w, 5) : SPV_COOPMAT_COMPONENT(w, 4), odd ? SPV_COOPMAT_COMPONENT(w, 7) : SPV_COOPMAT_COMPONENT(w, 6)), src);");
++			statement("vec<T, 2> h = rc.x >= 8 ? t.zw : t.xy;");
++			statement("return rc.y >= 8 ? h.y : h.x;");
++			end_scope();
++			statement("vec<T, 4> lo = simd_shuffle(vec<T, 4>(SPV_COOPMAT_COMPONENT(w, 0), SPV_COOPMAT_COMPONENT(w, 1), SPV_COOPMAT_COMPONENT(w, 2), SPV_COOPMAT_COMPONENT(w, 3)), src);");
++			statement("vec<T, 4> hi = simd_shuffle(vec<T, 4>(SPV_COOPMAT_COMPONENT(w, 4), SPV_COOPMAT_COMPONENT(w, 5), SPV_COOPMAT_COMPONENT(w, 6), SPV_COOPMAT_COMPONENT(w, 7)), src);");
++			statement("vec<T, 4> q = rc.x >= 8 ? hi : lo;");
++			statement("vec<T, 2> p = rc.y >= 8 ? q.zw : q.xy;");
++			statement("return (rc.y & 1) ? p.y : p.x;");
++			end_scope();
++			statement("");
++			statement("// Every lane passes its component i and value; each lane takes those that land in its own components.");
++			statement("// Shaders mostly pass the same i in every lane (a loop counter), which needs no exchange of indices and");
++			statement("// fewer of values: for use A, component i of lane l is in column i, so this invocation's components");
++			statement("// k and k ^ 1 come from the same lane; for B and accumulators, only lanes in row i take values.");
++			statement("template <int U, typename T>");
++			statement("static inline void spvCoopMatSet(thread spvCoopMatrix<T, 2, 2> &m, uint i, T v)");
++			begin_scope();
++			statement("ushort2 x = spvCoopMatLaneCoord(spvCoopMatLane());");
++			statement("uint u = simd_broadcast_first(i);");
++			statement("if (simd_all(i == u))");
++			begin_scope();
++			statement("u &= 7;");
++			statement("if (U == 0)");
++			begin_scope();
++			statement("int d = int(u) - int(x.y);");
++			statement("for (int j = 0; j < 4; j++)");
++			begin_scope();
++			statement("T sv = simd_shuffle(v, ushort((j >> 1) * 8 + x.x + (j & 1) * 16));");
++			statement("SPV_COOPMAT_COMPONENT(m, j * 2) = d == 0 ? sv : SPV_COOPMAT_COMPONENT(m, j * 2);");
++			statement("SPV_COOPMAT_COMPONENT(m, j * 2 + 1) = d == 1 ? sv : SPV_COOPMAT_COMPONENT(m, j * 2 + 1);");
++			end_scope();
++			end_scope();
++			statement("else");
++			begin_scope();
++			statement("for (int k = 0; k < 8; k++)");
++			begin_scope();
++			statement("T sv = simd_shuffle(v, ushort(((k >> 1) & 1) * 8 + x.y + (k & 1) + (k >> 2) * 16));");
++			statement("SPV_COOPMAT_COMPONENT(m, k) = x.x == u ? sv : SPV_COOPMAT_COMPONENT(m, k);");
++			end_scope();
++			end_scope();
++			statement("return;");
++			end_scope();
++			statement("#define SPV_COOPMAT_SET(k) { ushort2 o = spvCoopMatRdnaOwner<U>(ushort(((k) >> 2) * 8 + x.x), ushort((((k) >> 1) & 1) * 8 + x.y + ((k) & 1))); \\");
++			statement("    T sv = simd_shuffle(v, o.x); uint si = simd_shuffle(i & 7, o.x); SPV_COOPMAT_COMPONENT(m, k) = o.y == si ? sv : SPV_COOPMAT_COMPONENT(m, k); }");
++			statement("SPV_COOPMAT_SET(0) SPV_COOPMAT_SET(1) SPV_COOPMAT_SET(2) SPV_COOPMAT_SET(3)");
++			statement("SPV_COOPMAT_SET(4) SPV_COOPMAT_SET(5) SPV_COOPMAT_SET(6) SPV_COOPMAT_SET(7)");
++			statement("#undef SPV_COOPMAT_SET");
++			end_scope();
++			statement("");
++			statement("// Other shapes: the components in this invocation's own order.");
++			statement("template <int U, typename T, int R, int C>");
++			statement("static inline T spvCoopMatGet(thread const spvCoopMatrix<T, R, C> &m0, uint i)");
++			begin_scope();
++			statement("thread spvCoopMatrix<T, R, C> &m = const_cast<thread spvCoopMatrix<T, R, C> &>(m0);");
++			statement("T v = T(0);");
++			statement("for (int k = 0; k < R * C * 2; k++)");
++			statement("    v = uint(k) == i ? SPV_COOPMAT_COMPONENT(m, k) : v;");
++			statement("return v;");
++			end_scope();
++			statement("");
++			statement("template <int U, typename T, int R, int C>");
++			statement("static inline void spvCoopMatSet(thread spvCoopMatrix<T, R, C> &m, uint i, T v)");
++			begin_scope();
++			statement("for (int k = 0; k < R * C * 2; k++)");
++			statement("    SPV_COOPMAT_COMPONENT(m, k) = uint(k) == i ? v : SPV_COOPMAT_COMPONENT(m, k);");
++			end_scope();
++			statement("");
++			statement("// FP8 matrices from and to memory of FP8 encodings, component by component.");
++			statement("template <int R, int C, typename P>");
++			statement("static inline void spvCoopMatLoadFP8(thread spvCoopMatrix<half, R, C> &m, P p, uint stride, bool col_major)");
++			begin_scope();
++			statement("ushort2 x = spvCoopMatLaneCoord(spvCoopMatLane());");
++			statement("for (int k = 0; k < R * C * 2; k++)");
++			begin_scope();
++			statement("uint r = (k >> 1) / C * 8 + x.x, c = (k >> 1) % C * 8 + x.y + (k & 1);");
++			statement("SPV_COOPMAT_COMPONENT(m, k) = spvDecodeFP8E4M3(col_major ? p[c * stride + r] : p[r * stride + c]);");
++			end_scope();
++			end_scope();
++			statement("");
++			statement("template <int R, int C, typename P>");
++			statement("static inline void spvCoopMatStoreFP8(thread const spvCoopMatrix<half, R, C> &m0, P p, uint stride, bool col_major)");
++			begin_scope();
++			statement("thread spvCoopMatrix<half, R, C> &m = const_cast<thread spvCoopMatrix<half, R, C> &>(m0);");
++			statement("ushort2 x = spvCoopMatLaneCoord(spvCoopMatLane());");
++			statement("for (int k = 0; k < R * C * 2; k++)");
++			begin_scope();
++			statement("uint r = (k >> 1) / C * 8 + x.x, c = (k >> 1) % C * 8 + x.y + (k & 1);");
++			statement("p[col_major ? c * stride + r : r * stride + c] = spvFP8Bits(half(SPV_COOPMAT_COMPONENT(m, k)));");
++			end_scope();
++			end_scope();
++			statement("");
++			break;
++		}
++
+ 		case SPVFuncImplReduceAdd:
+ 			// Metal doesn't support __builtin_reduce_add or simd_reduce_add, so we need this.
+ 			// Metal also doesn't support the other vector builtins, which would have been useful to make this a single template.
+@@ -8483,7 +10383,17 @@ void CompilerMSL::emit_custom_functions()
  
  			statement("template <typename T>");
  			statement("T reduce_add(vec<T, 4> v) { return v.x + v.y + v.z + v.w; }");
@@ -2412,7 +2791,7 @@ index ff081182..57af698e 100644
  			statement("");
  			break;
  
-@@ -8504,6 +10163,225 @@ void CompilerMSL::emit_custom_functions()
+@@ -8504,6 +10414,225 @@ void CompilerMSL::emit_custom_functions()
  			statement("");
  			break;
  
@@ -2638,7 +3017,7 @@ index ff081182..57af698e 100644
  		case SPVFuncImplDepthCast:
  			statement("template <typename T>");
  			statement("static inline depth2d<T> spvDepthCast(texture2d<T> t)");
-@@ -8675,6 +10553,8 @@ void CompilerMSL::emit_resources()
+@@ -8675,6 +10804,8 @@ void CompilerMSL::emit_resources()
  
  	// Emit the special [[stage_in]] and [[stage_out]] interface blocks which we created.
  	emit_interface_block(stage_out_var_id);
@@ -2647,7 +3026,7 @@ index ff081182..57af698e 100644
  	emit_interface_block(patch_stage_out_var_id);
  	emit_interface_block(stage_in_var_id);
  	emit_interface_block(patch_stage_in_var_id);
-@@ -8738,7 +10618,7 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+@@ -8738,7 +10869,7 @@ void CompilerMSL::emit_specialization_constants_and_structs()
  			mark_scalar_layout_structs(type);
  	});
  
@@ -2656,7 +3035,7 @@ index ff081182..57af698e 100644
  	// Very special case. If gl_PerVertex is initialized as an array (tessellation)
  	// we have to potentially emit the gl_PerVertex struct type so that we can emit a constant LUT.
  	ir.for_each_typed_id<SPIRConstant>([&](uint32_t, SPIRConstant &c) {
-@@ -8779,6 +10659,11 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+@@ -8779,6 +10910,11 @@ void CompilerMSL::emit_specialization_constants_and_structs()
  	// attribute, and use its initializer to initialize all the spec constants with
  	// that ID.
  	std::unordered_map<uint32_t, ConstantID> unique_func_constants;
@@ -2668,7 +3047,7 @@ index ff081182..57af698e 100644
  
  	for (auto &id_ : ir.ids_for_constant_undef_or_type)
  	{
-@@ -9635,6 +11520,9 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
+@@ -9635,6 +11771,9 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
  bool CompilerMSL::access_chain_needs_stage_io_builtin_translation(uint32_t base)
  {
  	auto *var = maybe_get_backing_variable(base);
@@ -2678,7 +3057,586 @@ index ff081182..57af698e 100644
  	if (!var || !is_tessellation_shader())
  		return true;
  
-@@ -10126,25 +12014,47 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -9721,13 +11860,15 @@ bool CompilerMSL::check_physical_type_cast(std::string &expr, const SPIRType *ty
+ 	return false;
+ }
+ 
+-// Metal only implements Subgroup scoped 8x8 matrices with floating-point components.
++// Metal implements Subgroup scoped 8x8 matrices with floating-point components. Larger ones, made of 8x8 tiles, and
++// FP8 (E4M3) ones, held as half, are emulated (cooperative_matrix_is_tiled()).
+ void CompilerMSL::validate_cooperative_matrix_type(const SPIRType &type)
+ {
+-	// Only the component types which have a simdgroup_*8x8 equivalent.
++	// Only the component types which have a simdgroup_*8x8 equivalent, and FP8 E4M3 held as half.
+ 	auto &comp = get<SPIRType>(type.parent_type);
+-	if (comp.basetype != SPIRType::Float && comp.basetype != SPIRType::Half && comp.basetype != SPIRType::BFloat16)
+-		SPIRV_CROSS_THROW("MSL cooperative matrices only support float16, float32, and bfloat16 component types.");
++	if (comp.basetype != SPIRType::Float && comp.basetype != SPIRType::Half && comp.basetype != SPIRType::BFloat16 &&
++	    comp.basetype != SPIRType::FloatE4M3)
++		SPIRV_CROSS_THROW("MSL cooperative matrices only support float16, float32, bfloat16 and float8 E4M3 component types.");
+ 
+ 	// Only Subgroup scope.
+ 	auto &scope = get<SPIRConstant>(type.ext.cooperative.scope_id);
+@@ -9736,100 +11877,407 @@ void CompilerMSL::validate_cooperative_matrix_type(const SPIRType &type)
+ 	if (scope.scalar() != ScopeSubgroup)
+ 		SPIRV_CROSS_THROW("MSL cooperative matrices only support Subgroup scope.");
+ 
+-	// Only 8x8.
++	// Multiples of 8x8.
+ 	auto &rows = get<SPIRConstant>(type.ext.cooperative.rows_id);
+ 	auto &columns = get<SPIRConstant>(type.ext.cooperative.columns_id);
+ 	if (rows.specialization || columns.specialization)
+ 		SPIRV_CROSS_THROW("MSL does not support spec-constant dimensions for cooperative matrices.");
+-	if (rows.scalar() != 8 || columns.scalar() != 8)
+-		SPIRV_CROSS_THROW("MSL cooperative matrices only support 8x8 dimensions.");
++	if (rows.scalar() == 0 || columns.scalar() == 0 || rows.scalar() % 8 || columns.scalar() % 8)
++		SPIRV_CROSS_THROW("MSL cooperative matrices only support dimensions that are multiples of 8.");
++}
++
++uint32_t CompilerMSL::cooperative_matrix_dim(const SPIRType &type, bool columns)
++{
++	return get<SPIRConstant>(columns ? type.ext.cooperative.columns_id : type.ext.cooperative.rows_id).scalar();
++}
++
++uint32_t CompilerMSL::cooperative_matrix_use(const SPIRType &type)
++{
++	return get<SPIRConstant>(type.ext.cooperative.use_id).scalar();
++}
++
++bool CompilerMSL::cooperative_matrix_is_fp8(const SPIRType &type)
++{
++	return get<SPIRType>(type.parent_type).basetype == SPIRType::FloatE4M3;
++}
++
++bool CompilerMSL::cooperative_matrix_is_tiled(const SPIRType &type)
++{
++	return cooperative_matrix_dim(type, false) != 8 || cooperative_matrix_dim(type, true) != 8 ||
++	       cooperative_matrix_is_fp8(type);
++}
++
++// Components each invocation of the 32-wide SIMD-group holds: two of every 8x8 tile.
++uint32_t CompilerMSL::cooperative_matrix_components(const SPIRType &type)
++{
++	return (cooperative_matrix_dim(type, false) / 8) * (cooperative_matrix_dim(type, true) / 8) * 2;
++}
++
++// Validates all cooperative matrix types up-front, rather than failing partway through a function.
++void CompilerMSL::validate_cooperative_matrix_types()
++{
++	ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &type) {
++		if (type.op == OpTypeCooperativeMatrixKHR)
++			validate_cooperative_matrix_type(type);
++	});
++}
++
++// Non-matrix operands, e.g. the scalar in OpMatrixTimesScalar, are broadcast to every component. Component index
++// is this invocation's: 0 and 1 of an 8x8 matrix, 2 * tile + 0 and 1 of a tiled one.
++string CompilerMSL::to_cooperative_matrix_component(uint32_t id, uint32_t index)
++{
++	auto &type = expression_type(id);
++	if (type.op != OpTypeCooperativeMatrixKHR)
++		return to_enclosed_unpacked_expression(id);
++
++	if (cooperative_matrix_is_tiled(type))
++		return join(to_enclosed_unpacked_expression(id), ".e[", index / 2, "][", index % 2, "]");
++	return join(to_enclosed_unpacked_expression(id), ".thread_elements()[", index, "u]");
++}
++
++// One component of a matrix by index, as SPIR-V numbers them. In 16x16 matrices the index is the one AMD RDNA 4's
++// WMMA instructions give each lane's 8 components, which D3D12 shaders written for AMD's WMMA intrinsics rely on
++// (spvCoopMatGet); elsewhere it is the component index of to_cooperative_matrix_component().
++string CompilerMSL::cooperative_matrix_element_get(const SPIRType &type, const string &matrix, const string &index)
++{
++	if (!cooperative_matrix_is_tiled(type))
++		return join(matrix, ".thread_elements()[", index, "]");
++
++	string get = join("spvCoopMatGet<", cooperative_matrix_use(type), ">(", matrix, ", uint(", index, "))");
++	if (cooperative_matrix_is_fp8(type))
++		get = join("spvFP8Bits(half(", get, "))");
++	return get;
++}
++
++string CompilerMSL::cooperative_matrix_element_set(const SPIRType &type, const string &matrix, const string &index,
++                                                   const string &value)
++{
++	if (!cooperative_matrix_is_tiled(type))
++		return join(matrix, ".thread_elements()[", index, "] = ", value, ";");
++
++	string v = cooperative_matrix_is_fp8(type) ? join("spvDecodeFP8E4M3(", value, ")") : value;
++	return join("spvCoopMatSet<", cooperative_matrix_use(type), ">(", matrix, ", uint(", index, "), ", v, ");");
++}
++
++// A scalar operand as the value of a matrix's components: FP8 scalars are their encoding.
++string CompilerMSL::cooperative_matrix_from_scalar(const SPIRType &matrix_type, uint32_t id)
++{
++	if (expression_type(id).op != OpTypeCooperativeMatrixKHR && cooperative_matrix_is_fp8(matrix_type))
++		return join("spvDecodeFP8E4M3(", to_unpacked_expression(id), ")");
++	return to_cooperative_matrix_component(id, 0);
++}
++
++// op is prefixed to every component, so an empty op copies or broadcasts op0 instead.
++void CompilerMSL::emit_cooperative_matrix_unary_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
++                                                   const char *op)
++{
++	emit_uninitialized_temporary_expression(result_type, result_id);
++
++	uint32_t count = cooperative_matrix_components(get<SPIRType>(result_type));
++	for (uint32_t i = 0; i < count; i++)
++		statement(to_cooperative_matrix_component(result_id, i), " = ", op, to_cooperative_matrix_component(op0, i), ";");
++
++	inherit_expression_dependencies(result_id, op0);
++}
++
++void CompilerMSL::emit_cooperative_matrix_binary_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
++                                                    uint32_t op1, const char *op)
++{
++	emit_uninitialized_temporary_expression(result_type, result_id);
++
++	uint32_t count = cooperative_matrix_components(get<SPIRType>(result_type));
++	for (uint32_t i = 0; i < count; i++)
++	{
++		statement(to_cooperative_matrix_component(result_id, i), " = ", to_cooperative_matrix_component(op0, i), " ",
++		          op, " ", to_cooperative_matrix_component(op1, i), ";");
++	}
++
++	inherit_expression_dependencies(result_id, op0);
++	inherit_expression_dependencies(result_id, op1);
++}
++
++void CompilerMSL::emit_cooperative_matrix_unary_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
++                                                        const char *op)
++{
++	emit_uninitialized_temporary_expression(result_type, result_id);
++
++	uint32_t count = cooperative_matrix_components(get<SPIRType>(result_type));
++	for (uint32_t i = 0; i < count; i++)
++		statement(to_cooperative_matrix_component(result_id, i), " = ", op, "(", to_cooperative_matrix_component(op0, i), ");");
++
++	inherit_expression_dependencies(result_id, op0);
++}
++
++void CompilerMSL::emit_cooperative_matrix_select_op(uint32_t result_type, uint32_t result_id, uint32_t cond,
++                                                    uint32_t op0, uint32_t op1)
++{
++	emit_uninitialized_temporary_expression(result_type, result_id);
++
++	uint32_t count = cooperative_matrix_components(get<SPIRType>(result_type));
++	for (uint32_t i = 0; i < count; i++)
++	{
++		statement(to_cooperative_matrix_component(result_id, i), " = ", to_enclosed_unpacked_expression(cond), " ? ",
++		          to_cooperative_matrix_component(op0, i), " : ", to_cooperative_matrix_component(op1, i), ";");
++	}
++
++	inherit_expression_dependencies(result_id, cond);
++	inherit_expression_dependencies(result_id, op0);
++	inherit_expression_dependencies(result_id, op1);
+ }
+ 
+-// Validates all cooperative matrix types up-front, rather than failing partway through a function.
+-void CompilerMSL::validate_cooperative_matrix_types()
++// OpCooperativeMatrixLoadKHR and OpCooperativeMatrixStoreKHR of tiled matrices: each 8x8 tile with simdgroup_load or
++// simdgroup_store, or, for FP8, each invocation's components one by one (spvCoopMatLoadFP8, spvCoopMatStoreFP8).
++// Returns false for 8x8 matrices of a simdgroup_matrix type.
++bool CompilerMSL::emit_cooperative_matrix_tiled_load_store(const Instruction &instruction, bool load)
+ {
+-	ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &type) {
+-		if (type.op == OpTypeCooperativeMatrixKHR)
+-			validate_cooperative_matrix_type(type);
+-	});
+-}
++	auto *ops = stream(instruction);
++	uint32_t ptr = load ? ops[2] : ops[0];
++	uint32_t obj = ops[1];
++	uint32_t layout = load ? ops[3] : ops[2];
++	auto &mat_type = load ? get<SPIRType>(ops[0]) : expression_type(obj);
++	if (!cooperative_matrix_is_tiled(mat_type))
++		return false;
+ 
+-// 8x8 matrix over a 32-wide SIMD-group: every invocation holds two components.
+-static const uint32_t k_cooperative_matrix_components_per_thread = (8 * 8) / 32;
++	auto &layout_c = get<SPIRConstant>(layout);
++	if (layout_c.specialization)
++		SPIRV_CROSS_THROW("MSL cooperative matrix load/store does not support spec-constant layout.");
++	uint32_t layout_val = layout_c.scalar();
++	if (layout_val != CooperativeMatrixLayoutRowMajorKHR && layout_val != CooperativeMatrixLayoutColumnMajorKHR)
++		SPIRV_CROSS_THROW("MSL cooperative matrix load/store only supports RowMajorKHR and ColumnMajorKHR layouts.");
++	if (instruction.length < (load ? 5u : 4u))
++		SPIRV_CROSS_THROW("MSL cooperative matrix load/store requires Stride for row/column-major layouts.");
++	bool col_major = layout_val == CooperativeMatrixLayoutColumnMajorKHR;
++	uint32_t stride = load ? ops[4] : ops[3];
++
++	// The pointer may point to another element type than the matrix component: cast it, and convert the stride,
++	// which counts pointee elements, to components.
++	auto &component_type = get<SPIRType>(mat_type.parent_type);
++	bool fp8 = cooperative_matrix_is_fp8(mat_type);
++	auto &ptr_type = expression_type(ptr);
++	auto &pointee_type = get<SPIRType>(ptr_type.parent_type);
++	uint32_t src_bytes = (pointee_type.width * pointee_type.vecsize) / 8;
++	uint32_t dst_bytes = fp8 ? 1 : component_type.width / 8;
++	if (src_bytes == 0 || dst_bytes == 0)
++		SPIRV_CROSS_THROW("Cannot determine element size for cooperative matrix load/store.");
++	string stride_expr = to_enclosed_expression(stride);
++	if (src_bytes > dst_bytes && (src_bytes % dst_bytes) == 0)
++		stride_expr = join("(", stride_expr, " * ", src_bytes / dst_bytes, "u)");
++	else if (src_bytes < dst_bytes && (dst_bytes % src_bytes) == 0)
++		stride_expr = join("(", stride_expr, " / ", dst_bytes / src_bytes, "u)");
++	else if (src_bytes != dst_bytes)
++		stride_expr = join("((", stride_expr, " * ", src_bytes, "u) / ", dst_bytes, "u)");
++
++	auto addr_space = get_type_address_space(ptr_type, ptr);
++	string ptr_expr = join("reinterpret_cast<", addr_space, load ? " const " : " ", fp8 ? "uchar" : type_to_glsl(component_type),
++	                       "*>(", to_ptr_expression(ptr), ")");
++
++	uint32_t tile_rows = cooperative_matrix_dim(mat_type, false) / 8;
++	uint32_t tile_cols = cooperative_matrix_dim(mat_type, true) / 8;
++	string mat_expr;
++	if (load)
++	{
++		emit_uninitialized_temporary_expression(ops[0], obj);
++		mat_expr = to_expression(obj);
++	}
++	else
++		mat_expr = to_enclosed_unpacked_expression(obj);
+ 
+-// Non-matrix operands, e.g. the scalar in OpMatrixTimesScalar, are broadcast to every component.
+-string CompilerMSL::to_cooperative_matrix_component(uint32_t id, const string &index)
+-{
+-	if (expression_type(id).op != OpTypeCooperativeMatrixKHR)
+-		return to_enclosed_unpacked_expression(id);
++	if (fp8)
++	{
++		statement(load ? "spvCoopMatLoadFP8(" : "spvCoopMatStoreFP8(", mat_expr, ", ", ptr_expr, ", ", stride_expr, ", ",
++		          col_major ? "true" : "false", ");");
++	}
++	else
++	{
++		for (uint32_t i = 0; i < tile_rows; i++)
++		{
++			for (uint32_t j = 0; j < tile_cols; j++)
++			{
++				// Tile (i, j) starts at row 8i, column 8j, in memory at (8i, 8j) or, column-major, (8j, 8i).
++				uint32_t outer = col_major ? j * 8 : i * 8, inner = col_major ? i * 8 : j * 8;
++				string tile = join(mat_expr, ".e[", i * tile_cols + j, "]");
++				string args = join(ptr_expr, " + ", stride_expr, " * ", outer, "u + ", inner, "u, ", stride_expr,
++				                   col_major ? ", ulong2(0), true);" : ");");
++				if (load)
++				{
++					statement("{ simdgroup_matrix<", type_to_glsl(component_type), ", 8, 8> _t; simdgroup_load(_t, ", args, " ",
++					          tile, " = spvCoopMatElems(_t); }");
++				}
++				else
++					statement("simdgroup_store(spvCoopMatTile(", tile, "), ", args);
++			}
++		}
++	}
+ 
+-	return join(to_enclosed_unpacked_expression(id), ".thread_elements()[", index, "]");
++	if (load)
++		register_read(obj, ptr, false);
++	else
++		register_write(ptr);
++	return true;
+ }
+ 
+-// op is prefixed to every component, so an empty op copies or broadcasts op0 instead.
+-void CompilerMSL::emit_cooperative_matrix_unary_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
+-                                                   const char *op)
++// OpCooperativeMatrixMulAddKHR with tiled matrices: D = A B + C, tile by tile. Returns false when all are 8x8 of a
++// simdgroup_matrix type.
++bool CompilerMSL::emit_cooperative_matrix_tiled_mul_add(const Instruction &instruction)
+ {
+-	emit_uninitialized_temporary_expression(result_type, result_id);
++	auto *ops = stream(instruction);
++	uint32_t result_type = ops[0], id = ops[1], A = ops[2], B = ops[3], C = ops[4];
++	auto &a_type = expression_type(A), &b_type = expression_type(B), &c_type = expression_type(C);
++	auto &d_type = get<SPIRType>(result_type);
++	if (!cooperative_matrix_is_tiled(a_type) && !cooperative_matrix_is_tiled(b_type) &&
++	    !cooperative_matrix_is_tiled(c_type) && !cooperative_matrix_is_tiled(d_type))
++		return false;
+ 
+-	for (uint32_t i = 0; i < k_cooperative_matrix_components_per_thread; i++)
++	// Each operand tile goes to several multiplies: copy the operands once.
++	string a = join("_", id, "_a"), b = join("_", id, "_b"), c = join("_", id, "_c");
++	statement(type_to_glsl(a_type), " ", a, " = ", to_unpacked_expression(A), ";");
++	statement(type_to_glsl(b_type), " ", b, " = ", to_unpacked_expression(B), ";");
++	statement(type_to_glsl(c_type), " ", c, " = ", to_unpacked_expression(C), ";");
++	emit_uninitialized_temporary_expression(result_type, id);
++	string d = to_expression(id);
++
++	// Tiles of tiled matrices become simdgroup_matrix for the multiplies; 8x8 matrices already are one.
++	auto tile = [&](const string &m, const SPIRType &type, uint32_t index) -> string {
++		return cooperative_matrix_is_tiled(type) ? join("spvCoopMatTile(", m, ".e[", index, "])") : m;
++	};
++	uint32_t mt = cooperative_matrix_dim(a_type, false) / 8;
++	uint32_t kt = cooperative_matrix_dim(a_type, true) / 8;
++	uint32_t nt = cooperative_matrix_dim(b_type, true) / 8;
++	for (uint32_t i = 0; i < mt; i++)
++	{
++		for (uint32_t j = 0; j < nt; j++)
++		{
++			uint32_t t = i * nt + j;
++			statement("{");
++			statement("    auto _r = ", tile(c, c_type, t), ";");
++			for (uint32_t k = 0; k < kt; k++)
++				statement("    simdgroup_multiply_accumulate(_r, ", tile(a, a_type, i * kt + k), ", ", tile(b, b_type, k * nt + j), ", _r);");
++			if (cooperative_matrix_is_tiled(d_type))
++				statement("    ", d, ".e[", t, "] = spvCoopMatElems(_r);");
++			else
++				statement("    ", d, " = _r;");
++			statement("}");
++		}
++	}
++
++	// An FP8 result is rounded to E4M3, saturating with SaturatingAccumulation.
++	if (cooperative_matrix_is_fp8(d_type))
+ 	{
+-		auto index = join(i, "u");
+-		statement(to_cooperative_matrix_component(result_id, index), " = ", op,
+-		          to_cooperative_matrix_component(op0, index), ";");
++		bool saturate = instruction.length > 5 && (ops[5] & CooperativeMatrixOperandsSaturatingAccumulationKHRMask) != 0;
++		for (uint32_t i = 0; i < cooperative_matrix_components(d_type); i++)
++		{
++			auto component = to_cooperative_matrix_component(id, i);
++			statement(component, " = ", saturate ? "spvRoundFP8E4M3Sat" : "spvRoundFP8E4M3", "(", component, ");");
++		}
+ 	}
+ 
+-	inherit_expression_dependencies(result_id, op0);
++	inherit_expression_dependencies(id, A);
++	inherit_expression_dependencies(id, B);
++	inherit_expression_dependencies(id, C);
++	return true;
+ }
+ 
+-void CompilerMSL::emit_cooperative_matrix_binary_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
+-                                                    uint32_t op1, const char *op)
++// An access chain to one component of a cooperative matrix variable: loads and stores through it go to
++// cooperative_matrix_element_get and _set, since a component of a tile can't be addressed.
++bool CompilerMSL::maybe_emit_cooperative_matrix_access_chain(const Instruction &instruction)
+ {
+-	emit_uninitialized_temporary_expression(result_type, result_id);
++	auto *ops = stream(instruction);
++	if (static_cast<Op>(instruction.op) == OpPtrAccessChain || instruction.length < 4)
++		return false;
+ 
+-	for (uint32_t i = 0; i < k_cooperative_matrix_components_per_thread; i++)
++	uint32_t base = ops[2];
++	uint32_t count = instruction.length - 3;
++	auto *type = &get<SPIRType>(expression_type(base).parent_type);
++	for (uint32_t i = 0; i + 1 < count; i++)
+ 	{
+-		auto index = join(i, "u");
+-		statement(to_cooperative_matrix_component(result_id, index), " = ",
+-		          to_cooperative_matrix_component(op0, index), " ", op, " ",
+-		          to_cooperative_matrix_component(op1, index), ";");
++		if (is_array(*type))
++			type = &get<SPIRType>(type->parent_type);
++		else if (type->basetype == SPIRType::Struct)
++			type = &get<SPIRType>(type->member_types[get<SPIRConstant>(ops[3 + i]).scalar()]);
++		else
++			return false;
+ 	}
++	if (type->op != OpTypeCooperativeMatrixKHR)
++		return false;
+ 
+-	inherit_expression_dependencies(result_id, op0);
+-	inherit_expression_dependencies(result_id, op1);
++	CooperativeMatrixElementPointer e;
++	e.matrix_type = type->self;
++	if (count == 1)
++		e.matrix = to_enclosed_expression(base);
++	else
++	{
++		AccessChainMeta meta;
++		e.matrix = access_chain_internal(base, &ops[3], count - 1, 0, &meta, nullptr);
++	}
++	e.index = to_unpacked_expression(ops[3 + count - 1]);
++	auto *var = maybe_get_backing_variable(base);
++	e.base_variable = var ? uint32_t(var->self) : 0u;
++
++	set<SPIRExpression>(ops[1], cooperative_matrix_element_get(*type, e.matrix, e.index), ops[0], true);
++	cooperative_matrix_element_pointers[ops[1]] = std::move(e);
++	return true;
+ }
+ 
+-void CompilerMSL::emit_cooperative_matrix_unary_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0,
+-                                                        const char *op)
++// OpFConvert of FP8 scalars or vectors, which are their encodings (uchar).
++bool CompilerMSL::emit_float8_conversion(uint32_t result_type, uint32_t id, uint32_t arg)
+ {
+-	emit_uninitialized_temporary_expression(result_type, result_id);
++	auto &out_type = get<SPIRType>(result_type);
++	auto &in_type = expression_type(arg);
++	if (out_type.op == OpTypeCooperativeMatrixKHR || in_type.op == OpTypeCooperativeMatrixKHR)
++		return false;
++	if (out_type.basetype != SPIRType::FloatE4M3 && in_type.basetype != SPIRType::FloatE4M3)
++		return false;
+ 
+-	for (uint32_t i = 0; i < k_cooperative_matrix_components_per_thread; i++)
++	string expr;
++	if (out_type.basetype == SPIRType::FloatE4M3)
+ 	{
+-		auto index = join(i, "u");
+-		statement(to_cooperative_matrix_component(result_id, index), " = ", op, "(",
+-		          to_cooperative_matrix_component(op0, index), ");");
++		// Half keeps NaN's sign when encoded from its own bits; other types go through float.
++		SPIRType float_type = in_type;
++		if (in_type.basetype != SPIRType::Half)
++		{
++			float_type.basetype = SPIRType::Float;
++			float_type.width = 32;
++		}
++		bool saturate = has_decoration(id, DecorationSaturatedToLargestFloat8NormalConversionEXT);
++		expr = join("spvEncodeFP8E4M3(", type_to_glsl(float_type), "(", to_unpacked_expression(arg), "), ",
++		            saturate ? "true" : "false", ")");
+ 	}
++	else
++		expr = join(type_to_glsl(out_type), "(spvDecodeFP8E4M3(", to_unpacked_expression(arg), "))");
+ 
+-	inherit_expression_dependencies(result_id, op0);
++	emit_op(result_type, id, expr, should_forward(arg));
++	inherit_expression_dependencies(id, arg);
++	return true;
+ }
+ 
+-void CompilerMSL::emit_cooperative_matrix_select_op(uint32_t result_type, uint32_t result_id, uint32_t cond,
+-                                                    uint32_t op0, uint32_t op1)
++// Constant tiled cooperative matrices are filled with their one value. FP8 constants are their encodings.
++string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint32_t vector)
+ {
+-	emit_uninitialized_temporary_expression(result_type, result_id);
++	auto &type = get<SPIRType>(c.constant_type);
++	if (type.op == OpTypeCooperativeMatrixKHR && cooperative_matrix_is_tiled(type))
++	{
++		auto &comp = get<SPIRType>(type.parent_type);
++		float v = comp.basetype == SPIRType::FloatE4M3 ? c.scalar_floate4m3(vector, 0) :
++		          comp.basetype == SPIRType::Half ? c.scalar_f16(vector, 0) :
++		          comp.basetype == SPIRType::BFloat16 ? c.scalar_bf16(vector, 0) : c.scalar_f32(vector, 0);
++		char buf[64];
++		snprintf(buf, sizeof(buf), "%.9g", v);
++		string value = v != v ? "NAN" : std::isinf(v) ? (v < 0 ? "-INFINITY" : "INFINITY") : string(buf);
++		return join(type_to_glsl(type), "(", comp.basetype == SPIRType::FloatE4M3 ? string("half") : type_to_glsl(comp), "(",
++		            value, "))");
++	}
+ 
+-	for (uint32_t i = 0; i < k_cooperative_matrix_components_per_thread; i++)
++	if (type.basetype == SPIRType::FloatE4M3 && type.op != OpTypeCooperativeMatrixKHR)
+ 	{
+-		auto index = join(i, "u");
+-		statement(to_cooperative_matrix_component(result_id, index), " = ", to_enclosed_unpacked_expression(cond),
+-		          " ? ", to_cooperative_matrix_component(op0, index), " : ",
+-		          to_cooperative_matrix_component(op1, index), ";");
++		if (type.vecsize == 1)
++			return join("uchar(", uint32_t(c.scalar_u8(vector, 0)), ")");
++		string res = join(type_to_glsl(type), "(");
++		for (uint32_t i = 0; i < type.vecsize; i++)
++			res += join(i ? ", " : "", "uchar(", uint32_t(c.scalar_u8(vector, i)), ")");
++		return res + ")";
+ 	}
+ 
+-	inherit_expression_dependencies(result_id, cond);
+-	inherit_expression_dependencies(result_id, op0);
+-	inherit_expression_dependencies(result_id, op1);
++	return CompilerGLSL::constant_expression_vector(c, vector);
+ }
+ 
+ // Returns false if instruction is not a cooperative matrix op, so the caller can fall back.
+@@ -9861,7 +12309,9 @@ bool CompilerMSL::maybe_emit_cooperative_matrix_op(const Instruction &instructio
+ 			bool index_is_id = opcode == OpVectorExtractDynamic;
+ 			auto index = index_is_id ? to_expression(ops[3]) : join(ops[3], "u");
+ 
+-			emit_op(result_type, result_id, to_cooperative_matrix_component(ops[2], index), should_forward(ops[2]));
++			emit_op(result_type, result_id,
++			        cooperative_matrix_element_get(expression_type(ops[2]), to_enclosed_unpacked_expression(ops[2]), index),
++			        false);
+ 
+ 			inherit_expression_dependencies(result_id, ops[2]);
+ 			if (index_is_id)
+@@ -9898,17 +12348,41 @@ bool CompilerMSL::maybe_emit_cooperative_matrix_op(const Instruction &instructio
+ 
+ 	case OpFConvert:
+ 	{
+-		auto component_type = type_to_glsl(get<SPIRType>(type->parent_type));
+-		emit_cooperative_matrix_unary_func_op(result_type, result_id, ops[2], component_type.c_str());
++		// Between matrices of the same shape the components line up whatever their use, so this also converts
++		// between uses. FP8 results are rounded to E4M3 (saturating with SaturatedToLargestFloat8NormalConversionEXT)
++		// and held as half.
++		if (cooperative_matrix_is_fp8(*type))
++		{
++			bool saturate = has_decoration(result_id, DecorationSaturatedToLargestFloat8NormalConversionEXT);
++			emit_cooperative_matrix_unary_func_op(result_type, result_id, ops[2],
++			                                      saturate ? "spvRoundFP8E4M3Sat" : "spvRoundFP8E4M3");
++		}
++		else
++		{
++			auto component_type = type_to_glsl(get<SPIRType>(type->parent_type));
++			emit_cooperative_matrix_unary_func_op(result_type, result_id, ops[2], component_type.c_str());
++		}
+ 		break;
+ 	}
+ 
++	case OpCopyObject:
++		emit_op(result_type, result_id, to_unpacked_expression(ops[2]), should_forward(ops[2]));
++		inherit_expression_dependencies(result_id, ops[2]);
++		break;
++
+ 	case OpCompositeConstruct:
++	{
+ 		// A cooperative matrix is constructed from a single scalar, broadcast to every component.
+ 		if (instruction.length != 3)
+ 			SPIRV_CROSS_THROW("OpCompositeConstruct for cooperative matrix requires exactly one scalar component.");
+-		emit_cooperative_matrix_unary_op(result_type, result_id, ops[2], "");
++		emit_uninitialized_temporary_expression(result_type, result_id);
++		auto value = cooperative_matrix_from_scalar(*type, ops[2]);
++		uint32_t count = cooperative_matrix_components(*type);
++		for (uint32_t i = 0; i < count; i++)
++			statement(to_cooperative_matrix_component(result_id, i), " = ", value, ";");
++		inherit_expression_dependencies(result_id, ops[2]);
+ 		break;
++	}
+ 
+ 	case OpSelect:
+ 		// The condition is a scalar bool. Boolean cooperative matrices are rejected by validation.
+@@ -9926,8 +12400,10 @@ bool CompilerMSL::maybe_emit_cooperative_matrix_op(const Instruction &instructio
+ 		auto index = index_is_id ? to_expression(ops[4]) : join(ops[4], "u");
+ 
+ 		// Copy the matrix, then overwrite the one component being inserted.
+-		emit_cooperative_matrix_unary_op(result_type, result_id, matrix, "");
+-		statement(to_cooperative_matrix_component(result_id, index), " = ", to_unpacked_expression(object), ";");
++		emit_uninitialized_temporary_expression(result_type, result_id);
++		statement(to_expression(result_id), " = ", to_unpacked_expression(matrix), ";");
++		statement(cooperative_matrix_element_set(*type, to_expression(result_id), index, to_unpacked_expression(object)));
++		inherit_expression_dependencies(result_id, matrix);
+ 
+ 		inherit_expression_dependencies(result_id, object);
+ 		if (index_is_id)
+@@ -9936,7 +12412,7 @@ bool CompilerMSL::maybe_emit_cooperative_matrix_op(const Instruction &instructio
+ 	}
+ 
+ 	default:
+-		SPIRV_CROSS_THROW("Unsupported operation on cooperative matrix in MSL backend.");
++		SPIRV_CROSS_THROW(join("Unsupported operation on cooperative matrix in MSL backend: opcode ", uint32_t(opcode), "."));
+ 	}
+ 
+ 	return true;
+@@ -9973,6 +12449,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	{
+ 	case OpLoad:
+ 	{
++		auto element_ptr = cooperative_matrix_element_pointers.find(ops[2]);
++		if (element_ptr != end(cooperative_matrix_element_pointers))
++		{
++			auto &e = element_ptr->second;
++			emit_op(ops[0], ops[1], cooperative_matrix_element_get(get<SPIRType>(e.matrix_type), e.matrix, e.index), false);
++			if (e.base_variable)
++				inherit_expression_dependencies(ops[1], e.base_variable);
++			break;
++		}
++
+ 		auto &load_type = get<SPIRType>(ops[0]);
+ 		if (!load_type.pointer && load_type.basetype == SPIRType::RayQuery)
+ 			SPIRV_CROSS_THROW("MSL cannot copy ray query objects.");
+@@ -10126,25 +12612,47 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  	// Derivatives
  	case OpDPdx:
@@ -2738,7 +3696,7 @@ index ff081182..57af698e 100644
  
  	// Bitfield
  	case OpBitFieldInsert:
-@@ -10221,6 +12131,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10221,6 +12729,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  	// Atomics
  	case OpAtomicExchange:
  	{
@@ -2747,7 +3705,7 @@ index ff081182..57af698e 100644
  		uint32_t result_type = ops[0];
  		uint32_t id = ops[1];
  		uint32_t ptr = ops[2];
-@@ -10232,6 +12144,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10232,6 +12742,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  	case OpAtomicCompareExchange:
  	{
@@ -2756,7 +3714,7 @@ index ff081182..57af698e 100644
  		uint32_t result_type = ops[0];
  		uint32_t id = ops[1];
  		uint32_t ptr = ops[2];
-@@ -10250,6 +12164,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10250,6 +12762,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  	case OpAtomicLoad:
  	{
@@ -2765,7 +3723,7 @@ index ff081182..57af698e 100644
  		uint32_t result_type = ops[0];
  		uint32_t id = ops[1];
  		uint32_t ptr = ops[2];
-@@ -10261,6 +12177,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10261,6 +12775,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  	case OpAtomicStore:
  	{
@@ -2774,7 +3732,7 @@ index ff081182..57af698e 100644
  		uint32_t result_type = expression_type(ops[0]).self;
  		uint32_t id = ops[0];
  		uint32_t ptr = ops[0];
-@@ -10274,6 +12192,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10274,6 +12790,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  #define MSL_AFMO_IMPL(op, valsrc, valconst)                                                                      \
  	do                                                                                                           \
  	{                                                                                                            \
@@ -2783,7 +3741,7 @@ index ff081182..57af698e 100644
  		uint32_t result_type = ops[0];                                                                           \
  		uint32_t id = ops[1];                                                                                    \
  		uint32_t ptr = ops[2];                                                                                   \
-@@ -10329,6 +12249,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10329,6 +12847,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  	// Images
  
  	// Reads == Fetches in Metal
@@ -2800,7 +3758,7 @@ index ff081182..57af698e 100644
  	case OpImageRead:
  	{
  		// Mark that this shader reads from this image
-@@ -10456,9 +12386,15 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10456,9 +12984,15 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  		string expr;
  		if (needs_frag_discard_checks())
  			expr = join("(", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ((void)0) : ");
@@ -2819,7 +3777,16 @@ index ff081182..57af698e 100644
  		if (needs_frag_discard_checks())
  			expr += ")";
  		statement(expr, ";");
-@@ -10635,6 +12571,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10627,6 +13161,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpInBoundsAccessChain:
+ 	case OpAccessChain:
+ 	case OpPtrAccessChain:
++		if (maybe_emit_cooperative_matrix_access_chain(instruction))
++			break;
+ 		if (is_tessellation_shader())
+ 		{
+ 			if (!emit_tessellation_access_chain(ops, instruction.length))
+@@ -10635,10 +13171,22 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  		else
  			CompilerGLSL::emit_instruction(instruction);
  		fix_up_interpolant_access_chain(ops, instruction.length);
@@ -2827,7 +3794,22 @@ index ff081182..57af698e 100644
  		break;
  
  	case OpStore:
-@@ -10647,8 +12584,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	{
++		auto element_ptr = cooperative_matrix_element_pointers.find(ops[0]);
++		if (element_ptr != end(cooperative_matrix_element_pointers))
++		{
++			auto &e = element_ptr->second;
++			statement(cooperative_matrix_element_set(get<SPIRType>(e.matrix_type), e.matrix, e.index,
++			                                         to_unpacked_expression(ops[1])));
++			if (e.base_variable)
++				register_write(e.base_variable);
++			break;
++		}
++
+ 		auto &value_type = expression_type(ops[1]);
+ 		if (!value_type.pointer && value_type.basetype == SPIRType::RayQuery)
+ 			SPIRV_CROSS_THROW("MSL cannot copy ray query objects.");
+@@ -10647,8 +13195,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  		if (is_out_of_bounds_tessellation_level(ops[0]))
  			break;
  
@@ -2846,7 +3828,7 @@ index ff081182..57af698e 100644
  		{
  			// If we're in a continue block, this kludge will make the block too complex
  			// to emit normally.
-@@ -10659,13 +12604,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -10659,13 +13215,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  				current_emitting_block->complex_continue = true;
  				force_recompile();
  			}
@@ -2862,7 +3844,7 @@ index ff081182..57af698e 100644
  			end_scope();
  		if (has_decoration(ops[0], DecorationBuiltIn) && get_decoration(ops[0], DecorationBuiltIn) == BuiltInPointSize)
  			writes_to_point_size = true;
-@@ -11177,6 +13121,19 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -11177,6 +13732,19 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  		auto &type = get<SPIRType>(result_type);
  
@@ -2882,7 +3864,7 @@ index ff081182..57af698e 100644
  		// We'll get the appropriate sign-extend or zero-extend, no matter which type we cast to here.
  		// The addition in reduce_add is sign-invariant.
  		auto result_type_cast = join(type_to_glsl(type), input_size);
-@@ -11246,6 +13203,22 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -11246,6 +13814,22 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  		input_type1.basetype = pre_saturate_type;
  		input_type2.basetype = pre_saturate_type;
  
@@ -2905,7 +3887,49 @@ index ff081182..57af698e 100644
  		string exp = join(type_to_glsl(type), "(addsat(reduce_add(",
  		                  type_to_glsl(input_type1), "(", vec1input, ") * ",
  		                  type_to_glsl(input_type2), "(", vec2input, ")), ",
-@@ -11482,6 +13455,74 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -11288,6 +13872,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpCooperativeMatrixLoadKHR:
+ 	{
++		if (emit_cooperative_matrix_tiled_load_store(instruction, true))
++			break;
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t ptr = ops[2];
+@@ -11368,6 +13954,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpCooperativeMatrixStoreKHR:
+ 	{
++		if (emit_cooperative_matrix_tiled_load_store(instruction, false))
++			break;
+ 		uint32_t ptr = ops[0];
+ 		uint32_t obj = ops[1];
+ 		uint32_t layout = ops[2];
+@@ -11445,6 +14033,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	case OpCooperativeMatrixMulAddKHR:
+ 	{
++		if (emit_cooperative_matrix_tiled_mul_add(instruction))
++			break;
+ 		uint32_t result_type = ops[0];
+ 		uint32_t id = ops[1];
+ 		uint32_t A = ops[2], B = ops[3], C = ops[4];
+@@ -11472,6 +14062,14 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		if (coop_type.op != OpTypeCooperativeMatrixKHR)
+ 			SPIRV_CROSS_THROW("OpCooperativeMatrixLengthKHR requires cooperative matrix type.");
+ 
++		if (cooperative_matrix_is_tiled(coop_type))
++		{
++			emit_op(result_type, id,
++			        join(type_to_glsl(get<SPIRType>(result_type)), "(", cooperative_matrix_components(coop_type), ")"),
++			        true);
++			break;
++		}
++
+ 		auto &component_type = get<SPIRType>(coop_type.parent_type);
+ 		auto coop_type_name = type_to_glsl(coop_type);
+ 		auto component_type_name = type_to_glsl(component_type);
+@@ -11482,6 +14080,82 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  		break;
  	}
  
@@ -2977,10 +4001,18 @@ index ff081182..57af698e 100644
 +		break;
 +	}
 +
++	case OpFConvert:
++		if (maybe_emit_cooperative_matrix_op(instruction))
++			break;
++		if (emit_float8_conversion(ops[0], ops[1], ops[2]))
++			break;
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++
  	default:
  	{
  		// Prevent GLSL cooperative matrix code from leaking into MSL output.
-@@ -11499,7 +13540,55 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -11499,7 +14173,55 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
  {
  	if (sparse)
@@ -3037,27 +4069,10 @@ index ff081182..57af698e 100644
  
  	if (msl_options.use_framebuffer_fetch_subpasses)
  	{
-@@ -11878,17 +13967,179 @@ bool CompilerMSL::maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs)
- 		}
- 	}
+@@ -11889,6 +14611,168 @@ bool CompilerMSL::maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs)
+ }
  
--	auto lhs_storage = get_expression_effective_storage_class(id_lhs);
--	auto rhs_storage = get_expression_effective_storage_class(id_rhs);
--	if (!emit_array_copy(nullptr, id_lhs, id_rhs, lhs_storage, rhs_storage))
--		return false;
--
--	register_write(id_lhs);
-+	auto lhs_storage = get_expression_effective_storage_class(id_lhs);
-+	auto rhs_storage = get_expression_effective_storage_class(id_rhs);
-+	if (!emit_array_copy(nullptr, id_lhs, id_rhs, lhs_storage, rhs_storage))
-+		return false;
-+
-+	register_write(id_lhs);
-+
-+	return true;
-+}
-+
-+// Emits one of the atomic functions. In MSL, the atomic functions operate on pointers
+ // Emits one of the atomic functions. In MSL, the atomic functions operate on pointers
 +// Metal has no 64-bit atomics except non-returning min/max, so 64-bit buffer atomics take a
 +// spin lock from a hashed lock table and do the read-modify-write on the two 32-bit halves.
 +bool CompilerMSL::maybe_emit_atomic64_op(Op opcode, const uint32_t *ops)
@@ -3208,7 +4223,7 @@ index ff081182..57af698e 100644
 +
 +	if (!guard.empty())
 +		call = join("((", guard, ") ? ", call, " : 0ul)");
- 
++
 +	uint32_t result_type = ops[0];
 +	uint32_t id = ops[1];
 +	auto &res_type = get<SPIRType>(result_type);
@@ -3217,14 +4232,13 @@ index ff081182..57af698e 100644
 +	emit_op(result_type, id, call, false);
 +	register_write(ptr);
 +	flush_all_atomic_capable_variables();
- 	return true;
- }
- 
--// Emits one of the atomic functions. In MSL, the atomic functions operate on pointers
++	return true;
++}
++
  void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, const char *op, Op opcode,
                                        uint32_t mem_order_1, uint32_t mem_order_2, bool has_mem_order_2, uint32_t obj, uint32_t op1,
                                        bool op1_is_pointer, bool op1_is_literal, uint32_t op2)
-@@ -11924,6 +14175,16 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+@@ -11924,6 +14808,16 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
  	bool check_discard = opcode != OpAtomicLoad && needs_frag_discard_checks() &&
  	                     ptr_type.storage != StorageClassWorkgroup;
  
@@ -3241,7 +4255,7 @@ index ff081182..57af698e 100644
  	// Even compare exchange atomics are vec4 on metal for ... reasons :v
  	uint32_t vec4_temporary_id = 0;
  	if (use_native_image_atomic && is_atomic_compare_exchange_strong)
-@@ -11949,11 +14210,11 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+@@ -11949,11 +14843,11 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
  			emit_uninitialized_temporary_expression(result_type, result_id);
  			if (vec4_temporary_id)
  				emit_uninitialized_temporary_expression(vec4_temporary_id + 1, vec4_temporary_id);
@@ -3255,7 +4269,7 @@ index ff081182..57af698e 100644
  	}
  
  	if (use_native_image_atomic)
-@@ -12169,6 +14430,209 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+@@ -12169,6 +15063,209 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
  	flush_all_atomic_capable_variables();
  }
  
@@ -3465,7 +4479,7 @@ index ff081182..57af698e 100644
  // Metal only supports relaxed memory order for now
  const char *CompilerMSL::get_memory_order(uint32_t)
  {
-@@ -12192,7 +14656,8 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
+@@ -12192,7 +15289,8 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
  
  	// Only precise:: preserves NaN in trancendentals (supposedly, cannot find documentation for this).
  	const auto drop_nan_inf = FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask;
@@ -3475,7 +4489,7 @@ index ff081182..57af698e 100644
  	const char *preserve_str = preserve_nan ? "precise" : "fast";
  
  	// TODO: Emit the default behavior to match existing code. Might need to be revisited.
-@@ -12205,10 +14670,27 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
+@@ -12205,10 +15303,27 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
  			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count); \
  		break
  
@@ -3505,7 +4519,7 @@ index ff081182..57af698e 100644
  	EMIT_PRECISE_OVERRIDE(Tan, "tan");
  	EMIT_PRECISE_OVERRIDE(Acos, "acos");
  	EMIT_PRECISE_OVERRIDE(Asin, "asin");
-@@ -12719,18 +15201,35 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
+@@ -12719,18 +15834,35 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
  
  	if (processing_entry_point)
  	{
@@ -3546,7 +4560,7 @@ index ff081182..57af698e 100644
  
  		// append entry point args to avoid conflicts in local variable names.
  		local_variable_names.insert(resource_names.begin(), resource_names.end());
-@@ -12861,8 +15360,11 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -12861,8 +15993,11 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  		is_dynamic_img_sampler = has_extended_decoration(var->self, SPIRVCrossDecorationDynamicImageSampler);
  	}
  
@@ -3559,7 +4573,7 @@ index ff081182..57af698e 100644
  	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
  	{
  		bool is_compare = args.has_dref;
-@@ -12885,6 +15387,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -12885,6 +16020,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  	string fname;
  	if (needs_chroma_reconstruction(constexpr_sampler) && !is_dynamic_img_sampler)
  	{
@@ -3568,7 +4582,7 @@ index ff081182..57af698e 100644
  		if (constexpr_sampler->planes != 2 && constexpr_sampler->planes != 3)
  			SPIRV_CROSS_THROW("Unhandled number of color image planes!");
  		// 444 images aren't downsampled, so we don't need to do linear filtering.
-@@ -13001,6 +15505,13 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -13001,6 +16138,13 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  		}
  
  		fname = img_expr + ".";
@@ -3582,7 +4596,7 @@ index ff081182..57af698e 100644
  
  		// Texture function and sampler
  		if (args.base.is_fetch)
-@@ -13033,6 +15544,19 @@ static inline bool sampling_type_needs_f32_conversion(const SPIRType &type)
+@@ -13033,6 +16177,19 @@ static inline bool sampling_type_needs_f32_conversion(const SPIRType &type)
  }
  
  // Returns the function args for a texture sampling function for the specified image and sampling characteristics.
@@ -3602,7 +4616,7 @@ index ff081182..57af698e 100644
  string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool *p_forward)
  {
  	VariableID img = args.base.img;
-@@ -13393,6 +15917,71 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13393,6 +16550,71 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  		}
  	}
  
@@ -3674,7 +4688,7 @@ index ff081182..57af698e 100644
  	// LOD Options
  	// Metal does not support LOD for 1D textures.
  	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
-@@ -13598,6 +16187,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13598,6 +16820,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  
  	*p_forward = forward;
  
@@ -3685,7 +4699,7 @@ index ff081182..57af698e 100644
  	return farg_str;
  }
  
-@@ -14022,6 +16615,125 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
+@@ -14022,6 +17248,125 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
  		return img_expr.substr(0, index) + sampler_name_suffix + img_expr.substr(index);
  }
  
@@ -3811,7 +4825,7 @@ index ff081182..57af698e 100644
  string CompilerMSL::to_swizzle_expression(uint32_t id)
  {
  	auto *combined = maybe_get<SPIRCombinedImageSampler>(id);
-@@ -14076,11 +16788,10 @@ string CompilerMSL::to_buffer_size_expression(uint32_t id)
+@@ -14076,11 +17421,10 @@ string CompilerMSL::to_buffer_size_expression(uint32_t id)
  	{
  		if (auto var = maybe_get_backing_variable(id))
  		{
@@ -3826,7 +4840,7 @@ index ff081182..57af698e 100644
  				auto last_pos = array_expr.find_last_of(']');
  				if (last_pos != std::string::npos)
  					return buffer_expr + ".length(" + array_expr.substr(1, last_pos - 1) + ")";
-@@ -14478,8 +17189,11 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14478,8 +17822,11 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  			case BuiltInInstanceId:
  			case BuiltInInstanceIndex:
  			case BuiltInBaseInstance:
@@ -3839,7 +4853,7 @@ index ff081182..57af698e 100644
  				return string(" [[") + builtin_qualifier(builtin) + "]]";
  
  			default:
-@@ -14493,14 +17207,22 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14493,14 +17840,22 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  		else
  			locn = get_member_location(type.self, index);
  
@@ -3865,7 +4879,7 @@ index ff081182..57af698e 100644
  	if ((type.storage == StorageClassOutput || is_mesh_shader()) && use_semantic_stage_output)
  	{
  		if (is_builtin)
-@@ -14546,7 +17268,7 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14546,7 +17901,7 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  			return join(" [[", loc_qual, "]]");
  	}
  
@@ -3874,7 +4888,7 @@ index ff081182..57af698e 100644
  	{
  		// For this type of shader, we always arrange for it to capture its
  		// output to a buffer. For this reason, qualifiers are irrelevant here.
-@@ -14969,6 +17691,11 @@ bool CompilerMSL::entry_point_requires_const_device_buffers() const
+@@ -14969,6 +18324,11 @@ bool CompilerMSL::entry_point_requires_const_device_buffers() const
  // entry type if the current function is the entry point function
  string CompilerMSL::func_type_decl(SPIRType &type)
  {
@@ -3886,7 +4900,7 @@ index ff081182..57af698e 100644
  	// The regular function return type. If not processing the entry point function, that's all we need
  	string return_type = type_to_glsl(type) + type_to_array_glsl(type, 0);
  	if (!processing_entry_point)
-@@ -14982,13 +17709,18 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+@@ -14982,13 +18342,18 @@ string CompilerMSL::func_type_decl(SPIRType &type)
  
  	// Prepend a entry type, based on the execution model
  	string entry_type;
@@ -3907,7 +4921,7 @@ index ff081182..57af698e 100644
  		break;
  	case ExecutionModelTessellationEvaluation:
  		if (!msl_options.supports_msl_version(1, 2))
-@@ -15025,6 +17757,9 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+@@ -15025,6 +18390,9 @@ string CompilerMSL::func_type_decl(SPIRType &type)
  		break;
  	}
  
@@ -3917,7 +4931,7 @@ index ff081182..57af698e 100644
  	return entry_type + " " + return_type;
  }
  
-@@ -15052,6 +17787,11 @@ bool CompilerMSL::uses_explicit_early_fragment_test()
+@@ -15052,6 +18420,11 @@ bool CompilerMSL::uses_explicit_early_fragment_test()
  // In MSL, address space qualifiers are required for all pointer or reference variables
  string CompilerMSL::get_variable_address_space(const SPIRVariable &argument)
  {
@@ -3929,7 +4943,7 @@ index ff081182..57af698e 100644
  	const auto &type = get<SPIRType>(argument.basetype);
  	return get_type_address_space(type, argument.self, true);
  }
-@@ -15193,6 +17933,9 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
+@@ -15193,6 +18566,9 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
  			if (get_execution_model() == ExecutionModelVertex && has_decoration(type.self, DecorationBlock))
  				addr_space = "thread";
  
@@ -3939,7 +4953,7 @@ index ff081182..57af698e 100644
  			if (!addr_space)
  				addr_space = "device";
  		}
-@@ -15246,6 +17989,9 @@ const char *CompilerMSL::to_restrict(uint32_t id, bool space)
+@@ -15246,6 +18622,9 @@ const char *CompilerMSL::to_restrict(uint32_t id, bool space)
  	else
  		flags = get_decoration_bitset(id);
  
@@ -3949,7 +4963,7 @@ index ff081182..57af698e 100644
  	return flags.get(DecorationRestrict) || flags.get(DecorationRestrictPointerEXT) ?
  	       (space ? "__restrict " : "__restrict") : "";
  }
-@@ -15271,7 +18017,9 @@ string CompilerMSL::entry_point_arg_stage_in()
+@@ -15271,7 +18650,9 @@ string CompilerMSL::entry_point_arg_stage_in()
  		auto &type = get_variable_data_type(var);
  
  		add_resource_name(var.self);
@@ -3960,7 +4974,7 @@ index ff081182..57af698e 100644
  	}
  
  	return decl;
-@@ -15290,7 +18038,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15290,7 +18671,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  	case BuiltInInstanceId:
  	case BuiltInInstanceIndex:
  	case BuiltInBaseInstance:
@@ -3969,7 +4983,7 @@ index ff081182..57af698e 100644
  	// Tess. control function in
  	case BuiltInPosition:
  	case BuiltInPointSize:
-@@ -15307,6 +18055,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15307,6 +18688,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  		return false;
  	// Fragment function in
  	case BuiltInSamplePosition:
@@ -3977,7 +4991,7 @@ index ff081182..57af698e 100644
  	case BuiltInHelperInvocation:
  	case BuiltInBaryCoordKHR:
  	case BuiltInBaryCoordNoPerspKHR:
-@@ -15331,7 +18080,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15331,7 +18713,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  			return false;
  		/* fallthrough */
  	case BuiltInSubgroupLocalInvocationId:
@@ -3986,7 +5000,7 @@ index ff081182..57af698e 100644
  	case BuiltInDrawIndex:
  		// Emulated
  		return false;
-@@ -15367,6 +18116,15 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15367,6 +18749,15 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  {
  	depth_clip_viewport_idx_var_name = "";
  
@@ -4002,7 +5016,7 @@ index ff081182..57af698e 100644
  	// Builtin variables
  	SmallVector<pair<SPIRVariable *, BuiltIn>, 8> active_builtins;
  	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
-@@ -15405,16 +18163,18 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15405,16 +18796,18 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  				else
  					ep_args += builtin_type_decl(bi_type, var_id) + " " + to_expression(var_id);
  
@@ -4030,7 +5044,7 @@ index ff081182..57af698e 100644
  				builtin_declaration = false;
  			}
  		}
-@@ -15487,7 +18247,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15487,7 +18880,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  	{
  		// Add parameters to hold the indirect draw parameters and the shader output. This has to be handled
  		// specially because it needs to be a pointer, not a reference.
@@ -4039,7 +5053,7 @@ index ff081182..57af698e 100644
  		{
  			if (!ep_args.empty())
  				ep_args += ", ";
-@@ -15502,8 +18262,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15502,8 +18895,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			ep_args +=
  			    join("constant uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
  		}
@@ -4049,7 +5063,7 @@ index ff081182..57af698e 100644
  		{
  			if (!ep_args.empty())
  				ep_args += ", ";
-@@ -15511,7 +18270,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15511,7 +18903,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			    join("device uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
  		}
  
@@ -4058,7 +5072,7 @@ index ff081182..57af698e 100644
  		    (active_input_builtins.get(BuiltInVertexIndex) || active_input_builtins.get(BuiltInVertexId)) &&
  		    msl_options.vertex_index_type != Options::IndexType::None)
  		{
-@@ -15533,6 +18292,25 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15533,6 +18925,25 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			}
  		}
  
@@ -4084,7 +5098,7 @@ index ff081182..57af698e 100644
  		// Tessellation control shaders get three additional parameters:
  		// a buffer to hold the per-patch data, a buffer to hold the per-patch
  		// tessellation levels, and a block of workgroup memory to hold the
-@@ -15713,7 +18491,11 @@ string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
+@@ -15713,7 +19124,11 @@ string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
  		else
  			ep_args += type_to_glsl(type) + "& " + to_restrict(id, true) + to_name(id);
  
@@ -4097,7 +5111,7 @@ index ff081182..57af698e 100644
  
  		next_metal_resource_index_buffer = max(next_metal_resource_index_buffer, buffer_binding + 1);
  	}
-@@ -15749,23 +18531,12 @@ const MSLConstexprSampler *CompilerMSL::find_constexpr_sampler(uint32_t id) cons
+@@ -15749,23 +19164,12 @@ const MSLConstexprSampler *CompilerMSL::find_constexpr_sampler(uint32_t id) cons
  	return nullptr;
  }
  
@@ -4123,7 +5137,7 @@ index ff081182..57af698e 100644
  
  	entry_point_bindings.clear();
  	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
-@@ -15819,7 +18590,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15819,7 +19223,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  						// and it's being used as an alias (so we can emit void* instead).
  						resource.discrete_descriptor_alias = resource.var;
  						// Need to promote interlocked usage so that the primary declaration is correct.
@@ -4132,7 +5146,7 @@ index ff081182..57af698e 100644
  							interlocked_resources.insert(resource.var->self);
  
  						// Aliasing with unroll just gets too messy to deal with. I sure hope this never comes up ...
-@@ -15853,7 +18624,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15853,7 +19257,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  
  			if (type.basetype == SPIRType::SampledImage)
  			{
@@ -4141,7 +5155,7 @@ index ff081182..57af698e 100644
  
  				uint32_t plane_count = 1;
  				if (constexpr_sampler && constexpr_sampler->ycbcr_conversion_enable)
-@@ -15873,7 +18644,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15873,7 +19277,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  			else if (!constexpr_sampler)
  			{
  				// constexpr samplers are not declared as resources.
@@ -4150,7 +5164,7 @@ index ff081182..57af698e 100644
  
  				// Don't allocate resource indices for aliases.
  				uint32_t resource_index = ~0u;
-@@ -15888,9 +18659,29 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15888,9 +19292,29 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  	});
  
  	stable_sort(resources.begin(), resources.end(),
@@ -4181,7 +5195,7 @@ index ff081182..57af698e 100644
  	for (auto &r : resources)
  	{
  		auto &var = *r.var;
-@@ -15927,7 +18718,11 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15927,7 +19351,11 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				ep_args += "]]";
  			}
  
@@ -4194,7 +5208,7 @@ index ff081182..57af698e 100644
  			continue;
  		}
  
-@@ -15970,10 +18765,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15970,10 +19398,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  						ep_args += ", ";
  					ep_args += get_variable_address_space(var) + " " + type_to_glsl(type) + "* " +
  							   to_restrict(var_id, true) + r.name + "_" + convert_to_string(i);
@@ -4219,7 +5233,7 @@ index ff081182..57af698e 100644
  				}
  				is_using_builtin_array = false;
  			}
-@@ -15988,10 +18793,21 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15988,10 +19426,21 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				else
  					ep_args += type_to_glsl(type) + "& " + to_restrict(var_id, true) + r.name;
  
@@ -4245,7 +5259,7 @@ index ff081182..57af698e 100644
  			}
  			break;
  		}
-@@ -15999,7 +18815,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15999,7 +19448,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  			if (!ep_args.empty())
  				ep_args += ", ";
  			ep_args += sampler_type(type, var_id, false) + " " + r.name;
@@ -4257,7 +5271,7 @@ index ff081182..57af698e 100644
  			break;
  		case SPIRType::Image:
  		{
-@@ -16013,12 +18832,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16013,12 +19465,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				ep_args += image_type_glsl(type, var_id, false) + " " + r.name;
  				if (r.plane > 0)
  					ep_args += join(plane_name_suffix, r.plane);
@@ -4281,7 +5295,7 @@ index ff081182..57af698e 100644
  			}
  			else
  			{
-@@ -16035,10 +18859,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16035,10 +19492,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				const char *cv_flags = decoration_flags_signal_volatile(flags) ? "volatile " : "";
  				ep_args += join(", ", cv_flags, "device atomic_", type_to_glsl(get<SPIRType>(basetype.image.type), 0));
  				ep_args += "* " + r.name + "_atomic";
@@ -4303,7 +5317,7 @@ index ff081182..57af698e 100644
  			}
  			break;
  		}
-@@ -16064,10 +18895,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16064,10 +19528,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				           type_to_glsl(type, var_id) + "& " + r.name;
  			else
  				ep_args += type_to_glsl(type, var_id) + " " + r.name;
@@ -4325,7 +5339,7 @@ index ff081182..57af698e 100644
  			break;
  		}
  	}
-@@ -16095,7 +18933,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16095,7 +19566,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  	// Vertex shaders shouldn't have the problems with barriers in non-uniform control flow that
  	// tessellation control shaders do, so early returns should be OK. We may need to revisit this
  	// if it ever becomes possible to use barriers from a vertex shader.
@@ -4334,7 +5348,7 @@ index ff081182..57af698e 100644
  	{
  		entry_func.fixup_hooks_in.push_back([this]() {
  			statement("if (any(", to_expression(builtin_invocation_id_id),
-@@ -16104,6 +18942,51 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16104,6 +19575,51 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  		});
  	}
  
@@ -4386,7 +5400,7 @@ index ff081182..57af698e 100644
  	if (is_mesh_shader())
  	{
  		// If shader doesn't call SetMeshOutputsEXT, nothing should be rendered.
-@@ -16118,6 +19001,17 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16118,6 +19634,17 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  		uint32_t var_id = var.self;
  		bool ssbo = has_decoration(type.self, DecorationBufferBlock);
  
@@ -4404,7 +5418,7 @@ index ff081182..57af698e 100644
  		if (var.storage == StorageClassUniformConstant && !is_hidden_variable(var))
  		{
  			if (msl_options.swizzle_texture_samples && has_sampled_images && is_sampled_image_type(type))
-@@ -16143,7 +19037,8 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16143,7 +19670,8 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				});
  			}
  		}
@@ -4414,7 +5428,7 @@ index ff081182..57af698e 100644
  		         !is_hidden_variable(var))
  		{
  			if (buffer_requires_array_length(var.self))
-@@ -16151,7 +19046,9 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16151,7 +19679,9 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				entry_func.fixup_hooks_in.push_back(
  				    [this, &type, &var, var_id]()
  				    {
@@ -4425,7 +5439,7 @@ index ff081182..57af698e 100644
  
  					    uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
  					    if (descriptor_set_is_argument_buffer(desc_set))
-@@ -16209,6 +19106,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16209,6 +19739,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  					          to_expression(builtin_sample_id_id), ");");
  				});
  				break;
@@ -4441,7 +5455,7 @@ index ff081182..57af698e 100644
  			case BuiltInFragCoord:
  				if (is_sample_rate())
  				{
-@@ -16312,6 +19218,19 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16312,6 +19851,19 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				});
  				break;
  			case BuiltInSubgroupLocalInvocationId:
@@ -4461,7 +5475,7 @@ index ff081182..57af698e 100644
  				if (!msl_options.emulate_subgroups)
  					break;
  				// For subgroup emulation, assume subgroups of size 1.
-@@ -16540,13 +19459,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16540,13 +20092,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  					// Since every physical device is rendering a different view,
  					// there's no need for layered rendering here.
  				}
@@ -4481,7 +5495,7 @@ index ff081182..57af698e 100644
  					});
  				}
  				else if (get_execution_model() == ExecutionModelFragment)
-@@ -16622,23 +19543,33 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16622,23 +20176,33 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  			case BuiltInVertexId:
  			case BuiltInVertexIndex:
  				// This is direct-mapped normally.
@@ -4522,7 +5536,7 @@ index ff081182..57af698e 100644
  						break;
  					}
  					builtin_declaration = false;
-@@ -16646,36 +19577,46 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16646,36 +20210,46 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				break;
  			case BuiltInBaseVertex:
  				// This is direct-mapped normally.
@@ -4579,7 +5593,7 @@ index ff081182..57af698e 100644
  				});
  				break;
  			case BuiltInDrawIndex:
-@@ -16718,6 +19659,284 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16718,6 +20292,284 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  			}
  		}
  	});
@@ -4864,7 +5878,7 @@ index ff081182..57af698e 100644
  }
  
  // Returns the Metal index of the resource of the specified type as used by the specified variable.
-@@ -16882,6 +20101,12 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16882,6 +20734,12 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	auto &var_type = get<SPIRType>(arg.type);
  	StorageClass type_storage = var_type.storage;
  
@@ -4877,7 +5891,7 @@ index ff081182..57af698e 100644
  	// Physical pointer types are passed by pointer, not reference.
  	auto physical_type = arg.alias_global_variable ?
  	                         get_extended_decoration(arg.id, SPIRVCrossDecorationPhysicalTypeID) : 0;
-@@ -16916,10 +20141,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16916,10 +20774,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	bool type_is_tlas = type.basetype == SPIRType::AccelerationStructure;
  	bool is_tlas_address_array = type_is_tlas && type_storage == StorageClassUniformConstant &&
  	                             msl_options.acceleration_structure_descriptor_as_address && is_array(type) &&
@@ -4890,7 +5904,7 @@ index ff081182..57af698e 100644
  	string decl;
  
  	// If this is a combined image-sampler for a 2D image with floating-point type,
-@@ -16960,11 +20186,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16960,11 +20819,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  			is_using_builtin_array = true;
  
  		if (is_using_builtin_array)
@@ -4905,7 +5919,7 @@ index ff081182..57af698e 100644
  	{
  		const auto *parent_type = &get<SPIRType>(type.parent_type);
  		auto type_name = type_to_glsl(*parent_type, arg.id);
-@@ -16973,7 +20199,19 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16973,7 +20832,19 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  		else if (type_is_image)
  			decl = join("spvDescriptorArray<", cv_qualifier, type_name, ">");
  		else
@@ -4926,7 +5940,7 @@ index ff081182..57af698e 100644
  		address_space = "const";
  	}
  	else if ((type_storage == StorageClassUniform || type_storage == StorageClassStorageBuffer) && is_array(type))
-@@ -17003,7 +20241,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17003,7 +20874,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  		}
  		else
  		{
@@ -4935,7 +5949,7 @@ index ff081182..57af698e 100644
  		}
  	}
  
-@@ -17071,7 +20309,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17071,7 +20942,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  			decl = join(address_space, " ", decl);
  
  		// spvDescriptorArray absorbs the address space inside the template.
@@ -4944,7 +5958,7 @@ index ff081182..57af698e 100644
  		{
  			const char *argument_buffer_space = descriptor_address_space(name_id, type_storage, nullptr);
  			if (argument_buffer_space)
-@@ -17099,7 +20337,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17099,7 +20970,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  				decl += join("[", array_size, "]");
  			}
  		}
@@ -4953,7 +5967,7 @@ index ff081182..57af698e 100644
  		{
  			decl += " " + to_expression(name_id);
  		}
-@@ -17150,7 +20388,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17150,7 +21021,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	}
  	else if (type_is_image || type_is_tlas)
  	{
@@ -4962,7 +5976,65 @@ index ff081182..57af698e 100644
  		{
  			decl = address_space + " " + decl + " " + to_expression(name_id);
  		}
-@@ -18025,6 +21263,20 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
+@@ -17755,22 +21626,43 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 		return type_name;
+ 	}
+ 
+-	// Cooperative matrix -> Metal simdgroup matrix type
++	// Cooperative matrix -> Metal simdgroup matrix type. Arrays of them are wrapped as other arrays are.
+ 	{
+ 		const SPIRType *coop_type = &type;
+ 		while (coop_type && (is_pointer(*coop_type) || is_array(*coop_type)))
+ 			coop_type = maybe_get<SPIRType>(coop_type->parent_type);
+ 
++		if (coop_type && coop_type->op == OpTypeCooperativeMatrixKHR && coop_type != &type && !type.array.empty() &&
++		    !using_builtin_array())
++		{
++			add_spv_func_and_recompile(SPVFuncImplUnsafeArray);
++			string res, sizes;
++			for (uint32_t i = 0; i < uint32_t(type.array.size()); i++)
++			{
++				res += "spvUnsafeArray<";
++				sizes += join(", ", to_array_size(type, i), ">");
++			}
++			return res + type_to_glsl(*coop_type, 0, member) + sizes;
++		}
++
+ 		if (coop_type && coop_type->op == OpTypeCooperativeMatrixKHR)
+ 		{
+ 			if (!msl_options.supports_msl_version(3, 1))
+ 				SPIRV_CROSS_THROW("Cooperative matrices require MSL 3.1 or later.");
+ 
+-			// Only Subgroup scoped 8x8 matrices can be expressed.
++			// Only Subgroup scoped matrices of 8x8 tiles can be expressed.
+ 			validate_cooperative_matrix_type(*coop_type);
+ 
+-			// Map component type to simdgroup_*8x8
+ 			auto &comp = get<SPIRType>(coop_type->parent_type);
++			if (cooperative_matrix_is_tiled(*coop_type))
++			{
++				const char *component = comp.basetype == SPIRType::Float ? "float" :
++				                        comp.basetype == SPIRType::BFloat16 ? "bfloat" : "half";
++				return join("spvCoopMatrix<", component, ", ", cooperative_matrix_dim(*coop_type, false) / 8, ", ",
++				            cooperative_matrix_dim(*coop_type, true) / 8, ">");
++			}
++
++			// Map component type to simdgroup_*8x8
+ 			switch (comp.basetype)
+ 			{
+ 			case SPIRType::Float:
+@@ -17862,6 +21754,10 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 	case SPIRType::Half:
+ 		type_name = "half";
+ 		break;
++	// FP8 E4M3 values are their encoding; spvDecodeFP8E4M3 and spvEncodeFP8E4M3 convert.
++	case SPIRType::FloatE4M3:
++		type_name = "uchar";
++		break;
+ 	case SPIRType::Float:
+ 		type_name = "float";
+ 		break;
+@@ -18025,6 +21921,20 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
  		if (is_tese_shader() && is_builtin_variable(variable) && (builtin == BuiltInTessCoord || builtin == BuiltInPrimitiveId))
  			return false;
  
@@ -4983,7 +6055,7 @@ index ff081182..57af698e 100644
  		// We won't be able to catch writes to control point outputs here since variable
  		// refers to a function local pointer.
  		// This is fine, as there cannot be concurrent writers to that memory anyways,
-@@ -18218,9 +21470,12 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
+@@ -18218,9 +22128,12 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
  		break;
  	}
  
@@ -4998,7 +6070,7 @@ index ff081182..57af698e 100644
  
  	// For unsampled images, append the sample/read/write access qualifier.
  	// For kernel images, the access qualifier my be supplied directly by SPIR-V.
-@@ -18398,6 +21653,12 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
+@@ -18398,6 +22311,12 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
  	if (scope != ScopeSubgroup)
  		SPIRV_CROSS_THROW("Only subgroup scope is supported.");
  
@@ -5011,7 +6083,7 @@ index ff081182..57af698e 100644
  	switch (op)
  	{
  	case OpGroupNonUniformElect:
-@@ -18898,9 +22159,43 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
+@@ -18898,9 +22817,43 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
  			break;
  		if (is_mesh_shader())
  			break;
@@ -5056,7 +6128,7 @@ index ff081182..57af698e 100644
  		break;
  
  	case BuiltInSampleMask:
-@@ -19153,9 +22448,10 @@ string CompilerMSL::builtin_qualifier(BuiltIn builtin)
+@@ -19153,9 +23106,10 @@ string CompilerMSL::builtin_qualifier(BuiltIn builtin)
  			return "thread_index_in_simdgroup";
  		}
  		else if (execution.model == ExecutionModelKernel || execution.model == ExecutionModelGLCompute ||
@@ -5069,7 +6141,7 @@ index ff081182..57af698e 100644
  		{
  			// We are generating a Metal kernel function.
  			if (!msl_options.supports_msl_version(2))
-@@ -19258,6 +22554,8 @@ string CompilerMSL::builtin_type_decl(BuiltIn builtin, uint32_t id)
+@@ -19258,6 +23212,8 @@ string CompilerMSL::builtin_type_decl(BuiltIn builtin, uint32_t id)
  		return "uint";
  	case BuiltInSampleMask:
  		return "uint";
@@ -5078,7 +6150,7 @@ index ff081182..57af698e 100644
  	case BuiltInSamplePosition:
  		return "float2";
  	case BuiltInViewIndex:
-@@ -19903,7 +23201,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+@@ -19903,7 +23859,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
  		auto *var = self.maybe_get_backing_variable(args[2]);
  		if (var != nullptr)
  		{
@@ -5087,7 +6159,7 @@ index ff081182..57af698e 100644
  				self.buffers_requiring_array_length.insert(var->self);
  		}
  		break;
-@@ -19921,6 +23219,11 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+@@ -19921,6 +23877,11 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
  		set<SPIRExpression>(id, "", result_type, true);
  		self.register_read(id, ptr, true);
  		self.ir.ids[id].set_allow_type_rewrite();
@@ -5099,7 +6171,7 @@ index ff081182..57af698e 100644
  		break;
  	}
  
-@@ -20684,6 +23987,29 @@ bool CompilerMSL::is_supported_argument_buffer_type(const SPIRType &type) const
+@@ -20684,6 +24645,29 @@ bool CompilerMSL::is_supported_argument_buffer_type(const SPIRType &type) const
  	return is_supported_type && !type_is_msl_framebuffer_fetch(type);
  }
  
@@ -5129,7 +6201,7 @@ index ff081182..57af698e 100644
  void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &aliased_var,
                                                            const SPIRVariable &base_var)
  {
-@@ -20741,7 +24067,13 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
+@@ -20741,7 +24725,13 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
  		bool needs_post_cast_deref = !is_array(data_type);
  		string ref_type = needs_post_cast_deref ? "&" : join("(&)", type_to_array_glsl(var_type, aliased_var.self));
  
@@ -5144,7 +6216,7 @@ index ff081182..57af698e 100644
  		{
  			name = join("reinterpret_cast<",
  			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " *>(&",
-@@ -20905,6 +24237,12 @@ void CompilerMSL::analyze_argument_buffers()
+@@ -20905,6 +24895,12 @@ void CompilerMSL::analyze_argument_buffers()
  				set_needs_buffer_sizes[desc_set] = true;
  				needs_buffer_sizes = true;
  			}
@@ -5157,7 +6229,7 @@ index ff081182..57af698e 100644
  		}
  	});
  
-@@ -21028,6 +24366,10 @@ void CompilerMSL::analyze_argument_buffers()
+@@ -21028,6 +25024,10 @@ void CompilerMSL::analyze_argument_buffers()
  					r2.overlapping_var_id = r1.var->self;
  
  				set_extended_decoration(r2.var->self, SPIRVCrossDecorationOverlappingBinding, r2.overlapping_var_id);
@@ -5168,7 +6240,7 @@ index ff081182..57af698e 100644
  			}
  		}
  
-@@ -21393,6 +24735,320 @@ void CompilerMSL::activate_argument_buffer_resources()
+@@ -21393,6 +25393,320 @@ void CompilerMSL::activate_argument_buffer_resources()
  	});
  }
  
@@ -5489,7 +6561,7 @@ index ff081182..57af698e 100644
  bool CompilerMSL::using_builtin_array() const
  {
  	return msl_options.force_native_arrays || is_using_builtin_array;
-@@ -21560,7 +25216,9 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21560,7 +25874,9 @@ void CompilerMSL::emit_mesh_outputs()
  					// Declare the Clip/CullDistance as [[user(clip/cullN)]].
  					const uint32_t orig_index = get_member_decoration(type_vert.self, index, DecorationIndex);
  					access += "[" + to_string(orig_index) + "]";
@@ -5500,7 +6572,7 @@ index ff081182..57af698e 100644
  				}
  			}
  
-@@ -21571,6 +25229,8 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21571,6 +25887,8 @@ void CompilerMSL::emit_mesh_outputs()
  				          to_member_name(type_vert, index), ".y);", "    // Invert Y-axis for Metal");
  			}
  		}
@@ -5509,7 +6581,7 @@ index ff081182..57af698e 100644
  		statement("spvMesh.set_vertex(spvVI, spvV);");
  		end_scope();
  	}
-@@ -21643,7 +25303,11 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21643,7 +25961,11 @@ void CompilerMSL::emit_mesh_outputs()
  						access = "." + to_member_name(orig_type, orig_id);
  					}
  				}
@@ -5522,7 +6594,7 @@ index ff081182..57af698e 100644
  			}
  			statement("spvMesh.set_primitive(spvPI, spvP);");
  		}
-@@ -21666,6 +25330,27 @@ void CompilerMSL::emit_mesh_tasks(SPIRBlock &block)
+@@ -21666,6 +25988,27 @@ void CompilerMSL::emit_mesh_tasks(SPIRBlock &block)
  	statement("return;");
  }
  
@@ -5550,7 +6622,7 @@ index ff081182..57af698e 100644
  void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
  {
  	auto &type = get_variable_data_type(var);
-@@ -21704,7 +25389,7 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
+@@ -21704,7 +26047,7 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
  		statement("threadgroup uint *", var_ptr_name, " = (threadgroup uint *)&", var_name, ";");
  		statement("uint ", var_size_name, " = ", "sizeof(", var_name, ");");
  		statement("uint ", var_pos_name, " = gl_LocalInvocationIndex;");
@@ -5560,7 +6632,7 @@ index ff081182..57af698e 100644
  		statement("while (sizeof(uint) * ", var_pos_name, " < ", var_size_name, ")");
  		begin_scope();
 diff --git a/spirv_msl.hpp b/spirv_msl.hpp
-index 7d8fe5f6..892c5e8c 100644
+index 7d8fe5f6..5fd5ed39 100644
 --- a/spirv_msl.hpp
 +++ b/spirv_msl.hpp
 @@ -30,6 +30,7 @@
@@ -5914,7 +6986,12 @@ index 7d8fe5f6..892c5e8c 100644
  		SPVFuncImplSubgroupBroadcast,
  		SPVFuncImplSubgroupBroadcastFirst,
  		SPVFuncImplSubgroupBallot,
-@@ -924,9 +1156,15 @@ protected:
+@@ -921,12 +1153,20 @@ protected:
+ 		SPVFuncImplPaddedStd140,
+ 		SPVFuncImplPaddedArrayElement,
+ 		SPVFuncImplReduceAdd,
++		SPVFuncImplFloat8,
++		SPVFuncImplCooperativeMatrixTiled,
  		SPVFuncImplImageFence,
  		SPVFuncImplTextureCast,
  		SPVFuncImplDepthCast,
@@ -5930,7 +7007,7 @@ index 7d8fe5f6..892c5e8c 100644
  	};
  
  	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
-@@ -964,6 +1202,7 @@ protected:
+@@ -964,6 +1204,7 @@ protected:
  	void emit_mesh_outputs();
  	void emit_mesh_tasks(SPIRBlock &block) override;
  	void emit_workgroup_initialization(const SPIRVariable &var) override;
@@ -5938,7 +7015,7 @@ index 7d8fe5f6..892c5e8c 100644
  
  	// Allow Metal to use the array<T> template to make arrays a value type
  	std::string type_to_array_glsl(const SPIRType &type, uint32_t variable_id) override;
-@@ -1016,6 +1255,7 @@ protected:
+@@ -1016,6 +1257,7 @@ protected:
  	                                     bool is_packed, bool relaxed) override;
  
  	bool is_tesc_shader() const;
@@ -5946,7 +7023,7 @@ index 7d8fe5f6..892c5e8c 100644
  	bool is_tese_shader() const;
  	bool is_mesh_shader() const;
  
-@@ -1035,7 +1275,7 @@ protected:
+@@ -1035,7 +1277,7 @@ protected:
  	void extract_global_variables_from_function(uint32_t func_id, std::set<uint32_t> &added_arg_ids,
  	                                            std::unordered_set<uint32_t> &global_var_ids,
  	                                            std::unordered_set<uint32_t> &processed_func_ids);
@@ -5955,7 +7032,7 @@ index 7d8fe5f6..892c5e8c 100644
  	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
  	uint32_t add_meshlet_block(bool per_primitive);
  
-@@ -1101,6 +1341,7 @@ protected:
+@@ -1101,6 +1343,7 @@ protected:
  	bool maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs);
  	bool is_var_runtime_size_array(const SPIRVariable &var) const;
  	uint32_t get_resource_array_size(const SPIRType &type, uint32_t id) const;
@@ -5963,7 +7040,7 @@ index 7d8fe5f6..892c5e8c 100644
  
  	void fix_up_shader_inputs_outputs();
  
-@@ -1113,6 +1354,21 @@ protected:
+@@ -1113,6 +1356,21 @@ protected:
  	std::string entry_point_arg_stage_in();
  	void entry_point_args_builtin(std::string &args);
  	void entry_point_args_discrete_descriptors(std::string &args);
@@ -5985,7 +7062,42 @@ index 7d8fe5f6..892c5e8c 100644
  	std::string append_member_name(const std::string &qualifier, const SPIRType &type, uint32_t index);
  	std::string ensure_valid_name(std::string name, std::string pfx);
  	std::string to_sampler_expression(uint32_t id);
-@@ -1207,6 +1463,10 @@ protected:
+@@ -1196,7 +1454,33 @@ protected:
+ 	void build_implicit_builtins();
+ 
+ 	// Emulates element-wise operations on simdgroup matrices, which Metal does not support natively.
+-	std::string to_cooperative_matrix_component(uint32_t id, const std::string &index);
++	// Matrices other than 8x8 of float, half or bfloat16 are spvCoopMatrix tiles of 8x8 simdgroup matrices
++	// ("tiled"); FP8 (E4M3) matrices hold their values as half, which represents each exactly.
++	bool cooperative_matrix_is_tiled(const SPIRType &type);
++	uint32_t cooperative_matrix_components(const SPIRType &type);
++	uint32_t cooperative_matrix_dim(const SPIRType &type, bool columns);
++	uint32_t cooperative_matrix_use(const SPIRType &type);
++	bool cooperative_matrix_is_fp8(const SPIRType &type);
++	std::string cooperative_matrix_element_get(const SPIRType &type, const std::string &matrix, const std::string &index);
++	std::string cooperative_matrix_element_set(const SPIRType &type, const std::string &matrix, const std::string &index,
++	                                           const std::string &value);
++	std::string cooperative_matrix_from_scalar(const SPIRType &matrix_type, uint32_t id);
++	bool emit_cooperative_matrix_tiled_load_store(const Instruction &instruction, bool load);
++	bool emit_cooperative_matrix_tiled_mul_add(const Instruction &instruction);
++	bool emit_float8_conversion(uint32_t result_type, uint32_t id, uint32_t arg);
++	std::string constant_expression_vector(const SPIRConstant &c, uint32_t vector) override;
++	// Pointers to one component of a cooperative matrix variable: loads and stores through them use
++	// cooperative_matrix_element_get/set.
++	struct CooperativeMatrixElementPointer
++	{
++		uint32_t matrix_type;
++		uint32_t base_variable;
++		std::string matrix;
++		std::string index;
++	};
++	std::unordered_map<uint32_t, CooperativeMatrixElementPointer> cooperative_matrix_element_pointers;
++	bool maybe_emit_cooperative_matrix_access_chain(const Instruction &instruction);
++	std::string to_cooperative_matrix_component(uint32_t id, uint32_t index);
+ 	void emit_cooperative_matrix_unary_op(uint32_t result_type, uint32_t result_id, uint32_t op0, const char *op);
+ 	void emit_cooperative_matrix_binary_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1,
+ 	                                       const char *op);
+@@ -1207,6 +1491,10 @@ protected:
  	void validate_cooperative_matrix_type(const SPIRType &type);
  	void validate_cooperative_matrix_types();
  	uint32_t build_constant_uint_array_pointer();
@@ -5996,7 +7108,7 @@ index 7d8fe5f6..892c5e8c 100644
  	void emit_entry_point_declarations() override;
  	bool uses_explicit_early_fragment_test();
  
-@@ -1220,6 +1480,17 @@ protected:
+@@ -1220,6 +1508,17 @@ protected:
  	uint32_t builtin_base_instance_id = 0;
  	uint32_t builtin_view_idx_id = 0;
  	uint32_t builtin_layer_id = 0;
@@ -6014,7 +7126,7 @@ index 7d8fe5f6..892c5e8c 100644
  	uint32_t builtin_invocation_id_id = 0;
  	uint32_t builtin_primitive_id_id = 0;
  	uint32_t builtin_subgroup_invocation_id_id = 0;
-@@ -1236,6 +1507,11 @@ protected:
+@@ -1236,6 +1535,11 @@ protected:
  	uint32_t buffer_size_buffer_id = 0;
  	uint32_t acceleration_structure_address_table_id = 0;
  	uint32_t view_mask_buffer_id = 0;
@@ -6026,7 +7138,7 @@ index 7d8fe5f6..892c5e8c 100644
  	uint32_t draw_index_buffer_id = 0;
  	uint32_t dynamic_offsets_buffer_id = 0;
  	uint32_t uint_type_id = 0;
-@@ -1282,6 +1558,8 @@ protected:
+@@ -1282,6 +1586,8 @@ protected:
  	std::unordered_set<uint32_t> location_inputs_in_use_fallback;
  	std::unordered_set<uint32_t> location_outputs_in_use;
  	std::unordered_set<uint32_t> location_outputs_in_use_fallback;
@@ -6035,7 +7147,7 @@ index 7d8fe5f6..892c5e8c 100644
  	std::unordered_map<uint32_t, uint32_t> fragment_output_components;
  	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_input_location;
  	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_output_location;
-@@ -1310,6 +1588,7 @@ protected:
+@@ -1310,6 +1616,7 @@ protected:
  	VariableID mesh_out_per_vertex = 0;
  	VariableID mesh_out_per_primitive = 0;
  	VariableID stage_out_masked_builtin_type_id = 0;
@@ -6043,7 +7155,7 @@ index 7d8fe5f6..892c5e8c 100644
  
  	// Handle HLSL-style 0-based vertex/instance index.
  	enum class TriState
-@@ -1351,6 +1630,7 @@ protected:
+@@ -1351,6 +1658,7 @@ protected:
  	std::string depth_clip_viewport_idx_var_name;
  	std::string stage_in_var_name = "in";
  	std::string stage_out_var_name = "out";
@@ -6051,7 +7163,7 @@ index 7d8fe5f6..892c5e8c 100644
  	std::string patch_stage_in_var_name = "patchIn";
  	std::string patch_stage_out_var_name = "patchOut";
  	std::string sampler_name_suffix = "Smplr";
-@@ -1372,11 +1652,59 @@ protected:
+@@ -1372,11 +1680,59 @@ protected:
  	const MSLConstexprSampler *find_constexpr_sampler(uint32_t id) const;
  
  	std::unordered_set<uint32_t> buffers_requiring_array_length;
@@ -6111,7 +7223,7 @@ index 7d8fe5f6..892c5e8c 100644
  	SmallVector<SPIRVariable *> entry_point_bindings;
  
  	// Must be ordered since array is in a specific order.
-@@ -1399,6 +1727,8 @@ protected:
+@@ -1399,6 +1755,8 @@ protected:
  	void emit_argument_buffer_aliased_descriptor(const SPIRVariable &aliased_var,
  	                                             const SPIRVariable &base_var);
  
@@ -6120,7 +7232,7 @@ index 7d8fe5f6..892c5e8c 100644
  	void analyze_argument_buffers();
  	bool descriptor_set_is_argument_buffer(uint32_t desc_set) const;
  	const MSLResourceBinding &get_argument_buffer_resource(uint32_t desc_set, uint32_t arg_idx) const;
-@@ -1407,6 +1737,8 @@ protected:
+@@ -1407,6 +1765,8 @@ protected:
  	void add_argument_buffer_padding_sampler_type(SPIRType &struct_type, uint32_t &mbr_idx, uint32_t &arg_buff_index, MSLResourceBinding &rez_bind);
  	void add_argument_buffer_padding_type(uint32_t mbr_type_id, SPIRType &struct_type, uint32_t &mbr_idx, uint32_t &arg_buff_index, uint32_t count);
  

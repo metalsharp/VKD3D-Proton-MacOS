@@ -65,13 +65,14 @@ DXVK 3.1 depends on MoltenVK and SPIRV-Cross fixes that this repository carries 
 `patches/spirv-cross`), so use this release's MoltenVK with these DLLs. DXVK's own changes are made in
 metalsharp/DXVK-MacOS, whose releases also have i386 builds for 32-bit programs.
 
-## AMD FSR Upscaling 4
+## AMD FSR 4
 
-`METALSHARP_FSR4=1` lets games that ship AMD's FSR 4 DLLs (FSR SDK 2.x, up to FSR 4.1.2) offer FSR Upscaling 4 on
-an Apple GPU. It is off by default. With it on, VKD3D-Proton loads this repository's `amdxc64.dll`, which stands in for
-AMD's driver DLL, and DXVK's DXGI reports an AMD GPU; MetalSharp Wine answers AMD's driver-data query. FSR then runs
-its INT8 model, which needs a packed 8-bit dot product that Apple GPUs don't have. On an M4 it takes 177 ms per 1080p
-frame, against 11 ms for FSR 3.1, so it is a way to try FSR 4's image quality, not to play with.
+`METALSHARP_FSR4=1` lets games that ship AMD's FSR 4 DLLs (FSR SDK 2.x: FSR Upscaling 4.1.2, FSR Frame Generation
+4.0.2 and its swapchain 4.0.0) offer them on an Apple GPU. It is off by default. With it on, VKD3D-Proton loads this
+repository's `amdxc64.dll`, which stands in for AMD's driver DLL, DXVK's DXGI reports an AMD GPU and MetalSharp Wine
+answers AMD's driver-data query as RDNA 4. FSR's FP8 networks then run their matrix multiplies on Apple's matrix
+hardware through MoltenVK's `VK_KHR_cooperative_matrix`. On an M4 that takes 186 ms per upscaled and 76 ms per
+generated 1080p frame, against 10 and 23 ms for FSR 3.1, so it is a way to try FSR 4, not to play with.
 [docs/fsr4.md](docs/fsr4.md) has the details, measurements and the license terms of AMD's DLLs.
 
 ## Install
@@ -135,7 +136,7 @@ Start at [docs/README.md](docs/README.md), then see:
 - [Feature-level matrix](docs/features.md)
 - [Validation and regression](docs/validation.md)
 - [Tracing a problem with `METALSHARP_TRACE`](docs/tracing.md)
-- [AMD FSR Upscaling 4 (`METALSHARP_FSR4`)](docs/fsr4.md)
+- [AMD FSR 4 (`METALSHARP_FSR4`)](docs/fsr4.md)
 - [Release and packaging](docs/release.md)
 - [Final state](docs/Final.md)
 

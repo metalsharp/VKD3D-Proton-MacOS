@@ -12,8 +12,9 @@ OUT="${1:-$WS/artifacts/build/fsr-probe}"
 unset CFLAGS CXXFLAGS OBJCFLAGS LDFLAGS CPPFLAGS CC CXX OBJC
 mkdir -p "$OUT"
 "$LLVM_MINGW/bin/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -Wall -Wno-missing-field-initializers \
-    -I"$SDK/api/include" -I"$SDK/upscalers/include" \
+    -I"$SDK/api/include" -I"$SDK/upscalers/include" -I"$SDK/framegeneration/include" \
     "$WS/tests/fsr/fsr4probe.cpp" -o "$OUT/fsr4probe.exe" -static -ld3d12 -ldxgi
-cp "$SDK/signedbin/amd_fidelityfx_loader_dx12.dll" "$SDK/signedbin/amd_fidelityfx_upscaler_dx12.dll" "$OUT/"
+cp "$SDK/signedbin/amd_fidelityfx_loader_dx12.dll" "$SDK/signedbin/amd_fidelityfx_upscaler_dx12.dll" \
+    "$SDK/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$OUT/"
 cp "$SDK/docs/license.md" "$OUT/LICENSE.fsr-sdk.md"
 ls -la "$OUT"

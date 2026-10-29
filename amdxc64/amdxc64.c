@@ -25,6 +25,8 @@
 #include <windows.h>
 #include <initguid.h>
 #include <d3d12.h>
+#include <fcntl.h>
+#include <io.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,23 +47,38 @@ DEFINE_GUID(IID_IAmdExtD3DDevice6, 0xf764a768, 0x48b4, 0x46a5, 0x97, 0x79, 0x92,
 DEFINE_GUID(IID_IAmdExtD3DDevice7, 0xfee37afc, 0x3c50, 0x4abf, 0x86, 0xcc, 0x16, 0x22, 0x34, 0x9b, 0x29, 0xc0);
 DEFINE_GUID(IID_IAmdExtD3DDevice8, 0xf714e11a, 0xb54e, 0x4e0f, 0xab, 0xc5, 0xdf, 0x58, 0xb1, 0x81, 0x33, 0xd1);
 
-/* METALSHARP_FSR4_LOG=1: every request and its answer on stderr, to see what an FSR DLL asks for. */
+/* METALSHARP_FSR4_LOG: every request and its answer, to see what an FSR DLL asks for; 1 writes them on stderr, any
+ * other value is a file to append them to (created with the default security descriptor). */
+static FILE *open_log(const char *path)
+{
+    HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    int fd;
+
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    if ((fd = _open_osfhandle((intptr_t)file, _O_APPEND)) < 0) { CloseHandle(file); return NULL; }
+    return _fdopen(fd, "a");
+}
+
 static void amdxc_log(const char *format, ...)
 {
+    static FILE *out;
     static int enabled = -1;
     va_list args;
     if (enabled < 0)
     {
         const char *env = getenv("METALSHARP_FSR4_LOG");
-        enabled = env && *env == '1';
+        enabled = env && *env && strcmp(env, "0");
+        if (enabled) out = strcmp(env, "1") ? open_log(env) : stderr;
+        if (!out) enabled = 0;
     }
     if (!enabled) return;
     va_start(args, format);
-    fputs("amdxc64: ", stderr);
-    vfprintf(stderr, format, args);
-    fputc('\n', stderr);
+    fputs("amdxc64: ", out);
+    vfprintf(out, format, args);
+    fputc('\n', out);
     va_end(args);
-    fflush(stderr);
+    fflush(out);
 }
 
 static BOOL fsr4_enabled(void)
@@ -135,9 +152,58 @@ static const IAmdExtFfxApiVtbl ffx_api_vtbl =
     ffx_api_UpdateFfxApiProvider,
 };
 
+/* VKD3D-Proton's ID3D12DeviceExt3 (include/vkd3d_device_vkd3d_ext.idl), which says which of AMD's shader intrinsics
+ * (AGS) its shader compiler implements on this device: WMMA_FP8 with Vulkan cooperative matrices, WMMA_FP8_NATIVE when
+ * they also take FP8 (VK_EXT_shader_float8; MoltenVK has both on Apple GPUs). */
+DEFINE_GUID(IID_ID3D12DeviceExt3, 0x3aefa75c, 0xc9f3, 0x4b7f, 0xa1, 0x80, 0x5d, 0xf6, 0x95, 0xd0, 0x83, 0xbf);
+enum
+{
+    AGS_EXTENSION_INTRINSICS_16 = 0, AGS_EXTENSION_INTRINSICS_17 = 1, AGS_EXTENSION_INTRINSICS_19 = 5,
+    AGS_EXTENSION_BASE_VERTEX = 6, AGS_EXTENSION_BASE_INSTANCE = 7, AGS_EXTENSION_GET_WAVE_SIZE = 8,
+    AGS_EXTENSION_FLOAT_CONVERSION = 9, AGS_EXTENSION_READ_LANE_AT = 10, AGS_EXTENSION_RAY_HIT_TOKEN = 11,
+    AGS_EXTENSION_SHADER_CLOCK = 12, AGS_EXTENSION_WMMA_FP8 = 100, AGS_EXTENSION_WMMA_FP8_NATIVE = 101,
+};
+typedef struct ID3D12DeviceExt3 ID3D12DeviceExt3;
+typedef struct
+{
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID3D12DeviceExt3 *iface, REFIID iid, void **out);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ID3D12DeviceExt3 *iface);
+    ULONG (STDMETHODCALLTYPE *Release)(ID3D12DeviceExt3 *iface);
+    void *ext[7], *ext1[2], *ext2[4];   /* ID3D12DeviceExt, ID3D12DeviceExt1, ID3D12DeviceExt2 */
+    BOOL (STDMETHODCALLTYPE *SupportsAGSExtension)(ID3D12DeviceExt3 *iface, UINT extension);
+    HRESULT (STDMETHODCALLTYPE *SetAGSUAVSlot)(ID3D12DeviceExt3 *iface, UINT uav_slot);
+} ID3D12DeviceExt3Vtbl;
+struct ID3D12DeviceExt3 { const ID3D12DeviceExt3Vtbl *lpVtbl; };
+
+/* The application's D3D12 device, which the factory's interfaces answer for (the last one it was created with). */
+static IUnknown *d3d12_device;
+
+/* METALSHARP_FSR4_GPU=rdna3: Wine answers as an RDNA 3 GPU, and FSR should run its INT8 model, so the wave matrix
+ * intrinsics (and with them the FP8 models) are not offered. */
+static BOOL wave_matrix_allowed(void)
+{
+    const char *gpu = getenv("METALSHARP_FSR4_GPU");
+    return !gpu || strcmp(gpu, "rdna3");
+}
+
+static BOOL device_supports_ags(UINT extension)
+{
+    ID3D12DeviceExt3 *ext;
+    BOOL supported;
+
+    if ((extension == AGS_EXTENSION_WMMA_FP8 || extension == AGS_EXTENSION_WMMA_FP8_NATIVE) && !wave_matrix_allowed())
+        return FALSE;
+    if (!d3d12_device || FAILED(IUnknown_QueryInterface(d3d12_device, &IID_ID3D12DeviceExt3, (void **)&ext)))
+        return FALSE;
+    supported = ext->lpVtbl->SupportsAGSExtension(ext, extension);
+    ext->lpVtbl->Release(ext);
+    return supported;
+}
+
 /* IAmdExtD3DDevice8 (AMD's driver extension headers): FSR asks it which wave matrix (WMMA) shapes and types the
- * GPU multiplies. Apple GPUs have none that FSR's matrix models use, so there are none, and FSR runs a model that
- * doesn't use them. Its pipeline creation entry points take AMD shader binaries and are not supported. */
+ * GPU multiplies: 16x16x16 FP8 into FP32 where VKD3D-Proton runs them natively, which selects FSR's FP8 models
+ * (FSR Upscaling 4's RDNA 4 model, FSR Frame Generation 4). Its pipeline creation entry points take AMD shader
+ * binaries and are not supported. */
 typedef struct
 {
     SIZE_T mSize, nSize, kSize;
@@ -264,8 +330,17 @@ static HRESULT STDMETHODCALLTYPE ext_device_CreateComputePipelineCrossCompile(IA
 static HRESULT STDMETHODCALLTYPE ext_device_GetWaveMatrixProperties(IAmdExtD3DDevice8 *iface, SIZE_T *count,
         AmdExtWaveMatrixProperties *properties)
 {
-    amdxc_log("IAmdExtD3DDevice8::GetWaveMatrixProperties: none");
+    static const AmdExtWaveMatrixProperties fp8 = {16, 16, 16, 11 /* FP8 */, 11, 1 /* FP32 */, 1 /* FP32 */, FALSE};
+
     if (!count) return E_INVALIDARG;
+    if (device_supports_ags(AGS_EXTENSION_WMMA_FP8_NATIVE))
+    {
+        amdxc_log("IAmdExtD3DDevice8::GetWaveMatrixProperties: 16x16x16 FP8");
+        if (properties && *count >= 1) properties[0] = fp8;
+        *count = 1;
+        return S_OK;
+    }
+    amdxc_log("IAmdExtD3DDevice8::GetWaveMatrixProperties: none");
     *count = 0;
     return S_OK;
 }
@@ -296,20 +371,112 @@ typedef struct IAmdExtD3DFactoryVtbl
 } IAmdExtD3DFactoryVtbl;
 struct IAmdExtD3DFactory { const IAmdExtD3DFactoryVtbl *lpVtbl; };
 
+/* IAmdExtD3DShaderIntrinsics: which of AMD's shader intrinsics (called through a UAV in register space 0x7fff0ade)
+ * shaders may use. VKD3D-Proton's shader compiler implements them; it says which (ID3D12DeviceExt3). */
+enum
+{
+    INTRINSIC_READFIRSTLANE = 0x1, INTRINSIC_BARYCENTRICS = 0x8, INTRINSIC_WAVE_REDUCE = 0x9, INTRINSIC_WAVE_SCAN = 0xa,
+    INTRINSIC_DRAW_INDEX = 0xe, INTRINSIC_ATOMIC_U64 = 0xf, INTRINSIC_BASE_INSTANCE = 0x10,
+    INTRINSIC_BASE_VERTEX = 0x11, INTRINSIC_FLOAT_CONVERSION = 0x12, INTRINSIC_GET_WAVE_SIZE = 0x13,
+    INTRINSIC_READLANE_AT = 0x14, INTRINSIC_RAY_TRACE_HIT_TOKEN = 0x15, INTRINSIC_SHADER_CLOCK = 0x16,
+    INTRINSIC_SHADER_REALTIME_CLOCK = 0x17, INTRINSIC_WAVE_MATRIX = 0x1f, INTRINSIC_FLOAT8_CONVERSION = 0x20,
+};
+typedef struct IAmdExtD3DShaderIntrinsics IAmdExtD3DShaderIntrinsics;
+typedef struct
+{
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IAmdExtD3DShaderIntrinsics *iface, REFIID iid, void **out);
+    ULONG (STDMETHODCALLTYPE *AddRef)(IAmdExtD3DShaderIntrinsics *iface);
+    ULONG (STDMETHODCALLTYPE *Release)(IAmdExtD3DShaderIntrinsics *iface);
+    HRESULT (STDMETHODCALLTYPE *GetInfo)(IAmdExtD3DShaderIntrinsics *iface, void *info);
+    HRESULT (STDMETHODCALLTYPE *CheckSupport)(IAmdExtD3DShaderIntrinsics *iface, UINT intrinsic);
+    HRESULT (STDMETHODCALLTYPE *Enable)(IAmdExtD3DShaderIntrinsics *iface);
+} IAmdExtD3DShaderIntrinsicsVtbl;
+struct IAmdExtD3DShaderIntrinsics { const IAmdExtD3DShaderIntrinsicsVtbl *lpVtbl; };
+
+static HRESULT STDMETHODCALLTYPE intrinsics_QueryInterface(IAmdExtD3DShaderIntrinsics *iface, REFIID iid, void **out);
+static ULONG STDMETHODCALLTYPE intrinsics_AddRef(IAmdExtD3DShaderIntrinsics *iface) { return 2; }
+static ULONG STDMETHODCALLTYPE intrinsics_Release(IAmdExtD3DShaderIntrinsics *iface) { return 1; }
+static HRESULT STDMETHODCALLTYPE intrinsics_GetInfo(IAmdExtD3DShaderIntrinsics *iface, void *info)
+{
+    amdxc_log("IAmdExtD3DShaderIntrinsics::GetInfo");
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE intrinsics_CheckSupport(IAmdExtD3DShaderIntrinsics *iface, UINT intrinsic)
+{
+    BOOL supported;
+
+    if (intrinsic == INTRINSIC_WAVE_MATRIX)
+        supported = device_supports_ags(AGS_EXTENSION_WMMA_FP8);
+    else if (intrinsic == INTRINSIC_FLOAT8_CONVERSION)
+        supported = device_supports_ags(AGS_EXTENSION_WMMA_FP8_NATIVE);
+    else if (intrinsic >= INTRINSIC_READFIRSTLANE && intrinsic <= INTRINSIC_BARYCENTRICS)
+        supported = device_supports_ags(AGS_EXTENSION_INTRINSICS_16);
+    else if (intrinsic == INTRINSIC_WAVE_REDUCE || intrinsic == INTRINSIC_WAVE_SCAN)
+        supported = device_supports_ags(AGS_EXTENSION_INTRINSICS_17);
+    else if (intrinsic == INTRINSIC_DRAW_INDEX || intrinsic == INTRINSIC_ATOMIC_U64)
+        supported = device_supports_ags(AGS_EXTENSION_INTRINSICS_19);
+    else if (intrinsic == INTRINSIC_SHADER_CLOCK || intrinsic == INTRINSIC_SHADER_REALTIME_CLOCK)
+        supported = device_supports_ags(AGS_EXTENSION_SHADER_CLOCK);
+    else if (intrinsic == INTRINSIC_BASE_INSTANCE)
+        supported = device_supports_ags(AGS_EXTENSION_BASE_INSTANCE);
+    else if (intrinsic == INTRINSIC_BASE_VERTEX)
+        supported = device_supports_ags(AGS_EXTENSION_BASE_VERTEX);
+    else if (intrinsic == INTRINSIC_GET_WAVE_SIZE)
+        supported = device_supports_ags(AGS_EXTENSION_GET_WAVE_SIZE);
+    else if (intrinsic == INTRINSIC_FLOAT_CONVERSION)
+        supported = device_supports_ags(AGS_EXTENSION_FLOAT_CONVERSION);
+    else if (intrinsic == INTRINSIC_READLANE_AT)
+        supported = device_supports_ags(AGS_EXTENSION_READ_LANE_AT);
+    else if (intrinsic == INTRINSIC_RAY_TRACE_HIT_TOKEN)
+        supported = device_supports_ags(AGS_EXTENSION_RAY_HIT_TOKEN);
+    else
+        supported = FALSE;
+    amdxc_log("IAmdExtD3DShaderIntrinsics::CheckSupport %#x: %s", intrinsic, supported ? "yes" : "no");
+    return supported ? S_OK : E_NOTIMPL;
+}
+static HRESULT STDMETHODCALLTYPE intrinsics_Enable(IAmdExtD3DShaderIntrinsics *iface)
+{
+    /* VKD3D-Proton compiles them whenever a shader uses them. */
+    amdxc_log("IAmdExtD3DShaderIntrinsics::Enable");
+    return S_OK;
+}
+static const IAmdExtD3DShaderIntrinsicsVtbl intrinsics_vtbl =
+{
+    intrinsics_QueryInterface, intrinsics_AddRef, intrinsics_Release,
+    intrinsics_GetInfo, intrinsics_CheckSupport, intrinsics_Enable,
+};
+static IAmdExtD3DShaderIntrinsics intrinsics = { &intrinsics_vtbl };
+static HRESULT STDMETHODCALLTYPE intrinsics_QueryInterface(IAmdExtD3DShaderIntrinsics *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmdExtD3DShaderIntrinsics))
+    {
+        *out = &intrinsics;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
 static HRESULT STDMETHODCALLTYPE factory_CreateInterface(IAmdExtD3DFactory *iface, IUnknown *outer, REFIID iid, void **out)
 {
     char buf[40];
     HRESULT hr = E_NOINTERFACE;
 
     *out = NULL;
+    if (outer)
+        d3d12_device = outer;
     if (is_ext_device_iid(iid))
     {
         *out = &ext_device;
         hr = S_OK;
     }
+    else if (IsEqualGUID(iid, &IID_IAmdExtD3DShaderIntrinsics))
+    {
+        *out = &intrinsics;
+        hr = S_OK;
+    }
     else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi) && outer)
         hr = IUnknown_QueryInterface(outer, iid, out);
-    /* IAmdExtD3DShaderIntrinsics (AMD's shader intrinsics through a magic UAV) is declined: FSR then doesn't use them. */
     amdxc_log("IAmdExtD3DFactory::CreateInterface %s: %#lx", guid_str(iid, buf), (long)hr);
     return hr;
 }
@@ -337,6 +504,8 @@ HRESULT __cdecl AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **out
         amdxc_log("AmdExtD3DCreateInterface %s: METALSHARP_FSR4 is not 1", guid_str(iid, buf));
         return E_NOINTERFACE;
     }
+    if (outer)
+        d3d12_device = outer;
     if (IsEqualGUID(iid, &IID_IAmdExtFfxApi))
     {
         struct ffx_api *api = calloc(1, sizeof(*api));

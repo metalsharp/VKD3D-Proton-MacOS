@@ -2,7 +2,7 @@
  * fsr4probe: runs AMD FSR Upscaling from the FSR SDK's signed DLLs (amd_fidelityfx_loader_dx12.dll and
  * amd_fidelityfx_upscaler_dx12.dll next to the exe, unmodified) on the D3D12 device, and checks its output.
  *
- *   fsr4probe.exe [--version <substring>] [--frames N] [--mode quality|balanced|performance|ultra]
+ *   fsr4probe.exe [--fg [--swapchain]] [--version <substring>] [--frames N] [--mode quality|balanced|performance|ultra]
  *                 [--size WxH] [--images <dir>]
  *
  * 1. Reports the adapter, its shader model and the features FSR Upscaling 4 depends on.
@@ -13,6 +13,9 @@
  *    scene rendered at display resolution (PSNR), alongside a bilinear upscale of the last input frame,
  *    and checked for NaN/Inf. GPU time per dispatch comes from timestamp queries (stale on MoltenVK) and from
  *    the wall time from submit to completion, with the inputs uploaded in a submit of their own.
+ * 4. With --fg, runs frame generation (amd_fidelityfx_framegeneration_dx12.dll) instead: each version, or those
+ *    matching --version, interpolates the moving scene without a swapchain (runFrameGeneration), or, with
+ *    --swapchain, presents it through the frame generation swapchain on a hidden window (runFrameGenerationSwapchain).
  *
  * Build: scripts/build-fsr-probe.sh (llvm-mingw, x86_64), against the SDK's MIT-licensed API headers.
  */
@@ -33,6 +36,8 @@
 #include "ffx_api_loader.h"
 #include "dx12/ffx_api_dx12.h"
 #include "ffx_upscale.h"
+#include "ffx_framegeneration.h"
+#include "dx12/ffx_api_framegeneration_dx12.h"
 
 #define CHECK(expr) do { HRESULT hr_ = (expr); if (FAILED(hr_)) { printf("FAIL %s: hr %#lx (line %d)\n", #expr, (long)hr_, __LINE__); exit(2); } } while (0)
 
@@ -40,6 +45,7 @@ struct Options {
     std::string version;
     unsigned frames = 32, displayW = 1920, displayH = 1080, mode = FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
     std::string images;
+    bool frameGeneration = false, swapchain = false;
 };
 
 static ffxFunctions g_ffx;
@@ -180,6 +186,292 @@ static void writePPM(const std::string &path, const std::vector<float> &rgba, un
     DWORD written;
     WriteFile(file, data.data(), (DWORD)data.size(), &written, nullptr);
     CloseHandle(file);
+}
+
+/* Frame generation without a swapchain (FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY): each frame of the
+ * scene, rendered at display resolution, goes through PrepareV2 and generation, which interpolates the frame
+ * halfway between it and the one before. The last generated frame is compared with the scene at that time, alongside
+ * repeating the previous frame and blending the two. Returns 0 when it is finite and closer than repeating. */
+static int runFrameGeneration(const Options &opt, uint64_t versionId, const char *versionName) {
+    printf("\n== %s (id %#llx)\n", versionName, (unsigned long long)versionId);
+    const unsigned W = opt.displayW, H = opt.displayH;
+    ffxContext ctx = nullptr;
+    ffxCreateBackendDX12Desc backend = {}; backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12; backend.device = g_dev;
+    ffxCreateContextDescFrameGenerationVersion apiVersion = {}; apiVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+    apiVersion.version = FFX_FRAMEGENERATION_VERSION;
+    ffxOverrideVersion override_ = {}; override_.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION; override_.versionId = versionId;
+    ffxCreateContextDescFrameGeneration create = {}; create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    create.flags = FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS | FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
+    create.displaySize = {W, H}; create.maxRenderSize = {W, H};
+    create.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    create.header.pNext = &backend.header;
+    backend.header.pNext = &apiVersion.header;
+    apiVersion.header.pNext = &override_.header;
+    ffxReturnCode_t rc = g_ffx.CreateContext(&ctx, &create.header, nullptr);
+    if (rc != FFX_API_RETURN_OK) { printf("FAIL ffxCreateContext: return code %u\n", rc); return 1; }
+    ffxQueryGetProviderVersion pv = {}; pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    g_ffx.Query(&ctx, &pv.header);
+    printf("provider: %s (id %#llx)\n", pv.versionName ? pv.versionName : "?", (unsigned long long)pv.versionId);
+    printf("display %ux%u, %u frames\n", W, H, opt.frames);
+
+    ID3D12Resource *color = makeTexture(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *depth = makeTexture(W, H, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *motion = makeTexture(W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *output = makeTexture(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *stagingColor = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    ID3D12Resource *stagingDepth = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    ID3D12Resource *stagingMotion = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    UINT64 outRowPitch = ((UINT64)W * 4 + 255) & ~255ull;
+    ID3D12Resource *readback = makeBuffer(outRowPitch * H, D3D12_HEAP_TYPE_READBACK);
+
+    auto frameImage = [&](float t, std::vector<uint32_t> &px) {
+        px.resize((size_t)W * H);
+        for (unsigned y = 0; y < H; y++)
+            for (unsigned x = 0; x < W; x++) {
+                float rgb[3]; scene(x + 0.5f, y + 0.5f, t, rgb);
+                px[(size_t)y * W + x] = (uint32_t)(rgb[0] * 255 + 0.5f) | (uint32_t)(rgb[1] * 255 + 0.5f) << 8 |
+                                        (uint32_t)(rgb[2] * 255 + 0.5f) << 16 | 0xff000000u;
+            }
+    };
+    std::vector<uint32_t> colorData, prevData, motionData((size_t)W * H);
+    std::vector<float> depthData((size_t)W * H, 0.5f);
+    uint16_t mv[2] = {toHalf(-kVx), toHalf(-kVy)};
+    for (auto &m : motionData) memcpy(&m, mv, 4);
+    double wallMsTotal = 0; unsigned wallMsCount = 0;
+    int failed = 0;
+
+    for (unsigned frame = 0; frame < opt.frames && !failed; frame++) {
+        prevData.swap(colorData);
+        frameImage((float)frame, colorData);
+        upload(color, stagingColor, colorData.data(), W, H, 4);
+        upload(depth, stagingDepth, depthData.data(), W, H, 4);
+        upload(motion, stagingMotion, motionData.data(), W, H, 4);
+        const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier(color, D3D12_RESOURCE_STATE_COPY_DEST, read);
+        barrier(depth, D3D12_RESOURCE_STATE_COPY_DEST, read);
+        barrier(motion, D3D12_RESOURCE_STATE_COPY_DEST, read);
+        submitAndWait();
+
+        ffxConfigureDescFrameGeneration cfg = {}; cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.frameGenerationEnabled = true;
+        cfg.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+        cfg.generationRect = {0, 0, (int32_t)W, (int32_t)H};
+        cfg.frameID = frame;
+        rc = g_ffx.Configure(&ctx, &cfg.header);
+        if (rc != FFX_API_RETURN_OK) { printf("FAIL ffxConfigure (frame %u): return code %u\n", frame, rc); failed = 1; break; }
+
+        ffxDispatchDescFrameGenerationPrepareV2 prep = {}; prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+        prep.frameID = frame; prep.commandList = g_list;
+        prep.renderSize = {W, H}; prep.jitterOffset = {0, 0}; prep.motionVectorScale = {1.0f, 1.0f};
+        prep.frameTimeDelta = 16.6f; prep.reset = frame == 0;
+        prep.cameraNear = 0.1f; prep.cameraFar = 1000.0f; prep.cameraFovAngleVertical = 1.0f; prep.viewSpaceToMetersFactor = 1.0f;
+        prep.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        prep.motionVectors = ffxApiGetResourceDX12(motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        prep.cameraPosition[2] = -1.0f; prep.cameraUp[1] = 1.0f; prep.cameraRight[0] = 1.0f; prep.cameraForward[2] = 1.0f;
+        rc = g_ffx.Dispatch(&ctx, &prep.header);
+        if (rc != FFX_API_RETURN_OK) { printf("FAIL ffxDispatch prepare (frame %u): return code %u\n", frame, rc); failed = 1; }
+
+        ffxDispatchDescFrameGeneration gen = {}; gen.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+        gen.commandList = g_list;
+        gen.presentColor = ffxApiGetResourceDX12(color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        gen.outputs[0] = ffxApiGetResourceDX12(output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        gen.numGeneratedFrames = 1;
+        gen.reset = frame == 0;
+        gen.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        gen.minMaxLuminance[0] = 0.0f; gen.minMaxLuminance[1] = 1000.0f;
+        gen.generationRect = {0, 0, (int32_t)W, (int32_t)H};
+        gen.frameID = frame;
+        if (!failed && (rc = g_ffx.Dispatch(&ctx, &gen.header)) != FFX_API_RETURN_OK) {
+            printf("FAIL ffxDispatch frame generation (frame %u): return code %u\n", frame, rc); failed = 1;
+        }
+        barrier(color, read, D3D12_RESOURCE_STATE_COPY_DEST);
+        barrier(depth, read, D3D12_RESOURCE_STATE_COPY_DEST);
+        barrier(motion, read, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (frame == opt.frames - 1) {
+            barrier(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION src = {output, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}; src.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION dst = {readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, (UINT)outRowPitch};
+            g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            barrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        LARGE_INTEGER t0, t1, f; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        submitAndWait();
+        QueryPerformanceCounter(&t1);
+        if (frame >= 4) { wallMsTotal += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart; wallMsCount++; }
+    }
+
+    if (!failed && opt.frames >= 2) {
+        std::vector<float> out((size_t)W * H * 4), truth(out.size()), repeat(out.size()), blend(out.size());
+        unsigned char *map; D3D12_RANGE r = {0, (SIZE_T)(outRowPitch * H)};
+        CHECK(readback->Map(0, &r, (void **)&map));
+        double mean = 0;
+        for (unsigned y = 0; y < H; y++)
+            for (unsigned x = 0; x < W * 4; x++) {
+                float v = map[y * outRowPitch + x] / 255.0f;
+                out[(size_t)y * W * 4 + x] = v;
+                if ((x & 3) != 3) mean += v;
+            }
+        D3D12_RANGE none = {0, 0}; readback->Unmap(0, &none);
+        std::vector<uint32_t> mid; frameImage((float)opt.frames - 1.5f, mid);
+        for (size_t i = 0; i < (size_t)W * H; i++)
+            for (int c = 0; c < 4; c++) {
+                float a = ((prevData[i] >> (8 * c)) & 0xff) / 255.0f, b = ((colorData[i] >> (8 * c)) & 0xff) / 255.0f;
+                truth[i * 4 + c] = ((mid[i] >> (8 * c)) & 0xff) / 255.0f;
+                repeat[i * 4 + c] = a; blend[i * 4 + c] = 0.5f * (a + b);
+            }
+        mean /= (double)W * H * 3;
+        double pOut = psnr(out, truth), pRep = psnr(repeat, truth), pBlend = psnr(blend, truth);
+        printf("generated frame: mean %.3f; PSNR vs the scene halfway between frames %.2f dB (previous frame %.2f dB, 50%% blend %.2f dB)\n",
+               mean, pOut, pRep, pBlend);
+        if (wallMsCount) printf("submit-to-complete per frame (prepare + generation): %.2f ms (mean of %u frames)\n", wallMsTotal / wallMsCount, wallMsCount);
+        if (!opt.images.empty()) {
+            std::string tag;
+            for (const char *c = versionName; *c; c++) tag += isalnum((unsigned char)*c) ? *c : '_';
+            CreateDirectoryA(opt.images.c_str(), nullptr);
+            writePPM(opt.images + "\\" + tag + "-generated.ppm", out, W, H);
+            writePPM(opt.images + "\\fg-truth.ppm", truth, W, H);
+        }
+        if (mean < 0.02) { printf("FAIL generated frame is blank\n"); failed = 1; }
+        else if (pOut < pRep) { printf("FAIL generated frame is further from the scene than repeating the previous frame\n"); failed = 1; }
+        else printf("PASS\n");
+    }
+
+    g_ffx.DestroyContext(&ctx, nullptr);
+    color->Release(); depth->Release(); motion->Release(); output->Release();
+    stagingColor->Release(); stagingDepth->Release(); stagingMotion->Release(); readback->Release();
+    return failed;
+}
+
+/* Frame generation through its swapchain (FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12) on a
+ * window that is never shown: each frame of the scene is copied to the back buffer and presented, and the swapchain
+ * generates and presents a frame between each pair, calling the frame generation context back. Reports the time per
+ * rendered frame and how many frames DXGI presented. Returns 0 when every call succeeds and frames were generated. */
+static ffxReturnCode_t generateCallback(ffxDispatchDescFrameGeneration *params, void *ctx) {
+    return g_ffx.Dispatch((ffxContext *)ctx, &params->header);
+}
+
+static int runFrameGenerationSwapchain(const Options &opt, uint64_t versionId, const char *versionName,
+                                       uint64_t swapchainId, const char *swapchainName) {
+    printf("\n== %s with swapchain %s\n", versionName, swapchainName);
+    const unsigned W = opt.displayW, H = opt.displayH, buffers = 3;
+    WNDCLASSW wc = {}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"fsr4probe";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, L"fsr4probe", L"fsr4probe", WS_POPUP, 0, 0, W, H, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) { printf("FAIL CreateWindow (error %lu)\n", GetLastError()); return 1; }
+    IDXGIFactory4 *factory;
+    CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
+
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.Width = W; sd.Height = H; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = buffers; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain4 *swapchain = nullptr;
+    ffxContext scCtx = nullptr, ctx = nullptr;
+    ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 sc = {};
+    sc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+    sc.swapchain = &swapchain; sc.hwnd = hwnd; sc.desc = &sd; sc.dxgiFactory = factory; sc.gameQueue = g_queue;
+    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 scVersion = {};
+    scVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12;
+    scVersion.version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
+    ffxOverrideVersion scOverride = {}; scOverride.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION; scOverride.versionId = swapchainId;
+    sc.header.pNext = &scVersion.header; scVersion.header.pNext = &scOverride.header;
+    ffxReturnCode_t rc = g_ffx.CreateContext(&scCtx, &sc.header, nullptr);
+    if (rc != FFX_API_RETURN_OK || !swapchain) { printf("FAIL swapchain ffxCreateContext: return code %u\n", rc); return 1; }
+
+    ffxCreateBackendDX12Desc backend = {}; backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12; backend.device = g_dev;
+    ffxCreateContextDescFrameGenerationVersion apiVersion = {}; apiVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+    apiVersion.version = FFX_FRAMEGENERATION_VERSION;
+    ffxOverrideVersion override_ = {}; override_.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION; override_.versionId = versionId;
+    ffxCreateContextDescFrameGeneration create = {}; create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    create.flags = FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
+    create.displaySize = {W, H}; create.maxRenderSize = {W, H};
+    create.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    create.header.pNext = &backend.header; backend.header.pNext = &apiVersion.header; apiVersion.header.pNext = &override_.header;
+    rc = g_ffx.CreateContext(&ctx, &create.header, nullptr);
+    if (rc != FFX_API_RETURN_OK) { printf("FAIL ffxCreateContext: return code %u\n", rc); g_ffx.DestroyContext(&scCtx, nullptr); return 1; }
+
+    ID3D12Resource *color = makeTexture(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *depth = makeTexture(W, H, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *motion = makeTexture(W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *stagingColor = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    ID3D12Resource *stagingDepth = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    ID3D12Resource *stagingMotion = makeBuffer((UINT64)W * H * 4 + 65536 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    std::vector<uint32_t> px((size_t)W * H), mvData((size_t)W * H);
+    std::vector<float> depthData((size_t)W * H, 0.5f);
+    uint16_t mv[2] = {toHalf(-kVx), toHalf(-kVy)};
+    for (auto &m : mvData) memcpy(&m, mv, 4);
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    upload(depth, stagingDepth, depthData.data(), W, H, 4);
+    upload(motion, stagingMotion, mvData.data(), W, H, 4);
+    barrier(depth, D3D12_RESOURCE_STATE_COPY_DEST, read);
+    barrier(motion, D3D12_RESOURCE_STATE_COPY_DEST, read);
+    submitAndWait();
+
+    double frameMsTotal = 0; unsigned frameMsCount = 0;
+    int failed = 0;
+    LARGE_INTEGER f, last; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&last);
+    for (unsigned frame = 0; frame < opt.frames && !failed; frame++) {
+        for (unsigned y = 0; y < H; y++)
+            for (unsigned x = 0; x < W; x++) {
+                float rgb[3]; scene(x + 0.5f, y + 0.5f, (float)frame, rgb);
+                px[(size_t)y * W + x] = (uint32_t)(rgb[0] * 255 + 0.5f) | (uint32_t)(rgb[1] * 255 + 0.5f) << 8 |
+                                        (uint32_t)(rgb[2] * 255 + 0.5f) << 16 | 0xff000000u;
+            }
+        ID3D12Resource *bb;
+        CHECK(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)));
+        upload(color, stagingColor, px.data(), W, H, 4);
+        barrier(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        g_list->CopyResource(bb, color);
+        barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        barrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        ffxConfigureDescFrameGeneration cfg = {}; cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.swapChain = swapchain;
+        cfg.frameGenerationCallback = generateCallback; cfg.frameGenerationCallbackUserContext = &ctx;
+        cfg.frameGenerationEnabled = true;
+        cfg.generationRect = {0, 0, (int32_t)W, (int32_t)H};
+        cfg.frameID = frame;
+        if ((rc = g_ffx.Configure(&ctx, &cfg.header)) != FFX_API_RETURN_OK) { printf("FAIL ffxConfigure (frame %u): return code %u\n", frame, rc); failed = 1; }
+
+        ffxDispatchDescFrameGenerationPrepareV2 prep = {}; prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+        prep.frameID = frame; prep.commandList = g_list;
+        prep.renderSize = {W, H}; prep.motionVectorScale = {1.0f, 1.0f};
+        prep.frameTimeDelta = 16.6f; prep.reset = frame == 0;
+        prep.cameraNear = 0.1f; prep.cameraFar = 1000.0f; prep.cameraFovAngleVertical = 1.0f; prep.viewSpaceToMetersFactor = 1.0f;
+        prep.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        prep.motionVectors = ffxApiGetResourceDX12(motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        prep.cameraPosition[2] = -1.0f; prep.cameraUp[1] = 1.0f; prep.cameraRight[0] = 1.0f; prep.cameraForward[2] = 1.0f;
+        if (!failed && (rc = g_ffx.Dispatch(&ctx, &prep.header)) != FFX_API_RETURN_OK) { printf("FAIL ffxDispatch prepare (frame %u): return code %u\n", frame, rc); failed = 1; }
+        submitAndWait();
+        HRESULT hr = swapchain->Present(0, 0);
+        if (FAILED(hr)) { printf("FAIL Present (frame %u): hr %#lx\n", frame, (long)hr); failed = 1; }
+        bb->Release();
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (frame >= 4) { frameMsTotal += (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)f.QuadPart; frameMsCount++; }
+        last = now;
+    }
+    ffxDispatchDescFrameGenerationSwapChainWaitForPresentsDX12 wait = {};
+    wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12;
+    g_ffx.Dispatch(&scCtx, &wait.header);
+    UINT presents = 0;
+    swapchain->GetLastPresentCount(&presents);
+    if (frameMsCount) printf("time per rendered frame (upload, prepare, present): %.2f ms (mean of %u frames)\n", frameMsTotal / frameMsCount, frameMsCount);
+    printf("%u frames rendered; swapchain present count %u\n", opt.frames, presents);
+    if (!failed && presents <= opt.frames) { printf("FAIL no generated frames were presented\n"); failed = 1; }
+    if (!failed) printf("PASS\n");
+
+    ffxConfigureDescFrameGeneration off = {}; off.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    off.swapChain = swapchain; off.frameGenerationEnabled = false; off.frameID = opt.frames;
+    g_ffx.Configure(&ctx, &off.header);
+    g_ffx.DestroyContext(&ctx, nullptr);
+    g_ffx.DestroyContext(&scCtx, nullptr);
+    swapchain->Release(); factory->Release();
+    DestroyWindow(hwnd);
+    color->Release(); depth->Release(); motion->Release();
+    stagingColor->Release(); stagingDepth->Release(); stagingMotion->Release();
+    return failed;
 }
 
 static void printDevice() {
@@ -403,12 +695,14 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--version") && i + 1 < argc) opt.version = argv[++i];
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) opt.frames = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--images") && i + 1 < argc) opt.images = argv[++i];
+        else if (!strcmp(argv[i], "--fg")) opt.frameGeneration = true;
+        else if (!strcmp(argv[i], "--swapchain")) opt.frameGeneration = opt.swapchain = true;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%ux%u", &opt.displayW, &opt.displayH);
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
             opt.mode = !strcmp(m, "quality") ? FFX_UPSCALE_QUALITY_MODE_QUALITY : !strcmp(m, "balanced") ? FFX_UPSCALE_QUALITY_MODE_BALANCED
                      : !strcmp(m, "ultra") ? FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE : FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
-        } else { printf("usage: fsr4probe [--version <substring>] [--frames N] [--mode quality|balanced|performance|ultra] [--size WxH] [--images <dir>]\n"); return 1; }
+        } else { printf("usage: fsr4probe [--fg [--swapchain]] [--version <substring>] [--frames N] [--mode quality|balanced|performance|ultra] [--size WxH] [--images <dir>]\n"); return 1; }
     }
     if (opt.frames < 2) opt.frames = 2;
 
@@ -430,6 +724,39 @@ int main(int argc, char **argv) {
     if (!loader) { printf("FAIL amd_fidelityfx_loader_dx12.dll not found next to the exe (error %lu)\n", GetLastError()); return 1; }
     ffxLoadFunctions(&g_ffx, loader);
     if (!g_ffx.Query || !g_ffx.CreateContext) { printf("FAIL loader exports missing\n"); return 1; }
+
+    // Frame generation and its swapchain (amd_fidelityfx_framegeneration_dx12.dll next to the exe)
+    std::vector<uint64_t> fgIds, scIds; std::vector<const char *> fgNames, scNames;
+    for (auto [type, what] : {std::pair<uint64_t, const char *>{FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, "frame generation"},
+                              {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12, "frame generation swapchain"}}) {
+        uint64_t n = 0;
+        ffxQueryDescGetVersions fq = {}; fq.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+        fq.createDescType = type; fq.device = g_dev; fq.outputCount = &n;
+        ffxReturnCode_t frc = g_ffx.Query(nullptr, &fq.header);
+        std::vector<uint64_t> fids(n); std::vector<const char *> fnames(n);
+        fq.versionIds = fids.data(); fq.versionNames = fnames.data();
+        if (frc == FFX_API_RETURN_OK && n) frc = g_ffx.Query(nullptr, &fq.header);
+        printf("%s versions offered (return code %u): %llu\n", what, frc, (unsigned long long)n);
+        for (uint64_t i = 0; i < n; i++) printf("  %#018llx  %s\n", (unsigned long long)fids[i], fnames[i]);
+        if (type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION) { fgIds = fids; fgNames = fnames; }
+        else { scIds = fids; scNames = fnames; }
+    }
+    if (opt.frameGeneration) {
+        int failures = 0, runs = 0;
+        for (size_t i = 0; i < fgIds.size(); i++) {
+            if (!opt.version.empty() && !strstr(fgNames[i], opt.version.c_str())) continue;
+            runs++;
+            if (!opt.swapchain) { failures += runFrameGeneration(opt, fgIds[i], fgNames[i]); continue; }
+            // The swapchain version of the same major version
+            size_t k = 0;
+            while (k < scIds.size() && scNames[k][0] != fgNames[i][0]) k++;
+            if (k == scIds.size()) { printf("FAIL no swapchain version for %s\n", fgNames[i]); failures++; continue; }
+            failures += runFrameGenerationSwapchain(opt, fgIds[i], fgNames[i], scIds[k], scNames[k]);
+        }
+        if (!runs) { printf("FAIL no frame generation version matched \"%s\"\n", opt.version.c_str()); return 1; }
+        printf("\n%d of %d versions failed\n", failures, runs);
+        return failures ? 1 : 0;
+    }
 
     uint64_t count = 0;
     ffxQueryDescGetVersions vq = {}; vq.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
