@@ -4,18 +4,18 @@
 #   sources/MoltenVK      upstream MoltenVK + patches/moltenvk/metalsharp-vkmt.diff
 #                         (dttdrv's ray tracing, mesh shader and fix branches, then MetalSharp's work),
 #                         with External/SPIRV-Cross at the dttdrv revision + patches/spirv-cross/metalsharp.diff
-#   sources/dxvk          DXVK 2.7.1 + patches/dxvk/*.patch (dxgi and D3D11On12 for the x86_64 lane)
-#   sources/dxvk-arm64x   metalsharp/DXVK-MacOS (DXVK 3.1 on MoltenVK, built as ARM64X) for the arm64 lane, with its
-#                         dxbc-spirv patch applied
-#   scripts/fetch-sources.sh [vkd3d-proton] [moltenvk] [dxvk] [dxvk-arm64x]   (default: all four)
+#   sources/dxvk          metalsharp/DXVK-MacOS v3.1.1-macos.1 (DXVK 3.1.1 on MoltenVK) with its dxbc-spirv patch
+#                         applied, for both lanes: built for x86_64 (scripts/build-dxvk.sh) and as ARM64X
+#                         (scripts/build-dxvk-arm64x.sh)
+#   scripts/fetch-sources.sh [vkd3d-proton] [moltenvk] [dxvk]   (default: all three)
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 VKD3D_REV=ef9a02e873715c9e2da0d6db8a236aca8380b303
 MOLTENVK_REV=5189f8de
-DXVK_TAG=v2.7.1
-DXVK_ARM64X_REV=29ba2f9a5a0c911a053c6a673555b00b78af603d
+DXVK_REV=2c81c3c6cead6cc016dae804739b77740418bcaa   # metalsharp/DXVK-MacOS v3.1.1-macos.1
 mkdir -p "$WS/sources"
-WANT=" ${*:-vkd3d-proton moltenvk dxvk dxvk-arm64x} "
+WANT=" ${*:-vkd3d-proton moltenvk dxvk} "
+WANT="${WANT/ dxvk-arm64x / dxvk }"   # the arm64 lane's old name for the same source
 want() { [[ "$WANT" == *" $1 "* ]]; }
 
 if want vkd3d-proton && [ ! -d "$WS/sources/vkd3d-proton/.git" ]; then
@@ -38,17 +38,12 @@ if want moltenvk && [ ! -d "$WS/sources/MoltenVK/.git" ]; then
         commit -q -m "MetalSharp SPIRV-Cross (patches/spirv-cross/metalsharp.diff)"
 fi
 if want dxvk && [ ! -d "$WS/sources/dxvk/.git" ]; then
-    git clone --branch "$DXVK_TAG" --depth 1 --recurse-submodules --shallow-submodules \
-        https://github.com/doitsujin/dxvk.git "$WS/sources/dxvk"
-    git -C "$WS/sources/dxvk" checkout -b metalsharp-dxvk
-    git -C "$WS/sources/dxvk" -c user.name=MetalSharp -c user.email=metalsharp@users.noreply.github.com \
-        am "$WS"/patches/dxvk/*.patch
-fi
-if want dxvk-arm64x && [ ! -d "$WS/sources/dxvk-arm64x/.git" ]; then
-    git clone https://github.com/metalsharp/DXVK-MacOS.git "$WS/sources/dxvk-arm64x"
-    git -C "$WS/sources/dxvk-arm64x" checkout -b metalsharp-arm64x "$DXVK_ARM64X_REV"
-    git -C "$WS/sources/dxvk-arm64x" submodule update --init --recursive
-    git -C "$WS/sources/dxvk-arm64x/subprojects/dxbc-spirv" apply ../../patches/dxbc-spirv-moltenvk.patch
+    git clone https://github.com/metalsharp/DXVK-MacOS.git "$WS/sources/dxvk"
+    git -C "$WS/sources/dxvk" checkout -b metalsharp-dxvk "$DXVK_REV"
+    git -C "$WS/sources/dxvk" submodule update --init --recursive
+    git -C "$WS/sources/dxvk/subprojects/dxbc-spirv" apply ../../patches/dxbc-spirv-moltenvk.patch
+    # DXVK's version is `git describe --dirty=+`: the patched submodule would make it v3.1.1-macos.1+
+    git -C "$WS/sources/dxvk" config submodule.subprojects/dxbc-spirv.ignore all
 fi
 echo "sources ready; build MoltenVK with scripts/build-moltenvk.sh, DXVK with scripts/build-dxvk.sh (x86_64 lane)"
 echo "and scripts/build-dxvk-arm64x.sh (arm64 lane)"

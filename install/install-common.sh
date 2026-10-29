@@ -45,8 +45,8 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "error: $*" >&2; exit 1; }
-# The arm64 lane's D3D12 pair is ARM64X (aarch64-windows), which x86_64 programs load as ARM64EC under FEX; its
-# DXVK DXGI and D3D10/11 are x86_64 (x86_64-windows), as MetalSharp Wine's VKD3D-Proton lane runs them.
+# The arm64 lane's D3D12 pair is in aarch64-windows and its DXVK DXGI and D3D10/11 in x86_64-windows, where MetalSharp
+# Wine's VKD3D-Proton lane has them; all five are ARM64X, which x86_64 programs load as ARM64EC under FEX.
 dll_dir() { case "$LANE:$1" in arm64:d3d12|arm64:d3d12core) echo aarch64-windows ;; *) echo x86_64-windows ;; esac; }
 SYS32="$PREFIX/drive_c/windows/system32"
 HOME_DIR="$PREFIX/vkd3d-proton-macos"

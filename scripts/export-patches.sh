@@ -1,6 +1,6 @@
 #!/bin/bash
-# Export sources/vkd3d-proton, sources/MoltenVK and its External/SPIRV-Cross work, and sources/dxvk's, into patches/
-# (see fetch-sources.sh).
+# Export sources/vkd3d-proton, sources/MoltenVK and its External/SPIRV-Cross work into patches/ (see fetch-sources.sh).
+# DXVK's changes live in metalsharp/DXVK-MacOS, which fetch-sources.sh pins: commit them there.
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 # VKD3D-Proton: the commit series on the upstream revision fetch-sources.sh pins, applied there with git am
@@ -16,8 +16,3 @@ rm -f "$WS"/patches/spirv-cross/*.patch
 git diff c1af5739..HEAD > "$WS/patches/spirv-cross/metalsharp.diff"
 git log --format='%h %s' c1af5739..HEAD > "$WS/patches/spirv-cross/metalsharp.log"
 ls "$WS/patches/spirv-cross"
-cd "$WS/sources/dxvk"
-mkdir -p "$WS/patches/dxvk"
-rm -f "$WS"/patches/dxvk/*.patch
-git format-patch -q v2.7.1..HEAD -o "$WS/patches/dxvk"
-ls "$WS/patches/dxvk"

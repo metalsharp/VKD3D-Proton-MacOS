@@ -6,12 +6,16 @@ package.
 | Package | For | DLLs |
 |---|---|---|
 | `vkd3d-proton-<tag>-x86_64.tar.zst` | an x86_64 Wine (on Intel, or under Rosetta 2) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, all x86_64 |
-| `vkd3d-proton-<tag>-arm64.tar.zst` | an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine) | `d3d12`, `d3d12core` as ARM64X; `dxgi`, `d3d11`, `d3d10core` as x86_64 |
+| `vkd3d-proton-<tag>-arm64.tar.zst` | an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, all ARM64X |
 | `moltenvk-<tag>-universal.tar.zst` | both | `libMoltenVK.dylib` (arm64 + x86_64), `MoltenVK_icd.json`, and Apple's Metal Shader Converter library `libmetalirconverter.dylib` |
 
-The arm64 package is the VKD3D-Proton lane MetalSharp Wine runs games with. x86_64 programs load its ARM64X D3D12 DLLs
-as ARM64EC code under FEX, and present with DXVK's x86_64 DXGI. It is for x86_64 programs: native arm64 programs in
-the prefix can't load the x86_64 DXGI.
+The arm64 package is the VKD3D-Proton lane MetalSharp Wine runs games with. x86_64 programs load all five DLLs as
+ARM64EC code under FEX, so neither VKD3D-Proton nor DXVK is emulated. The installer puts the DXVK DLLs in the
+`x86_64-windows` folder MetalSharp Wine's lane uses for x86_64 programs.
+
+Both packages' `dxgi`, `d3d11` and `d3d10core` are [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS)
+(DXVK 3.1.1 on MoltenVK), at the tag in the package's `DXVK-VERSION` file. They need this release's MoltenVK: DXVK
+3.1 relies on MoltenVK and SPIRV-Cross fixes that upstream MoltenVK lacks.
 
 ## Install
 
