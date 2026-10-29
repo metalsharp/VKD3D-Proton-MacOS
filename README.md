@@ -65,6 +65,15 @@ DXVK 3.1 depends on MoltenVK and SPIRV-Cross fixes that this repository carries 
 `patches/spirv-cross`), so use this release's MoltenVK with these DLLs. DXVK's own changes are made in
 metalsharp/DXVK-MacOS, whose releases also have i386 builds for 32-bit programs.
 
+## AMD FSR Upscaling 4
+
+`METALSHARP_FSR4=1` lets games that ship AMD's FSR 4 DLLs (FSR SDK 2.x, up to FSR 4.1.2) offer FSR Upscaling 4 on
+an Apple GPU. It is off by default. With it on, VKD3D-Proton loads this repository's `amdxc64.dll`, which stands in for
+AMD's driver DLL, and DXVK's DXGI reports an AMD GPU; MetalSharp Wine answers AMD's driver-data query. FSR then runs
+its INT8 model, which needs a packed 8-bit dot product that Apple GPUs don't have. On an M4 it takes 177 ms per 1080p
+frame, against 11 ms for FSR 3.1, so it is a way to try FSR 4's image quality, not to play with.
+[docs/fsr4.md](docs/fsr4.md) has the details, measurements and the license terms of AMD's DLLs.
+
 ## Install
 
 Download a VKD3D-Proton package and the MoltenVK package from the latest release, extract them side by side, and run
@@ -126,6 +135,7 @@ Start at [docs/README.md](docs/README.md), then see:
 - [Feature-level matrix](docs/features.md)
 - [Validation and regression](docs/validation.md)
 - [Tracing a problem with `METALSHARP_TRACE`](docs/tracing.md)
+- [AMD FSR Upscaling 4 (`METALSHARP_FSR4`)](docs/fsr4.md)
 - [Release and packaging](docs/release.md)
 - [Final state](docs/Final.md)
 
@@ -141,8 +151,8 @@ This repository's own code, scripts and documentation are licensed under the
 [GNU Affero General Public License v3.0](LICENSE).
 
 The projects it builds keep their own licenses, and so do this repository's changes to them in `patches/`:
-VKD3D-Proton is LGPL-2.1, DXVK is zlib, its dxbc-spirv shader compiler is MIT, and MoltenVK and SPIRV-Cross are
-Apache-2.0. Each release package carries
+VKD3D-Proton is LGPL-2.1, `amdxc64/` is LGPL-2.1-or-later (it builds on Proton's `amdxc64`), DXVK is zlib, its
+dxbc-spirv shader compiler is MIT, and MoltenVK and SPIRV-Cross are Apache-2.0. Each release package carries
 the licenses of what it contains. [Third-party licenses](#third-party-licenses) lists them, with the terms Apple's
 Metal Shader Converter library ships under.
 
@@ -153,6 +163,7 @@ Metal Shader Converter library ships under.
 | [VKD3D-Proton](https://github.com/HansKristian-Work/vkd3d-proton) | `d3d12.dll`, `d3d12core.dll` | LGPL-2.1 | `LICENSE.vkd3d-proton` |
 | [DXVK](https://github.com/doitsujin/dxvk), as [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll`, `d3d9.dll`, `d3d8.dll` | zlib | `LICENSE.dxvk` |
 | [dxbc-spirv](https://github.com/doitsujin/dxbc-spirv) | built into DXVK's DLLs | MIT | `LICENSE.dxbc-spirv` |
+| `amdxc64.dll` (`amdxc64/`, based on [Proton](https://github.com/ValveSoftware/wine)'s `amdxc64`) | `amdxc64.dll` | LGPL-2.1-or-later | `LICENSE.amdxc64` |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |
 | Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license, see below | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |

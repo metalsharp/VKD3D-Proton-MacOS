@@ -2,10 +2,10 @@ name: Release
 
 # Builds the runtime's three parts from the pinned sources and this repository's patches:
 #   x86_64    VKD3D-Proton's d3d12.dll + d3d12core.dll, and metalsharp/DXVK-MacOS's dxgi.dll, d3d11.dll, d3d10core.dll,
-#             d3d9.dll, d3d8.dll built for x86_64 (x86_64-windows)
+#             d3d9.dll, d3d8.dll built for x86_64 (x86_64-windows), with amdxc64.dll (amdxc64/, AMD FSR 4: docs/fsr4.md)
 #   arm64     VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows), which x86_64 programs load as
 #             ARM64EC under FEX, with metalsharp/DXVK-MacOS's dxgi.dll, d3d11.dll, d3d10core.dll, d3d9.dll, d3d8.dll,
-#             also ARM64X
+#             and amdxc64.dll, also ARM64X
 #             (x86_64-windows, the folder MetalSharp Wine's VKD3D-Proton lane loads them from)
 #   moltenvk  the universal libMoltenVK.dylib and its ICD file, with Apple's Metal Shader Converter library
 # A pushed tag vX.Y publishes them as one release, vX.Y, with each part a package of its own.
@@ -67,6 +67,7 @@ jobs:
             bash scripts/build-vkd3d-proton-arm64x.sh
             bash scripts/build-dxvk-arm64x.sh
           fi
+          bash scripts/build-amdxc64.sh
 
       - name: Package
         run: |
@@ -81,6 +82,10 @@ jobs:
           [ "${{ matrix.lane }}" = x86_64 ] || DXVK=dxvk-arm64x
           mkdir -p "$ROOT/x86_64-windows"
           for dll in dxgi d3d11 d3d10core d3d9 d3d8; do cp artifacts/build/$DXVK/x86_64-windows/$dll.dll "$ROOT/x86_64-windows/"; done
+          # amdxc64.dll, which AMD FSR looks for to offer FSR Upscaling 4 (only with METALSHARP_FSR4=1: docs/fsr4.md)
+          AMDXC=x86_64-windows
+          [ "${{ matrix.lane }}" = x86_64 ] || AMDXC=arm64x
+          cp artifacts/build/amdxc64/$AMDXC/amdxc64.dll "$ROOT/x86_64-windows/"
           if [ "${{ matrix.lane }}" = x86_64 ]; then
             DIR="$ROOT/x86_64-windows"
             cp artifacts/build/vkd3d-proton/x86_64-windows/d3d12.dll artifacts/build/vkd3d-proton/x86_64-windows/d3d12core.dll "$DIR/"
@@ -93,6 +98,8 @@ jobs:
           cp sources/dxvk/subprojects/dxbc-spirv/LICENSE "$ROOT/LICENSE.dxbc-spirv"
           git -C sources/dxvk describe --tags > "$ROOT/DXVK-VERSION"
           cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.vkd3d-proton"
+          # amdxc64.dll is LGPL-2.1-or-later (it builds on Proton's amdxc64), the license VKD3D-Proton's file holds
+          cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.amdxc64"
           cp LICENSE "$ROOT/LICENSE"
           # the lane's installer, run from the extracted package next to the extracted MoltenVK package
           cp install/install-common.sh "install/install-${{ matrix.lane }}-wine.sh" "$ROOT/"
@@ -186,8 +193,8 @@ jobs:
           cat > notes.md <<EOF
           Built from $GITHUB_SHA. Each package holds its files, their licenses and SHA256SUMS.
 
-          - **vkd3d-proton-$TAG-x86_64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\`, with metalsharp/DXVK-MacOS's \`dxgi.dll\`, \`d3d11.dll\`, \`d3d10core.dll\`, \`d3d9.dll\` and \`d3d8.dll\` (DXVK 3.1.1 on MoltenVK), for x86_64 Windows programs (\`x86_64-windows\`). Stage them together.
-          - **vkd3d-proton-$TAG-arm64**: for an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine): VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`, loaded by x86_64 programs as ARM64EC), with metalsharp/DXVK-MacOS's \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\`, also ARM64X (\`x86_64-windows\`, for x86_64 programs).
+          - **vkd3d-proton-$TAG-x86_64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\`, with metalsharp/DXVK-MacOS's \`dxgi.dll\`, \`d3d11.dll\`, \`d3d10core.dll\`, \`d3d9.dll\` and \`d3d8.dll\` (DXVK 3.1.1 on MoltenVK), and \`amdxc64.dll\` (AMD FSR Upscaling 4 with \`METALSHARP_FSR4=1\`, off by default), for x86_64 Windows programs (\`x86_64-windows\`). Stage them together.
+          - **vkd3d-proton-$TAG-arm64**: for an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine): VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`, loaded by x86_64 programs as ARM64EC), with metalsharp/DXVK-MacOS's \`dxgi.dll\`, \`d3d11.dll\`, \`d3d10core.dll\`, \`d3d9.dll\` and \`d3d8.dll\`, and \`amdxc64.dll\`, also ARM64X (\`x86_64-windows\`, for x86_64 programs).
           - **moltenvk-$TAG-universal**: the universal (arm64 + x86_64), ad-hoc signed \`libMoltenVK.dylib\` and \`MoltenVK_icd.json\` both lanes run on, with Apple's Metal Shader Converter library (\`libmetalirconverter.dylib\`, unmodified, Apple-signed), which MoltenVK uses to convert DXIL compute, vertex and pixel shaders for VKD3D-Proton (\`METALSHARP_MSC=0\` turns it off).
           EOF
           gh release create "$TAG" dist/x86_64/*.tar.zst dist/arm64/*.tar.zst dist/moltenvk/*.tar.zst \

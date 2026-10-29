@@ -19,8 +19,8 @@ set -euo pipefail
 
 REPO="metalsharp/VKD3D-Proton-MacOS"
 case "$LANE" in
-    x86_64) DLL_DIR=x86_64-windows; MACHINE="x86-64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core d3d9 d3d8) ;;
-    arm64)  DLL_DIR=aarch64-windows; MACHINE="Aarch64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core d3d9 d3d8) ;;
+    x86_64) DLL_DIR=x86_64-windows; MACHINE="x86-64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core d3d9 d3d8 amdxc64) ;;
+    arm64)  DLL_DIR=aarch64-windows; MACHINE="Aarch64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core d3d9 d3d8 amdxc64) ;;
     *) echo "unknown lane $LANE" >&2; exit 1 ;;
 esac
 
@@ -45,8 +45,8 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "error: $*" >&2; exit 1; }
-# The arm64 lane's D3D12 pair is in aarch64-windows and its DXVK DXGI and D3D10/11 in x86_64-windows, where MetalSharp
-# Wine's VKD3D-Proton lane has them; all seven are ARM64X, which x86_64 programs load as ARM64EC under FEX.
+# The arm64 lane's D3D12 pair is in aarch64-windows and its DXVK DXGI, D3D8 to 11 and amdxc64.dll in x86_64-windows,
+# where MetalSharp Wine's VKD3D-Proton lane has them; all are ARM64X, which x86_64 programs load as ARM64EC under FEX.
 dll_dir() { case "$LANE:$1" in arm64:d3d12|arm64:d3d12core) echo aarch64-windows ;; *) echo x86_64-windows ;; esac; }
 SYS32="$PREFIX/drive_c/windows/system32"
 HOME_DIR="$PREFIX/vkd3d-proton-macos"
@@ -124,8 +124,9 @@ for root in "$DLL_ROOT" "$MVK_ROOT"; do
     if ! (cd "$root" && shasum -a 256 -c --quiet SHA256SUMS); then die "checksums of $root don't match"; fi
 done
 
-# Packages before v4.7 have no DXVK D3D9 and D3D8: the prefix keeps Wine's for them
-for dll in d3d9 d3d8; do
+# Packages before v4.7 have no DXVK D3D9 and D3D8, the prefix keeps Wine's for them; packages before v4.8 have no
+# amdxc64.dll (AMD FSR Upscaling 4 with METALSHARP_FSR4=1, docs/fsr4.md)
+for dll in d3d9 d3d8 amdxc64; do
     [ -f "$DLL_ROOT/$(dll_dir "$dll")/$dll.dll" ] || DLLS=("${DLLS[@]/$dll}")
 done
 DLLS=(${DLLS[@]})

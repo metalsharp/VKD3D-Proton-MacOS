@@ -5,17 +5,21 @@ package.
 
 | Package | For | DLLs |
 |---|---|---|
-| `vkd3d-proton-<tag>-x86_64.tar.zst` | an x86_64 Wine (on Intel, or under Rosetta 2) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, `d3d9`, `d3d8`, all x86_64 |
-| `vkd3d-proton-<tag>-arm64.tar.zst` | an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, `d3d9`, `d3d8`, all ARM64X |
+| `vkd3d-proton-<tag>-x86_64.tar.zst` | an x86_64 Wine (on Intel, or under Rosetta 2) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, `d3d9`, `d3d8`, `amdxc64`, all x86_64 |
+| `vkd3d-proton-<tag>-arm64.tar.zst` | an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine) | `d3d12`, `d3d12core`, `dxgi`, `d3d11`, `d3d10core`, `d3d9`, `d3d8`, `amdxc64`, all ARM64X |
 | `moltenvk-<tag>-universal.tar.zst` | both | `libMoltenVK.dylib` (arm64 + x86_64), `MoltenVK_icd.json`, and Apple's Metal Shader Converter library `libmetalirconverter.dylib` |
 
-The arm64 package is the VKD3D-Proton lane MetalSharp Wine runs games with. x86_64 programs load all seven DLLs as
+The arm64 package is the VKD3D-Proton lane MetalSharp Wine runs games with. x86_64 programs load all eight DLLs as
 ARM64EC code under FEX, so neither VKD3D-Proton nor DXVK is emulated. The installer puts the DXVK DLLs in the
 `x86_64-windows` folder MetalSharp Wine's lane uses for x86_64 programs.
 
 Both packages' `dxgi`, `d3d11`, `d3d10core`, `d3d9` and `d3d8` are [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS)
 (DXVK 3.1.1 on MoltenVK), at the tag in the package's `DXVK-VERSION` file. They need this release's MoltenVK: DXVK
 3.1 relies on MoltenVK and SPIRV-Cross fixes that upstream MoltenVK lacks.
+
+`amdxc64` lets AMD FSR offer FSR Upscaling 4. It does nothing unless `METALSHARP_FSR4=1` is set, and it also needs a
+Wine that answers AMD's driver-data query, as MetalSharp Wine and Proton do. [fsr4.md](fsr4.md) covers the setting,
+what it changes, and its performance.
 
 ## Install
 

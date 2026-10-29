@@ -12,7 +12,7 @@ set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 VKD3D_REV=ef9a02e873715c9e2da0d6db8a236aca8380b303
 MOLTENVK_REV=5189f8de
-DXVK_REV=2c81c3c6cead6cc016dae804739b77740418bcaa   # metalsharp/DXVK-MacOS v3.1.1-macos.1
+DXVK_REV=ef2094a1e1f63eb9f21562328966f6fc5c2c9ea7   # metalsharp/DXVK-MacOS v3.1.1-macos.1 + the METALSHARP_FSR4 adapter identity (branch fsr4-amd-identity)
 mkdir -p "$WS/sources"
 WANT=" ${*:-vkd3d-proton moltenvk dxvk} "
 WANT="${WANT/ dxvk-arm64x / dxvk }"   # the arm64 lane's old name for the same source

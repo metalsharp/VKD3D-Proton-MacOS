@@ -6,17 +6,18 @@ and a `SHA256SUMS` file.
 ```text
 vkd3d-proton-vX.Y-x86_64/            for an x86_64 Wine
 ├── x86_64-windows/                  d3d12.dll d3d12core.dll (VKD3D-Proton), dxgi.dll d3d11.dll d3d10core.dll d3d9.dll
-│                                    d3d8.dll (DXVK)
+│                                    d3d8.dll (DXVK), amdxc64.dll (AMD FSR 4 with METALSHARP_FSR4=1: fsr4.md)
 ├── install-x86_64-wine.sh, install-common.sh
 ├── DXVK-VERSION                     the metalsharp/DXVK-MacOS tag the DXVK DLLs are built from
-└── LICENSE (AGPL-3.0), LICENSE.vkd3d-proton (LGPL-2.1), LICENSE.dxvk (zlib), LICENSE.dxbc-spirv (MIT), SHA256SUMS
+└── LICENSE (AGPL-3.0), LICENSE.vkd3d-proton (LGPL-2.1), LICENSE.amdxc64 (LGPL-2.1), LICENSE.dxvk (zlib),
+    LICENSE.dxbc-spirv (MIT), SHA256SUMS
 
 vkd3d-proton-vX.Y-arm64/             for an arm64 Wine that runs x86_64 programs with FEX
 ├── aarch64-windows/                 d3d12.dll d3d12core.dll as ARM64X (VKD3D-Proton)
-├── x86_64-windows/                  dxgi.dll d3d11.dll d3d10core.dll d3d9.dll d3d8.dll as ARM64X (DXVK)
+├── x86_64-windows/                  dxgi.dll d3d11.dll d3d10core.dll d3d9.dll d3d8.dll (DXVK), amdxc64.dll, as ARM64X
 ├── install-arm64-wine.sh, install-common.sh
 ├── DXVK-VERSION
-└── LICENSE, LICENSE.vkd3d-proton, LICENSE.dxvk, LICENSE.dxbc-spirv, SHA256SUMS
+└── LICENSE, LICENSE.vkd3d-proton, LICENSE.amdxc64, LICENSE.dxvk, LICENSE.dxbc-spirv, SHA256SUMS
 
 moltenvk-vX.Y-universal/             for both
 ├── libMoltenVK.dylib                arm64 + x86_64, ad-hoc signed
