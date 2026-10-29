@@ -81,8 +81,10 @@ not as a way to play.
   that computed both forms and returned the integer one. So the change comes from how Metal's compiler builds the
   rest of the shader around that instruction, not from the values. Fast math, forced threadgroup barriers and
   zero-initialized variables made no difference.
-- **Shader path.** FSR's shaders run on SPIR-V. Through the Metal Shader Converter bridge, the output was wrong
-  (14 dB) and slower (175 ms), so they must stay on SPIR-V if the bridge starts taking compute shaders with quirks.
+- **Shader path.** 49 of FSR's 50 pipelines go through the Metal Shader Converter bridge: the same output as on
+  SPIR-V, 175 ms, and milliseconds instead of seconds to build each pipeline. The one shader that uses both wave
+  operations and 16-bit types drew wrong there (30 dB instead of 34 after 12 frames, found by moving shaders to the
+  bridge by hash range: `METALSHARP_MSC_HASHES`), so shaders with both stay on SPIR-V.
 
 ## Testing
 

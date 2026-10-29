@@ -182,7 +182,11 @@ Apache-2.0 headers above, to convert the DXIL shaders VKD3D-Proton hands it into
 compute shaders, and the vertex and pixel shaders of graphics pipelines. Without it, every shader goes
 DXIL → SPIR-V → MSL text, and Metal compiles that text at run time: 0.4–1.7 s per large shader, against 1–4 ms
 for the converter. Shader conversion is all the library does here. `METALSHARP_MSC=0` turns it off. If the library
-is missing or a conversion fails, VKD3D-Proton builds that pipeline from SPIR-V as before.
+is missing or a conversion fails, VKD3D-Proton builds that pipeline from SPIR-V as before. Some shaders stay on SPIR-V:
+those a game's quirks change, pixel shaders with wave operations, shaders with both wave operations and 16-bit
+types, and those reading typed buffers. VKD3D-Proton's log names the path and reason for each pipeline
+(`Compute PSO cs <hash>: ...`), and `METALSHARP_MSC_HASHES=<lo>-<hi>` limits the converter to a range of shader
+hashes, to find a shader it gets wrong.
 
 **Why we may use and ship it this way.** Our reading of Apple's agreement:
 

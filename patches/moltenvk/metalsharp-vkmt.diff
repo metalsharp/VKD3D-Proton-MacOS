@@ -9716,10 +9716,10 @@ index 731645c1..43576fe9 100644
      bool _isThreadSafe;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
-index 3787d6bf..b338c504 100644
+index 3787d6bf..d279854a 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
-@@ -17,6 +17,44 @@
+@@ -17,6 +17,48 @@
   */
  
  #include "MVKMTLBufferAllocation.h"
@@ -9738,8 +9738,12 @@ index 3787d6bf..b338c504 100644
 +// 16 to 32 MB a second, each also added to and removed from the residency set. Kept per device (a buffer is
 +// resident in its device's residency set), and by length and storage mode.
 +static constexpr uint64_t kMVKTempBufferReserveMax = 512ull * 1024 * 1024;
-+static std::mutex _mvkTempBufferReserveLock;
-+static std::unordered_map<MVKDevice*, std::unordered_map<uint64_t, std::vector<id<MTLBuffer>>>> _mvkTempBufferReserve;
++// Allocated once and never destroyed: Metal's completion handlers give buffers back on their own threads, and one that
++// ran after static destructors at process exit (a program that exits without destroying its device) locked a
++// destroyed mutex, so the process aborted and, under Wine, never exited.
++static std::mutex& _mvkTempBufferReserveLock = *new std::mutex();
++static std::unordered_map<MVKDevice*, std::unordered_map<uint64_t, std::vector<id<MTLBuffer>>>>& _mvkTempBufferReserve =
++	*new std::unordered_map<MVKDevice*, std::unordered_map<uint64_t, std::vector<id<MTLBuffer>>>>();
 +static uint64_t _mvkTempBufferReserveBytes = 0;
 +
 +static uint64_t mvkTempBufferReserveKey(NSUInteger length, MTLStorageMode storageMode) {
@@ -9764,7 +9768,7 @@ index 3787d6bf..b338c504 100644
  
  
  #pragma mark -
-@@ -46,15 +84,44 @@
+@@ -46,15 +88,44 @@
  void MVKMTLBufferAllocationPool::addMTLBuffer() {
      MTLResourceOptions mbOpts = (_mtlStorageMode << MTLResourceStorageModeShift) | MTLResourceCPUCacheModeDefaultCache;
      _mtlBuffers.push_back({ [getMTLDevice() newBufferWithLength: _mtlBufferLength options: mbOpts], 0 });
@@ -9812,7 +9816,7 @@ index 3787d6bf..b338c504 100644
      return ba;
  }
  
-@@ -68,9 +135,26 @@
+@@ -68,9 +139,26 @@
  }
  
  void MVKMTLBufferAllocationPool::returnAllocationUnlocked(MVKMTLBufferAllocation* ba) {
@@ -9841,7 +9845,7 @@ index 3787d6bf..b338c504 100644
      returnObject(ba);
  }
  
-@@ -92,6 +176,7 @@
+@@ -92,6 +180,7 @@
  	_isThreadSafe = makeThreadSafe;
      _mtlBufferLength = _allocationLength * (isDedicated ? 1 : calcMTLBufferAllocationCount());
      _mtlStorageMode = mtlStorageMode;
@@ -9849,7 +9853,7 @@ index 3787d6bf..b338c504 100644
      _nextOffset = _mtlBufferLength;     // Force a MTLBuffer to be added on first access
  }
  
-@@ -108,6 +193,7 @@
+@@ -108,6 +197,7 @@
  MVKMTLBufferAllocationPool::~MVKMTLBufferAllocationPool() {
      for (uint32_t bufferIndex = 0; bufferIndex < _mtlBuffers.size(); ++bufferIndex) {
  		getDevice()->removeResidency(_mtlBuffers[bufferIndex].mtlBuffer);
@@ -13389,7 +13393,7 @@ index 534a414f..2bad2b16 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..5859723e 100644
+index 359f8a2b..7d83d819 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -14987,7 +14991,7 @@ index 359f8a2b..5859723e 100644
  
  	// If the physical device is lost, bail.
  	// Must have initialized everything accessed in destructor to null.
-@@ -5252,10 +6256,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6256,279 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -15187,8 +15191,10 @@ index 359f8a2b..5859723e 100644
 +// archive was never written past its first seconds). At exit, the devices still alive save both, on another
 +// thread and for at most 5 seconds: when Wine ends a process its other threads may already be stopped, holding
 +// a lock the save needs, and the game must still exit. Saves go to a temporary file renamed when complete.
-+static std::mutex _mvkLiveDevicesLock;
-+static std::vector<MVKDevice*> _mvkLiveDevices;
++// Never destroyed, so a save still running when the wait below gives up, or a device destroyed on another thread
++// during exit, doesn't lock a destroyed mutex (MVKMTLBufferAllocation.mm has the same for its reserve).
++static std::mutex& _mvkLiveDevicesLock = *new std::mutex();
++static std::vector<MVKDevice*>& _mvkLiveDevices = *new std::vector<MVKDevice*>();
 +
 +static void mvkFlushPipelineCachesAtExit() {
 +	dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -15265,7 +15271,7 @@ index 359f8a2b..5859723e 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6538,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6540,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -15278,7 +15284,7 @@ index 359f8a2b..5859723e 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5576,6 +6851,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5576,6 +6853,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -15287,7 +15293,7 @@ index 359f8a2b..5859723e 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +6868,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +6870,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
@@ -22092,7 +22098,7 @@ index c5b74991..a4679f8f 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..ba3579a2 100644
+index 3aa44a44..bc67c79a 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,13 @@
@@ -22377,7 +22383,7 @@ index 3aa44a44..ba3579a2 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +704,345 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +704,348 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -22658,6 +22664,9 @@ index 3aa44a44..ba3579a2 100644
 +		auto& robustness2 = getEnabledRobustness2Features();
 +		if (robustness2.robustBufferAccess2 || robustness2.nullDescriptor) { compatFlags |= IRCompatibilityFlagBoundsCheck; }
 +		if (getMVKConfig().fastMathEnabled != MVK_CONFIG_FAST_MATH_ALWAYS) { compatFlags |= IRCompatibilityFlagDisableNanInfOptimization; }
++		// Invariant position, as VKD3D-Proton compiles vertex shaders for SPIR-V by default, so that passes drawing the same
++		// geometry with converted and SPIR-V vertex shaders give the same depth.
++		if (hdr.stage == kMVKMSCStageVertex) { compatFlags |= IRCompatibilityFlagPositionInvariance; }
 +		msc.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)compatFlags);
 +
 +		dxil = msc.IRObjectCreateFromDXIL(blob + hdr.dxilOffset, hdr.dxilSize, IRBytecodeOwnershipNone);
@@ -22723,7 +22732,7 @@ index 3aa44a44..ba3579a2 100644
  }
  
  
-@@ -741,4 +1236,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1239,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }
