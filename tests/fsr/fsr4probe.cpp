@@ -163,20 +163,23 @@ static double psnr(const std::vector<float> &a, const std::vector<float> &b) {
 }
 
 static void writePPM(const std::string &path, const std::vector<float> &rgba, unsigned w, unsigned h) {
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) return;
-    fprintf(f, "P6\n%u %u\n255\n", w, h);
-    std::vector<unsigned char> row(w * 3);
-    for (unsigned y = 0; y < h; y++) {
+    char header[64];
+    int len = snprintf(header, sizeof(header), "P6\n%u %u\n255\n", w, h);
+    std::vector<unsigned char> data(header, header + len);
+    data.reserve(len + (size_t)w * h * 3);
+    for (unsigned y = 0; y < h; y++)
         for (unsigned x = 0; x < w; x++)
             for (int c = 0; c < 3; c++) {
                 float v = rgba[((size_t)y * w + x) * 4 + c];
                 v = std::isfinite(v) ? (v < 0 ? 0 : v > 1 ? 1 : v) : 1;
-                row[x * 3 + c] = (unsigned char)(powf(v, 1.0f / 2.2f) * 255.0f + 0.5f);
+                data.push_back((unsigned char)(powf(v, 1.0f / 2.2f) * 255.0f + 0.5f));
             }
-        fwrite(row.data(), 1, row.size(), f);
-    }
-    fclose(f);
+    // CreateFile with the default security descriptor (the directory's inherited permissions)
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(file, data.data(), (DWORD)data.size(), &written, nullptr);
+    CloseHandle(file);
 }
 
 static void printDevice() {
