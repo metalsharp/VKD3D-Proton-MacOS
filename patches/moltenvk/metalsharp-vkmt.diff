@@ -9688,7 +9688,7 @@ index 9d3b0465..952449a8 100644
 +#undef MVK_RT_CMD_TYPE_POOL_LAST
  #undef MVK_TMPLT_DECL
 diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.h b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.h
-index 731645c1..fe76ea07 100644
+index 731645c1..43576fe9 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.h
 @@ -68,6 +68,9 @@ protected:
@@ -9701,22 +9701,25 @@ index 731645c1..fe76ea07 100644
  #pragma mark -
  #pragma mark MVKMTLBufferAllocationPool
  
-@@ -110,6 +113,10 @@ protected:
+@@ -110,6 +113,13 @@ protected:
      NSUInteger _mtlBufferLength;
      MTLStorageMode _mtlStorageMode;
      struct MTLBufferTracker { id<MTLBuffer> mtlBuffer; uint64_t allocationCount; };
-+    // Allocations of at least kMVKUnpooledAllocationLength get their own MTLBuffer, released when returned.
-+    static constexpr NSUInteger kMVKUnpooledAllocationLength = 16 * 1024 * 1024;
++    // Allocations larger than kMVKPooledAllocationMax get their own MTLBuffer, which is released when returned,
++    // or kept in a reserve shared by the process (see MVKMTLBufferAllocation.mm). Smaller ones share MTLBuffers
++    // that the pool keeps. Large temporary buffers are traced from kMVKLargeTraceLength.
++    static constexpr NSUInteger kMVKPooledAllocationMax = 256 * 1024;
++    static constexpr NSUInteger kMVKLargeTraceLength = 16 * 1024 * 1024;
 +    static constexpr uint64_t kMVKUnpooledIndex = ~0ull;
 +    bool _isUnpooled = false;
      MVKSmallVector<MTLBufferTracker, 64> _mtlBuffers;
      bool _isThreadSafe;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
-index 3787d6bf..dc9bf33c 100644
+index 3787d6bf..b338c504 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
-@@ -17,6 +17,43 @@
+@@ -17,6 +17,44 @@
   */
  
  #include "MVKMTLBufferAllocation.h"
@@ -9727,10 +9730,10 @@ index 3787d6bf..dc9bf33c 100644
 +#include <unordered_map>
 +#include <vector>
 +
-+// Bytes of large temporary buffers alive in the process, for METALSHARP_TRACE=memory.
++// Bytes of unpooled temporary buffers alive in the process (in use or in the reserve), for METALSHARP_TRACE=memory.
 +static std::atomic<uint64_t> _mvkUnpooledTempBytes{0};
 +
-+// Large temporary buffers given back are kept for reuse, up to kMVKTempBufferReserveMax bytes for the process:
++// Unpooled temporary buffers given back are kept for reuse, up to kMVKTempBufferReserveMax bytes for the process:
 +// releasing each one when its command buffer completed made God of War allocate and free about 74 buffers of
 +// 16 to 32 MB a second, each also added to and removed from the residency set. Kept per device (a buffer is
 +// resident in its device's residency set), and by length and storage mode.
@@ -9751,6 +9754,7 @@ index 3787d6bf..dc9bf33c 100644
 +		for (auto buff : buffs) {
 +			_mvkTempBufferReserveBytes -= buff.length;
 +			_mvkUnpooledTempBytes -= buff.length;
++			MVK_MS_COUNT(LargeTempBytes, -(int64_t)buff.length);
 +			device->removeResidency(buff);
 +			[buff release];
 +		}
@@ -9760,16 +9764,24 @@ index 3787d6bf..dc9bf33c 100644
  
  
  #pragma mark -
-@@ -51,10 +88,33 @@
+@@ -46,15 +84,44 @@
+ void MVKMTLBufferAllocationPool::addMTLBuffer() {
+     MTLResourceOptions mbOpts = (_mtlStorageMode << MTLResourceStorageModeShift) | MTLResourceCPUCacheModeDefaultCache;
+     _mtlBuffers.push_back({ [getMTLDevice() newBufferWithLength: _mtlBufferLength options: mbOpts], 0 });
++	MVK_MS_COUNT(PooledTempBytes, _mtlBufferLength);
+ 	getDevice()->makeResident(_mtlBuffers.back().mtlBuffer);
+     _nextOffset = 0;
  }
  
  MVKMTLBufferAllocation* MVKMTLBufferAllocationPool::acquireAllocationUnlocked() {
 -    MVKMTLBufferAllocation* ba = acquireObject();
 -    if (!_mtlBuffers[ba->_poolIndex].allocationCount++) {
 -        [ba->_mtlBuffer setPurgeableState: MTLPurgeableStateNonVolatile];
-+    // A large temporary buffer is allocated for its command buffer and released once the GPU is done with it.
-+    // Pooled, each command pool kept every one it ever needed (tessellation draws need hundreds of MB each),
-+    // and RDR2's Metal memory grew by gigabytes that were never given back.
++    // A temporary buffer larger than kMVKPooledAllocationMax is allocated for its command buffer and released once
++    // the GPU is done with it, or kept in the process's reserve. Pooled, each command pool (VKD3D-Proton makes one
++    // per D3D12 command allocator) kept every buffer it ever needed at once (tessellation outputs, ExecuteIndirect
++    // arguments), and RDR2's Metal memory grew by 8.5 GB of such buffers that were never given back, until the Mac
++    // swapped and frames took 400 ms.
 +    if (_isUnpooled) {
 +        {
 +            std::lock_guard<std::mutex> lock(_mvkTempBufferReserveLock);
@@ -9786,8 +9798,11 @@ index 3787d6bf..dc9bf33c 100644
 +        if ( !mtlBuff ) { return nullptr; }
 +        getDevice()->makeResident(mtlBuff);
 +        uint64_t total = (_mvkUnpooledTempBytes += _allocationLength);
-+        MVK_MS_TRACE(Memory, "temporary buffer %.1f MB (storage mode %lu); large temporary buffers alive: %.1f MB",
-+                     _allocationLength / 1048576.0, (unsigned long)_mtlStorageMode, total / 1048576.0);
++        MVK_MS_COUNT(LargeTempBytes, _allocationLength);
++        if (_allocationLength >= kMVKLargeTraceLength) {
++            MVK_MS_TRACE(Memory, "temporary buffer %.1f MB (storage mode %lu); unpooled temporary buffers alive: %.1f MB",
++                         _allocationLength / 1048576.0, (unsigned long)_mtlStorageMode, total / 1048576.0);
++        }
 +        return new MVKMTLBufferAllocation(this, mtlBuff, 0, _allocationLength, kMVKUnpooledIndex);
      }
 +    // The pool's buffers stay non-volatile: making them volatile when their last allocation was returned,
@@ -9797,7 +9812,7 @@ index 3787d6bf..dc9bf33c 100644
      return ba;
  }
  
-@@ -68,9 +128,25 @@
+@@ -68,9 +135,26 @@
  }
  
  void MVKMTLBufferAllocationPool::returnAllocationUnlocked(MVKMTLBufferAllocation* ba) {
@@ -9817,6 +9832,7 @@ index 3787d6bf..dc9bf33c 100644
 +            getDevice()->removeResidency(ba->_mtlBuffer);
 +            [ba->_mtlBuffer release];
 +            _mvkUnpooledTempBytes -= ba->_length;
++            MVK_MS_COUNT(LargeTempBytes, -(int64_t)ba->_length);
 +        }
 +        ba->destroy();
 +        return;
@@ -9825,14 +9841,22 @@ index 3787d6bf..dc9bf33c 100644
      returnObject(ba);
  }
  
-@@ -92,6 +168,7 @@
+@@ -92,6 +176,7 @@
  	_isThreadSafe = makeThreadSafe;
      _mtlBufferLength = _allocationLength * (isDedicated ? 1 : calcMTLBufferAllocationCount());
      _mtlStorageMode = mtlStorageMode;
-+    _isUnpooled = _allocationLength >= kMVKUnpooledAllocationLength;
++    _isUnpooled = _allocationLength > kMVKPooledAllocationMax;
      _nextOffset = _mtlBufferLength;     // Force a MTLBuffer to be added on first access
  }
  
+@@ -108,6 +193,7 @@
+ MVKMTLBufferAllocationPool::~MVKMTLBufferAllocationPool() {
+     for (uint32_t bufferIndex = 0; bufferIndex < _mtlBuffers.size(); ++bufferIndex) {
+ 		getDevice()->removeResidency(_mtlBuffers[bufferIndex].mtlBuffer);
++		MVK_MS_COUNT(PooledTempBytes, -(int64_t)_mtlBuffers[bufferIndex].mtlBuffer.length);
+         [_mtlBuffers[bufferIndex].mtlBuffer release];
+     }
+     _mtlBuffers.clear();
 diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h b/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h
 index 6175f58a..79716d25 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h
@@ -11077,7 +11101,7 @@ index 9b6a7351..83e32eb0 100644
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
-index a00c09bd..9ea56253 100644
+index a00c09bd..f2e33d08 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 @@ -17,6 +17,7 @@
@@ -11201,7 +11225,7 @@ index a00c09bd..9ea56253 100644
  			_device->makeResident(buf);
  			_device->getLiveResources().add(buf);
  			_mtlBuffer = buf;
-@@ -170,7 +247,9 @@
+@@ -170,12 +247,15 @@
  }
  
  uint64_t MVKBuffer::getMTLBufferGPUAddress() {
@@ -11212,7 +11236,13 @@ index a00c09bd..9ea56253 100644
  }
  
  #pragma mark Construction
-@@ -200,6 +279,29 @@
+ 
+ MVKBuffer::MVKBuffer(MVKDevice* device, const VkBufferCreateInfo* pCreateInfo) : MVKResource(device), _usage(pCreateInfo->usage) {
++	MVK_MS_COUNT(Buffers, 1);
+     _byteAlignment = getMetalFeatures().mtlBufferAlignment;
+     _byteCount = pCreateInfo->size;
+ 
+@@ -200,6 +280,29 @@
  				break;
  		}
  	}
@@ -11242,7 +11272,15 @@ index a00c09bd..9ea56253 100644
  }
  
  void MVKBuffer::initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes) {
-@@ -236,16 +338,54 @@
+@@ -217,6 +320,7 @@
+ 
+ // Memory detached in destructor too, as a fail-safe.
+ MVKBuffer::~MVKBuffer() {
++	MVK_MS_COUNT(Buffers, -1);
+ 	detachMemory();
+ }
+ 
+@@ -236,16 +340,54 @@
  
  // Potentially called twice, from destroy() and destructor, so ensure everything is nulled out.
  void MVKBuffer::detachMemory() {
@@ -13351,7 +13389,7 @@ index 534a414f..2bad2b16 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..d44f07ba 100644
+index 359f8a2b..5859723e 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -14935,7 +14973,21 @@ index 359f8a2b..d44f07ba 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6250,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5174,7 +6172,13 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	}
+ }
+ 
++// METALSHARP_TRACE=memory reports the Metal device's allocated size every 5 s.
++static uint64_t mvkMSTraceMetalAllocatedSize(void* mtlDevice) { return ((id<MTLDevice>)mtlDevice).currentAllocatedSize; }
++
+ MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
++	if (MVK_MS_TRACE_ON(Memory) && physicalDevice->getMTLDevice()) {
++		mvkMSTraceSetMetalAllocatedSize(mvkMSTraceMetalAllocatedSize, (void*)physicalDevice->getMTLDevice());
++	}
+ 
+ 	// If the physical device is lost, bail.
+ 	// Must have initialized everything accessed in destructor to null.
+@@ -5252,10 +6256,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -15213,7 +15265,7 @@ index 359f8a2b..d44f07ba 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6532,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6538,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -15226,7 +15278,7 @@ index 359f8a2b..d44f07ba 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5576,6 +6845,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5576,6 +6851,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -15235,7 +15287,7 @@ index 359f8a2b..d44f07ba 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +6862,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +6868,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
@@ -15648,7 +15700,7 @@ index 45ddd3a4..54ff7a75 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..1c24596b 100644
+index 2b394922..54a143ca 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -15874,7 +15926,15 @@ index 2b394922..1c24596b 100644
  VkResult MVKImage::bindDeviceMemory2(const VkBindImageMemoryInfo* pBindInfo) {
      uint8_t planeIndex = 0;
      for (const auto* next = (const VkBaseInStructure*)pBindInfo->pNext; next; next = next->pNext) {
-@@ -1312,6 +1490,8 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1192,6 +1370,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ #pragma mark Construction
+ 
+ MVKImage::MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo) : MVKVulkanAPIDeviceObject(device) {
++	MVK_MS_COUNT(Images, 1);
+ 	_ioSurface = nil;
+ 
+ 	// Stencil usage is implied to be the same as usage, unless overridden in the pNext chain.
+@@ -1312,6 +1491,8 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
      }
      _hasExpectedTexelSize = _hasChromaSubsampling || (pixFmts->getBytesPerBlock(_planes[0]->_mtlPixFmt) == pixFmts->getBytesPerBlock(_vkFormat));
  
@@ -15883,7 +15943,15 @@ index 2b394922..1c24596b 100644
  	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
  
  	// Setting Metal objects directly will override Vulkan settings.
-@@ -1599,6 +1779,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1497,6 +1678,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ }
+ 
+ MVKImage::~MVKImage() {
++	MVK_MS_COUNT(Images, -1);
+ 	mvkDestroyContainerContents(_memoryBindings);
+ 	mvkDestroyContainerContents(_planes);
+     releaseIOSurface();
+@@ -1599,6 +1781,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			}
  			signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
  			signal(signaler.fence);
@@ -15891,7 +15959,7 @@ index 2b394922..1c24596b 100644
  			[mtlCmdBuff commit];
  		}
  
-@@ -1624,8 +1805,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1624,8 +1807,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
  			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
  				uint64_t startTime = getPerformanceTimestamp();
@@ -15903,7 +15971,7 @@ index 2b394922..1c24596b 100644
  				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
  				if (hasInvalidFormat) { releaseMetalDrawable(); }
  			}
-@@ -1656,7 +1840,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1656,7 +1842,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// Attach present handler before presenting to avoid race condition.
  	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
  	MVKSwapchainSignaler signaler = getPresentationSignaler();
@@ -15915,7 +15983,7 @@ index 2b394922..1c24596b 100644
  
  		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
  
-@@ -1751,6 +1939,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1751,6 +1941,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// time will not be available if the presentation did not actually happen, such as when
  	// running headless, or on a test harness that is not attached to the windowing system.
  	if (actualPresentTime == 0) { actualPresentTime = mvkGetRuntimeNanoseconds(); }
@@ -15931,7 +15999,7 @@ index 2b394922..1c24596b 100644
  
  	{	// Scope to avoid deadlock if release() is run within detachment lock
  		// If I have become detached from the swapchain, it means the swapchain, and possibly the
-@@ -1903,6 +2100,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1903,6 +2102,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
              MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
              initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
@@ -15939,7 +16007,7 @@ index 2b394922..1c24596b 100644
          }
          return _mtlTexture;
      } else {
-@@ -1911,6 +2109,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1911,6 +2111,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  }
  
  bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
@@ -15949,7 +16017,7 @@ index 2b394922..1c24596b 100644
      id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
      if (cachedBaseMTLTexture == mtlTexture) { return true; }
  
-@@ -2202,6 +2403,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2202,6 +2405,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		[tex release];
  		_mtlTexture = nil;
  	}
@@ -15958,7 +16026,23 @@ index 2b394922..1c24596b 100644
  }
  
  MVKImageViewPlane::~MVKImageViewPlane() {
-@@ -2570,6 +2773,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -2262,6 +2467,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ #pragma mark Construction
+ 
+ MVKImageView::MVKImageView(MVKDevice* device, const VkImageViewCreateInfo* pCreateInfo) : MVKVulkanAPIDeviceObject(device) {
++	MVK_MS_COUNT(ImageViews, 1);
+ 	_image = (MVKImage*)pCreateInfo->image;
+ 	_image->retain();		// Ensure image sticks around while this image view is in flight.
+ 
+@@ -2365,6 +2571,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ // Memory detached in destructor too, as a fail-safe.
+ MVKImageView::~MVKImageView() {
++	MVK_MS_COUNT(ImageViews, -1);
+ 	detachMemory();
+ 	_image->release();
+ }
+@@ -2570,6 +2777,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
@@ -25746,7 +25830,7 @@ index 5f7e0a58..5469986a 100644
 -
 +#define kMVKConfigurationInternalPaddingByteCount  8
 diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp b/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
-index 5c91403c..e3daf2ab 100644
+index 5c91403c..50a315cb 100644
 --- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
 +++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
 @@ -96,6 +96,8 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
@@ -25767,7 +25851,7 @@ index 5c91403c..e3daf2ab 100644
  	mvkSetGlobalConfig(evCfg);
  }
  
-@@ -161,3 +165,209 @@ void mvkSetGlobalConfig(const MVKConfiguration& srcMVKConfig) {
+@@ -161,3 +165,233 @@ void mvkSetGlobalConfig(const MVKConfiguration& srcMVKConfig) {
  	mvkSetConfig(_globalMVKConfig, srcMVKConfig, _globalMVKConfigStringHolders);
  }
  
@@ -25775,6 +25859,7 @@ index 5c91403c..e3daf2ab 100644
 +#pragma mark -
 +#pragma mark MetalSharp trace flag
 +
++#include <atomic>
 +#include <crt_externs.h>
 +#include <mutex>
 +#include <pthread.h>
@@ -25885,6 +25970,17 @@ index 5c91403c..e3daf2ab 100644
 +	}
 +}
 +
++static std::atomic<int64_t> _mvkMSTraceCounts[kMVKMSTraceCountMax];
++static uint64_t (*_mvkMSTraceMetalAllocatedSize)(void*);
++static void* _mvkMSTraceMetalAllocatedSizeContext;
++
++void mvkMSTraceCount(MVKMSTraceCount counter, int64_t delta) { _mvkMSTraceCounts[counter] += delta; }
++
++void mvkMSTraceSetMetalAllocatedSize(uint64_t (*allocatedSize)(void* context), void* context) {
++	_mvkMSTraceMetalAllocatedSizeContext = context;
++	_mvkMSTraceMetalAllocatedSize = allocatedSize;
++}
++
 +// METALSHARP_TRACE=memory: every 5 s, this process's memory footprint and the system's swap and paging, which
 +// explain GPU work that slows to seconds once the Mac starts paging (the GPU shares the process's memory).
 +static void mvkMSTraceSampleMemory(void*) {
@@ -25912,6 +26008,18 @@ index 5c91403c..e3daf2ab 100644
 +					 footprintMB, peakMB, (double)swap.xsu_used / 1048576.0, vmStat.compressor_page_count * pageMB,
 +					 vmStat.free_count * pageMB, first ? 0ull : (unsigned long long)pageouts,
 +					 first ? 0ull : (unsigned long long)swapouts);
++	// The Metal device's allocated size counts every Metal allocation this process made (vkAllocateMemory heaps
++	// and buffers, textures, and MoltenVK's own buffers); the footprint beyond it is CPU memory.
++	auto metalAllocated = _mvkMSTraceMetalAllocatedSize;
++	double metalMB = metalAllocated ? (double)metalAllocated(_mvkMSTraceMetalAllocatedSizeContext) / 1048576.0 : -1.0;
++	mvkMSTracePrintf(kMVKMSTraceMemory, "Metal device allocated %.0f MB, process memory beyond it %.0f MB; alive: %lld images, "
++					 "%lld image views, %lld buffers; pooled temporary buffers %.0f MB, unpooled temporary buffers %.0f MB",
++					 metalMB, metalMB >= 0 ? footprintMB - metalMB : -1.0,
++					 (long long)_mvkMSTraceCounts[kMVKMSTraceCountImages].load(),
++					 (long long)_mvkMSTraceCounts[kMVKMSTraceCountImageViews].load(),
++					 (long long)_mvkMSTraceCounts[kMVKMSTraceCountBuffers].load(),
++					 (double)_mvkMSTraceCounts[kMVKMSTraceCountPooledTempBytes].load() / 1048576.0,
++					 (double)_mvkMSTraceCounts[kMVKMSTraceCountLargeTempBytes].load() / 1048576.0);
 +}
 +
 +static void mvkMSTraceStartMemorySampler() {
@@ -25978,10 +26086,10 @@ index 5c91403c..e3daf2ab 100644
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
-index e6d176c8..5e42d33f 100644
+index e6d176c8..868f0100 100644
 --- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
 +++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
-@@ -79,6 +79,56 @@ const MVKConfiguration& getGlobalMVKConfig();
+@@ -79,6 +79,75 @@ const MVKConfiguration& getGlobalMVKConfig();
  /** Sets the MoltenVK global configuration content. */
  void mvkSetGlobalConfig(const MVKConfiguration& srcMVKConfig);
  
@@ -26035,10 +26143,29 @@ index e6d176c8..5e42d33f 100644
 +#define MVK_MS_TRACE_ON(cat)	((mvkMSTraceMask() & kMVKMSTrace##cat) != 0)
 +#define MVK_MS_TRACE(cat, ...)	do { if (MVK_MS_TRACE_ON(cat)) { mvkMSTracePrintf(kMVKMSTrace##cat, __VA_ARGS__); } } while (0)
 +
++/**
++ * METALSHARP_TRACE=memory: live objects and bytes MoltenVK holds outside vkAllocateMemory, which the 5 s memory line
++ * reports with the Metal device's allocated size, to tell a growing GPU allocation from growing process memory.
++ */
++typedef enum {
++	kMVKMSTraceCountImages,
++	kMVKMSTraceCountImageViews,
++	kMVKMSTraceCountBuffers,
++	kMVKMSTraceCountPooledTempBytes,		// MVKMTLBufferAllocationPool buffers, kept until their pool is destroyed
++	kMVKMSTraceCountLargeTempBytes,			// Unpooled temporary buffers alive or kept for reuse
++	kMVKMSTraceCountMax
++} MVKMSTraceCount;
++
++void mvkMSTraceCount(MVKMSTraceCount counter, int64_t delta);
++#define MVK_MS_COUNT(counter, delta)	do { if (MVK_MS_TRACE_ON(Memory)) { mvkMSTraceCount(kMVKMSTraceCount##counter, (int64_t)(delta)); } } while (0)
++
++/** Reports the Metal device's currentAllocatedSize in the 5 s memory line. */
++void mvkMSTraceSetMetalAllocatedSize(uint64_t (*allocatedSize)(void* context), void* context);
++
  /** 
   * Sets the content from the source config into the destination 
   * config, while using the string object to retain string content.
-@@ -102,7 +152,7 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
+@@ -102,7 +171,7 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
  
  /** Process command queue submissions on the same thread on which the submission call was made. */
  #ifndef MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS
@@ -26047,7 +26174,7 @@ index e6d176c8..5e42d33f 100644
  #endif
  
  /** Fill a Metal command buffer when each Vulkan command buffer is filled. */
-@@ -350,3 +400,11 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
+@@ -350,3 +419,11 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
  #ifndef MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES
  #   define MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES 0
  #endif
