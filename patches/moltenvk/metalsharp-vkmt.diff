@@ -27374,7 +27374,7 @@ index 6e58d48c..b3f614c8 100644
  }
  #endif
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-index 7a6272ca..82d3addd 100644
+index 7a6272ca..b7afb76f 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 +++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 @@ -17,6 +17,7 @@
@@ -28300,7 +28300,18 @@ index 7a6272ca..82d3addd 100644
  
      // To check GLSL conversion
      if (shouldLogGLSL) {
-@@ -541,7 +1310,7 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
+@@ -513,7 +1282,9 @@ void SPIRVToMSLConverter::logSource(string& log, string& src, const char* srcLan
+ // Although LocalSizeId is the modern mechanism, the Builtin takes precedence if it is present.
+ static void getWorkgroupSize(Compiler* pCompiler, SPIREntryPoint& spvEP, uint32_t& x, uint32_t& y, uint32_t& z) {
+ 	auto& wgSz = spvEP.workgroup_size;
+-	if (spvEP.flags.get(ExecutionModeLocalSizeId) && !wgSz.constant) {
++	// LocalSizeId gives the size as constants, and the literal sizes are 0 then, also when a WorkgroupSize
++	// builtin composite exists (which only matters for specialization, below).
++	if (spvEP.flags.get(ExecutionModeLocalSizeId)) {
+ 		x = wgSz.id_x ? pCompiler->get_constant(wgSz.id_x).scalar() : 0;
+ 		y = wgSz.id_y ? pCompiler->get_constant(wgSz.id_y).scalar() : 0;
+ 		z = wgSz.id_z ? pCompiler->get_constant(wgSz.id_z).scalar() : 0;
+@@ -541,7 +1312,7 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
  
  	SPIREntryPoint spvEP;
  	if (options.hasEntryPoint()) {
@@ -28309,7 +28320,19 @@ index 7a6272ca..82d3addd 100644
  	} else {
  		const auto& entryPoints = pMSLCompiler->get_entry_points_and_stages();
  		if ( !entryPoints.empty() ) {
-@@ -574,6 +1343,12 @@ bool SPIRVToMSLConverter::usesPhysicalStorageBufferAddressesCapability(Compiler*
+@@ -558,6 +1329,11 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
+ 
+ 	SpecializationConstant widthSC, heightSC, depthSC;
+ 	pMSLCompiler->get_work_group_size_specialization_constants(widthSC, heightSC, depthSC);
++	// A WorkgroupSize composite of plain constants is not specialized: its components have no SpecId, and
++	// treating them as specialization constant 0 sized the threadgroup from whatever constant 0 held.
++	for (SpecializationConstant* sc : { &widthSC, &heightSC, &depthSC }) {
++		if (uint32_t(sc->id) && !pMSLCompiler->get_constant(sc->id).specialization) { *sc = {}; }
++	}
+ 
+ 	auto& wgSize = entryPoint.workgroupSize;
+ 	populateWorkgroupDimension(wgSize.width,  x, widthSC);
+@@ -574,6 +1350,12 @@ bool SPIRVToMSLConverter::usesPhysicalStorageBufferAddressesCapability(Compiler*
  			}
  		}
  	}
