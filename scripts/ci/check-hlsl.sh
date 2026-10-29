@@ -13,9 +13,9 @@ command -v "$DXC" >/dev/null 2>&1 || {
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-compile() {
+compile() {   # compile <source> <entry> <profile> <output> [dxc flags...]
     local source="$1" entry="$2" profile="$3" output="$4"
-    local -a flags=(-nologo -HV 2021)
+    local -a flags=(-nologo -HV 2021 "${@:5}")
     # The InnerCoverage probe intentionally targets the custom rasterization
     # path; current DXC rejects its DXIL intrinsic overload during validation
     # even though it emits the shader used by the runtime probe.
@@ -45,6 +45,13 @@ while IFS= read -r source; do
         # Metal Shader Converter bridge tests, with tests/msc-bridge/build.sh's profiles
         tests/msc-bridge/hlsl/cs3.hlsl)
             compile "$source" main cs_6_6 "msc-$(basename "$source").dxil" ;;
+        tests/msc-bridge/hlsl/wave16*.hlsl)
+            compile "$source" main cs_6_2 "msc-$(basename "$source").dxil" -enable-16bit-types ;;
+        # tests/memory/build.sh: one file, a stage per define
+        tests/memory/tess_stress.hlsl)
+            for s in vs hs ds ps; do
+                compile "$source" main ${s}_6_0 "tess_stress-$s.dxil" -D "$(echo $s | tr a-z A-Z)=1"
+            done ;;
         tests/msc-bridge/hlsl/*cs*.hlsl)
             compile "$source" main cs_6_0 "msc-$(basename "$source").dxil" ;;
         tests/msc-bridge/hlsl/*vs.hlsl)
@@ -58,5 +65,5 @@ while IFS= read -r source; do
 done < <(cd "$ROOT" && git ls-files '*.hlsl' | sort)
 
 count=$(find "$OUT" -type f -name '*.dxil' | wc -l | tr -d ' ')
-[ "$count" -eq 23 ] || { echo "expected 23 DXIL outputs, found $count" >&2; exit 1; }
+[ "$count" -eq 29 ] || { echo "expected 29 DXIL outputs, found $count" >&2; exit 1; }
 echo "HLSL/DXIL source check: PASS ($count shaders)"

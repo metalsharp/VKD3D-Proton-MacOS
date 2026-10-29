@@ -71,7 +71,8 @@ int main(int argc, char **argv)
     unsigned short *halves;
     unsigned char *p;
     unsigned int i;
-    FILE *f;
+    HANDLE file;
+    DWORD written;
 
     if (argc < 2) { printf("usage: wave16btest <output file>\n"); return 2; }
     range.BaseShaderRegister = 2;
@@ -143,9 +144,11 @@ int main(int argc, char **argv)
     while (ID3D12Fence_GetCompletedValue(fence) < 1)
         Sleep(1);
     CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&p));
-    if (!(f = fopen(argv[1], "wb"))) { printf("FAIL can't write %s\n", argv[1]); return 1; }
-    fwrite(p, 1, THREADS * SLOTS * 4 + RAW_SIZE, f);
-    fclose(f);
+    /* CreateFile with the default security descriptor (the directory's inherited permissions) */
+    file = CreateFileA(argv[1], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) { printf("FAIL can't write %s\n", argv[1]); return 1; }
+    WriteFile(file, p, THREADS * SLOTS * 4 + RAW_SIZE, &written, NULL);
+    CloseHandle(file);
     printf("wrote %s\n", argv[1]);
     return 0;
 }
