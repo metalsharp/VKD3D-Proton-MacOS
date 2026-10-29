@@ -71,4 +71,4 @@ Feature level and shader model gates are in `libs/vkd3d/device.c`
 | 64-bit buffer atomics | SM 6.6 | no (Metal has 64-bit min/max only) | emulation |
 | `shaderQuadControl` + maximal reconvergence | SM 6.7 | yes | validate |
 | fragment shading rate | VRS tier 2 | no | rasterization rate maps |
-| D3D11on12 | D3D11 apps on D3D12 | yes (`shaderCullDistance` as clip distances, `VK_KHR_pipeline_library`) | DXVK 2.7.1 `dxgi`/`d3d11` (`scripts/build-dxvk.sh`), D3D12 test `d3d11on12` |
+| D3D11on12 | D3D11 apps on D3D12 | yes (`shaderCullDistance` as clip distances, `VK_KHR_pipeline_library`) | metalsharp/DXVK-MacOS (DXVK 3.1) `dxgi`/`d3d11` as ARM64X (`scripts/build-dxvk-arm64x.sh`), D3D12 test `d3d11on12` |
