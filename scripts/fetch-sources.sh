@@ -13,7 +13,7 @@ WS="$(cd "$(dirname "$0")/.." && pwd)"
 VKD3D_REV=ef9a02e873715c9e2da0d6db8a236aca8380b303
 MOLTENVK_REV=5189f8de
 DXVK_TAG=v2.7.1
-DXVK_ARM64X_REV=0b75608308177bf30f61ddb5e1cb6c8dd357e1b8
+DXVK_ARM64X_REV=29ba2f9a5a0c911a053c6a673555b00b78af603d
 mkdir -p "$WS/sources"
 WANT=" ${*:-vkd3d-proton moltenvk dxvk dxvk-arm64x} "
 want() { [[ "$WANT" == *" $1 "* ]]; }
