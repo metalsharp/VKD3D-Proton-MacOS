@@ -13,7 +13,7 @@
 </p>
 
 <pre>D3D12 application → vkd3d-proton → Vulkan → custom MoltenVK → Metal
-D3D10/11 application, D3D12 swap chains → DXVK (metalsharp/DXVK-MacOS) → Vulkan → custom MoltenVK → Metal</pre>
+D3D8/9/10/11 application, D3D12 swap chains → DXVK (metalsharp/DXVK-MacOS) → Vulkan → custom MoltenVK → Metal</pre>
 
 <p>
   Each <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/latest">release</a> has a package for
@@ -41,14 +41,16 @@ gate.
 
 ## DXVK
 
-Both VKD3D-Proton packages ship DXVK's `dxgi.dll`, `d3d11.dll` and `d3d10core.dll` from
+Both VKD3D-Proton packages ship DXVK's `dxgi.dll`, `d3d11.dll`, `d3d10core.dll`, `d3d9.dll` and `d3d8.dll` from
 [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS), our fork of DXVK 3.1.1 for MoltenVK, at the release
-tag `scripts/fetch-sources.sh` pins (`DXVK_REV`; each package names it in `DXVK-VERSION`). VKD3D-Proton needs them:
+tag `scripts/fetch-sources.sh` pins (`DXVK_REV`; each package names it in `DXVK-VERSION`). With them, one package
+runs every Direct3D version from 8 to 12:
 
 - **DXGI:** `dxgi.dll` creates the swap chains D3D12 games present with.
 - **D3D10 and D3D11:** `d3d11.dll` and `d3d10core.dll` run D3D10 and D3D11 games, including D3D11 renderers in
   otherwise D3D12 games.
 - **D3D11On12:** `d3d11.dll` provides `D3D11On12CreateDevice` on VKD3D-Proton's devices.
+- **D3D9 and D3D8:** `d3d9.dll` and `d3d8.dll` run D3D9 and D3D8 games.
 
 The x86_64 package builds them for x86_64. The arm64 package builds them as ARM64X, like its D3D12 DLLs, so that
 under FEX DXVK runs natively too.
@@ -61,7 +63,7 @@ Over upstream DXVK, the fork adds:
 
 DXVK 3.1 depends on MoltenVK and SPIRV-Cross fixes that this repository carries (`patches/moltenvk`,
 `patches/spirv-cross`), so use this release's MoltenVK with these DLLs. DXVK's own changes are made in
-metalsharp/DXVK-MacOS. Its releases also carry D3D8 and D3D9.
+metalsharp/DXVK-MacOS, whose releases also have i386 builds for 32-bit programs.
 
 ## Install
 
@@ -149,7 +151,7 @@ Metal Shader Converter library ships under.
 | Component | In the release | License | License file in the package |
 | --- | --- | --- | --- |
 | [VKD3D-Proton](https://github.com/HansKristian-Work/vkd3d-proton) | `d3d12.dll`, `d3d12core.dll` | LGPL-2.1 | `LICENSE.vkd3d-proton` |
-| [DXVK](https://github.com/doitsujin/dxvk), as [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll` | zlib | `LICENSE.dxvk` |
+| [DXVK](https://github.com/doitsujin/dxvk), as [metalsharp/DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll`, `d3d9.dll`, `d3d8.dll` | zlib | `LICENSE.dxvk` |
 | [dxbc-spirv](https://github.com/doitsujin/dxbc-spirv) | built into DXVK's DLLs | MIT | `LICENSE.dxbc-spirv` |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |

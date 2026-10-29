@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build DXVK for the x86_64 lane from sources/dxvk, metalsharp/DXVK-MacOS (DXVK 3.1.1 with its MoltenVK work, see
 # fetch-sources.sh): dxgi.dll presents VKD3D-Proton's swap chains, d3d11.dll and d3d10core.dll run D3D11 and D3D10
-# programs and provide D3D11On12CreateDevice on VKD3D-Proton devices. The arm64 lane builds the same source as ARM64X
+# programs and provide D3D11On12CreateDevice on VKD3D-Proton devices, d3d9.dll and d3d8.dll run D3D9 and D3D8 ones. The arm64 lane builds the same source as ARM64X
 # (build-dxvk-arm64x.sh).
 #   LLVM_MINGW=<llvm-mingw> scripts/build-dxvk.sh [out-dir]
 set -euo pipefail
@@ -33,7 +33,7 @@ CROSS
     -Db_ndebug=if-release "$OUT/x86_64" "$SRC" >/dev/null
 ninja -C "$OUT/x86_64" >/dev/null
 mkdir -p "$OUT/x86_64-windows"
-for dll in dxgi/dxgi d3d11/d3d11 d3d10/d3d10core; do
+for dll in dxgi/dxgi d3d11/d3d11 d3d10/d3d10core d3d9/d3d9 d3d8/d3d8; do
     llvm-strip -o "$OUT/x86_64-windows/${dll##*/}.dll" "$OUT/x86_64/src/$dll.dll"
 done
 ls -la "$OUT/x86_64-windows"
