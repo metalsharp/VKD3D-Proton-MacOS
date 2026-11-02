@@ -48,7 +48,7 @@ index 7e6ae495..9a3550f0 100644
 -aa217aeb6c9f0ace7a0ab233b28807edf45eb165
 +c1af57390a0dd4950af578ec2135120ac218806f
 diff --git a/MoltenVK/MoltenVK.xcodeproj/project.pbxproj b/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
-index 8fe2ad82..a33ac090 100644
+index 8fe2ad82..d1c66b9a 100644
 --- a/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
 +++ b/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
 @@ -7,6 +7,18 @@
@@ -143,6 +143,42 @@ index 8fe2ad82..a33ac090 100644
  				DCFD7F282A45BC6E007BBBF7 /* MVKBlockObserver.m in Sources */,
  				DCFD7F292A45BC6E007BBBF7 /* MTLRenderPipelineDescriptor+MoltenVK.m in Sources */,
  				DCFD7F2A2A45BC6E007BBBF7 /* MVKResource.mm in Sources */,
+@@ -2403,6 +2439,8 @@
+ 				EXECUTABLE_PREFIX = lib;
+ 				LD_DYLIB_INSTALL_NAME = "@rpath/lib${PRODUCT_NAME}.dylib";
+ 				OTHER_LDFLAGS = (
++					"-weak_framework",
++					MetalFX,
+ 					"-all_load",
+ 					"-w",
+ 				);
+@@ -2416,6 +2454,8 @@
+ 				EXECUTABLE_PREFIX = lib;
+ 				LD_DYLIB_INSTALL_NAME = "@rpath/lib${PRODUCT_NAME}.dylib";
+ 				OTHER_LDFLAGS = (
++					"-weak_framework",
++					MetalFX,
+ 					"-all_load",
+ 					"-w",
+ 				);
+@@ -2545,6 +2585,8 @@
+ 				GENERATE_INFOPLIST_FILE = YES;
+ 				LD_DYLIB_INSTALL_NAME = "@rpath/${PRODUCT_NAME}.framework/${PRODUCT_NAME}";
+ 				OTHER_LDFLAGS = (
++					"-weak_framework",
++					MetalFX,
+ 					"-all_load",
+ 					"-w",
+ 				);
+@@ -2558,6 +2600,8 @@
+ 				GENERATE_INFOPLIST_FILE = YES;
+ 				LD_DYLIB_INSTALL_NAME = "@rpath/${PRODUCT_NAME}.framework/${PRODUCT_NAME}";
+ 				OTHER_LDFLAGS = (
++					"-weak_framework",
++					MetalFX,
+ 					"-all_load",
+ 					"-w",
+ 				);
 diff --git a/MoltenVK/MoltenVK/API/mvk_datatypes.h b/MoltenVK/MoltenVK/API/mvk_datatypes.h
 index 1d91cf23..cad6aa0a 100644
 --- a/MoltenVK/MoltenVK/API/mvk_datatypes.h
@@ -167,6 +203,117 @@ index 69df0349..985607ba 100644
  } MVKPhysicalDeviceMetalFeatures;
  
  
+diff --git a/MoltenVK/MoltenVK/API/mvk_metalfx.h b/MoltenVK/MoltenVK/API/mvk_metalfx.h
+new file mode 100644
+index 00000000..9d1aa0d3
+--- /dev/null
++++ b/MoltenVK/MoltenVK/API/mvk_metalfx.h
+@@ -0,0 +1,105 @@
++/*
++ * mvk_metalfx.h
++ *
++ * MetalSharp: Apple's MetalFX upscalers through Vulkan, for D3D layers (VKD3D-Proton, DXVK) on MoltenVK.
++ *
++ * Wine's Vulkan layer forwards only the functions and structures of known Vulkan extensions, but on 64-bit it hands
++ * a VkDependencyInfo and a VkSwapchainCreateInfoKHR to the driver as they are, extension chain included. So:
++ *
++ * - a VkMetalFXScaleInfoMVK in the pNext chain of vkCmdPipelineBarrier2's VkDependencyInfo runs a MetalFX temporal
++ *   or denoised scaler after the barrier, in the command buffer's order;
++ * - a VkSwapchainMetalFXSpatialCreateInfoMVK in the pNext chain of VkSwapchainCreateInfoKHR has the swapchain's
++ *   images upscaled with MetalFX's spatial scaler to the surface's native size when they are presented.
++ *
++ * A MoltenVK that supports them says so in VkPhysicalDeviceDriverProperties::driverInfo: the words "metalfx"
++ * (temporal and spatial scalers) and "metalfx-denoised" (MetalFX's denoised scaler, macOS 26).
++ *
++ * This file is copied as it is into the D3D layers that use it.
++ */
++
++#ifndef __mvk_metalfx_h_
++#define __mvk_metalfx_h_ 1
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK ((VkStructureType)1000999100)
++#define VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK ((VkStructureType)1000999101)
++
++#define VK_MVK_METALFX_DRIVER_INFO "metalfx"
++#define VK_MVK_METALFX_DENOISED_DRIVER_INFO "metalfx-denoised"
++
++typedef enum VkMetalFXScalerTypeMVK {
++	VK_METALFX_SCALER_TYPE_NONE_MVK = 0,		/* only releases pReleaseScalerIds */
++	VK_METALFX_SCALER_TYPE_TEMPORAL_MVK = 1,	/* MTLFXTemporalScaler (DLSS Super Resolution) */
++	VK_METALFX_SCALER_TYPE_DENOISED_MVK = 2,	/* MTLFXTemporalDenoisedScaler (DLSS Ray Reconstruction) */
++} VkMetalFXScalerTypeMVK;
++
++/* The textures of a scale, by their index in images and formats */
++typedef enum VkMetalFXImageMVK {
++	VK_METALFX_IMAGE_COLOR_MVK = 0,
++	VK_METALFX_IMAGE_DEPTH_MVK = 1,
++	VK_METALFX_IMAGE_MOTION_MVK = 2,
++	VK_METALFX_IMAGE_OUTPUT_MVK = 3,
++	VK_METALFX_IMAGE_EXPOSURE_MVK = 4,				/* optional */
++	VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK = 5,		/* denoised */
++	VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK = 6,		/* denoised */
++	VK_METALFX_IMAGE_NORMALS_MVK = 7,				/* denoised */
++	VK_METALFX_IMAGE_ROUGHNESS_MVK = 8,				/* denoised */
++	VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK = 9,	/* denoised, optional */
++	VK_METALFX_IMAGE_COUNT_MVK = 10,
++} VkMetalFXImageMVK;
++
++typedef enum VkMetalFXScaleFlagBitsMVK {
++	VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK = 0x1,
++	VK_METALFX_SCALE_RESET_BIT_MVK = 0x2,
++	VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK = 0x4,
++} VkMetalFXScaleFlagBitsMVK;
++
++/*
++ * One scale. The scaler is MoltenVK's, kept under scalerId (any nonzero value the caller picks, one per upscaling
++ * feature, since a temporal scaler keeps the history of its earlier frames) and made again when the images' sizes or
++ * formats change. Its caller releases it by naming its id in pReleaseScalerIds of a later scale (of any type,
++ * VK_METALFX_SCALER_TYPE_NONE_MVK included); MoltenVK releases the rest with the device.
++ *
++ * formats[i] is the format images[i] is read or written as (VK_FORMAT_UNDEFINED: the image's own), such as a float
++ * format for an integer-typed depth; a different format needs an image made with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
++ * The images are read in the general layout, and their contents must be available to the barrier's second scope;
++ * the output is written for a later barrier to make visible.
++ */
++typedef struct VkMetalFXScaleInfoMVK {
++	VkStructureType sType;
++	const void* pNext;
++	uint64_t scalerId;
++	uint32_t scalerType;					/* VkMetalFXScalerTypeMVK */
++	uint32_t flags;							/* VkMetalFXScaleFlagBitsMVK */
++	VkImage images[VK_METALFX_IMAGE_COUNT_MVK];
++	VkFormat formats[VK_METALFX_IMAGE_COUNT_MVK];
++	uint32_t inputContentWidth;				/* 0: the color image's width */
++	uint32_t inputContentHeight;			/* 0: the color image's height */
++	float motionVectorScaleX;
++	float motionVectorScaleY;
++	float jitterOffsetX;
++	float jitterOffsetY;
++	float preExposure;
++	float worldToViewMatrix[16];			/* denoised: row-major, of row vectors (D3D's) */
++	float viewToClipMatrix[16];				/* denoised */
++	uint32_t releaseScalerIdCount;
++	const uint64_t* pReleaseScalerIds;
++} VkMetalFXScaleInfoMVK;
++
++/* MetalFX spatial upscaling at present, to the surface's native size, where that is larger than the images' */
++typedef struct VkSwapchainMetalFXSpatialCreateInfoMVK {
++	VkStructureType sType;
++	const void* pNext;
++	uint32_t enable;
++} VkSwapchainMetalFXSpatialCreateInfoMVK;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/MoltenVK/MoltenVK/API/mvk_private_api.h b/MoltenVK/MoltenVK/API/mvk_private_api.h
 index fdfa71ae..6af06310 100644
 --- a/MoltenVK/MoltenVK/API/mvk_private_api.h
@@ -4708,10 +4855,25 @@ index d0452973..2b841ef4 100644
 +}
 +
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
-index 5119f856..a9a60821 100644
+index 5119f856..b1f07111 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
-@@ -84,6 +84,7 @@ public:
+@@ -22,12 +22,14 @@
+ #include "MVKMTLResourceBindings.h"
+ #include "MVKSync.h"
+ #include "MVKSmallVector.h"
++#include <MoltenVK/mvk_metalfx.h>
+ 
+ class MVKCommandBuffer;
+ class MVKPipeline;
+ class MVKPipelineLayout;
+ class MVKDescriptorSet;
+ class MVKDescriptorUpdateTemplate;
++class MVKImage;
+ 
+ 
+ #pragma mark -
+@@ -84,6 +86,7 @@ public:
  						const VkImageMemoryBarrier* pImageMemoryBarriers);
  
  	void encode(MVKCommandEncoder* cmdEncoder) override;
@@ -4719,7 +4881,38 @@ index 5119f856..a9a60821 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -109,6 +110,8 @@ public:
+@@ -99,6 +102,30 @@ typedef MVKCmdPipelineBarrier<4> MVKCmdPipelineBarrier4;
+ typedef MVKCmdPipelineBarrier<32> MVKCmdPipelineBarrierMulti;
+ 
+ 
++#pragma mark -
++#pragma mark MVKCmdMetalFXScale
++
++/**
++ * MetalSharp: a MetalFX temporal or denoised scale (VkMetalFXScaleInfoMVK in the pNext chain of a
++ * vkCmdPipelineBarrier2), encoded after its barrier.
++ */
++class MVKCmdMetalFXScale : public MVKCommand {
++
++public:
++	VkResult setContent(MVKCommandBuffer* cmdBuff, const VkMetalFXScaleInfoMVK* pInfo);
++
++	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool hoistDrawConversions(MVKCommandEncoder* cmdEncoder) override { return false; }
++
++protected:
++	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
++	id<MTLTexture> getTexture(VkMetalFXImageMVK index, MTLPixelFormat* pFormat);
++
++	VkMetalFXScaleInfoMVK _info;
++	MVKImage* _images[VK_METALFX_IMAGE_COUNT_MVK];
++};
++
++
+ #pragma mark -
+ #pragma mark MVKCmdBindPipeline
+ 
+@@ -109,6 +136,8 @@ public:
  	VkResult setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline);
  
  	virtual bool isTessellationPipeline() { return false; };
@@ -4728,7 +4921,7 @@ index 5119f856..a9a60821 100644
  
  protected:
  	MVKPipeline* _pipeline;
-@@ -125,6 +128,8 @@ public:
+@@ -125,6 +154,8 @@ public:
  	void encode(MVKCommandEncoder* cmdEncoder) override;
  
  	bool isTessellationPipeline() override;
@@ -4737,7 +4930,7 @@ index 5119f856..a9a60821 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -139,6 +144,28 @@ class MVKCmdBindComputePipeline : public MVKCmdBindPipeline {
+@@ -139,6 +170,28 @@ class MVKCmdBindComputePipeline : public MVKCmdBindPipeline {
  
  public:
  	void encode(MVKCommandEncoder* cmdEncoder) override;
@@ -4766,7 +4959,7 @@ index 5119f856..a9a60821 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -273,6 +300,13 @@ protected:
+@@ -273,6 +326,13 @@ protected:
  	void clearDescriptorWrites();
  
  	MVKSmallVector<VkWriteDescriptorSet, 1> _descriptorWrites;
@@ -4780,7 +4973,7 @@ index 5119f856..a9a60821 100644
  	MVKPipelineLayout* _pipelineLayout = nullptr;
  	VkPipelineBindPoint _pipelineBindPoint;
  	uint32_t _set;
-@@ -300,6 +334,7 @@ protected:
+@@ -300,6 +360,7 @@ protected:
  
  	MVKDescriptorUpdateTemplate* _descUpdateTemplate = nullptr;
  	MVKPipelineLayout* _pipelineLayout = nullptr;
@@ -4788,7 +4981,7 @@ index 5119f856..a9a60821 100644
  	void* _pData = nullptr;
  	size_t _dataSize = 0;
  	uint32_t _set = 0;
-@@ -378,6 +413,7 @@ public:
+@@ -378,6 +439,7 @@ public:
  						const VkImageMemoryBarrier* pImageMemoryBarriers);
  
  	void encode(MVKCommandEncoder* cmdEncoder) override;
@@ -4797,10 +4990,10 @@ index 5119f856..a9a60821 100644
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-index 3e9fc79f..b4c55c72 100644
+index 3e9fc79f..743001ea 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-@@ -22,6 +22,7 @@
+@@ -22,9 +22,12 @@
  #include "MVKImage.h"
  #include "MVKBuffer.h"
  #include "MVKPipeline.h"
@@ -4808,7 +5001,12 @@ index 3e9fc79f..b4c55c72 100644
  #include "MVKFoundation.h"
  #include "mvk_datatypes.hpp"
  
-@@ -116,6 +117,25 @@
++#import <MetalFX/MetalFX.h>
++
+ 
+ #pragma mark -
+ #pragma mark MVKCmdExecuteCommands
+@@ -116,6 +119,25 @@
  	
  	auto& mtlFeats = cmdEncoder->getMetalFeatures();
  
@@ -4834,7 +5032,7 @@ index 3e9fc79f..b4c55c72 100644
  #if MVK_MACOS
  	// Calls below invoke MTLBlitCommandEncoder so must apply this first.
  	// Check if pipeline barriers are available and we are in a renderpass.
-@@ -123,6 +143,8 @@
+@@ -123,6 +145,8 @@
  		for (auto& b : _barriers) {
  			MTLRenderStages srcStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.srcStageMask, false);
  			MTLRenderStages dstStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.dstStageMask, true);
@@ -4843,7 +5041,7 @@ index 3e9fc79f..b4c55c72 100644
  			switch (b.type) {
  				case MVKPipelineBarrier::Memory: {
  					MTLBarrierScope scope = (mvkMTLBarrierScopeFromVkAccessFlags(b.srcAccessMask) |
-@@ -190,9 +212,21 @@
+@@ -190,9 +214,21 @@
  				needsRenderpassRestart = true;
  				break;
  			}
@@ -4865,7 +5063,206 @@ index 3e9fc79f..b4c55c72 100644
  			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
  		}
  	}
-@@ -260,6 +294,14 @@
+@@ -237,6 +273,198 @@
+ template class MVKCmdPipelineBarrier<32>;
+ 
+ 
++#pragma mark -
++#pragma mark MVKCmdMetalFXScale
++
++VkResult MVKCmdMetalFXScale::setContent(MVKCommandBuffer* cmdBuff, const VkMetalFXScaleInfoMVK* pInfo) {
++	_info = *pInfo;
++	_info.pNext = nullptr;
++	_info.releaseScalerIdCount = 0;
++	_info.pReleaseScalerIds = nullptr;
++	for (uint32_t i = 0; i < VK_METALFX_IMAGE_COUNT_MVK; i++) {
++		_images[i] = (MVKImage*)pInfo->images[i];
++	}
++	// A command buffer encoded with a released scaler keeps it until it completes; a later one makes a new one.
++	if (pInfo->releaseScalerIdCount) {
++		cmdBuff->getDevice()->releaseMetalFXScalers(pInfo->pReleaseScalerIds, pInfo->releaseScalerIdCount);
++	}
++	return VK_SUCCESS;
++}
++
++// The image's texture, viewed in the format the scale asks for. Autoreleased where it is a view.
++id<MTLTexture> MVKCmdMetalFXScale::getTexture(VkMetalFXImageMVK index, MTLPixelFormat* pFormat) {
++	MVKImage* image = _images[index];
++	id<MTLTexture> texture = image ? image->getMTLTexture(0) : nil;
++	*pFormat = texture ? texture.pixelFormat : MTLPixelFormatInvalid;
++	if ( !texture || !_info.formats[index] ) { return texture; }
++
++	MTLPixelFormat format = image->getPixelFormats()->getMTLPixelFormat(_info.formats[index]);
++	if (format == MTLPixelFormatInvalid || format == texture.pixelFormat) { return texture; }
++	id<MTLTexture> view = [texture newTextureViewWithPixelFormat: format];
++	if ( !view ) { return texture; }
++	*pFormat = format;
++	return [view autorelease];
++}
++
++// The scale waits for the work its barrier orders before it, through the scaler's fence: a compute encoder waits
++// for the barrier's fences and updates the scaler's, and after the scale another waits for the scaler's fence and,
++// as it ends, updates the compute stage's fences, which the barriers after the scale wait for.
++void MVKCmdMetalFXScale::encode(MVKCommandEncoder* cmdEncoder) {
++	if (_info.scalerType != VK_METALFX_SCALER_TYPE_TEMPORAL_MVK &&
++		_info.scalerType != VK_METALFX_SCALER_TYPE_DENOISED_MVK) { return; }
++	bool denoised = _info.scalerType == VK_METALFX_SCALER_TYPE_DENOISED_MVK;
++	if (denoised) {
++		if (@available(macOS 26.0, iOS 26.0, *)) {} else { return; }
++	}
++
++	@autoreleasepool {
++		std::array<MTLPixelFormat, VK_METALFX_IMAGE_COUNT_MVK> formats;
++		id<MTLTexture> textures[VK_METALFX_IMAGE_COUNT_MVK];
++		for (uint32_t i = 0; i < VK_METALFX_IMAGE_COUNT_MVK; i++) {
++			textures[i] = getTexture((VkMetalFXImageMVK)i, &formats[i]);
++		}
++		id<MTLTexture> color = textures[VK_METALFX_IMAGE_COLOR_MVK];
++		id<MTLTexture> output = textures[VK_METALFX_IMAGE_OUTPUT_MVK];
++		if ( !color || !output || !textures[VK_METALFX_IMAGE_DEPTH_MVK] || !textures[VK_METALFX_IMAGE_MOTION_MVK] ) {
++			MVKLogWarn("MetalFX: a scale without its color, depth, motion or output image is skipped.");
++			return;
++		}
++		if (denoised && ( !textures[VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK] || !textures[VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK] ||
++						  !textures[VK_METALFX_IMAGE_NORMALS_MVK] || !textures[VK_METALFX_IMAGE_ROUGHNESS_MVK] )) {
++			MVKLogWarn("MetalFX: a denoised scale without its albedo, normal or roughness image is skipped.");
++			return;
++		}
++
++		bool autoExposure = mvkIsAnyFlagEnabled(_info.flags, VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK);
++		std::vector<uint32_t> key = { _info.scalerType, (uint32_t)color.width, (uint32_t)color.height,
++									  (uint32_t)output.width, (uint32_t)output.height, autoExposure };
++		for (uint32_t i = 0; i < VK_METALFX_IMAGE_COUNT_MVK; i++) {
++			if (i != VK_METALFX_IMAGE_EXPOSURE_MVK) { key.push_back((uint32_t)formats[i]); }
++		}
++
++		MVKDevice* device = cmdEncoder->getDevice();
++		id<MTLDevice> mtlDevice = cmdEncoder->getMTLDevice();
++		uint32_t scalerType = _info.scalerType;
++		id<MTLFence> fence = nil;
++		id scaler = device->getMetalFXScaler(_info.scalerId, key, &fence, ^id {
++			id made = nil;
++			if (scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK) {
++				MTLFXTemporalScalerDescriptor* desc = [MTLFXTemporalScalerDescriptor new];
++				desc.colorTextureFormat = formats[VK_METALFX_IMAGE_COLOR_MVK];
++				desc.depthTextureFormat = formats[VK_METALFX_IMAGE_DEPTH_MVK];
++				desc.motionTextureFormat = formats[VK_METALFX_IMAGE_MOTION_MVK];
++				desc.outputTextureFormat = formats[VK_METALFX_IMAGE_OUTPUT_MVK];
++				desc.inputWidth = color.width;
++				desc.inputHeight = color.height;
++				desc.outputWidth = output.width;
++				desc.outputHeight = output.height;
++				desc.autoExposureEnabled = autoExposure;
++				// The game renders a part of the color image (dynamic resolution), at most 3x smaller than the output.
++				desc.inputContentPropertiesEnabled = YES;
++				desc.inputContentMinScale = 1.0f;
++				desc.inputContentMaxScale = 3.0f;
++				if (@available(macOS 15.0, iOS 18.0, *)) { desc.requiresSynchronousInitialization = YES; }
++				made = [desc newTemporalScalerWithDevice: mtlDevice];
++				[desc release];
++			} else if (@available(macOS 26.0, iOS 26.0, *)) {
++				MTLFXTemporalDenoisedScalerDescriptor* desc = [MTLFXTemporalDenoisedScalerDescriptor new];
++				desc.colorTextureFormat = formats[VK_METALFX_IMAGE_COLOR_MVK];
++				desc.depthTextureFormat = formats[VK_METALFX_IMAGE_DEPTH_MVK];
++				desc.motionTextureFormat = formats[VK_METALFX_IMAGE_MOTION_MVK];
++				desc.diffuseAlbedoTextureFormat = formats[VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK];
++				desc.specularAlbedoTextureFormat = formats[VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK];
++				desc.normalTextureFormat = formats[VK_METALFX_IMAGE_NORMALS_MVK];
++				desc.roughnessTextureFormat = formats[VK_METALFX_IMAGE_ROUGHNESS_MVK];
++				desc.outputTextureFormat = formats[VK_METALFX_IMAGE_OUTPUT_MVK];
++				if (formats[VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK] != MTLPixelFormatInvalid) {
++					desc.specularHitDistanceTextureEnabled = YES;
++					desc.specularHitDistanceTextureFormat = formats[VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK];
++				}
++				desc.inputWidth = color.width;
++				desc.inputHeight = color.height;
++				desc.outputWidth = output.width;
++				desc.outputHeight = output.height;
++				desc.autoExposureEnabled = autoExposure;
++				desc.requiresSynchronousInitialization = YES;
++				made = [desc newTemporalDenoisedScalerWithDevice: mtlDevice];
++				[desc release];
++			}
++			if (made) {
++				MVKLogInfo("MetalFX: %s upscaling %lux%lu to %lux%lu.", scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK ? "temporal" : "denoised",
++						   (unsigned long)color.width, (unsigned long)color.height, (unsigned long)output.width, (unsigned long)output.height);
++			} else {
++				MVKLogError("MetalFX: no %s scaler for %lux%lu to %lux%lu (color format %lu, depth %lu, motion %lu, output %lu).",
++							scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK ? "temporal" : "denoised",
++							(unsigned long)color.width, (unsigned long)color.height, (unsigned long)output.width, (unsigned long)output.height,
++							(unsigned long)formats[VK_METALFX_IMAGE_COLOR_MVK], (unsigned long)formats[VK_METALFX_IMAGE_DEPTH_MVK],
++							(unsigned long)formats[VK_METALFX_IMAGE_MOTION_MVK], (unsigned long)formats[VK_METALFX_IMAGE_OUTPUT_MVK]);
++			}
++			return made;
++		});
++		if ( !scaler ) { return; }
++
++		cmdEncoder->endCurrentMetalEncoding();
++		[cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) updateFence: fence];
++		cmdEncoder->endCurrentMetalEncoding();
++
++		id<MTLCommandBuffer> mtlCmdBuff = cmdEncoder->_mtlCmdBuffer;
++		bool reset = mvkIsAnyFlagEnabled(_info.flags, VK_METALFX_SCALE_RESET_BIT_MVK);
++		bool depthReversed = mvkIsAnyFlagEnabled(_info.flags, VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK);
++		// DLSS's default pre-exposure is 0 for "none", which MetalFX would multiply the frame by.
++		float preExposure = _info.preExposure > 0.0f ? _info.preExposure : 1.0f;
++		if ( !denoised ) {
++			id<MTLFXTemporalScaler> temporal = (id<MTLFXTemporalScaler>)scaler;
++			temporal.colorTexture = color;
++			temporal.depthTexture = textures[VK_METALFX_IMAGE_DEPTH_MVK];
++			temporal.motionTexture = textures[VK_METALFX_IMAGE_MOTION_MVK];
++			temporal.outputTexture = output;
++			temporal.exposureTexture = textures[VK_METALFX_IMAGE_EXPOSURE_MVK];
++			temporal.fence = fence;
++			temporal.inputContentWidth = _info.inputContentWidth ? _info.inputContentWidth : color.width;
++			temporal.inputContentHeight = _info.inputContentHeight ? _info.inputContentHeight : color.height;
++			temporal.reset = reset;
++			temporal.depthReversed = depthReversed;
++			temporal.motionVectorScaleX = _info.motionVectorScaleX;
++			temporal.motionVectorScaleY = _info.motionVectorScaleY;
++			temporal.jitterOffsetX = _info.jitterOffsetX;
++			temporal.jitterOffsetY = _info.jitterOffsetY;
++			temporal.preExposure = preExposure;
++			[temporal encodeToCommandBuffer: mtlCmdBuff];
++		} else if (@available(macOS 26.0, iOS 26.0, *)) {
++			id<MTLFXTemporalDenoisedScaler> denoiser = (id<MTLFXTemporalDenoisedScaler>)scaler;
++			simd_float4x4 worldToView, viewToClip;
++			memcpy(&worldToView, _info.worldToViewMatrix, sizeof(worldToView));
++			memcpy(&viewToClip, _info.viewToClipMatrix, sizeof(viewToClip));
++			denoiser.colorTexture = color;
++			denoiser.depthTexture = textures[VK_METALFX_IMAGE_DEPTH_MVK];
++			denoiser.motionTexture = textures[VK_METALFX_IMAGE_MOTION_MVK];
++			denoiser.diffuseAlbedoTexture = textures[VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK];
++			denoiser.specularAlbedoTexture = textures[VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK];
++			denoiser.normalTexture = textures[VK_METALFX_IMAGE_NORMALS_MVK];
++			denoiser.roughnessTexture = textures[VK_METALFX_IMAGE_ROUGHNESS_MVK];
++			denoiser.specularHitDistanceTexture = textures[VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK];
++			denoiser.exposureTexture = textures[VK_METALFX_IMAGE_EXPOSURE_MVK];
++			denoiser.outputTexture = output;
++			denoiser.fence = fence;
++			denoiser.preExposure = preExposure;
++			denoiser.jitterOffsetX = _info.jitterOffsetX;
++			denoiser.jitterOffsetY = _info.jitterOffsetY;
++			denoiser.motionVectorScaleX = _info.motionVectorScaleX;
++			denoiser.motionVectorScaleY = _info.motionVectorScaleY;
++			denoiser.shouldResetHistory = reset;
++			denoiser.depthReversed = depthReversed;
++			denoiser.worldToViewMatrix = worldToView;
++			denoiser.viewToClipMatrix = viewToClip;
++			[denoiser encodeToCommandBuffer: mtlCmdBuff];
++		}
++		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) { [scaler release]; }];
++
++		[cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) waitForFence: fence];
++		cmdEncoder->endCurrentMetalEncoding();
++	}
++}
++
++
+ #pragma mark -
+ #pragma mark MVKCmdBindPipeline
+ 
+@@ -260,6 +488,14 @@
  	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
  }
  
@@ -4880,7 +5277,7 @@ index 3e9fc79f..b4c55c72 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindComputePipeline
-@@ -268,6 +310,18 @@
+@@ -268,6 +504,18 @@
  	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
  }
  
@@ -4899,7 +5296,7 @@ index 3e9fc79f..b4c55c72 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindDescriptorSetsStatic
-@@ -279,14 +333,16 @@
+@@ -279,14 +527,16 @@
  													   uint32_t firstSet,
  													   uint32_t setCount,
  													   const VkDescriptorSet* pDescriptorSets) {
@@ -4919,7 +5316,7 @@ index 3e9fc79f..b4c55c72 100644
  	// Add the descriptor sets
  	_descriptorSets.clear();	// Clear for reuse
  	_descriptorSets.reserve(setCount);
-@@ -373,7 +429,7 @@
+@@ -373,7 +623,7 @@
  
  template <size_t N>
  void MVKCmdPushConstants<N>::encode(MVKCommandEncoder* cmdEncoder) {
@@ -4928,7 +5325,7 @@ index 3e9fc79f..b4c55c72 100644
  }
  
  template class MVKCmdPushConstants<64>;
-@@ -384,57 +440,188 @@
+@@ -384,57 +634,188 @@
  #pragma mark -
  #pragma mark MVKCmdPushDescriptorSet
  
@@ -5138,7 +5535,7 @@ index 3e9fc79f..b4c55c72 100644
  		}
  	}
  
-@@ -442,7 +629,11 @@
+@@ -442,7 +823,11 @@
  }
  
  void MVKCmdPushDescriptorSet::encode(MVKCommandEncoder* cmdEncoder) {
@@ -5151,7 +5548,7 @@ index 3e9fc79f..b4c55c72 100644
  }
  
  MVKCmdPushDescriptorSet::~MVKCmdPushDescriptorSet() {
-@@ -452,24 +643,24 @@
+@@ -452,24 +837,24 @@
  
  void MVKCmdPushDescriptorSet::clearDescriptorWrites() {
  	for (VkWriteDescriptorSet &descWrite : _descriptorWrites) {
@@ -5190,7 +5587,7 @@ index 3e9fc79f..b4c55c72 100644
  }
  
  
-@@ -481,11 +672,21 @@
+@@ -481,11 +866,21 @@
  														 VkPipelineLayout layout,
  														 uint32_t set,
  														 const void* pData) {
@@ -5216,7 +5613,7 @@ index 3e9fc79f..b4c55c72 100644
  
  	size_t oldSize = _dataSize;
  	_dataSize = _descUpdateTemplate->getSize();
-@@ -495,6 +696,15 @@
+@@ -495,6 +890,15 @@
  	}
  	if (_pData && pData) {
  		mvkCopy(_pData, pData, _dataSize);
@@ -5232,7 +5629,7 @@ index 3e9fc79f..b4c55c72 100644
  	}
  
  	return VK_SUCCESS;
-@@ -505,6 +715,8 @@
+@@ -505,6 +909,8 @@
  }
  
  MVKCmdPushDescriptorSetWithTemplate::~MVKCmdPushDescriptorSetWithTemplate() {
@@ -9618,7 +10015,7 @@ index 48fc9879..62b026bd 100644
  	_mtlLibrary = nil;
  	if (_transferImageMemory) { _transferImageMemory->destroy(); }
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def b/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
-index 9d3b0465..952449a8 100644
+index 9d3b0465..0b5d5cbc 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
 @@ -41,6 +41,14 @@
@@ -9636,15 +10033,18 @@ index 9d3b0465..952449a8 100644
  #define MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(cmdType, threshold)	\
  	MVK_TMPLT_DECL MVK_CMD_TYPE_POOL(cmdType ##threshold)		\
  	MVK_TMPLT_DECL MVK_CMD_TYPE_POOL(cmdType ##Multi)
-@@ -75,6 +83,7 @@
+@@ -73,8 +81,10 @@
+ 	MVK_TMPLT_DECL MVK_CMD_TYPE_POOL(cmdType ##Multi          ##Multi)
+ 
  MVK_CMD_TYPE_POOLS_FROM_2_THRESHOLDS(PipelineBarrier, 1, 4)
++MVK_CMD_TYPE_POOL(MetalFXScale)
  MVK_CMD_TYPE_POOL(BindGraphicsPipeline)
  MVK_CMD_TYPE_POOL(BindComputePipeline)
 +MVK_RT_CMD_TYPE_POOL(BindRayTracingPipeline)
  MVK_CMD_TYPE_POOLS_FROM_5_THRESHOLDS(BeginRenderPass, 1, 2, 0, 1, 2)
  MVK_CMD_TYPE_POOL(NextSubpass)
  MVK_CMD_TYPE_POOL(EndRenderPass)
-@@ -116,10 +125,15 @@ MVK_CMD_TYPE_POOL(SetRasterizerDiscardEnable)
+@@ -116,10 +126,15 @@ MVK_CMD_TYPE_POOL(SetRasterizerDiscardEnable)
  MVK_CMD_TYPE_POOL(SetProvokingVertexMode)
  MVK_CMD_TYPE_POOLS_FROM_2_THRESHOLDS(BindVertexBuffers, 1, 2)
  MVK_CMD_TYPE_POOL(BindIndexBuffer)
@@ -9660,7 +10060,7 @@ index 9d3b0465..952449a8 100644
  MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(CopyImage, 1)
  MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(BlitImage, 1)
  MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(ResolveImage, 1)
-@@ -139,15 +153,25 @@ MVK_CMD_TYPE_POOL(CopyQueryPoolResults)
+@@ -139,15 +154,25 @@ MVK_CMD_TYPE_POOL(CopyQueryPoolResults)
  MVK_CMD_TYPE_POOLS_FROM_2_THRESHOLDS(PushConstants, 64, 128)
  MVK_CMD_TYPE_POOL(Dispatch)
  MVK_CMD_TYPE_POOL(DispatchIndirect)
@@ -12829,7 +13229,7 @@ index 3cdc6234..e932be3b 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..2bad2b16 100644
+index 534a414f..3691593b 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,12 @@
@@ -13174,10 +13574,19 @@ index 534a414f..2bad2b16 100644
  	bool hasResidencySet() {
  #if MVK_XCODE_16
  		return _residencySet != nil;
-@@ -1050,12 +1233,21 @@ public:
+@@ -1050,12 +1233,30 @@ public:
  		return _barrierFences[stage][index];
  	}
  
++	/**
++	 * MetalSharp: the MetalFX scaler kept under scalerId (VkMetalFXScaleInfoMVK), and its fence, made by make() where
++	 * there is none or the one there was made for another key. Returned retained; nil where make() makes none.
++	 */
++	id getMetalFXScaler(uint64_t scalerId, const std::vector<uint32_t>& key, id<MTLFence>* pFence, id (^make)(void));
++
++	/** MetalSharp: releases the MetalFX scalers kept under these ids. */
++	void releaseMetalFXScalers(const uint64_t* scalerIds, uint32_t count);
++
 +	/** returns the Metal render stages that run Vulkan pre-rasterization shaders */
 +	MTLRenderStages getMTLVertexStages() {
 +		return _enabledMeshShaderFeatures.meshShader ? MTLRenderStageVertex | MTLRenderStageObject | MTLRenderStageMesh : MTLRenderStageVertex;
@@ -13196,7 +13605,7 @@ index 534a414f..2bad2b16 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1076,6 +1268,8 @@ protected:
+@@ -1076,6 +1277,8 @@ protected:
  	void getDescriptorVariableDescriptorCountLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
@@ -13205,7 +13614,19 @@ index 534a414f..2bad2b16 100644
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
-@@ -1097,7 +1291,16 @@ protected:
+@@ -1093,11 +1296,28 @@ protected:
+ 
+ 	id<MTLFence> _barrierFences[kMVKBarrierStageCount][kMVKBarrierFenceCount];
+ 
++	struct MVKMetalFXScaler {
++		std::vector<uint32_t> key;
++		id scaler = nil;
++		id<MTLFence> fence = nil;
++	};
++	std::unordered_map<uint64_t, MVKMetalFXScaler> _metalFXScalers;
++	std::mutex _metalFXScalersLock;
++
+ 	MVKPerformanceStatistics _performanceStats;
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
  	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
  	MVKSmallVector<MVKResource*> _resources;
@@ -13222,7 +13643,7 @@ index 534a414f..2bad2b16 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1308,58 @@ protected:
+@@ -1105,16 +1325,58 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -13281,7 +13702,7 @@ index 534a414f..2bad2b16 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1410,15 @@ public:
+@@ -1165,12 +1427,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -13299,7 +13720,7 @@ index 534a414f..2bad2b16 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1523,50 @@ protected:
+@@ -1275,6 +1540,50 @@ protected:
  };
  
  
@@ -13351,7 +13772,7 @@ index 534a414f..2bad2b16 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..d44f07ba 100644
+index 359f8a2b..caf87756 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -13366,7 +13787,7 @@ index 359f8a2b..d44f07ba 100644
  #include "MVKImage.h"
  #include "MVKSwapchain.h"
  #include "MVKQueryPool.h"
-@@ -37,7 +39,12 @@
+@@ -37,7 +39,15 @@
  #import "CAMetalLayer+MoltenVK.h"
  
  #include <sys/stat.h>
@@ -13376,10 +13797,13 @@ index 359f8a2b..d44f07ba 100644
  #include <cmath>
 +#include <sys/sysctl.h>
 +#include <unistd.h>
++
++#import <MetalFX/MetalFX.h>
++#include <MoltenVK/mvk_metalfx.h>
  
  using namespace std;
  
-@@ -133,6 +140,10 @@
+@@ -133,6 +143,10 @@
  #if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
  	supportsSamplerReduction = supportsApple10 && mvkOSVersionIsAtLeast(26.0);
  #endif
@@ -13390,7 +13814,7 @@ index 359f8a2b..d44f07ba 100644
  }
  
  
-@@ -160,8 +171,8 @@
+@@ -160,8 +174,8 @@
  		.storagePushConstant16 = true,
  		.storageInputOutput16 = true,
  		.multiview = true,
@@ -13401,7 +13825,7 @@ index 359f8a2b..d44f07ba 100644
  		.variablePointersStorageBuffer = true,
  		.variablePointers = true,
  		.protectedMemory = false,
-@@ -178,8 +189,9 @@
+@@ -178,8 +192,9 @@
  		.storageBuffer8BitAccess = true,
  		.uniformAndStorageBuffer8BitAccess = true,
  		.storagePushConstant8 = true,
@@ -13413,7 +13837,7 @@ index 359f8a2b..d44f07ba 100644
  		.shaderFloat16 = true,
  		.shaderInt8 = true,
  		.descriptorIndexing = _vulkan12NoExtFeatures.descriptorIndexing,
-@@ -572,6 +584,25 @@
+@@ -572,6 +587,25 @@
  				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
  				break;
  			}
@@ -13439,7 +13863,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
  				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
  				barycentricFeatures->fragmentShaderBarycentric = true;
-@@ -631,11 +662,26 @@
+@@ -631,11 +665,26 @@
  				presentWait2Features->presentWait2 = true;
  				break;
  			}
@@ -13468,7 +13892,7 @@ index 359f8a2b..d44f07ba 100644
  				break;
  			}
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR: {
-@@ -650,6 +696,20 @@
+@@ -650,6 +699,20 @@
  				shaderReconvergenceFeatures->shaderMaximalReconvergence = _metalFeatures.maximalReconvergence;
  				break;
  			}
@@ -13489,7 +13913,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR: {
  				auto* shaderQuadControlFeatures = (VkPhysicalDeviceShaderQuadControlFeaturesKHR*)next;
  				shaderQuadControlFeatures->shaderQuadControl = _metalFeatures.quadControlFlow && _metalFeatures.quadPermute;
-@@ -677,6 +737,19 @@
+@@ -677,6 +740,19 @@
  				formatFeatures->formatA4B4G4R4 = canSupport4444;
  				break;
  			}
@@ -13509,7 +13933,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT: {
  				auto* depthFeatures = (VkPhysicalDeviceDepthClipControlFeaturesEXT*)next;
  				depthFeatures->depthClipControl = true;
-@@ -752,6 +825,16 @@
+@@ -752,6 +828,16 @@
  				legacyDitheringFeatures->legacyDithering = getMVKConfig().useMetalPrivateAPI;
  				break;
  			}
@@ -13526,7 +13950,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT: {
  				auto* multiDrawFeatures = (VkPhysicalDeviceMultiDrawFeaturesEXT*)next;
  				multiDrawFeatures->multiDraw = true;
-@@ -811,6 +894,14 @@
+@@ -811,6 +897,14 @@
  				ycbcr2Plane444Features->ycbcr2plane444Formats = true;
  				break;
  			}
@@ -13541,9 +13965,19 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_FUNCTIONS_2_FEATURES_INTEL: {
  				auto* shaderIntFuncsFeatures = (VkPhysicalDeviceShaderIntegerFunctions2FeaturesINTEL*)next;
  				shaderIntFuncsFeatures->shaderIntegerFunctions2 = true;
-@@ -860,16 +951,18 @@
+@@ -859,17 +953,28 @@
+ 	supportedProps12.driverID = VK_DRIVER_ID_MOLTENVK;
  	strcpy(supportedProps12.driverName, kMVKMoltenVKDriverLayerName);
  	strcpy(supportedProps12.driverInfo, MVK_VERSION_STRING);
++	// MetalSharp: the MetalFX scalers of mvk_metalfx.h
++	if ([MTLFXTemporalScalerDescriptor supportsDevice: _mtlDevice] && [MTLFXSpatialScalerDescriptor supportsDevice: _mtlDevice]) {
++		strlcat(supportedProps12.driverInfo, " " VK_MVK_METALFX_DRIVER_INFO, VK_MAX_DRIVER_INFO_SIZE);
++		if (@available(macOS 26.0, iOS 26.0, *)) {
++			if ([MTLFXTemporalDenoisedScalerDescriptor supportsDevice: _mtlDevice]) {
++				strlcat(supportedProps12.driverInfo, " " VK_MVK_METALFX_DENOISED_DRIVER_INFO, VK_MAX_DRIVER_INFO_SIZE);
++			}
++		}
++	}
  	supportedProps12.conformanceVersion = testedCTSVer;
 -	supportedProps12.denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
 +	// Apple GPUs always flush 32-bit denormals and preserve 16-bit ones (measured: arithmetic, conversion and
@@ -13563,7 +13997,7 @@ index 359f8a2b..d44f07ba 100644
  	supportedProps12.shaderDenormFlushToZeroFloat64 = false;
  	supportedProps12.shaderRoundingModeRTEFloat16 = true;
  	supportedProps12.shaderRoundingModeRTEFloat32 = true;
-@@ -906,8 +999,8 @@
+@@ -906,8 +1011,8 @@
  	supportedProps12.supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;	// Metal allows you to set the stencil resolve filter to either Sample0 or the same sample used for depth resolve. This is impossible to express in Vulkan.
  	supportedProps12.independentResolveNone = true;
  	supportedProps12.independentResolve = true;
@@ -13574,7 +14008,7 @@ index 359f8a2b..d44f07ba 100644
  	supportedProps12.maxTimelineSemaphoreValueDifference = std::numeric_limits<uint64_t>::max();
  	supportedProps12.framebufferIntegerColorSampleCounts = _metalFeatures.supportedSampleCounts;
  
-@@ -1284,6 +1377,31 @@
+@@ -1284,6 +1389,31 @@
  				shaderIntDotProperties->integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = supportedProps13.integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated;
  				break;
  			}
@@ -13606,7 +14040,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES: {
  				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorProperties*)next;
  				divisorProps->maxVertexAttribDivisor = supportedProps14.maxVertexAttribDivisor;
-@@ -1311,6 +1429,43 @@
+@@ -1311,6 +1441,43 @@
  				nestedCmdBuffProps->maxCommandBufferNestingLevel = std::numeric_limits<uint32_t>::max();
  				break;
  			}
@@ -13650,7 +14084,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
  				auto* multiDrawProps = (VkPhysicalDeviceMultiDrawPropertiesEXT*)next;
  				// Each draw is encoded as a separate command, so no limit is imposed.
-@@ -1340,6 +1495,53 @@
+@@ -1340,6 +1507,53 @@
  				sampLocnProps->variableSampleLocations = true;
  				break;
  			}
@@ -13704,7 +14138,7 @@ index 359f8a2b..d44f07ba 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT: {
  				// VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT is different than the promoted VkPhysicalDeviceVertexAttributeDivisorProperties.
  				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*)next;
-@@ -1588,6 +1790,13 @@
+@@ -1588,6 +1802,13 @@
  	const auto placementHeapFlags = VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT |
  	                                VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
  	                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
@@ -13718,7 +14152,7 @@ index 359f8a2b..d44f07ba 100644
  	if (!_metalFeatures.placementHeaps && mvkIsAnyFlagEnabled(flags, placementHeapFlags)) {
  		return VK_ERROR_FORMAT_NOT_SUPPORTED;
  	}
-@@ -1742,7 +1951,7 @@
+@@ -1742,7 +1963,7 @@
  	pImageFormatProperties->maxExtent = maxExt;
  	pImageFormatProperties->maxMipLevels = maxLevels;
  	pImageFormatProperties->maxArrayLayers = maxLayers;
@@ -13727,7 +14161,7 @@ index 359f8a2b..d44f07ba 100644
  	pImageFormatProperties->maxResourceSize = kMVKUndefinedLargeUInt64;
  
  	return VK_SUCCESS;
-@@ -2242,24 +2451,26 @@
+@@ -2242,24 +2463,26 @@
  		qfProps.queueCount = kMVKQueueCountPerQueueFamily;
  		qfProps.timestampValidBits = 64;
  		qfProps.minImageTransferGranularity = { 1, 1, 1};
@@ -13758,7 +14192,7 @@ index 359f8a2b..d44f07ba 100644
  			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
  		}
  
-@@ -2569,8 +2780,10 @@
+@@ -2569,8 +2792,10 @@
  		_metalFeatures.subgroupUniformControlFlow = true;
  		_metalFeatures.maximalReconvergence = true;
  
@@ -13771,7 +14205,7 @@ index 359f8a2b..d44f07ba 100644
  
  		// Don't use barriers in render passes on Apple GPUs. Apple GPUs don't support them,
  		// and in fact Metal's validation layer will complain if you try to use them.
-@@ -2668,6 +2881,15 @@
+@@ -2668,6 +2893,15 @@
  	_metalFeatures.programmableSamplePositions = _mtlDevice.areProgrammableSamplePositionsSupported;
  	_metalFeatures.rasterOrderGroups = _mtlDevice.areRasterOrderGroupsSupported;
  	_metalFeatures.pullModelInterpolation = _mtlDevice.supportsPullModelInterpolation;
@@ -13787,7 +14221,7 @@ index 359f8a2b..d44f07ba 100644
  
  	// Both current and deprecated properties are retrieved and OR'd together, due to a
  	// Metal bug that, in some environments, returned true for one and false for the other.
-@@ -2712,8 +2934,9 @@
+@@ -2712,8 +2946,9 @@
                  break;
              case kAppleVendorId:
                  _metalFeatures.maxSubgroupSize = 32;
@@ -13799,7 +14233,7 @@ index 359f8a2b..d44f07ba 100644
                  break;
              default:
                  // Apply a sane default.
-@@ -2726,6 +2949,9 @@
+@@ -2726,6 +2961,9 @@
  
  	// Argument buffers
  	_metalFeatures.argumentBuffersTier = _mtlDevice.argumentBuffersSupport;
@@ -13809,7 +14243,7 @@ index 359f8a2b..d44f07ba 100644
  
  	// Metal argument buffer support for descriptor sets is supported on macOS 11.0 or later,
  	// or on older versions of macOS using an Intel GPU, or on iOS & tvOS 16.0 or later (Metal 3).
-@@ -2738,6 +2964,8 @@
+@@ -2738,6 +2976,8 @@
  													_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  
  	_isUsingMetalArgumentBuffers = _metalFeatures.descriptorSetArgumentBuffers && getMVKConfig().useMetalArgumentBuffers;
@@ -13818,7 +14252,7 @@ index 359f8a2b..d44f07ba 100644
  
  #define checkSupportsMTLCounterSamplingPoint(mtlSP, mvkSP)  \
  	if ([_mtlDevice supportsCounterSampling: MTLCounterSamplingPointAt ##mtlSP ##Boundary]) {  \
-@@ -2787,6 +3015,74 @@
+@@ -2787,6 +3027,74 @@
  	_metalFeatures.renderWithoutAttachments = true;
  }
  
@@ -13893,7 +14327,7 @@ index 359f8a2b..d44f07ba 100644
  bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
  	return _isUsingMetalArgumentBuffers && (_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  }
-@@ -2794,12 +3090,13 @@
+@@ -2794,12 +3102,13 @@
  // Initializes the physical device features of this instance.
  void MVKPhysicalDevice::initFeatures() {
  	mvkClear(&_features);	// Start with everything cleared
@@ -13908,7 +14342,7 @@ index 359f8a2b..d44f07ba 100644
      _features.depthBiasClamp = true;
      _features.fillModeNonSolid = true;
      _features.largePoints = true;
-@@ -2808,16 +3105,34 @@
+@@ -2808,16 +3117,34 @@
      _features.samplerAnisotropy = true;
      _features.shaderImageGatherExtended = true;
      _features.shaderStorageImageExtendedFormats = true;
@@ -13943,7 +14377,7 @@ index 359f8a2b..d44f07ba 100644
  
  	_features.shaderSampledImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
  	_features.textureCompressionBC = _gpuCapabilities.supportsBCTextureCompression;
-@@ -2828,7 +3143,7 @@
+@@ -2828,7 +3155,7 @@
      _features.depthClamp = true;
  
      _features.shaderStorageImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
@@ -13952,7 +14386,7 @@ index 359f8a2b..d44f07ba 100644
  
      if ( supportsMTLGPUFamily(Apple1) ) {
          _features.textureCompressionETC2 = true;
-@@ -2869,7 +3184,7 @@
+@@ -2869,7 +3196,7 @@
  	_vulkan12NoExtFeatures.samplerMirrorClampToEdge = _metalFeatures.samplerMirrorClampToEdge;
  	_vulkan12NoExtFeatures.drawIndirectCount = _metalFeatures.indirectDrawing;
  	_vulkan12NoExtFeatures.descriptorIndexing = _metalFeatures.arrayOfTextures && _metalFeatures.arrayOfSamplers;
@@ -13961,7 +14395,7 @@ index 359f8a2b..d44f07ba 100644
  	_vulkan12NoExtFeatures.shaderOutputViewportIndex = _features.multiViewport;
  	_vulkan12NoExtFeatures.shaderOutputLayer = _metalFeatures.layeredRendering;
  	_vulkan12NoExtFeatures.subgroupBroadcastDynamicId = _metalFeatures.simdPermute || _metalFeatures.quadPermute;
-@@ -2919,7 +3234,7 @@
+@@ -2919,7 +3246,7 @@
  	_properties.limits.maxSamplerAnisotropy = 16;
  
      _properties.limits.maxVertexInputAttributes = 31;
@@ -13970,7 +14404,7 @@ index 359f8a2b..d44f07ba 100644
  
      _properties.limits.maxVertexInputBindingStride = supportsMTLGPUFamily(Apple2) ? kMVKUndefinedLargeUInt32 : (4 * KIBI);
  	_properties.limits.maxVertexInputAttributeOffset = _properties.limits.maxVertexInputBindingStride - 1;
-@@ -2931,6 +3246,14 @@
+@@ -2931,6 +3258,14 @@
  	_properties.limits.maxPerStageDescriptorStorageImages = _metalFeatures.maxPerStageStorageTextureCount;
  	_properties.limits.maxPerStageDescriptorInputAttachments = _metalFeatures.maxPerStageTextureCount;
  
@@ -13985,7 +14419,7 @@ index 359f8a2b..d44f07ba 100644
      _properties.limits.maxPerStageResources = (_metalFeatures.maxPerStageBufferCount + _metalFeatures.maxPerStageTextureCount);
      _properties.limits.maxFragmentCombinedOutputResources = _properties.limits.maxPerStageResources;
  
-@@ -2944,7 +3267,7 @@
+@@ -2944,7 +3279,7 @@
  	_properties.limits.maxDescriptorSetInputAttachments = (_properties.limits.maxPerStageDescriptorInputAttachments * 5);
  
  	_properties.limits.maxClipDistances = 8;	// Per Apple engineers.
@@ -13994,7 +14428,7 @@ index 359f8a2b..d44f07ba 100644
  	_properties.limits.maxCombinedClipAndCullDistances = max(_properties.limits.maxClipDistances,
  															 _properties.limits.maxCullDistances);  // If supported, these consume the same slots.
  
-@@ -3143,13 +3466,21 @@
+@@ -3143,13 +3478,21 @@
  
      // Unsupported features - set to zeros generally
  
@@ -14022,7 +14456,7 @@ index 359f8a2b..d44f07ba 100644
  }
  
  #if MVK_MACOS
-@@ -3288,6 +3619,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3288,6 +3631,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  #endif	//MVK_MACOS
  
@@ -14042,7 +14476,7 @@ index 359f8a2b..d44f07ba 100644
  // Since this is a uint8_t array, use Big-Endian byte ordering,
  // so a hex dump of the array is human readable in its parts.
  void MVKPhysicalDevice::initPipelineCacheUUID() {
-@@ -3299,8 +3643,14 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3299,8 +3655,14 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  	// First 4 bytes contains MoltenVK revision.
  	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
@@ -14057,7 +14491,7 @@ index 359f8a2b..d44f07ba 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -3313,8 +3663,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3313,8 +3675,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// might affect the contents of the pipeline cache (mostly MSL content).
  	uint32_t mtlFeatures = 0;
  	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
@@ -14077,7 +14511,7 @@ index 359f8a2b..d44f07ba 100644
  }
  
  // Combine OS major (8 bits), OS minor (8 bits), Mac GPU family (8 bits), and
-@@ -3545,6 +3906,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3545,6 +3918,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -14100,7 +14534,7 @@ index 359f8a2b..d44f07ba 100644
  void MVKPhysicalDevice::initExtensions() {
  	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
  	pWritableExtns->disableAllButEnabledDeviceExtensions();
-@@ -3555,6 +3932,18 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3555,6 +3944,18 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.maximalReconvergence) {
  		pWritableExtns->vk_KHR_shader_maximal_reconvergence.enabled = false;
  	}
@@ -14119,7 +14553,7 @@ index 359f8a2b..d44f07ba 100644
  	if (!_metalFeatures.quadControlFlow || !_metalFeatures.quadPermute) {
  		pWritableExtns->vk_KHR_shader_quad_control.enabled = false;
  	}
-@@ -3592,15 +3981,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3592,15 +3993,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.placementHeaps) {
  		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
  	}
@@ -14151,7 +14585,7 @@ index 359f8a2b..d44f07ba 100644
  
  	if (!_gpuCapabilities.isAppleGPU) {
  		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
-@@ -4034,6 +4438,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4034,6 +4450,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  			maxVarDescCount = mtlFeats.maxPerStageBufferCount - mtlBuffCnt;
  			break;
@@ -14161,7 +14595,7 @@ index 359f8a2b..d44f07ba 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			maxVarDescCount = (uint32_t)min<VkDeviceSize>(mtlFeats.maxMTLBufferSize, numeric_limits<uint32_t>::max());
  			break;
-@@ -4045,7 +4452,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4045,7 +4464,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
  		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
  				maxVarDescCount = min(mtlFeats.maxPerStageTextureCount - mtlTexCnt,
@@ -14170,7 +14604,7 @@ index 359f8a2b..d44f07ba 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4185,12 +4592,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4185,12 +4604,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKBuffer* MVKDevice::createBuffer(const VkBufferCreateInfo* pCreateInfo,
  								   const VkAllocationCallbacks* pAllocator) {
@@ -14189,7 +14623,7 @@ index 359f8a2b..d44f07ba 100644
  	removeBuffer(mvkBuff);
  	mvkBuff->destroy();
  }
-@@ -4221,12 +4633,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4221,12 +4645,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
      MVKImage* mvkImg = (swapchainInfo)
          ? new MVKPeerSwapchainImage(this, pCreateInfo, (MVKSwapchain*)swapchainInfo->swapchain, uint32_t(-1))
          : new MVKImage(this, pCreateInfo);
@@ -14207,7 +14641,7 @@ index 359f8a2b..d44f07ba 100644
  	removeImage(mvkImg);
  	mvkImg->destroy();
  }
-@@ -4355,8 +4772,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,8 +4784,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -14223,7 +14657,7 @@ index 359f8a2b..d44f07ba 100644
  			default:
  				return new MVKUnsupportedQueryPool(this, pCreateInfo);
  		}
-@@ -4398,6 +4822,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4398,6 +4834,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -14269,7 +14703,7 @@ index 359f8a2b..d44f07ba 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +4927,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +4939,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -14282,7 +14716,7 @@ index 359f8a2b..d44f07ba 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4567,16 +5036,68 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4567,16 +5048,68 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKDeviceMemory* MVKDevice::allocateMemory(const VkMemoryAllocateInfo* pAllocateInfo,
  										   const VkAllocationCallbacks* pAllocator) {
@@ -14353,7 +14787,7 @@ index 359f8a2b..d44f07ba 100644
  VkResult MVKDevice::createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  										  const VkAllocationCallbacks* pAllocator,
  										  VkPrivateDataSlot* pPrivateDataSlot) {
-@@ -4629,6 +5150,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +5162,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -14363,7 +14797,7 @@ index 359f8a2b..d44f07ba 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5164,350 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5176,350 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -14620,7 +15054,9 @@ index 359f8a2b..d44f07ba 100644
 +}
 +
 +void MVKDevice::addGPUAddressableAccelerationStructure(MVKAccelerationStructure* accelerationStructure) {
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	_gpuAddressableAccelerationStructures.push_back(accelerationStructure);
 +}
 +
@@ -14658,9 +15094,7 @@ index 359f8a2b..d44f07ba 100644
 +}
 +
 +MVKBuffer* MVKDevice::getBufferAtAddress(VkDeviceAddress address, VkDeviceSize& offset, VkDeviceSize requiredSize) {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	for (;;) {
 +		if (_gpuAddressableBufferIndexDirty) {
 +			_gpuAddressableBufferIndex.clear();
@@ -14717,7 +15151,7 @@ index 359f8a2b..d44f07ba 100644
  	}
  }
  
-@@ -4696,6 +5556,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4696,6 +5568,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  								   MVKCommandUse cmdUse) {
  	if (!mvkIsAnyFlagEnabled(barrier.dstStageMask, VK_PIPELINE_STAGE_HOST_BIT) ||
  		!mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT) ) { return; }
@@ -14726,7 +15160,7 @@ index 359f8a2b..d44f07ba 100644
  	lock_guard<mutex> lock(_rezLock);
  	for (auto& rez : _resources) {
  		rez->applyMemoryBarrier(barrier, cmdEncoder, cmdUse);
-@@ -4841,6 +5703,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4841,6 +5715,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -14734,7 +15168,7 @@ index 359f8a2b..d44f07ba 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4917,11 +5780,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,11 +5792,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		// typically have stricter alignment requirements due to it being a 2-component format.
  		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
  	}
@@ -14781,7 +15215,7 @@ index 359f8a2b..d44f07ba 100644
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
-@@ -4967,6 +5864,93 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +5876,93 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -14875,7 +15309,7 @@ index 359f8a2b..d44f07ba 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +5972,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +5984,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -14904,7 +15338,7 @@ index 359f8a2b..d44f07ba 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,17 +5994,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,17 +6006,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -14935,7 +15369,7 @@ index 359f8a2b..d44f07ba 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6250,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6262,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -15213,7 +15647,7 @@ index 359f8a2b..d44f07ba 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6532,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6544,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -15226,16 +15660,46 @@ index 359f8a2b..d44f07ba 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5576,6 +6845,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +6856,38 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	}
  }
  
++id MVKDevice::getMetalFXScaler(uint64_t scalerId, const std::vector<uint32_t>& key, id<MTLFence>* pFence, id (^make)(void)) {
++	lock_guard<mutex> lock(_metalFXScalersLock);
++	auto& entry = _metalFXScalers[scalerId];
++	if ( !entry.scaler || entry.key != key ) {
++		[entry.scaler release];
++		entry.scaler = make();	// retained
++		entry.key = key;
++		if ( !entry.fence ) { entry.fence = [_physicalDevice->getMTLDevice() newFence]; }	// retained
++	}
++	*pFence = entry.fence;
++	return [entry.scaler retain];
++}
++
++void MVKDevice::releaseMetalFXScalers(const uint64_t* scalerIds, uint32_t count) {
++	lock_guard<mutex> lock(_metalFXScalersLock);
++	for (uint32_t i = 0; i < count; i++) {
++		auto found = _metalFXScalers.find(scalerIds[i]);
++		if (found == _metalFXScalers.end()) { continue; }
++		[found->second.scaler release];
++		[found->second.fence release];
++		_metalFXScalers.erase(found);
++	}
++}
++
  MVKDevice::~MVKDevice() {
++	for (auto& entry : _metalFXScalers) {
++		[entry.second.scaler release];
++		[entry.second.fence release];
++	}
++	_metalFXScalers.clear();
 +	for (auto icb : _dgcFreeICBs) { [icb release]; }
 +	_dgcFreeICBs.clear();
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +6862,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +6903,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
@@ -15551,7 +16015,7 @@ index 00b182b8..81934068 100644
  	_mtlHeap = nil;
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-index 45ddd3a4..54ff7a75 100644
+index 45ddd3a4..a611fb05 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 @@ -152,6 +152,19 @@ protected:
@@ -15617,7 +16081,15 @@ index 45ddd3a4..54ff7a75 100644
  	bool _hasExtendedUsage;
  	bool _hasMutableFormat;
  	bool _shouldSupportAtomics;
-@@ -570,6 +605,9 @@ protected:
+@@ -508,6 +543,7 @@ protected:
+ 
+ 	id<CAMetalDrawable> _mtlDrawable = nil;
+ 	id<MTLTexture> _mtlTextureHeadless = nil;
++	id<MTLTexture> _mtlTextureMetalFX = nil;	// MetalSharp: the image of a MetalFX-upscaled swapchain
+ 	MVKSwapchainImageAvailability _availability;
+ 	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
+ 	MVKSwapchainSignaler _preSignaler = {};
+@@ -570,6 +606,9 @@ protected:
      friend MVKImageView;
      MVKImageView* _imageView;
  	id<MTLTexture> _mtlTexture;
@@ -15627,7 +16099,7 @@ index 45ddd3a4..54ff7a75 100644
  	VkComponentMapping _componentSwizzle;
      MTLPixelFormat _mtlPixFmt;
  	uint8_t _planeIndex;
-@@ -733,6 +771,12 @@ public:
+@@ -733,6 +772,12 @@ public:
  	/** Returns whether this sampler must be implemented as a hardcoded constant sampler in the shader MSL code. */
  	inline 	bool getRequiresConstExprSampler() { return _requiresConstExprSampler; }
  
@@ -15640,7 +16112,7 @@ index 45ddd3a4..54ff7a75 100644
  	/** Returns the Metal MTLSamplerAddressMode corresponding to the specified Vulkan VkSamplerAddressMode. */
  	MTLSamplerAddressMode getMTLSamplerAddressMode(VkSamplerAddressMode vkMode);
  
-@@ -751,5 +795,6 @@ protected:
+@@ -751,5 +796,6 @@ protected:
  	id<MTLSamplerState> _mtlSamplerState;
  	SPIRV_CROSS_NAMESPACE::MSLConstexprSampler _constExprSampler;
  	MVKSamplerYcbcrConversion* _ycbcrConversion;
@@ -15648,7 +16120,7 @@ index 45ddd3a4..54ff7a75 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..1c24596b 100644
+index 2b394922..80f39421 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -15903,7 +16375,23 @@ index 2b394922..1c24596b 100644
  				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
  				if (hasInvalidFormat) { releaseMetalDrawable(); }
  			}
-@@ -1656,7 +1840,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1641,6 +1825,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
+ id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
++	if (_mtlTextureMetalFX) { return _mtlTextureMetalFX; }	// MetalSharp: upscaled into the drawable at present
+ 	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
+ }
+ 
+@@ -1649,6 +1834,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+ 															  MVKImagePresentInfo presentInfo) {
+ 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
++	if (_mtlTextureMetalFX) { _swapchain->encodeMetalFXSpatialScale(_mtlTextureMetalFX, getCAMetalDrawable(), mtlCmdBuff); }
+ 
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+ 	// MTLCommandBuffer scheduled-handler than it is to call MTLCommandBuffer presentDrawable:.
+@@ -1656,7 +1842,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// Attach present handler before presenting to avoid race condition.
  	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
  	MVKSwapchainSignaler signaler = getPresentationSignaler();
@@ -15915,7 +16403,7 @@ index 2b394922..1c24596b 100644
  
  		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
  
-@@ -1751,6 +1939,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1751,6 +1941,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// time will not be available if the presentation did not actually happen, such as when
  	// running headless, or on a test harness that is not attached to the windowing system.
  	if (actualPresentTime == 0) { actualPresentTime = mvkGetRuntimeNanoseconds(); }
@@ -15931,7 +16419,37 @@ index 2b394922..1c24596b 100644
  
  	{	// Scope to avoid deadlock if release() is run within detachment lock
  		// If I have become detached from the swapchain, it means the swapchain, and possibly the
-@@ -1903,6 +2100,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1811,6 +2010,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ 			_mtlTextureHeadless = [[getMTLDevice() newTextureWithDescriptor: mtlTexDesc] retain];	// retained
+ 		}
++	} else if (swapchain->_metalFXSpatialScaler) {
++		@autoreleasepool {
++			MTLTextureDescriptor* mtlTexDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: getMTLPixelFormat()
++																								  width: pCreateInfo->extent.width
++																								 height: pCreateInfo->extent.height
++																							  mipmapped: NO];
++			// MetalFX reads it; the application renders to it, and may write or view it as its usage says
++			MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++			if (mvkIsAnyFlagEnabled(pCreateInfo->usage, VK_IMAGE_USAGE_STORAGE_BIT)) { usage |= MTLTextureUsageShaderWrite; }
++			if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) { usage |= MTLTextureUsagePixelFormatView; }
++			mtlTexDesc.usage = usage;
++			mtlTexDesc.storageMode = MTLStorageModePrivate;
++			_mtlTextureMetalFX = [getMTLDevice() newTextureWithDescriptor: mtlTexDesc];	// retained
++		}
+ 	}
+ }
+ 
+@@ -1819,6 +2032,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	releaseMetalDrawable();
+ 	[_mtlTextureHeadless release];
+ 	_mtlTextureHeadless = nil;
++	[_mtlTextureMetalFX release];
++	_mtlTextureMetalFX = nil;
+ 	MVKSwapchainImage::destroy();
+ }
+ 
+@@ -1903,6 +2118,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
              MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
              initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
@@ -15939,7 +16457,7 @@ index 2b394922..1c24596b 100644
          }
          return _mtlTexture;
      } else {
-@@ -1911,6 +2109,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1911,6 +2127,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  }
  
  bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
@@ -15949,7 +16467,7 @@ index 2b394922..1c24596b 100644
      id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
      if (cachedBaseMTLTexture == mtlTexture) { return true; }
  
-@@ -2202,6 +2403,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2202,6 +2421,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		[tex release];
  		_mtlTexture = nil;
  	}
@@ -15958,7 +16476,7 @@ index 2b394922..1c24596b 100644
  }
  
  MVKImageViewPlane::~MVKImageViewPlane() {
-@@ -2570,6 +2773,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -2570,6 +2791,21 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
@@ -22631,6 +23149,167 @@ index 3aa44a44..ba3579a2 100644
  	[_mtlFunction release];
  }
 -
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
+index 1665b514..d215195a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
+@@ -125,6 +125,8 @@ protected:
+ 	void endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime = 0);
+ 	void notifyPresentComplete(const MVKImagePresentInfo& presentInfo);
+ 	void forceUnpresentedImageCompletion();
++	void initMetalFXSpatialScaler(const VkSwapchainCreateInfoKHR* pCreateInfo);
++	void encodeMetalFXSpatialScale(id<MTLTexture> mtlTexture, id<CAMetalDrawable> mtlDrawable, id<MTLCommandBuffer> mtlCmdBuff);
+ 
+ 	MVKSurface* _surface = nullptr;
+     MVKWatermark* _licenseWatermark = nullptr;
+@@ -145,4 +147,11 @@ protected:
+ 	uint32_t _presentHistoryIndex = 0;
+ 	uint32_t _presentHistoryHeadIndex = 0;
+ 	bool _isDeliberatelyScaled = false;
++
++	// MetalSharp: MetalFX spatial upscaling at present (VkSwapchainMetalFXSpatialCreateInfoMVK). The images are
++	// textures of their own, which the scaler upscales into _metalFXOutput, the drawable's size, copied to the drawable.
++	id _metalFXSpatialScaler = nil;
++	id<MTLTexture> _metalFXOutput = nil;
++	VkExtent2D _metalFXOutputExtent = {0, 0};
++	VkExtent2D _metalFXSurfaceExtent = {0, 0};	// the surface's natural extent when the scaler was made
+ };
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+index 4c908669..358c438e 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+@@ -26,10 +26,12 @@
+ #include "MVKWatermarkTextureContent.h"
+ #include "MVKWatermarkShaderSource.h"
+ #include "mvk_datatypes.hpp"
++#include <MoltenVK/mvk_metalfx.h>
+ #include <libkern/OSByteOrder.h>
+ 
+ #import "CAMetalLayer+MoltenVK.h"
+ #import "MVKBlockObserver.h"
++#import <MetalFX/MetalFX.h>
+ 
+ 
+ using namespace std;
+@@ -130,6 +132,12 @@
+ // swapchain scaling, or if the surface is headless, or if the surface extent has not changed 
+ // since the swapchain was created, and the surface will not need to be scaled when composited.
+ bool MVKSwapchain::hasOptimalSurface() {
++	// Upscaled by MetalFX to the surface's native size: optimal while the surface keeps that size.
++	// Upscaled by MetalFX to the surface's size on screen, measured when it was made: optimal while the surface keeps
++	// the size it had then (a change remeasures it in the swapchain that replaces this one).
++	if (_metalFXSpatialScaler) {
++		return mvkVkExtent2DsAreEqual(_surface->getNaturalExtent(), _metalFXSurfaceExtent);
++	}
+ 	if (_isDeliberatelyScaled || isHeadless()) { return true; }
+ 
+ 	VkExtent2D surfExtent = _surface->getExtent();
+@@ -437,6 +445,7 @@ static inline CIE1931XY VkXYColorEXTToCIE1931XY(VkXYColorEXT xy) {
+ 	uint32_t imgCnt = mvkClamp(pCreateInfo->minImageCount,
+ 							   mtlFeats.minSwapchainImageCount,
+ 							   mtlFeats.maxSwapchainImageCount);
++	initMetalFXSpatialScaler(pCreateInfo);		// Before initCAMetalLayer() and initSurfaceImages()
+ 	initCAMetalLayer(pCreateInfo, pScalingInfo, imgCnt);
+     initSurfaceImages(pCreateInfo, imgCnt);		// After initCAMetalLayer()
+ }
+@@ -499,7 +508,7 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+ 	}
+ 
+ 	auto minMagFilter = getMVKConfig().swapchainMinMagFilterUseNearest ? kCAFilterNearest : kCAFilterLinear;
+-	mtlLayer.drawableSize = mvkCGSizeFromVkExtent2D(_imageExtent);
++	mtlLayer.drawableSize = mvkCGSizeFromVkExtent2D(_metalFXSpatialScaler ? _metalFXOutputExtent : _imageExtent);
+ 	mtlLayer.device = getMTLDevice();
+ 	mtlLayer.pixelFormat = getPixelFormats()->getMTLPixelFormat(pCreateInfo->imageFormat);
+ 	mtlLayer.maximumDrawableCount = imgCnt;
+@@ -511,7 +520,8 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+ 																			  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+ 																			  VK_IMAGE_USAGE_SAMPLED_BIT |
+ 																			  VK_IMAGE_USAGE_STORAGE_BIT)) &&
+-								!mvkAreAllFlagsEnabled(pCreateInfo->flags, VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR);
++								!mvkAreAllFlagsEnabled(pCreateInfo->flags, VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) &&
++								!_metalFXSpatialScaler;	// MetalFX's output is copied to the drawable
+ 
+ 	if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+ 		mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+@@ -658,5 +668,78 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+ 
+ MVKSwapchain::~MVKSwapchain() {
+     if (_licenseWatermark) { _licenseWatermark->destroy(); }
++	[_metalFXSpatialScaler release];
++	[_metalFXOutput release];
++}
++
++// MetalSharp: a MetalFX spatial scaler from the images' size to the surface's native size, where the swapchain asks
++// for one (VkSwapchainMetalFXSpatialCreateInfoMVK) and the surface is larger than the images.
++void MVKSwapchain::initMetalFXSpatialScaler(const VkSwapchainCreateInfoKHR* pCreateInfo) {
++	bool requested = false;
++	for (auto* next = (const VkBaseInStructure*)pCreateInfo->pNext; next; next = next->pNext) {
++		if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK) {
++			requested = ((const VkSwapchainMetalFXSpatialCreateInfoMVK*)next)->enable;
++		}
++	}
++	if ( !requested || isHeadless() || getIsSurfaceLost() ) { return; }
++
++	// The size the layer is shown at: in native macOS fullscreen at an emulated display mode, Wine keeps the
++	// view at the mode's size and scales it up to the screen, which MetalFX does instead.
++	VkExtent2D output = mvkVkExtent2DFromCGSize(getCAMetalLayer().onScreenDrawableSizeMVK);
++	if (output.width < _imageExtent.width || output.height < _imageExtent.height ||
++		mvkVkExtent2DsAreEqual(output, _imageExtent)) {
++		VkExtent2D natural = _surface->getNaturalExtent();
++		MVKLogInfo("MetalFX: no spatial upscaling of %ux%u images to a %ux%u surface (%ux%u on screen).",
++				   _imageExtent.width, _imageExtent.height, natural.width, natural.height, output.width, output.height);
++		return;
++	}
++
++	MTLPixelFormat format = getPixelFormats()->getMTLPixelFormat(pCreateInfo->imageFormat);
++	@autoreleasepool {
++		MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
++		desc.colorTextureFormat = format;
++		desc.outputTextureFormat = format;
++		desc.inputWidth = _imageExtent.width;
++		desc.inputHeight = _imageExtent.height;
++		desc.outputWidth = output.width;
++		desc.outputHeight = output.height;
++		id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice: getMTLDevice()];	// retained
++		[desc release];
++
++		MTLTextureDescriptor* texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: format
++																						   width: output.width
++																						  height: output.height
++																					   mipmapped: NO];
++		texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
++		texDesc.storageMode = MTLStorageModePrivate;
++		id<MTLTexture> texture = scaler ? [getMTLDevice() newTextureWithDescriptor: texDesc] : nil;	// retained
++		if ( !scaler || !texture ) {
++			[scaler release];
++			MVKLogWarn("MetalFX: no spatial scaler for %ux%u to %ux%u (format %lu); presenting without it.",
++					   _imageExtent.width, _imageExtent.height, output.width, output.height, (unsigned long)format);
++			return;
++		}
++		_metalFXSpatialScaler = scaler;
++		_metalFXOutput = texture;
++		_metalFXOutputExtent = output;
++		_metalFXSurfaceExtent = _surface->getNaturalExtent();
++		MVKLogInfo("MetalFX: spatial upscaling %ux%u to %ux%u.", _imageExtent.width, _imageExtent.height, output.width, output.height);
++	}
++}
++
++// MetalSharp: the image upscaled into the drawable. The presents of a swapchain run in order, which orders the
++// shared output's writes and copies.
++void MVKSwapchain::encodeMetalFXSpatialScale(id<MTLTexture> mtlTexture, id<CAMetalDrawable> mtlDrawable, id<MTLCommandBuffer> mtlCmdBuff) {
++	id<MTLTexture> drawableTexture = mtlDrawable.texture;
++	if ( !drawableTexture || drawableTexture.width != _metalFXOutput.width || drawableTexture.height != _metalFXOutput.height ) { return; }
++	id<MTLFXSpatialScaler> scaler = (id<MTLFXSpatialScaler>)_metalFXSpatialScaler;
++	scaler.colorTexture = mtlTexture;
++	scaler.outputTexture = _metalFXOutput;
++	scaler.inputContentWidth = mtlTexture.width;
++	scaler.inputContentHeight = mtlTexture.height;
++	[scaler encodeToCommandBuffer: mtlCmdBuff];
++	id<MTLBlitCommandEncoder> blit = [mtlCmdBuff blitCommandEncoder];
++	[blit copyFromTexture: _metalFXOutput toTexture: drawableTexture];
++	[blit endEncoding];
+ }
+ 
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSync.h b/MoltenVK/MoltenVK/GPUObjects/MVKSync.h
 index e357299e..36823729 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSync.h
@@ -25568,6 +26247,60 @@ index 00000000..5ceab3f5
 +#ifdef __cplusplus
 +}
 +#endif
+diff --git a/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.h b/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.h
+index b373721d..86c6c7f8 100644
+--- a/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.h
++++ b/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.h
+@@ -39,6 +39,14 @@
+  */
+ @property(nonatomic, readonly) CGSize naturalDrawableSizeMVK;
+ 
++/**
++ * MetalSharp: the size, in pixels, at which the layer is shown on screen: its bounds in its window's
++ * coordinates, scaled by the window's backing scale. Larger than the natural drawable size where a
++ * view or layer above it scales it up (Wine in native macOS fullscreen at an emulated display mode).
++ * The natural drawable size where it is not in a window.
++ */
++@property(nonatomic, readonly) CGSize onScreenDrawableSizeMVK;
++
+ /**
+  * Replacement for the displaySyncEnabled property.
+  *
+diff --git a/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.mm b/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.mm
+index 3ece4876..b7c9982f 100644
+--- a/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.mm
++++ b/MoltenVK/MoltenVK/OS/CAMetalLayer+MoltenVK.mm
+@@ -37,6 +37,30 @@ -(CGSize) naturalDrawableSizeMVK {
+     return drawSize;
+ }
+ 
++-(CGSize) onScreenDrawableSizeMVK {
++	__block CGSize size = self.naturalDrawableSizeMVK;
++#if MVK_MACOS && !MVK_MACCAT
++	mvkDispatchToMainAndWait(^{
++		if ( ![self.delegate isKindOfClass: NSView.class] ) { return; }
++		NSView* view = (NSView*)self.delegate;
++		NSWindow* window = view.window;
++		if ( !window ) { return; }
++		// Through the views (their frames and bounds), and through the layers (their transforms)
++		CGSize inWindow = [view convertRect: view.bounds toView: nil].size;
++		CALayer* contentLayer = window.contentView.layer;
++		if (contentLayer) {
++			CGSize inContent = [self convertRect: self.bounds toLayer: contentLayer].size;
++			inWindow.width = MAX(inWindow.width, inContent.width);
++			inWindow.height = MAX(inWindow.height, inContent.height);
++		}
++		CGFloat scale = window.backingScaleFactor;
++		size.width = MAX(size.width, round(inWindow.width * scale));
++		size.height = MAX(size.height, round(inWindow.height * scale));
++	});
++#endif
++	return size;
++}
++
+ -(BOOL) displaySyncEnabledMVK {
+ #if MVK_MACOS
+     return self.displaySyncEnabled;
 diff --git a/MoltenVK/MoltenVK/OS/MTLRenderPipelineDescriptor+MoltenVK.h b/MoltenVK/MoltenVK/OS/MTLRenderPipelineDescriptor+MoltenVK.h
 index 20365cf3..15e3ea9d 100644
 --- a/MoltenVK/MoltenVK/OS/MTLRenderPipelineDescriptor+MoltenVK.h
@@ -26262,7 +26995,7 @@ index 9ee4db10..e18d611a 100644
          result |= 1 << kMVKBarrierStageCopy;
  
 diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
-index 9ee0c4eb..5a27b2cd 100644
+index 9ee0c4eb..121636ad 100644
 --- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 +++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 @@ -41,6 +41,7 @@
@@ -26528,7 +27261,24 @@ index 9ee0c4eb..5a27b2cd 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -2859,8 +2983,16 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetDeviceImageSparseMemoryRequirements(
+@@ -2616,7 +2740,15 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPipelineBarrier2(
+ 
+ 	MVKTraceVulkanCallStart();
+ 	uint32_t barrierCount = pDependencyInfo->memoryBarrierCount + pDependencyInfo->bufferMemoryBarrierCount + pDependencyInfo->imageMemoryBarrierCount;
+-	MVKAddCmdFrom2Thresholds(PipelineBarrier, barrierCount, 1, 4, commandBuffer, pDependencyInfo);
++	{
++		MVKAddCmdFrom2Thresholds(PipelineBarrier, barrierCount, 1, 4, commandBuffer, pDependencyInfo);
++	}
++	// MetalSharp: a MetalFX scale after the barrier (mvk_metalfx.h)
++	for (auto* next = (const VkBaseInStructure*)pDependencyInfo->pNext; next; next = next->pNext) {
++		if (next->sType == VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK) {
++			MVKAddCmd(MetalFXScale, commandBuffer, (const VkMetalFXScaleInfoMVK*)next);
++		}
++	}
+ 	MVKTraceVulkanCallEnd();
+ }
+ 
+@@ -2859,8 +2991,16 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetDeviceImageSparseMemoryRequirements(
  	VkSparseImageMemoryRequirements2*           pSparseMemoryRequirements) {
  	
  	MVKTraceVulkanCallStart();
@@ -26547,7 +27297,7 @@ index 9ee0c4eb..5a27b2cd 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -2967,6 +3099,14 @@ MVK_PUBLIC_VULKAN_SYMBOL void  vkGetDeviceImageSubresourceLayout(
+@@ -2967,6 +3107,14 @@ MVK_PUBLIC_VULKAN_SYMBOL void  vkGetDeviceImageSubresourceLayout(
  	MVKTraceVulkanCallEnd();
  }
  
@@ -26562,7 +27312,7 @@ index 9ee0c4eb..5a27b2cd 100644
  MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
      VkCommandBuffer                             commandBuffer,
      const VkBindDescriptorSetsInfo*             pBindDescriptorSetsInfo) {
-@@ -2975,7 +3115,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
+@@ -2975,7 +3123,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
  	// If stageFlags specifies a subset of all stages corresponding to one or more pipeline bind points,
  	// the binding operation still affects all stages corresponding to the given pipeline bind point(s)
  	// as if the equivalent original version of this command had been called with the same parameters.
@@ -26571,7 +27321,7 @@ index 9ee0c4eb..5a27b2cd 100644
  		if (pBindDescriptorSetsInfo->dynamicOffsetCount) {
  			MVKAddCmdFromThreshold(BindDescriptorSetsDynamic, pBindDescriptorSetsInfo->descriptorSetCount, 4, commandBuffer,
  					VK_PIPELINE_BIND_POINT_GRAPHICS, pBindDescriptorSetsInfo->layout, pBindDescriptorSetsInfo->firstSet,
-@@ -2999,6 +3139,18 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
+@@ -2999,6 +3147,18 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindDescriptorSets2(
  					pBindDescriptorSetsInfo->descriptorSetCount, pBindDescriptorSetsInfo->pDescriptorSets);
  		}
  	}
@@ -26590,7 +27340,7 @@ index 9ee0c4eb..5a27b2cd 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -3020,7 +3172,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
+@@ -3020,7 +3180,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
  	// If stageFlags specifies a subset of all stages corresponding to one or more pipeline bind points,
  	// the binding operation still affects all stages corresponding to the given pipeline bind point(s)
  	// as if the equivalent original version of this command had been called with the same parameters.
@@ -26599,7 +27349,7 @@ index 9ee0c4eb..5a27b2cd 100644
  		MVKAddCmd(PushDescriptorSet, commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pPushDescriptorSetInfo->layout,
  				pPushDescriptorSetInfo->set, pPushDescriptorSetInfo->descriptorWriteCount, pPushDescriptorSetInfo->pDescriptorWrites);
  	}
-@@ -3028,6 +3180,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
+@@ -3028,6 +3188,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdPushDescriptorSet2(
  		MVKAddCmd(PushDescriptorSet, commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pPushDescriptorSetInfo->layout,
  				pPushDescriptorSetInfo->set, pPushDescriptorSetInfo->descriptorWriteCount, pPushDescriptorSetInfo->pDescriptorWrites);
  	}
@@ -26610,7 +27360,7 @@ index 9ee0c4eb..5a27b2cd 100644
  	MVKTraceVulkanCallEnd();
  }
  
-@@ -3160,6 +3316,214 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRenderingInputAttachmentIndices(
+@@ -3160,6 +3324,214 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRenderingInputAttachmentIndices(
  }
  
  
@@ -26825,7 +27575,7 @@ index 9ee0c4eb..5a27b2cd 100644
  #pragma mark -
  #pragma mark VK_KHR_bind_memory2 extension
  
-@@ -3562,6 +3926,8 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueuePresentKHR(
+@@ -3562,6 +3934,8 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueuePresentKHR(
      const VkPresentInfoKHR*                      pPresentInfo) {
  
  	MVKTraceVulkanCallStart();
@@ -26834,7 +27584,7 @@ index 9ee0c4eb..5a27b2cd 100644
      MVKQueue* mvkQ = MVKQueue::getMVKQueue(queue);
      VkResult rslt = mvkQ->submit(pPresentInfo);
  	MVKTraceVulkanCallEnd();
-@@ -4297,6 +4663,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
+@@ -4297,6 +4671,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkCmdSetLineStipple, EXT);
  
  
@@ -26882,7 +27632,7 @@ index 9ee0c4eb..5a27b2cd 100644
  #pragma mark -
  #pragma mark VK_EXT_multi_draw extension
  
-@@ -4383,7 +4790,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkExportMetalObjectsEXT(
+@@ -4383,7 +4798,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkExportMetalObjectsEXT(
  #pragma mark -
  #pragma mark VK_EXT_sample_locations extension
  
@@ -26891,7 +27641,7 @@ index 9ee0c4eb..5a27b2cd 100644
  	VkPhysicalDevice                            physicalDevice,
  	VkSampleCountFlagBits                       samples,
  	VkMultisamplePropertiesEXT*                 pMultisampleProperties) {
-@@ -4394,7 +4801,7 @@ void vkGetPhysicalDeviceMultisamplePropertiesEXT(
+@@ -4394,7 +4809,7 @@ void vkGetPhysicalDeviceMultisamplePropertiesEXT(
  	MVKTraceVulkanCallEnd();
  }
  
@@ -26900,7 +27650,7 @@ index 9ee0c4eb..5a27b2cd 100644
  	VkCommandBuffer                             commandBuffer,
  	const VkSampleLocationsInfoEXT*             pSampleLocationsInfo) {
  
-@@ -4409,6 +4816,162 @@ void vkCmdSetSampleLocationsEXT(
+@@ -4409,6 +4824,162 @@ void vkCmdSetSampleLocationsEXT(
  
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkGetPhysicalDeviceToolProperties, EXT);
  
@@ -27063,7 +27813,7 @@ index 9ee0c4eb..5a27b2cd 100644
  
  #pragma mark -
  #pragma mark VK_GOOGLE_display_timing extension
-@@ -4439,6 +5002,41 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPastPresentationTimingGOOGLE(
+@@ -4439,6 +5010,41 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPastPresentationTimingGOOGLE(
  }
  
  

@@ -1,0 +1,148 @@
+From 4222baf11fa63735fe275402b024211f1f7cdb3b Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sun, 1 Nov 2026 17:04:01 -0700
+Subject: [PATCH 3/3] MetalSharp: DXGI sets up DLSS for this lane's NGX core,
+ without Mullion's NVEXT query
+
+---
+ src/dxgi/dxgi_main.cpp          |  4 ----
+ src/dxgi/dxgi_ngx.cpp           | 28 ++++------------------------
+ src/dxgi/dxgi_ngx.h             | 19 +++++--------------
+ src/dxgi/dxgi_ngx_certificate.h |  7 ++++---
+ 4 files changed, 13 insertions(+), 45 deletions(-)
+
+diff --git a/src/dxgi/dxgi_main.cpp b/src/dxgi/dxgi_main.cpp
+index bcdac5f..438545c 100644
+--- a/src/dxgi/dxgi_main.cpp
++++ b/src/dxgi/dxgi_main.cpp
+@@ -51,10 +51,6 @@ extern "C" {
+   DLLEXPORT HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid, void **ppDebug) {
+     static bool errorShown = false;
+ 
+-    // MetalSharp: Mullion's NGX core and NVAPI ask whether the program is shown an NVIDIA GPU
+-    if (dxvk::IsNvidiaExtensionQuery(riid))
+-      return dxvk::NvidiaExtensionEnabled() ? S_OK : E_NOINTERFACE;
+-
+     if (!std::exchange(errorShown, true))
+       dxvk::Logger::warn("DXGIGetDebugInterface1: Stub");
+ 
+diff --git a/src/dxgi/dxgi_ngx.cpp b/src/dxgi/dxgi_ngx.cpp
+index a0be706..0a4ca58 100644
+--- a/src/dxgi/dxgi_ngx.cpp
++++ b/src/dxgi/dxgi_ngx.cpp
+@@ -11,19 +11,10 @@
+ 
+ namespace dxvk {
+ 
+-  /* ba0af616-4a43-4259-815c-db3b89829905 (Mullion's src/dxgi/dxgi_interfaces.h) */
+-  static const GUID MullionNvextGuid = {0xba0af616, 0x4a43, 0x4259, {0x81, 0x5c, 0xdb, 0x3b, 0x89, 0x82, 0x99, 0x05}};
+-
+   static std::once_flag s_nvextInit;
+-  static bool s_nvextEnabled = false;
+ 
+ 
+   static bool NvidiaExtensionRequested() {
+-    std::string env = env::getEnvVar("MULLION_ENABLE_NVEXT");
+-
+-    if (env == "1" || env == "0")
+-      return env == "1";
+-
+     std::string vendor = Config::getUserConfig().getOption<std::string>("dxgi.customVendorId", "");
+     std::transform(vendor.begin(), vendor.end(), vendor.begin(), [] (unsigned char c) { return std::tolower(c); });
+     return vendor == "10de" || vendor == "0x10de";
+@@ -49,7 +40,7 @@ namespace dxvk {
+     if (open && add && close) {
+       if (void* store = open(reinterpret_cast<LPCSTR>(10), 0, 0, 2 << 16, L"Root")) {
+         if (!add(store, 1, mullion_ngx_certificate, sizeof(mullion_ngx_certificate), 2, nullptr))
+-          Logger::warn("NVEXT: Failed to trust the NGX core's certificate");
++          Logger::warn("DLSS: Failed to trust the NGX core's certificate");
+         close(store, 0);
+       }
+     }
+@@ -59,8 +50,8 @@ namespace dxvk {
+ 
+ 
+   // The NVIDIA driver's registry values NGX looks for its core with: NVIDIA Corporation\Global\NGXCore FullPath
+-  // and nvlddmkm\NGXCore NGXPath, System32, where Mullion's signed nvngx.dll is. A process without NVEXT leaves
+-  // them as they are: they are the prefix's.
++  // and nvlddmkm\NGXCore NGXPath, System32, whose nvngx.dll Wine loads as this lane's. A process not shown an NVIDIA
++  // GPU leaves them as they are: they are the prefix's.
+   static void InitNvidiaExtensionOnce() {
+ #ifndef _WIN64
+     return;
+@@ -97,8 +88,7 @@ namespace dxvk {
+       RegSetValueExW(keys[3], L"NGXPath", 0, REG_SZ, reinterpret_cast<const BYTE*>(folder), size);
+       TrustNgxCertificate();
+ 
+-      Logger::info("Vendor extension enabled: NVEXT");
+-      s_nvextEnabled = true;
++      Logger::info("DLSS: NGX core registered");
+     }
+ 
+     for (uint32_t i = 0; i < 4; i++) {
+@@ -114,14 +104,4 @@ namespace dxvk {
+   }
+ 
+ 
+-  bool IsNvidiaExtensionQuery(REFIID riid) {
+-    return riid == MullionNvextGuid;
+-  }
+-
+-
+-  bool NvidiaExtensionEnabled() {
+-    InitNvidiaExtension();
+-    return s_nvextEnabled;
+-  }
+-
+ }
+diff --git a/src/dxgi/dxgi_ngx.h b/src/dxgi/dxgi_ngx.h
+index 5711635..43ff1d3 100644
+--- a/src/dxgi/dxgi_ngx.h
++++ b/src/dxgi/dxgi_ngx.h
+@@ -5,22 +5,13 @@
+ namespace dxvk {
+ 
+   /**
+-   * \brief MetalSharp: Mullion's NVIDIA extension (NVEXT) on VKD3D-Proton's lane
++   * \brief MetalSharp: DLSS's setup for VKD3D-Proton-MacOS's NGX core
+    *
+-   * Mullion's NGX core (nvngx.dll) and NVAPI (nvapi64.dll) run DLSS on MetalFX
+-   * with VKD3D-Proton's command lists as with Mullion's. They ask DXGI whether
+-   * the program is shown an NVIDIA GPU with DXGIGetDebugInterface1 and Mullion's
+-   * NVEXT GUID; where it is, this DXGI also sets up the NVIDIA driver's registry
+-   * values NGX finds its core by, and trusts the certificate the core is signed
+-   * with in the prefix's Root store, as Mullion's DXGI does.
+-   *
+-   * It is on with MULLION_ENABLE_NVEXT=1, or where the configuration shows the
+-   * program an NVIDIA GPU (dxgi.customVendorId = 10de), unless MULLION_ENABLE_NVEXT=0.
++   * Where the program is shown an NVIDIA GPU (dxgi.customVendorId = 10de), sets
++   * the NVIDIA driver's registry values NGX finds its core by (System32, where
++   * Wine finds this lane's nvngx.dll) and trusts the certificate NGX checks the
++   * core's file in System32 against, in the prefix's Root store.
+    */
+   void InitNvidiaExtension();
+ 
+-  bool IsNvidiaExtensionQuery(REFIID riid);
+-
+-  bool NvidiaExtensionEnabled();
+-
+ }
+diff --git a/src/dxgi/dxgi_ngx_certificate.h b/src/dxgi/dxgi_ngx_certificate.h
+index 90706be..8d78d28 100644
+--- a/src/dxgi/dxgi_ngx_certificate.h
++++ b/src/dxgi/dxgi_ngx_certificate.h
+@@ -1,7 +1,8 @@
+ #pragma once
+-// the certificate Mullion's nvngx.dll is signed with (Mullion's src/nvngx/signing/mullion-ngx.pem, in DER): NGX loads only a core
+-// whose signature chains to a trusted root, so NVEXT adds it to the prefix's Root store
+-// (regenerate with: openssl x509 -in src/nvngx/signing/mullion-ngx.pem -outform der | xxd -i)
++// the certificate the prefix's System32\nvngx.dll is signed with ("Mullion NGX", self-issued): NGX checks that file's
++// signature chains to a trusted root before it loads it, and Wine then loads the core by name (on this lane, this
++// lane's nvngx.dll). The prefix is shared by MetalSharp's lanes, so both trust this certificate.
++// (regenerate with: openssl x509 -in <certificate.pem> -outform der | xxd -i)
+ static const unsigned char mullion_ngx_certificate[] = {
+   0x30, 0x82, 0x04, 0x35, 0x30, 0x82, 0x02, 0x9d, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14, 0x38,
+   0x2a, 0xe9, 0x9c, 0xea, 0x51, 0x3c, 0xe6, 0x92, 0x0e, 0x54, 0x73, 0x62, 0x61, 0x2d, 0x2b, 0x84,
+-- 
+2.54.0 (Apple Git-157)
+
