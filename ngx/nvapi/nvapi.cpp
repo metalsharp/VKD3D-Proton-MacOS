@@ -28,6 +28,7 @@
 #undef __NVAPI_EMPTY_SAL
 
 #include "../common/lane.hpp"
+#include "dxvk_ext_context.h"
 
 namespace {
 
@@ -184,18 +185,56 @@ NVAPI_EXPORT NvAPI_D3D_GetCurrentSLIState(IUnknown *pDevice, NV_GET_CURRENT_SLI_
   }
 }
 
-// D3D11's NVIDIA extensions are DXVK's to answer, and are not here yet
+// D3D11's NVIDIA extensions, on DXVK's context extension (ID3D11VkExtContext), as DXVK-NVAPI does
+namespace {
+
+ID3D11VkExtContext *GetExtContext(IUnknown *pDeviceOrContext) {
+  ID3D11VkExtContext *ext = nullptr;
+  ID3D11DeviceContext *context = nullptr;
+  ID3D11Device *device = nullptr;
+  if (!pDeviceOrContext)
+    return nullptr;
+  if (SUCCEEDED(pDeviceOrContext->QueryInterface(__uuidof(ID3D11VkExtContext), (void **)&ext)))
+    return ext;
+  if (FAILED(pDeviceOrContext->QueryInterface(__uuidof(ID3D11Device), (void **)&device)))
+    return nullptr;
+  device->GetImmediateContext(&context);
+  device->Release();
+  if (context) {
+    if (FAILED(context->QueryInterface(__uuidof(ID3D11VkExtContext), (void **)&ext)))
+      ext = nullptr;
+    context->Release();
+  }
+  return ext;
+}
+
+NvAPI_Status SetBarrierControl(IUnknown *pDeviceOrContext, UINT flags) {
+  auto ext = GetExtContext(pDeviceOrContext);
+  if (!ext)
+    return NVAPI_INVALID_ARGUMENT;
+  ext->SetBarrierControl(flags);
+  ext->Release();
+  return NVAPI_OK;
+}
+
+} // namespace
+
 NVAPI_EXPORT NvAPI_D3D11_BeginUAVOverlap(IUnknown *pDeviceOrContext) {
-  return pDeviceOrContext ? NVAPI_NOT_SUPPORTED : NVAPI_INVALID_ARGUMENT;
+  return SetBarrierControl(pDeviceOrContext, D3D11_VK_BARRIER_CONTROL_IGNORE_WRITE_AFTER_WRITE);
 }
 
 NVAPI_EXPORT NvAPI_D3D11_EndUAVOverlap(IUnknown *pDeviceOrContext) {
-  return pDeviceOrContext ? NVAPI_NOT_SUPPORTED : NVAPI_INVALID_ARGUMENT;
+  return SetBarrierControl(pDeviceOrContext, 0);
 }
 
 NVAPI_EXPORT NvAPI_D3D11_SetDepthBoundsTest(IUnknown *pDeviceOrContext, NvU32 bEnable, float fMinDepth,
                                             float fMaxDepth) {
-  return NVAPI_NOT_SUPPORTED;
+  auto ext = GetExtContext(pDeviceOrContext);
+  if (!ext)
+    return NVAPI_INVALID_ARGUMENT;
+  ext->SetDepthBoundsTest(bEnable, fMinDepth, fMaxDepth);
+  ext->Release();
+  return NVAPI_OK;
 }
 
 // no NVIDIA shader extension opcodes: Unreal Engine (64-bit atomics, shuffles) and Tomb Raider (FP16 atomics) ask

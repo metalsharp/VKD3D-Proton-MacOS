@@ -1,6 +1,6 @@
 // VKD3D-Proton-MacOS's NGX core: DLSS Super Resolution on MetalFX's temporal scaler and DLSS Ray Reconstruction on
-// its denoised scaler, recorded in VKD3D-Proton's command lists (ID3D12GraphicsCommandListMetalFX), which MoltenVK
-// runs. NVIDIA's NGX library loads it as its core (nvngx.dll) where the NVIDIA driver's registry values name it.
+// its denoised scaler, recorded in VKD3D-Proton's command lists (ID3D12GraphicsCommandListMetalFX) and, for
+// Super Resolution in D3D11, DXVK's contexts (ID3D11VkMetalFXContext), which MoltenVK runs. NVIDIA's NGX library loads it as its core (nvngx.dll) where the NVIDIA driver's registry values name it.
 //
 // From Mullion's NGX core (src/nvngx, LGPL-2.1), with VKD3D-Proton's interface in place of Mullion's.
 //
@@ -22,8 +22,11 @@
 extern "C" {
 #include "vkd3d_metalfx.h"
 }
+#include "d3d11_metalfx_interface.h"
 
 namespace ngx {
+
+#define NVNGX_SUCCEED(result) (!(NVNGX_FAILED(result)))
 
 #define NVNGX_Parameter_DLSS_Roughness_Mode "DLSS.Roughness.Mode"
 #define NVNGX_Parameter_Use_HW_Depth "DLSS.Use.HW.Depth"
@@ -50,8 +53,9 @@ struct DLSSFeature : CommonFeature {
   int quality;
   int flag;
   int enable_output_subrects;
-  // the MetalFX scaler the command list made for it
+  // the MetalFX scaler the command list (D3D12) or context (D3D11) made for it
   ID3D12MetalFXScaler *scaler = nullptr;
+  ID3D11VkMetalFXScaler *scaler11 = nullptr;
 };
 
 // DLSS Ray Reconstruction, on MetalFX's denoised scaler
@@ -429,7 +433,14 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_ReleaseFeature(unsigned int *handle) {
   return NVNGX_RESULT_OK;
 }
 
-// D3D11 (DXVK's): not yet, so a D3D11 game reports DLSS unsupported rather than failing in it
+// D3D11 (DXVK's): Super Resolution
+
+static ID3D11VkMetalFXContext *GetMetalFX11(ID3D11DeviceContext *context) {
+  ID3D11VkMetalFXContext *metalfx = nullptr;
+  if (!context || FAILED(context->QueryInterface(__uuidof(ID3D11VkMetalFXContext), (void **)&metalfx)))
+    return nullptr;
+  return metalfx;
+}
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_Init(unsigned long long id, const wchar_t *path, ID3D11Device *device,
                                                const void *feature_info, unsigned int sdk_version) {
@@ -481,11 +492,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_DestroyParameters(NVNGXParameter *para
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_GetCapabilityParameters(NVNGXParameter **out_params) {
-  auto params = new ParametersImpl();
-  params->Set("SuperSampling.Available", 0u);
-  params->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 0u);
-  params->Set("SuperSampling.NeedsUpdatedDriver", 0);
-  *out_params = params;
+  *out_params = CapabilityParameters();
   return NVNGX_RESULT_OK;
 }
 
@@ -496,22 +503,89 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_GetParameters(NVNGXParameter **out_par
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_GetFeatureRequirements(IDXGIAdapter *adapter,
                                                                  const NVNGX_FeatureDiscoveryInfo *discovery_info,
                                                                  NVNGX_FeatureRequirement *requirement) {
-  if (requirement)
-    requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_UNSUPPORTED;
-  return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  return FeatureRequirements(discovery_info, requirement, false);
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *context, unsigned int feature,
                                                         NVNGXParameter *params, unsigned int **out_handle) {
-  return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  auto parameters = static_cast<ParametersImpl *>(params);
+  auto metalfx = GetMetalFX11(context);
+  if (!metalfx || !out_handle || !parameters) {
+    if (metalfx)
+      metalfx->Release();
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  }
+  bool supported = feature == NVNGX_FEATURE_SUPERSAMPLING && metalfx->SupportsTemporalUpscale();
+  metalfx->Release();
+  if (!supported) {
+    lane::log("err", "D3D11 CreateFeature: feature %u is not supported", feature);
+    return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  }
+  auto dlss = std::make_unique<DLSSFeature>();
+  dlss->feature = NVNGX_FEATURE_SUPERSAMPLING;
+  if (NVNGX_FAILED(ReadCreate(parameters, *dlss)))
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  lane::log("info", "D3D11 Super Resolution %ux%u to %ux%u on MetalFX's temporal scaler", dlss->width, dlss->height,
+            dlss->target_width, dlss->target_height);
+  *out_handle = &dlss.release()->handle;
+  return NVNGX_RESULT_OK;
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext *context, const unsigned int *handle,
                                                           NVNGXParameter *params, void *callback) {
-  return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  auto parameters = static_cast<ParametersImpl *>(params);
+  auto common = static_cast<CommonFeature *>((void *)handle);
+  if (!handle || !parameters || common->feature != NVNGX_FEATURE_SUPERSAMPLING)
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  auto dlss = static_cast<DLSSFeature *>(common);
+  auto metalfx = GetMetalFX11(context);
+  if (!metalfx) {
+    lane::log("err", "D3D11 EvaluateFeature: a context without MetalFX");
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  }
+  D3D11_VK_METALFX_TEMPORAL_DESC desc = {};
+  ID3D11Resource *resource = nullptr;
+  if (NVNGX_SUCCEED(parameters->Get(NVNGX_Parameter_Color, &resource)))
+    desc.Color = resource;
+  resource = nullptr;
+  if (NVNGX_SUCCEED(parameters->Get(NVNGX_Parameter_Output, &resource)))
+    desc.Output = resource;
+  resource = nullptr;
+  if (NVNGX_SUCCEED(parameters->Get(NVNGX_Parameter_Depth, &resource)))
+    desc.Depth = resource;
+  resource = nullptr;
+  if (NVNGX_SUCCEED(parameters->Get(NVNGX_Parameter_MotionVectors, &resource)))
+    desc.MotionVector = resource;
+  resource = nullptr;
+  if (NVNGX_SUCCEED(parameters->Get(NVNGX_Parameter_ExposureTexture, &resource)))
+    desc.ExposureTexture = resource;
+  if (!desc.Color || !desc.Output || !desc.Depth || !desc.MotionVector) {
+    metalfx->Release();
+    lane::log("err", "D3D11 EvaluateFeature: Super Resolution without its color, output, depth or motion vectors");
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  }
+  desc.InputContentWidth = GetOr(parameters, NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, 0u);
+  desc.InputContentHeight = GetOr(parameters, NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, 0u);
+  desc.DepthReversed = bool(dlss->flag & NVNGX_DLSS_FLAG_DEPTH_INVERTED);
+  desc.AutoExposure = bool(dlss->flag & NVNGX_DLSS_FLAG_AUTO_EXPOSURE);
+  desc.MotionVectorInDisplayRes = !bool(dlss->flag & NVNGX_DLSS_FLAG_MV_LOWRES);
+  ReadCommon(parameters, desc.MotionVectorScaleX, desc.MotionVectorScaleY, desc.JitterOffsetX, desc.JitterOffsetY,
+             desc.PreExposure, desc.InReset);
+  HRESULT hr = metalfx->TemporalUpscale(&desc, &dlss->scaler11);
+  metalfx->Release();
+  return FAILED(hr) ? NVNGX_RESULT_FAIL : NVNGX_RESULT_OK;
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_ReleaseFeature(unsigned int *handle) {
+  if (!handle)
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  auto common = static_cast<CommonFeature *>((void *)handle);
+  if (common->feature == NVNGX_FEATURE_SUPERSAMPLING) {
+    auto dlss = static_cast<DLSSFeature *>(common);
+    if (dlss->scaler11)
+      dlss->scaler11->Destroy();
+    delete dlss;
+  }
   return NVNGX_RESULT_OK;
 }
 
