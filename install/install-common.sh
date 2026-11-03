@@ -20,7 +20,7 @@ set -euo pipefail
 REPO="metalsharp/VKD3D-Proton-MacOS"
 case "$LANE" in
     x86_64) DLL_DIR=x86_64-windows; MACHINE="x86-64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core) ;;
-    arm64)  DLL_DIR=aarch64-windows; MACHINE="Aarch64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core) ;;
+    arm64)  DLL_DIR=aarch64-windows; MACHINE="Aarch64"; DLLS=(d3d12 d3d12core dxgi d3d11 d3d10core nvngx nvapi64) ;;
     *) echo "unknown lane $LANE" >&2; exit 1 ;;
 esac
 
@@ -47,7 +47,7 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 # The arm64 lane's D3D12 pair is ARM64X (aarch64-windows), which x86_64 programs load as ARM64EC under FEX; its
 # DXVK DXGI and D3D10/11 are x86_64 (x86_64-windows), as MetalSharp Wine's VKD3D-Proton lane runs them.
-dll_dir() { case "$LANE:$1" in arm64:d3d12|arm64:d3d12core) echo aarch64-windows ;; *) echo x86_64-windows ;; esac; }
+dll_dir() { case "$LANE:$1" in arm64:d3d12|arm64:d3d12core|arm64:nvngx|arm64:nvapi64) echo aarch64-windows ;; *) echo x86_64-windows ;; esac; }
 SYS32="$PREFIX/drive_c/windows/system32"
 HOME_DIR="$PREFIX/vkd3d-proton-macos"
 BACKUP="$HOME_DIR/backup"
@@ -124,6 +124,14 @@ for root in "$DLL_ROOT" "$MVK_ROOT"; do
     if ! (cd "$root" && shasum -a 256 -c --quiet SHA256SUMS); then die "checksums of $root don't match"; fi
 done
 
+# The lane's NGX core and NVAPI (DLSS on MetalFX) came in 5.0: older packages go without them.
+present=()
+for dll in "${DLLS[@]}"; do
+    case "$dll" in nvngx|nvapi64) [ -f "$DLL_ROOT/$(dll_dir "$dll")/$dll.dll" ] || continue ;; esac
+    present+=("$dll")
+done
+DLLS=("${present[@]}")
+
 mkdir -p "$BACKUP" "$HOME_DIR/moltenvk"
 for dll in "${DLLS[@]}"; do
     src="$DLL_ROOT/$(dll_dir "$dll")/$dll.dll"
@@ -147,12 +155,21 @@ ln -sf libMoltenVK.dylib "$HOME_DIR/moltenvk/libvulkan.1.dylib"
 sed "s#\"library_path\": *\"[^\"]*\"#\"library_path\": \"$HOME_DIR/moltenvk/libMoltenVK.dylib\"#" \
     "$MVK_ROOT/MoltenVK_icd.json" > "$HOME_DIR/moltenvk/MoltenVK_icd.json"
 
+# The lane's settings (MetalFX upscaling, DLSS's GPU identity), which MetalSharp writes itself: kept where the user
+# changed them, so a reinstall doesn't overwrite them.
+for conf in vkd3d.conf dxvk.conf; do
+    if [ -f "$DLL_ROOT/$conf" ] && [ ! -f "$HOME_DIR/$conf" ]; then cp "$DLL_ROOT/$conf" "$HOME_DIR/$conf"; fi
+done
+
 cat > "$HOME_DIR/env.sh" <<EOF
 # source this before running $PREFIX's programs with VKD3D-Proton macOS
 export WINEPREFIX="$PREFIX"
 export VK_DRIVER_FILES="$HOME_DIR/moltenvk/MoltenVK_icd.json"
 export VK_ICD_FILENAMES="\$VK_DRIVER_FILES"
 export DYLD_LIBRARY_PATH="$HOME_DIR/moltenvk\${DYLD_LIBRARY_PATH:+:\$DYLD_LIBRARY_PATH}"
+# The lane's settings, unless already set to other files: read by Windows code, so as Windows paths (Z: is /)
+export VKD3D_CONFIG_FILE="\${VKD3D_CONFIG_FILE:-Z:$HOME_DIR/vkd3d.conf}"
+export DXVK_CONFIG_FILE="\${DXVK_CONFIG_FILE:-Z:$HOME_DIR/dxvk.conf}"
 # With Wine's default debug channels on, VKD3D-Proton reads an unfilled driver ID and refuses the device
 # ("Lacking support for single texel alignment"); set WINEDEBUG before sourcing this to debug anyway.
 export WINEDEBUG="\${WINEDEBUG:--all}"
