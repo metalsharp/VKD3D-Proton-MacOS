@@ -20,9 +20,11 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_WINE = "/Volumes/AverySSD/fex-test-home/runtime/wine/bin/wine"
+# MetalSharp's runtime copy of MetalSharp Wine (its FEX wrapper)
+RUNTIME = os.path.expanduser("~/.metalsharp/runtime")
+DEFAULT_WINE = os.path.join(RUNTIME, "wine/bin/wine")
 DEFAULT_EXE = os.path.join(HERE, "../../artifacts/build/perf/d3d12_perf_probe-x86_64.exe")
-DEFAULT_DXCOMPILER = "Z:\\Volumes\\AverySSD\\fex-test-home\\runtime\\MetalSharp-Wine.app\\Contents\\share\\wine\\shadercompilers\\arm64\\dxcompiler.dll"
+DEFAULT_DXCOMPILER = "Z:" + os.path.join(RUNTIME, "MetalSharp-Wine.app/Contents/share/wine/shadercompilers/arm64/dxcompiler.dll").replace("/", "\\")
 DXIL_CACHE = os.path.join(HERE, "../../artifacts/perf/dxilcache")
 
 

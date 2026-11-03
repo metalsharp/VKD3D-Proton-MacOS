@@ -1345,6 +1345,82 @@ uint4 ps() : SV_Target { return uint4(0x19, 0x5a, 0xf0, 0x0f); }
     return true;
 }
 
+// Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
+// 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
+// zero constant (the select on the address, robust_guarded_load), which this is the check of.
+static const char *cbv_rows_robust_src = R"(
+cbuffer A : register(b0) { float4 a[32]; };
+cbuffer N : register(b1) { float4 n[32]; };
+RWByteAddressBuffer o : register(u0);
+[numthreads(32, 1, 1)] void cs(uint i : SV_GroupIndex)
+{
+    o.Store4(i * 16, asuint(a[i]));
+    o.Store4(512 + i * 16, asuint(n[i]));
+}
+)";
+
+static bool run_cbv_rows_robust(const char *kind, const std::vector<char> &cs)
+{
+    if (cs.empty())
+        return false;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 2, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = { 1, &range };
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, params };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.CS = { cs.data(), cs.size() };
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    // 16 rows of data, then 16 more the view leaves out
+    ID3D12Resource *cb = create_buffer(512, D3D12_HEAP_TYPE_UPLOAD);
+    float *rows = nullptr;
+    cb->Map(0, nullptr, (void **)&rows);
+    for (int i = 0; i < 128; i++)
+        rows[i] = (float)(i + 1);
+    cb->Unmap(0, nullptr);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cv = { cb->GetGPUVirtualAddress(), 256 };
+    g.device->CreateConstantBufferView(&cv, cpu);
+    cpu.ptr += inc;
+    g.device->CreateConstantBufferView(nullptr, cpu);
+    ID3D12Resource *out = create_buffer(1024, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = create_buffer(1024, D3D12_HEAP_TYPE_READBACK);
+    transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, out, 0, 1024);
+    if (!execute_and_wait())
+        return false;
+    const float *got = nullptr;
+    D3D12_RANGE r = { 0, 1024 };
+    rb->Map(0, &r, (void **)&got);
+    for (int i = 0; i < 128; i++)
+        EXPECT(got[i] == (i < 64 ? (float)(i + 1) : 0.0f), "%s: row %d component %d = %g, want %g", kind, i / 4, i % 4,
+               got[i], i < 64 ? (float)(i + 1) : 0.0f);
+    for (int i = 128; i < 256; i++)
+        EXPECT(got[i] == 0.0f, "%s: null view row %d component %d = %g, want 0", kind, (i - 128) / 4, i % 4, got[i]);
+    rb->Release(); out->Release(); heap->Release(); cb->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_cbv_rows_robust_dxil() { return run_cbv_rows_robust("DXIL", compile_dxc(cbv_rows_robust_src, "cs", "cs_6_0")); }
+static bool test_cbv_rows_robust_dxbc() { return run_cbv_rows_robust("DXBC", compile_fxc(cbv_rows_robust_src, "cs", "cs_5_0")); }
+
 // Raw buffer SRVs through a descriptor table: out-of-range and null descriptors read 0,
 // out-of-range UAV writes are dropped (robustBufferAccess2 / nullDescriptor).
 static bool test_robust()
@@ -4331,6 +4407,8 @@ static const Test tests[] = {
     { "gs_packed_dxil", test_gs_packed_dxil },
     { "gs_packed_dxbc", test_gs_packed_dxbc },
     { "pervertex", test_pervertex },
+    { "cbv_rows_robust_dxil", test_cbv_rows_robust_dxil },
+    { "cbv_rows_robust_dxbc", test_cbv_rows_robust_dxbc },
     { "predication", test_predication },
     { "native16bit", test_native16bit },
     { "groupshared64", test_groupshared64 },
