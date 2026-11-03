@@ -3304,6 +3304,80 @@ void main(uint t : SV_DispatchThreadID)
 
 // Render target basics: 4x MSAA with a resolve, a depth test, a stencil write and test (D24S8, which Metal has
 // as D32S8), and occlusion and timestamp queries.
+// Timestamps: back to back, around GPU work and from two heaps interleaved (MoltenVK samples the timestamps between
+// two Metal encoders once and resolves that into each), resolved whole and in part at an offset.
+static bool test_timestamps()
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint t : SV_DispatchThreadID)
+{
+    uint v = t;
+    for (uint i = 0; i < 20000; i++)
+        v = v * 1664525u + 1013904223u;
+    o.Store((t % 64) * 4, v);
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+    D3D12_QUERY_HEAP_DESC qd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 8 };
+    ID3D12QueryHeap *a = nullptr, *b = nullptr;
+    CHECK_HR(g.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&a)));
+    CHECK_HR(g.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&b)));
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *res = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    g.list->Dispatch(256, 1, 1);
+    g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+    g.list->EndQuery(b, D3D12_QUERY_TYPE_TIMESTAMP, 5);
+    g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+    g.list->Dispatch(256, 1, 1);
+    g.list->EndQuery(b, D3D12_QUERY_TYPE_TIMESTAMP, 6);
+    g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 4);
+    // Resolved after the timestamps' list completes. Open bug (VKD3D lane): MoltenVK resolves stage-boundary samples
+    // correctly only once the Metal command buffer that took them has completed, so resolving in the same list reads 0.
+    if (!execute_and_wait())
+        return false;
+    g.list->ResolveQueryData(a, D3D12_QUERY_TYPE_TIMESTAMP, 0, 5, res, 0);
+    g.list->ResolveQueryData(b, D3D12_QUERY_TYPE_TIMESTAMP, 5, 2, res, 64);
+    g.list->ResolveQueryData(a, D3D12_QUERY_TYPE_TIMESTAMP, 2, 3, res, 128);
+    ID3D12Resource *rb;
+    const uint64_t *t = (const uint64_t *)read_buffer(res, D3D12_RESOURCE_STATE_COPY_DEST, 256, &rb);
+    if (!t)
+        return false;
+    printf("  a: %llu %llu %llu %llu %llu, b: %llu %llu\n", (unsigned long long)t[0], (unsigned long long)t[1],
+           (unsigned long long)t[2], (unsigned long long)t[3], (unsigned long long)t[4], (unsigned long long)t[8],
+           (unsigned long long)t[9]);
+    EXPECT(t[0] != 0, "first timestamp is 0");
+    for (int i = 1; i < 5; i++)
+        EXPECT(t[i] >= t[i - 1], "timestamp %d (%llu) before %d (%llu)", i, (unsigned long long)t[i], i - 1,
+               (unsigned long long)t[i - 1]);
+    EXPECT(t[2] > t[1], "no time passed over a dispatch (%llu, %llu)", (unsigned long long)t[1], (unsigned long long)t[2]);
+    // Heap b's timestamps are taken with a's next to them, each heap's a moment after the other's.
+    EXPECT(t[8] >= t[1] && t[9] >= t[8] && t[9] >= t[3], "heap b's timestamps %llu %llu out of order with a's",
+           (unsigned long long)t[8], (unsigned long long)t[9]);
+    for (int i = 0; i < 3; i++)
+        EXPECT(t[16 + i] == t[2 + i], "partial resolve %d = %llu, want %llu", i, (unsigned long long)t[16 + i],
+               (unsigned long long)t[2 + i]);
+    rb->Release(); res->Release(); buf->Release(); b->Release(); a->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 static bool test_msaa_depth_stencil()
 {
     static const char *src = R"(
@@ -4741,6 +4815,7 @@ static const Test tests[] = {
     { "sm67_textures", test_sm67_textures },
     { "rootcbv", test_rootcbv },
     { "fencelatency", test_fencelatency },
+    { "timestamps", test_timestamps },
     { "uavchain", test_uavchain },
     { "aliaschain", test_aliaschain },
     { "draw", test_draw },
