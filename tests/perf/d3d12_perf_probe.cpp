@@ -714,6 +714,59 @@ static void set_quad_state(ID3D12GraphicsCommandList *l, ID3D12PipelineState *ps
     l->SetGraphicsRootDescriptorTable(2, srv_gpu(0));
 }
 
+// sample and sample_table*: the graphics root signature with a table of one sampler at s0 in place of the static one
+static ID3D12RootSignature *table_sample_rs;
+static ID3D12DescriptorHeap *table_sample_heap;
+static ID3D12PipelineState *table_sample_pso;
+
+static void table_sample_init(UINT anisotropy)
+{
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0 };
+    D3D12_DESCRIPTOR_RANGE sampler = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[4] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants = { 0, 0, 4 };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[1].Descriptor = { 1, 0 };
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[2].DescriptorTable = { 1, &range };
+    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[3].DescriptorTable = { 1, &sampler };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 4, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    table_sample_rs = serialize_root_signature(rsd);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&table_sample_heap)));
+    D3D12_SAMPLER_DESC sd = {};
+    sd.Filter = anisotropy > 1 ? D3D12_FILTER_ANISOTROPIC : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.MaxAnisotropy = anisotropy;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sd.MaxLOD = D3D12_FLOAT32_MAX;
+    p.device->CreateSampler(&sd, table_sample_heap->GetCPUDescriptorHandleForHeapStart());
+    PsoDesc d; d.ps = "ps_tex"; d.rs = table_sample_rs;
+    table_sample_pso = create_pso(d);
+}
+
+static void table_sample_frame(UINT f)
+{
+    ID3D12DescriptorHeap *heaps[] = { p.srv_heap, table_sample_heap };
+    p.list->SetDescriptorHeaps(2, heaps);
+    p.list->SetGraphicsRootSignature(table_sample_rs);
+    p.list->SetPipelineState(table_sample_pso);
+    p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    void *cpu;
+    D3D12_GPU_VIRTUAL_ADDRESS cb = upload_alloc(256, &cpu);
+    memset(cpu, 0, 256);
+    p.list->SetGraphicsRootConstantBufferView(1, cb);
+    p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(0));
+    p.list->SetGraphicsRootDescriptorTable(3, table_sample_heap->GetGPUDescriptorHandleForHeapStart());
+    for (UINT i = 0; i < 20; i++)
+    {
+        float rc[4] = { 0, 0, 1, f * 0.01f };
+        p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+        p.list->DrawInstanced(3, 1, 0, 0);
+    }
+}
+
 static void viewport(ID3D12GraphicsCommandList *l, UINT w = W, UINT h = H)
 {
     D3D12_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
@@ -860,6 +913,55 @@ static std::vector<Scene> base_scenes()
                 barrier(p.list, tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             }
             extras.add("record_us_per_barrier", (qpc_ms() - t) * 1000.0 / 1000);
+        } },
+        // Starfield's pattern (dttdrv/mullion#32): ~300 aliasing barriers naming no resource a frame, while a reserved
+        // buffer exists. a translation that drains the GPU at each runs at a few frames a second
+        { "alias_barriers", "300 aliasing barriers (no resources named) between draws, with a reserved buffer alive", [] {
+            flat = create_pso({});
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = 1 << 20;
+            desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            static ID3D12Resource *reserved;
+            if (FAILED(p.device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reserved))))
+                fprintf(stderr, "alias_barriers: no reserved buffer\n");
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 300; i++)
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                p.list->ResourceBarrier(1, &b);
+                small_quad(p.list, i, f * 0.01f);
+            }
+        } },
+        // the same between dispatches, as Starfield's compute passes have them
+        { "alias_dispatches", "300 aliasing barriers (no resources named) between small dispatches, with a reserved buffer alive", [] {
+            compute = create_compute_pso();
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = 1 << 20;
+            desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            static ID3D12Resource *reserved;
+            if (FAILED(p.device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reserved))))
+                fprintf(stderr, "alias_dispatches: no reserved buffer\n");
+        }, [](UINT f) {
+            p.list->SetComputeRootSignature(p.compute_root_signature);
+            p.list->SetPipelineState(compute);
+            p.list->SetComputeRootUnorderedAccessView(1, p.uav_buffer->GetGPUVirtualAddress());
+            for (UINT i = 0; i < 300; i++)
+            {
+                uint32_t rc[4] = { i + f, 0, 0, 0 };
+                p.list->SetComputeRoot32BitConstants(0, 4, rc, 0);
+                p.list->Dispatch(1, 1, 1);
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                p.list->ResourceBarrier(1, &b);
+            }
         } },
         { "upload_buffer", "4 MiB written to an upload heap and copied to a default buffer per frame", [] {
             flat = create_pso({});
@@ -1121,6 +1223,10 @@ static std::vector<Scene> base_scenes()
                 p.list->DrawInstanced(3, 1, 0, 0);
             }
         } },
+        // the same through a descriptor table's sampler, not anisotropic and anisotropic: the shader learns which only
+        // from the descriptor
+        { "sample_table", "sample, through a descriptor table's linear sampler", [] { table_sample_init(1); }, table_sample_frame },
+        { "sample_table_aniso", "sample, through a descriptor table's 8x anisotropic sampler", [] { table_sample_init(8); }, table_sample_frame },
         { "blend_depth", "40 full-screen blended quads with depth test at 1080p (GPU ROP)", [] {
             PsoDesc d; d.blend = true; d.depth = true; flat_depth = create_pso(d);
         }, [](UINT f) {
@@ -1186,6 +1292,31 @@ static std::vector<Scene> base_scenes()
             }
             extras.add("hlsl_compile_ms_per_pso", compile_ms / 4);
             extras.add("create_ms_per_pso", create_ms / 4);
+        } },
+        { "pso_cold_threads", "8 threads each make a new graphics pipeline per frame from never-seen shaders (a title loading)", base, [](UINT f) {
+            // what a driver lets run at once shows in the time each creation takes while the others are made
+            constexpr UINT threads = 8;
+            double create_ms[threads] = {};
+            ID3D12PipelineState *made[threads] = {};
+            std::vector<std::thread> workers;
+            double t = qpc_ms();
+            for (UINT i = 0; i < threads; i++)
+                workers.emplace_back([i, f, &create_ms, &made] {
+                    PsoDesc d; d.ps = (i & 1) ? "ps_heavy" : "ps_tex"; d.salt = p.salt * 100000 + 50000 + f * threads + i + 1;
+                    double compile = 0;
+                    made[i] = create_pso(d, &compile, &create_ms[i]);
+                });
+            for (auto &w : workers) w.join();
+            extras.add("wall_ms_per_frame", qpc_ms() - t);
+            double sum = 0;
+            for (UINT i = 0; i < threads; i++)
+            {
+                sum += create_ms[i];
+                set_quad_state(p.list, made[i]);
+                small_quad(p.list, i, 0.5f);
+                deferred_release(made[i]);
+            }
+            extras.add("create_ms_per_pso", sum / threads);
         } },
         { "pso_warm", "the same 4 graphics pipelines re-created per frame (cache hits)", base, [](UINT) {
             double compile_ms = 0, create_ms = 0;
@@ -3538,13 +3669,152 @@ static std::vector<Scene> engine_scenes()
 // Submission-side costs below the game: many command lists recorded in parallel and executed together
 // (the driver encodes them on one queue thread), per-draw descriptor changes, and render target rebinds
 // split by unrelated barriers (each can end a render pass, and each pass is a Metal render encoder).
+// Constant buffer rows: a compute shader that reads 256 constant rows of a descriptor-table CBV per thread, as the
+// heavy compute shaders of large D3D12 titles do (Starfield, dttdrv/mullion#32). What a backend spends on bounds
+// checking a constant row (D3D11.3 7.5: rows past the bound size read 0) shows here.
+static const char cbv_rows_hlsl[] = R"(
+cbuffer Rows : register(b0) { float4 rows[256]; };
+RWTexture2D<float4> image : register(u0);
+[numthreads(8, 8, 1)] void cs_rows(uint2 id : SV_DispatchThreadID) {
+  float4 v = float4(id.xyxy) * 0.001;
+  float4 acc = 0;
+  [unroll] for (uint i = 0; i < 256; i++) acc = mad(v, rows[i], acc.wzyx);
+  image[id] = acc;
+}
+)";
+
+// the same, with rows of buffers that depend on the thread: a structured buffer's float4 elements, or a raw buffer's
+// Load4, through a descriptor table, so that each read is checked against the view's size
+static const char buffer_rows_hlsl[] = R"(
+StructuredBuffer<float4> srows : register(t0);
+ByteAddressBuffer rrows : register(t1);
+RWTexture2D<float4> image : register(u0);
+float4 row(uint i) {
+#ifdef RAW
+  return asfloat(rrows.Load4(i * 16));
+#else
+  return srows[i];
+#endif
+}
+[numthreads(8, 8, 1)] void cs_rows(uint2 id : SV_DispatchThreadID) {
+  float4 v = float4(id.xyxy) * 0.001;
+  float4 acc = 0;
+  uint base = id.x * 7 + id.y * 13;
+#ifdef PLAIN
+  [unroll] for (uint i = 0; i < 256; i++) acc += v * row((base + i * 5) & 1023);
+#else
+  [unroll] for (uint i = 0; i < 256; i++) acc = mad(v, row((base + i * 5) & 1023), acc.wzyx);
+#endif
+  image[id] = acc;
+}
+)";
+
+static std::vector<Scene> cbv_scenes()
+{
+    enum { CBV_ROWS = 10050, UAV_ROWS = 10051, BUFFER_ROWS = 10052 };
+    static ID3D12RootSignature *rows_rs;
+    static ID3D12PipelineState *rows_pso;
+    static ID3D12Resource *rows_cb, *rows_image, *rows_buffer;
+    static ID3D12RootSignature *buffer_rs;
+    static ID3D12PipelineState *buffer_pso;
+    auto init = [](const char *target) {
+        return [target] {
+            D3D12_DESCRIPTOR_RANGE cbv = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0 };
+            D3D12_DESCRIPTOR_RANGE uav = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+            D3D12_ROOT_PARAMETER rp[2] = {};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[0].DescriptorTable = { 1, &cbv };
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable = { 1, &uav };
+            D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+            rows_rs = serialize_root_signature(rsd);
+            rows_pso = compute_pso_from(rows_rs, shader_code(cbv_rows_hlsl, "cs_rows", target));
+            rows_cb = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+            float *mapped = nullptr;
+            CHECK(rows_cb->Map(0, nullptr, (void **)&mapped));
+            for (UINT i = 0; i < 1024; i++) mapped[i] = (float)(i % 7) * 0.125f;
+            rows_cb->Unmap(0, nullptr);
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cd = { rows_cb->GetGPUVirtualAddress(), 4096 };
+            p.device->CreateConstantBufferView(&cd, srv_cpu(CBV_ROWS));
+            rows_image = create_texture(W, H, HDR_FORMAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            p.device->CreateUnorderedAccessView(rows_image, nullptr, nullptr, srv_cpu(UAV_ROWS));
+        };
+    };
+    auto frame = [](UINT) {
+        p.list->SetComputeRootSignature(rows_rs);
+        p.list->SetPipelineState(rows_pso);
+        p.list->SetComputeRootDescriptorTable(0, srv_gpu(CBV_ROWS));
+        p.list->SetComputeRootDescriptorTable(1, srv_gpu(UAV_ROWS));
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = rows_image;
+        for (UINT i = 0; i < 4; i++)
+        {
+            p.list->Dispatch(W / 8, H / 8, 1);
+            p.list->ResourceBarrier(1, &b);
+        }
+    };
+    // the buffer scenes: rows_image from cbv_rows' init, and a 16 KB buffer seen as 1024 float4 elements and as raw
+    auto buffer_init = [init](const char *target, bool raw) {
+        return [init, target, raw] {
+            init(target)();
+            D3D12_DESCRIPTOR_RANGE srv = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+            D3D12_DESCRIPTOR_RANGE uav = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+            D3D12_ROOT_PARAMETER rp[2] = {};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[0].DescriptorTable = { 1, &srv };
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable = { 1, &uav };
+            D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+            buffer_rs = serialize_root_signature(rsd);
+            buffer_pso = compute_pso_from(buffer_rs, shader_code(std::string(raw ? "#define RAW\n" : "") + (getenv("PROBE_ROWS_PLAIN") ? "#define PLAIN\n" : "") + buffer_rows_hlsl, "cs_rows", target));
+            rows_buffer = create_buffer(16384, D3D12_HEAP_TYPE_UPLOAD);
+            float *mapped = nullptr;
+            CHECK(rows_buffer->Map(0, nullptr, (void **)&mapped));
+            for (UINT i = 0; i < 4096; i++) mapped[i] = (float)(i % 7) * 0.125f;
+            rows_buffer->Unmap(0, nullptr);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Buffer = { 0, 1024, 16, D3D12_BUFFER_SRV_FLAG_NONE };
+            p.device->CreateShaderResourceView(rows_buffer, &sd, srv_cpu(BUFFER_ROWS));
+            sd.Format = DXGI_FORMAT_R32_TYPELESS;
+            sd.Buffer = { 0, 4096, 0, D3D12_BUFFER_SRV_FLAG_RAW };
+            p.device->CreateShaderResourceView(rows_buffer, &sd, srv_cpu(BUFFER_ROWS + 1));
+            p.device->CreateUnorderedAccessView(rows_image, nullptr, nullptr, srv_cpu(BUFFER_ROWS + 2));
+        };
+    };
+    auto buffer_frame = [](UINT) {
+        p.list->SetComputeRootSignature(buffer_rs);
+        p.list->SetPipelineState(buffer_pso);
+        p.list->SetComputeRootDescriptorTable(0, srv_gpu(BUFFER_ROWS));
+        p.list->SetComputeRootDescriptorTable(1, srv_gpu(BUFFER_ROWS + 2));
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = rows_image;
+        for (UINT i = 0; i < 4; i++)
+        {
+            p.list->Dispatch(W / 8, H / 8, 1);
+            p.list->ResourceBarrier(1, &b);
+        }
+    };
+    return {
+        { "srv_rows", "4 compute passes at 1080p, 256 float4 rows of a table's structured buffer per thread, by thread (DXBC)", buffer_init("cs_5_0", false), buffer_frame },
+        { "srv_rows_dxil", "the same compiled as DXIL", buffer_init("cs_6_0", false), buffer_frame, false, 0, true },
+        { "raw_rows", "the same with a raw buffer's Load4 (DXBC)", buffer_init("cs_5_0", true), buffer_frame },
+        { "raw_rows_dxil", "the same compiled as DXIL", buffer_init("cs_6_0", true), buffer_frame, false, 0, true },
+        { "cbv_rows", "4 compute passes at 1080p, 256 constant rows of a table CBV read per thread (DXBC)", init("cs_5_0"), frame },
+        { "cbv_rows_dxil", "the same compiled as DXIL", init("cs_6_0"), frame, false, 0, true },
+    };
+}
+
 static std::vector<Scene> submit_scenes()
 {
-    enum { THREADS = 8, MT_DRAWS = 500, BIND_DRAWS = 4000, REBIND_GROUPS = 64 };
+    enum { THREADS = 8, MT_DRAWS = 500, BIND_DRAWS = 4000, REBIND_GROUPS = 64, MARKED_DRAWS = 2500 };
     static ID3D12PipelineState *tex_pso, *tex_pso2;
     static ID3D12CommandAllocator *mt_alloc[THREADS][FRAMES_IN_FLIGHT];
     static ID3D12GraphicsCommandList *mt_list[THREADS];
-    static ID3D12Resource *mt_upload[THREADS], *uav_dummy;
+    static ID3D12Resource *mt_upload[THREADS], *uav_dummy, *marker_buffer;
     static uint8_t *mt_upload_ptr[THREADS];
     static std::thread workers[THREADS];
     static std::mutex lock;
@@ -3667,6 +3937,29 @@ static std::vector<Scene> submit_scenes()
                 p.list->ResourceBarrier(1, &b);
             }
             extras.add("record_ms", qpc_ms() - t);
+        } },
+        { "draw_markers", "2500 draws, each between a MARKER_IN and a MARKER_OUT WriteBufferImmediate (5000 markers, as Starfield writes)",
+          [common_init] {
+            common_init();
+            marker_buffer = create_buffer(65536, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        }, [draws, begin_hdr](UINT f) {
+            static UINT64 offset;
+            ID3D12GraphicsCommandList2 *l2;
+            CHECK(p.list->QueryInterface(IID_PPV_ARGS(&l2)));
+            double t = qpc_ms();
+            begin_hdr(p.list, tex_pso);
+            const D3D12_WRITEBUFFERIMMEDIATE_MODE in = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+                                                  out = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            for (UINT i = 0; i < MARKED_DRAWS; i++)
+            {
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER m = { marker_buffer->GetGPUVirtualAddress() + (i % 8192) * 8, f * MARKED_DRAWS + i };
+                l2->WriteBufferImmediate(1, &m, &in);
+                draws(p.list, 1, 16, p.upload_ptr, p.upload_ring->GetGPUVirtualAddress(), offset, i, f * 0.01f);
+                m.Dest += 4;
+                l2->WriteBufferImmediate(1, &m, &out);
+            }
+            extras.add("record_ms", qpc_ms() - t);
+            l2->Release();
         } },
     };
 }
@@ -3922,7 +4215,8 @@ static std::vector<Scene> stress_scenes()
 static std::vector<Scene> scenes()
 {
     std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes(),
-                       sub = submit_scenes(), stress = stress_scenes();
+                       sub = submit_scenes(), stress = stress_scenes(), cbv = cbv_scenes();
+    all.insert(all.end(), cbv.begin(), cbv.end());
     all.insert(all.end(), more.begin(), more.end());
     all.insert(all.end(), sm6.begin(), sm6.end());
     all.insert(all.end(), feat.begin(), feat.end());
