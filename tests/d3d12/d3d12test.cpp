@@ -1174,6 +1174,110 @@ void read()
 
 // Typed buffer views at element offsets that are not 16-byte aligned (D3D12 only requires element
 // alignment): an SRV from element 3 and a UAV from element 5 of R32_UINT buffers.
+// A buffer view of 32-bit elements reads the same memory whichever kind of buffer the shader declares (as games rely on
+// it; drivers all honor it): StructuredBuffer<uint>, ByteAddressBuffer and Buffer<uint> each given a typed R32_UINT,
+// a structured (stride 4) and a raw view, each starting past the buffer's start. Hogwarts Legacy's lighting reads its
+// tile lists through a typed view in a StructuredBuffer slot (black on Mullion until it read them).
+static bool view_kinds(bool dxbc)
+{
+    static const char *src = R"(
+#if KIND == 0
+StructuredBuffer<uint> words : register(t0);
+uint word(uint i) { return words[i]; }
+uint count() { uint n, stride; words.GetDimensions(n, stride); return n; }
+#elif KIND == 1
+ByteAddressBuffer words : register(t0);
+uint word(uint i) { return words.Load(i * 4); }
+uint count() { uint n; words.GetDimensions(n); return n / 4; }
+#else
+Buffer<uint> words : register(t0);
+uint word(uint i) { return words[i]; }
+uint count() { uint n; words.GetDimensions(n); return n; }
+#endif
+RWStructuredBuffer<uint> results : register(u0);
+[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID)
+{
+    results[i] = word(i);
+    if (i == 0)
+        results[64] = count();
+}
+)";
+    static const char *kinds[3] = { "StructuredBuffer<uint>", "ByteAddressBuffer", "Buffer<uint>" };
+    static const char *views[3] = { "a typed R32_UINT view", "a structured view", "a raw view" };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps[3] = {};
+    for (int k = 0; k < 3; k++)
+    {
+        std::string full = std::string("#define KIND ") + std::to_string(k) + "\n" + src;
+        ps[k] = create_compute_pipeline(rs, dxbc ? compile_fxc(full.c_str(), "main", "cs_5_0") : compile_dxc(full.c_str(), "main", "cs_6_0"));
+        if (!ps[k])
+            return false;
+    }
+    const UINT total = 128, first = 16, count = 64;
+    ID3D12Resource *data = create_buffer(total * 4, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *m = nullptr;
+    data->Map(0, nullptr, (void **)&m);
+    for (UINT i = 0; i < total; i++)
+        m[i] = 0x10000 * i + i + 1;
+    data->Unmap(0, nullptr);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (UINT v = 0; v < 3; v++)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = v == 0 ? DXGI_FORMAT_R32_UINT : v == 1 ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.FirstElement = first;
+        sd.Buffer.NumElements = count;
+        sd.Buffer.StructureByteStride = v == 1 ? 4 : 0;
+        sd.Buffer.Flags = v == 2 ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += v * inc;
+        g.device->CreateShaderResourceView(data, &sd, h);
+    }
+    for (int k = 0; k < 3; k++)
+    {
+        for (UINT v = 0; v < 3; v++)
+        {
+            ID3D12Resource *out = create_buffer(65 * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            D3D12_GPU_DESCRIPTOR_HANDLE gh = heap->GetGPUDescriptorHandleForHeapStart();
+            gh.ptr += v * inc;
+            g.list->SetDescriptorHeaps(1, &heap);
+            g.list->SetComputeRootSignature(rs);
+            g.list->SetPipelineState(ps[k]);
+            g.list->SetComputeRootDescriptorTable(0, gh);
+            g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+            g.list->Dispatch(1, 1, 1);
+            ID3D12Resource *rb;
+            const uint32_t *got = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 65 * 4, &rb);
+            if (!got)
+                return false;
+            UINT wrong = 0;
+            for (UINT i = 0; i < count; i++)
+                wrong += got[i] != 0x10000 * (first + i) + first + i + 1;
+            EXPECT(!wrong, "%s given %s: %u of %u elements wrong (element 0 = %#x)", kinds[k], views[v], wrong, count, got[0]);
+            EXPECT(got[64] == count, "%s given %s: %u elements, want %u", kinds[k], views[v], got[64], count);
+            rb->Release(); out->Release();
+        }
+    }
+    heap->Release(); data->Release(); rs->Release();
+    for (auto p : ps) p->Release();
+    return true;
+}
+
+static bool test_view_kinds_dxil() { return view_kinds(false); }
+static bool test_view_kinds_dxbc() { return view_kinds(true); }
+
 // Typed buffer SRVs of the three-component 32-bit formats (Buffer<float3>, Buffer<uint3>, Buffer<int3>), which
 // Metal has no texel buffer format for, starting at an element that isn't 16-byte aligned.
 static bool test_typedbuffer_rgb32()
@@ -4936,6 +5040,8 @@ static const Test tests[] = {
     { "tiled3d", test_tiled3d },
     { "typedbuffer", test_typedbuffer },
     { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
+    { "view_kinds_dxil", test_view_kinds_dxil },
+    { "view_kinds_dxbc", test_view_kinds_dxbc },
     { "robust", test_robust },
     { "logicop", test_logicop },
     { "streamoutput", test_streamoutput },
