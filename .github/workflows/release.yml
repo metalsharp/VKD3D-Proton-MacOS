@@ -58,13 +58,23 @@ jobs:
           bash scripts/fetch-sources.sh vkd3d-proton dxvk nvapi
 
       - name: Build
+        env:
+          NGX_SIGNING_KEY: ${{ secrets.NGX_SIGNING_KEY }}
         run: |
           if [ "${{ matrix.lane }}" = x86_64 ]; then
             bash scripts/build-vkd3d-proton.sh
           else
             bash scripts/build-vkd3d-proton-arm64x.sh
-            # the lane's own NGX core and NVAPI (DLSS on MetalFX), ARM64X
+            # the lane's own NGX core and NVAPI (DLSS on MetalFX), ARM64X; nvngx.dll signed with the NGX key (ngx/signing)
+            if [ -n "$NGX_SIGNING_KEY" ]; then
+              brew install osslsigncode
+              export NGX_SIGNING_KEY_FILE="$RUNNER_TEMP/ngx-key.pem"
+              printf '%s\n' "$NGX_SIGNING_KEY" > "$NGX_SIGNING_KEY_FILE"
+            else
+              echo "::warning::NGX_SIGNING_KEY is not set: nvngx.dll stays unsigned, and NGX will not load it"
+            fi
             bash scripts/build-ngx-arm64x.sh
+            rm -f "$RUNNER_TEMP/ngx-key.pem"
           fi
           bash scripts/build-dxvk.sh
 
@@ -88,6 +98,8 @@ jobs:
             cp artifacts/build/vkd3d-proton/aarch64-windows/d3d12.dll artifacts/build/vkd3d-proton/aarch64-windows/d3d12core.dll "$DIR/"
             cp artifacts/build/ngx/aarch64-windows/nvngx.dll artifacts/build/ngx/aarch64-windows/nvapi64.dll "$DIR/"
             cp sources/nvapi/License.txt "$ROOT/LICENSE.nvapi"
+            # the lane's settings (MetalFX upscaling, DLSS's GPU identity), which the installer points the prefix at
+            cp install/vkd3d.conf install/dxvk.conf "$ROOT/"
           fi
           cp sources/dxvk/LICENSE "$ROOT/LICENSE.dxvk"
           cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.vkd3d-proton"

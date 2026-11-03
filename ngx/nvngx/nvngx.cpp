@@ -1,5 +1,6 @@
-// VKD3D-Proton-MacOS's NGX core: DLSS Super Resolution on MetalFX's temporal scaler and DLSS Ray Reconstruction on
-// its denoised scaler, recorded in VKD3D-Proton's command lists (ID3D12GraphicsCommandListMetalFX) and, for
+// VKD3D-Proton-MacOS's NGX core: DLSS Super Resolution on MetalFX's temporal scaler, DLSS Ray Reconstruction on its
+// denoised scaler and DLSS Frame Generation on its frame interpolator, recorded in VKD3D-Proton's command lists
+// (ID3D12GraphicsCommandListMetalFX) and, for
 // Super Resolution in D3D11, DXVK's contexts (ID3D11VkMetalFXContext), which MoltenVK runs. NVIDIA's NGX library loads it as its core (nvngx.dll) where the NVIDIA driver's registry values name it.
 //
 // From Mullion's NGX core (src/nvngx, LGPL-2.1), with VKD3D-Proton's interface in place of Mullion's.
@@ -11,9 +12,13 @@
 #include <d3d12.h>
 #include <dxgi.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "ngx.hpp"
 #include "parameters.hpp"
@@ -63,6 +68,72 @@ struct DLSSDFeature : DLSSFeature {
   unsigned int roughness_mode; // 1: roughness in the normals' alpha
   unsigned int hw_depth;       // 0: linear depth, which MetalFX does not take
 };
+
+// DLSS Frame Generation (D3D12), on MetalFX's frame interpolator
+struct DLSSGFeature : CommonFeature {
+  uint32_t width;
+  uint32_t height;
+  // when the last frame was interpolated to, for the time between frames
+  int64_t last_counter = 0;
+  ID3D12MetalFXScaler *interpolator = nullptr;
+};
+
+// NGX's NVSDK_NGX_FeatureCommonInfo: where the application keeps its feature libraries (nvsdk_ngx_defs.h)
+struct NVNGX_PathListInfo {
+  const wchar_t *const *Path;
+  unsigned int Length;
+};
+struct NVNGX_FeatureCommonInfo {
+  NVNGX_PathListInfo PathListInfo;
+  void *InternalData;
+};
+
+// the folders an Init named for feature libraries
+static std::mutex library_paths_mutex;
+static std::vector<std::wstring> library_paths;
+
+static void RememberLibraryPaths(const void *feature_info) {
+  auto info = static_cast<const NVNGX_FeatureCommonInfo *>(feature_info);
+  if (!info || !info->PathListInfo.Path)
+    return;
+  std::lock_guard<std::mutex> lock(library_paths_mutex);
+  for (unsigned i = 0; i < info->PathListInfo.Length; i++)
+    if (info->PathListInfo.Path[i])
+      library_paths.emplace_back(info->PathListInfo.Path[i]);
+}
+
+// whether the application ships a feature's library (`name`): NVIDIA's NGX core offers a feature only when it finds
+// its snippet (nvngx_dlssd.dll for Ray Reconstruction, nvngx_dlssg.dll for Frame Generation) loaded, beside the
+// executable, or in a folder Init or the discovery names. a game that ships none asks for the feature anyway where it
+// is offered, and then has none of its inputs (Control turns Ray Reconstruction on, and passes none of its textures)
+static bool HasFeatureLibrary(const wchar_t *name, const void *feature_info = nullptr) {
+  if (GetModuleHandleW(name))
+    return true;
+  std::vector<std::wstring> folders;
+  wchar_t exe[MAX_PATH];
+  DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (length && length < MAX_PATH) {
+    std::wstring path(exe, length);
+    folders.push_back(path.substr(0, path.find_last_of(L"\\/")));
+  }
+  {
+    std::lock_guard<std::mutex> lock(library_paths_mutex);
+    folders.insert(folders.end(), library_paths.begin(), library_paths.end());
+  }
+  auto info = static_cast<const NVNGX_FeatureCommonInfo *>(feature_info);
+  if (info && info->PathListInfo.Path)
+    for (unsigned i = 0; i < info->PathListInfo.Length; i++)
+      if (info->PathListInfo.Path[i])
+        folders.emplace_back(info->PathListInfo.Path[i]);
+  for (auto &folder : folders) {
+    auto path = folder;
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+      path += L'\\';
+    if (GetFileAttributesW((path + name).c_str()) != INVALID_FILE_ATTRIBUTES)
+      return true;
+  }
+  return false;
+}
 
 // the command list's MetalFX interface, released by the caller
 static ID3D12GraphicsCommandListMetalFX *GetMetalFX(ID3D12GraphicsCommandList *list) {
@@ -175,8 +246,28 @@ static NVNGX_RESULT GetStatsCallback(NVNGXParameter *params) {
   return NVNGX_RESULT_OK;
 }
 
-// what the core offers: Super Resolution, and Ray Reconstruction (whose availability games read the same way)
-static ParametersImpl *CapabilityParameters() {
+// what Streamline asks of a Frame Generation feature at each frame: that it evaluates every frame (when it is off too,
+// so the real frame is copied out), and that no capture is running
+static NVNGX_RESULT DLSSG_GetCurrentSettings(unsigned int *handle, NVNGXParameter *params) {
+  if (!params)
+    return NVNGX_RESULT_INVALID_PARAMETER;
+  params->Set("DLSSG.MustCallEval", 1u);
+  params->Set("DLSSG.BurstCaptureRunning", 0u);
+  return NVNGX_RESULT_OK;
+}
+
+// the video memory Frame Generation needs at a size, which Streamline asks before turning it on: MetalFX's interpolator
+// keeps a few frames at the output size
+static NVNGX_RESULT DLSSG_EstimateVRAM(unsigned int width, unsigned int height, unsigned int, unsigned int, unsigned int,
+                                      unsigned int, unsigned int, unsigned int, unsigned int, size_t *estimated) {
+  if (estimated)
+    *estimated = size_t(std::max(width, 1u)) * std::max(height, 1u) * 4 * 8 + (64 << 20);
+  return NVNGX_RESULT_OK;
+}
+
+// what the core offers: Super Resolution, Ray Reconstruction (whose availability games read the same way) where the
+// application ships its library, and, in D3D12, Frame Generation where it ships its library
+static ParametersImpl *CapabilityParameters(bool d3d12) {
   auto params = new ParametersImpl();
   params->Set("SuperSampling.Available", 1u);
   params->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 1u);
@@ -184,7 +275,7 @@ static ParametersImpl *CapabilityParameters() {
   params->Set("SuperSampling.MinDriverVersionMinor", 0);
   params->Set("SuperSampling.NeedsUpdatedDriver", 0);
   params->Set("SuperSampling.FeatureInitResult", 1u);
-  params->Set("SuperSamplingDenoising.Available", 1u);
+  params->Set("SuperSamplingDenoising.Available", unsigned(HasFeatureLibrary(L"nvngx_dlssd.dll")));
   params->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
   params->Set("SuperSamplingDenoising.MinDriverVersionMajor", 0);
   params->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
@@ -206,15 +297,30 @@ static ParametersImpl *CapabilityParameters() {
   params->Set("VisibilityNodeMask", 1);
   params->Set("DLSS.Enable.Output.Subrects", 1);
   params->Set("RTXValue", 0);
+  // Frame Generation, as the game's Streamline (sl.dlss_g) reads it: one frame between two, no Reflex frame warp
+  unsigned frame_generation = d3d12 && HasFeatureLibrary(L"nvngx_dlssg.dll");
+  params->Set("FrameGeneration.Available", frame_generation);
+  params->Set("FrameInterpolation.Available", frame_generation);
+  params->Set("FrameGeneration.NeedsUpdatedDriver", 0);
+  params->Set("FrameGeneration.MinDriverVersionMajor", 0);
+  params->Set("FrameGeneration.MinDriverVersionMinor", 0);
+  params->Set("FrameGeneration.FeatureInitResult", 1u);
+  params->Set("DLSSG.GetCurrentSettingsCallback", (void *)&DLSSG_GetCurrentSettings);
+  params->Set("DLSSG.EstimateVRAMCallback", (void *)&DLSSG_EstimateVRAM);
+  params->Set("DLSSG.MultiFrameCountMax", 1u);
+  params->Set("DLSSG.ReflexWarp.Available", 0u);
   return params;
 }
 
 static NVNGX_RESULT FeatureRequirements(const NVNGX_FeatureDiscoveryInfo *discovery, NVNGX_FeatureRequirement *requirement,
-                                        bool ray_reconstruction) {
+                                        bool d3d12) {
   if (!requirement || !discovery)
     return NVNGX_RESULT_INVALID_PARAMETER;
   if (discovery->FeatureID == NVNGX_FEATURE_SUPERSAMPLING ||
-      (ray_reconstruction && discovery->FeatureID == NVNGX_FEATURE_RAYRECONSTRUCTION)) {
+      (d3d12 && discovery->FeatureID == NVNGX_FEATURE_RAYRECONSTRUCTION &&
+       HasFeatureLibrary(L"nvngx_dlssd.dll", discovery->FeatureInfo)) ||
+      (d3d12 && discovery->FeatureID == NVNGX_FEATURE_FRAMEGENERATION &&
+       HasFeatureLibrary(L"nvngx_dlssg.dll", discovery->FeatureInfo))) {
     requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;
     requirement->MinHWArchitecture = 0;
     strcpy(requirement->MinOSVersion, "10.0.16299.0");
@@ -238,6 +344,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_UpdateFeature(const void *app_id, const unsi
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_Init(unsigned long long id, const wchar_t *path, ID3D12Device *device,
                                                const void *feature_info, unsigned int sdk_version) {
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -250,6 +357,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_Init_ProjectID(const char *project, un
                                                          const char *engine_version, const wchar_t *path,
                                                          ID3D12Device *device, unsigned int sdk_version,
                                                          const void *feature_info) {
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -257,6 +365,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_Init_with_ProjectID(const char *projec
                                                               const char *engine_version, const wchar_t *path,
                                                               ID3D12Device *device, const void *feature_info,
                                                               unsigned int sdk_version) {
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -286,7 +395,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_DestroyParameters(NVNGXParameter *para
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
-  *out_params = CapabilityParameters();
+  *out_params = CapabilityParameters(true);
   return NVNGX_RESULT_OK;
 }
 
@@ -319,7 +428,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandLis
     return NVNGX_RESULT_OK;
   }
   if (feature == NVNGX_FEATURE_RAYRECONSTRUCTION) {
-    if (!metalfx.iface->lpVtbl->SupportsDenoisedUpscale(metalfx.iface))
+    if (!metalfx.iface->lpVtbl->SupportsDenoisedUpscale(metalfx.iface) || !HasFeatureLibrary(L"nvngx_dlssd.dll"))
       return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
     auto dlssd = std::make_unique<DLSSDFeature>();
     dlssd->feature = NVNGX_FEATURE_RAYRECONSTRUCTION;
@@ -334,8 +443,106 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandLis
     *out_handle = &dlssd.release()->handle;
     return NVNGX_RESULT_OK;
   }
+  if (feature == NVNGX_FEATURE_FRAMEGENERATION) {
+    if (!metalfx.iface->lpVtbl->SupportsFrameInterpolation(metalfx.iface) || !HasFeatureLibrary(L"nvngx_dlssg.dll"))
+      return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+    auto dlssg = std::make_unique<DLSSGFeature>();
+    dlssg->feature = NVNGX_FEATURE_FRAMEGENERATION;
+    dlssg->width = GetOr(parameters, NVNGX_Parameter_Width, 0u);
+    dlssg->height = GetOr(parameters, NVNGX_Parameter_Height, 0u);
+    parameters->Set("DLSSG.MustCallEval", 1u);
+    lane::log("info", "Frame Generation at %ux%u on MetalFX's frame interpolator", dlssg->width, dlssg->height);
+    *out_handle = &dlssg.release()->handle;
+    return NVNGX_RESULT_OK;
+  }
   lane::log("err", "CreateFeature: feature %u is not supported", feature);
   return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+}
+
+// the camera Frame Generation is given: near and far planes, and the vertical field of view in degrees. Streamline's
+// is in radians, which some games give in degrees; without one it comes from the projection (row vectors: [1][1] is
+// 1 / tan(fov / 2))
+static void ReadCamera(const ParametersImpl *params, VKD3D_METALFX_FRAME_INTERPOLATE_DESC &desc) {
+  desc.Near = GetOr(params, "DLSSG.CameraNear", 0.0f);
+  desc.Far = GetOr(params, "DLSSG.CameraFar", 0.0f);
+  float fov = GetOr(params, "DLSSG.CameraFOV", 0.0f);
+  float *view_to_clip = nullptr;
+  params->Get("DLSSG.CameraViewToClip", (void **)&view_to_clip);
+  if (!(fov > 0.0f) && view_to_clip && view_to_clip[5] > 0.0f)
+    fov = 2.0f * std::atan(1.0f / view_to_clip[5]);
+  if (!(fov > 0.0f))
+    fov = 1.0f;
+  desc.FieldOfView = fov > 10.0f ? fov : fov * 180.0f / 3.14159265f;
+  // 0 is a far plane at infinity
+  if (!(desc.Far > 0.0f) || !std::isfinite(desc.Far))
+    desc.Far = std::max(desc.Near, 0.1f) * 1.0e5f;
+  if (!(desc.Near > 0.0f))
+    desc.Near = 0.1f;
+}
+
+static NVNGX_RESULT EvaluateFrameGeneration(ID3D12GraphicsCommandList *list, ID3D12GraphicsCommandListMetalFX *metalfx,
+                                            DLSSGFeature *dlssg, ParametersImpl *params) {
+  params->Set("DLSSG.FlushRequired", 0u);
+  // Streamline records the feature's work in a list it hands over closed unless it says it is recording
+  bool recording = GetOr(params, "DLSSG.IsRecording", 0u) != 0;
+  if (!recording) {
+    ID3D12CommandAllocator *allocator = nullptr;
+    params->Get("DLSSG.CmdAlloc", (void **)&allocator);
+    if (!allocator || FAILED(list->Reset(allocator, nullptr))) {
+      lane::log("err", "EvaluateFeature: Frame Generation without a command allocator");
+      return NVNGX_RESULT_INVALID_PARAMETER;
+    }
+  }
+  auto backbuffer = GetResource(params, "DLSSG.Backbuffer");
+  auto real = GetResource(params, "DLSSG.OutputReal");
+  NVNGX_RESULT result = NVNGX_RESULT_OK;
+  if (GetOr(params, "DLSSG.EnableInterp", 0u)) {
+    VKD3D_METALFX_FRAME_INTERPOLATE_DESC desc = {};
+    auto hudless = GetResource(params, "DLSSG.HUDLess");
+    desc.UI = GetResource(params, "DLSSG.UI");
+    // the frame without its UI, and the UI on top, where the game gives both; else the frame as presented, with the
+    // UI it has in it where the game gives that
+    desc.Color = hudless && desc.UI ? hudless : backbuffer;
+    desc.UIComposited = desc.Color == backbuffer;
+    desc.Depth = GetResource(params, "DLSSG.Depth");
+    desc.MotionVector = GetResource(params, "DLSSG.MVecs");
+    desc.Output = GetResource(params, "DLSSG.OutputInterpolated");
+    if (!desc.Color || !desc.Depth || !desc.MotionVector || !desc.Output) {
+      lane::log("err", "EvaluateFeature: Frame Generation without %s%s%s%s", !desc.Color ? "color " : "",
+                !desc.Depth ? "depth " : "", !desc.MotionVector ? "motion vectors " : "", !desc.Output ? "an output" : "");
+      result = NVNGX_RESULT_INVALID_PARAMETER;
+    } else {
+      // NGX's scale takes the motion vectors to pixels, as DLSS's MV.Scale (Streamline's normalizing scale times the
+      // render size)
+      desc.MotionVectorScaleX = GetOr(params, "DLSSG.MvecScaleX", 1.0f);
+      desc.MotionVectorScaleY = GetOr(params, "DLSSG.MvecScaleY", 1.0f);
+      desc.JitterOffsetX = GetOr(params, "DLSSG.JitterOffsetX", 0.0f);
+      desc.JitterOffsetY = GetOr(params, "DLSSG.JitterOffsetY", 0.0f);
+      desc.DepthReversed = GetOr(params, "DLSSG.DepthInverted", 0u) != 0;
+      desc.InReset = GetOr(params, "DLSSG.Reset", 0u) != 0 || !dlssg->last_counter;
+      ReadCamera(params, desc);
+      D3D12_RESOURCE_DESC output = desc.Output->GetDesc();
+      desc.AspectRatio = GetOr(params, "DLSSG.CameraAspectRatio", 0.0f);
+      if (!(desc.AspectRatio > 0.0f))
+        desc.AspectRatio = float(output.Width) / float(std::max(output.Height, 1u));
+      LARGE_INTEGER now, frequency;
+      QueryPerformanceCounter(&now);
+      QueryPerformanceFrequency(&frequency);
+      desc.DeltaTime = dlssg->last_counter ? float(now.QuadPart - dlssg->last_counter) / float(frequency.QuadPart)
+                                           : 1.0f / 60.0f;
+      if (!(desc.DeltaTime > 0.0f) || desc.DeltaTime > 0.25f)
+        desc.DeltaTime = 1.0f / 60.0f;
+      dlssg->last_counter = now.QuadPart;
+      if (FAILED(metalfx->lpVtbl->FrameInterpolate(metalfx, &desc, &dlssg->interpolator)))
+        result = NVNGX_RESULT_FAIL;
+    }
+  }
+  // the real frame, which Streamline presents after the interpolated one
+  if (backbuffer && real && backbuffer != real)
+    list->CopyResource(real, backbuffer);
+  if (!recording)
+    list->Close();
+  return result;
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList *list, const unsigned int *handle,
@@ -405,6 +612,8 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandL
     return FAILED(metalfx.iface->lpVtbl->DenoisedUpscale(metalfx.iface, &desc, &dlssd->scaler)) ? NVNGX_RESULT_FAIL
                                                                                                   : NVNGX_RESULT_OK;
   }
+  case NVNGX_FEATURE_FRAMEGENERATION:
+    return EvaluateFrameGeneration(list, metalfx.iface, static_cast<DLSSGFeature *>(common), parameters);
   default:
     break;
   }
@@ -429,6 +638,11 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_ReleaseFeature(unsigned int *handle) {
       delete static_cast<DLSSDFeature *>(common);
     else
       delete dlss;
+  } else if (common->feature == NVNGX_FEATURE_FRAMEGENERATION) {
+    auto dlssg = static_cast<DLSSGFeature *>(common);
+    if (dlssg->interpolator)
+      dlssg->interpolator->lpVtbl->Destroy(dlssg->interpolator);
+    delete dlssg;
   }
   return NVNGX_RESULT_OK;
 }
@@ -492,7 +706,7 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_DestroyParameters(NVNGXParameter *para
 }
 
 NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D11_GetCapabilityParameters(NVNGXParameter **out_params) {
-  *out_params = CapabilityParameters();
+  *out_params = CapabilityParameters(false);
   return NVNGX_RESULT_OK;
 }
 

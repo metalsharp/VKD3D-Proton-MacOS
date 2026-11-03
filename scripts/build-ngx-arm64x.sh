@@ -37,4 +37,18 @@ meson setup --cross-file "$CROSS" --buildtype release --strip "$OUT" "$WS/ngx"
 ninja -C "$OUT"
 mkdir -p "$STAGE"
 cp "$OUT/nvngx.dll" "$OUT/nvapi64.dll" "$STAGE/"
+
+# NGX loads only a core whose Authenticode signature chains to a trusted root: nvngx.dll is signed with the Mullion
+# NGX key, whose certificate (ngx/signing/mullion-ngx.pem) the lane's DXGI trusts in the prefix (ngx/signing/README.md).
+# The key: NGX_SIGNING_KEY_FILE, else ~/.metalsharp/ngx-signing/key.pem; without one nvngx.dll stays unsigned.
+KEY="${NGX_SIGNING_KEY_FILE:-$HOME/.metalsharp/ngx-signing/key.pem}"
+if [ -f "$KEY" ] && command -v osslsigncode >/dev/null; then
+    osslsigncode sign -certs "$WS/ngx/signing/mullion-ngx.pem" -key "$KEY" -n "Mullion NGX" -h sha256 \
+        -in "$STAGE/nvngx.dll" -out "$STAGE/nvngx.dll.signed"
+    mv "$STAGE/nvngx.dll.signed" "$STAGE/nvngx.dll"
+    osslsigncode verify -CAfile "$WS/ngx/signing/mullion-ngx.pem" -in "$STAGE/nvngx.dll" >/dev/null
+    echo "signed nvngx.dll"
+else
+    echo "warning: no NGX signing key (or osslsigncode): nvngx.dll is unsigned, and NGX will not load it" >&2
+fi
 file "$STAGE"/*.dll

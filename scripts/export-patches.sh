@@ -6,6 +6,11 @@ WS="$(cd "$(dirname "$0")/.." && pwd)"
 # VKD3D-Proton: the commit series on the upstream revision fetch-sources.sh pins, applied there with git am
 git -C "$WS/sources/vkd3d-proton" format-patch -q --stdout ef9a02e873715c9e2da0d6db8a236aca8380b303..HEAD \
     > "$WS/patches/vkd3d-proton-moltenvk.patch"
+# dxil-spirv: its commits on the revision VKD3D-Proton's series pins, applied there with git am (fetch-sources.sh), so
+# a fix taken from upstream dxil-spirv needs no unpublished submodule revision
+DXIL_SPIRV_REV=$(git -C "$WS/sources/vkd3d-proton" ls-tree HEAD subprojects/dxil-spirv | awk '{print $3}')
+rm -rf "$WS/patches/dxil-spirv"
+git -C "$WS/sources/vkd3d-proton/subprojects/dxil-spirv" format-patch -q "$DXIL_SPIRV_REV..HEAD" -o "$WS/patches/dxil-spirv"
 cd "$WS/sources/MoltenVK"
 git diff 5189f8de..HEAD -- . ':!External' > "$WS/patches/moltenvk/metalsharp-vkmt.diff"
 git log --format='%h %s' 5189f8de..HEAD > "$WS/patches/moltenvk/metalsharp-vkmt.log"

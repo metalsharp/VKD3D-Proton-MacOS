@@ -1,6 +1,7 @@
 #!/bin/bash
 # Recreate sources/ from upstream and this repository's patches:
-#   sources/vkd3d-proton  upstream VKD3D-Proton + patches/vkd3d-proton-moltenvk.patch
+#   sources/vkd3d-proton  upstream VKD3D-Proton + patches/vkd3d-proton-moltenvk.patch, and its subprojects/dxil-spirv
+#                         + patches/dxil-spirv/*.patch
 #   sources/MoltenVK      upstream MoltenVK + patches/moltenvk/metalsharp-vkmt.diff
 #                         (dttdrv's ray tracing, mesh shader and fix branches, then MetalSharp's work),
 #                         with External/SPIRV-Cross at the dttdrv revision + patches/spirv-cross/metalsharp.diff
@@ -20,6 +21,10 @@ if want vkd3d-proton && [ ! -d "$WS/sources/vkd3d-proton/.git" ]; then
     git -C "$WS/sources/vkd3d-proton" checkout -b metalsharp-moltenvk "$VKD3D_REV"
     git -C "$WS/sources/vkd3d-proton" submodule update --init --recursive
     git -C "$WS/sources/vkd3d-proton" am "$WS/patches/vkd3d-proton-moltenvk.patch"
+    if ls "$WS"/patches/dxil-spirv/*.patch >/dev/null 2>&1; then
+        git -C "$WS/sources/vkd3d-proton/subprojects/dxil-spirv" -c user.name=MetalSharp \
+            -c user.email=metalsharp@users.noreply.github.com am "$WS"/patches/dxil-spirv/*.patch
+    fi
 fi
 
 if want moltenvk && [ ! -d "$WS/sources/MoltenVK/.git" ]; then

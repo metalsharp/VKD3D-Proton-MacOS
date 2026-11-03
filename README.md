@@ -52,6 +52,26 @@ tar -xf moltenvk-<tag>-universal.tar.zst
 
 [docs/install.md](docs/install.md) covers both packages, the options, running programs and uninstalling.
 
+### MetalFX and DLSS settings
+
+The arm64 package ships `vkd3d.conf` and `dxvk.conf`, which the installer copies into
+`<prefix>/vkd3d-proton-macos/` (a reinstall keeps your edits) and points `VKD3D_CONFIG_FILE` and `DXVK_CONFIG_FILE` at
+from `env.sh`. MetalSharp writes its own; other Wines use these:
+
+- **MetalFX spatial upscaling** of the swap chain to the display, where a game renders smaller than its window: on in
+  `vkd3d.conf` (`d3d12.metalSpatialUpscale`) and `dxvk.conf` (`d3d11.metalSpatialUpscale`). `VKD3D_METALFX_SPATIAL=1`
+  or `0` overrides the file for D3D12.
+- **DLSS** (Super Resolution, Ray Reconstruction and Frame Generation on MetalFX): the package's NGX core (`nvngx.dll`,
+  signed with the Mullion NGX key, whose certificate the lane's DXGI trusts in the prefix) and NVAPI answer only games
+  that DXGI shows an NVIDIA GPU. Uncomment the `dxgi.customVendorId = 10de` lines in `dxvk.conf` under the game's
+  `[Game.exe]` section. Ray Reconstruction and Frame Generation need the game to ship `nvngx_dlssd.dll` and
+  `nvngx_dlssg.dll`, as on Windows; Frame Generation needs macOS 27.
+
+A path in either variable may be a Unix path or a Windows one (`Z:/...`).
+
+MoltenVK compiles Metal pipelines on background threads, so a game's own compile threads don't wait on Metal;
+`MVK_CONFIG_DEFERRED_PIPELINES=0` compiles them where they're created instead.
+
 ## Build from source
 
 ```bash
