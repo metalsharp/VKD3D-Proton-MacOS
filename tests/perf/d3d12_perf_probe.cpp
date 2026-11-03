@@ -4269,6 +4269,15 @@ int main(int argc, char **argv)
     if (!scene) { printf("unknown scene %s\n", argv[1]); return 2; }
 
     g_level = scene->level;
+
+    // PROBE_BUSY_THREADS=N: N threads spin for the whole run, as a game's worker threads (and FEX) keep the CPU busy,
+    // to see whether fence completion and submission degrade under load.
+    if (const char *busy = getenv("PROBE_BUSY_THREADS"))
+    {
+        for (int i = 0, n = atoi(busy); i < n; i++)
+            std::thread([] { volatile unsigned long long x = 0; for (;;) x = x * 6364136223846793005ull + 1; }).detach();
+        printf("busy_threads=%d\n", atoi(busy));
+    }
     setup();
     double t = qpc_ms();
     scene->init();
