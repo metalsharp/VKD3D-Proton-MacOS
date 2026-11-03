@@ -2948,6 +2948,70 @@ float4 ps(DSOut i) : SV_Target { return i.pid == 0 ? float4(1, 0, 0, 1) : float4
     return true;
 }
 
+// Compute ExecuteIndirect with a count buffer below MaxCommandCount (GPU culling): only the counted commands
+// run, each with its own root constant, an empty dispatch inside the count runs nothing, and a count above
+// MaxCommandCount is clamped to it.
+static bool test_executeindirect_dispatch_count()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint id; };
+RWByteAddressBuffer o : register(u0);
+[numthreads(4, 1, 1)]
+void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(id * 4, 1); }
+)";
+    std::vector<char> csb = compile_dxc(src, "cs", "cs_6_0");
+    if (csb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[0].ShaderVisibility = rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, csb);
+    if (!cps)
+        return false;
+    D3D12_INDIRECT_ARGUMENT_DESC ia[2] = {};
+    ia[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    ia[0].Constant.Num32BitValuesToSet = 1;
+    ia[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    struct Cmd { UINT id; D3D12_DISPATCH_ARGUMENTS dispatch; };
+    D3D12_COMMAND_SIGNATURE_DESC sd = { sizeof(Cmd), 2, ia, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&sd, rs, IID_PPV_ARGS(&sig)));
+
+    const UINT N = 16;
+    ID3D12Resource *args = create_buffer(2 * N * sizeof(Cmd) + 16, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *a = nullptr;
+    args->Map(0, nullptr, (void **)&a);
+    Cmd *c = (Cmd *)a;
+    for (UINT i = 0; i < 2 * N; i++)
+        c[i] = { i, { 1 + i % 3, 1, i == 3 ? 0u : 1u } };
+    UINT *counts = (UINT *)(a + 2 * N * sizeof(Cmd));
+    counts[0] = 10;
+    counts[1] = 20;  // Above MaxCommandCount.
+    args->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(2 * N * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(cps);
+    g.list->ExecuteIndirect(sig, N, args, 0, args, 2 * N * sizeof(Cmd));
+    g.list->ExecuteIndirect(sig, N, args, N * sizeof(Cmd), args, 2 * N * sizeof(Cmd) + 4);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 2 * N * 4, &rb);
+    if (!v)
+        return false;
+    for (UINT i = 0; i < 2 * N; i++)
+    {
+        UINT want = (i < N && i >= 10) || i == 3 ? 0 : 4 * (1 + i % 3);
+        EXPECT(v[i] == want, "command %u ran %u threads, want %u", i, v[i], want);
+    }
+    rb->Release(); out->Release(); args->Release(); sig->Release(); cps->Release(); rs->Release();
+    return true;
+}
+
 // ExecuteIndirect: a command signature that changes a root constant and draws indexed (3 commands, the count
 // buffer allowing 2), one that dispatches, and one that also changes the root UAV; each command writes its root
 // constant into its own slot.
@@ -4686,6 +4750,7 @@ static const Test tests[] = {
     { "mesh", test_mesh },
     { "tessellation", test_tessellation },
     { "executeindirect", test_executeindirect },
+    { "executeindirect_dispatch_count", test_executeindirect_dispatch_count },
     { "dynamicresources", test_dynamicresources },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
