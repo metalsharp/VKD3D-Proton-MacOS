@@ -5193,7 +5193,7 @@ index 5119f856..a1ee183c 100644
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-index 3e9fc79f..8444582e 100644
+index 3e9fc79f..96925414 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 @@ -22,9 +22,12 @@
@@ -5271,7 +5271,7 @@ index 3e9fc79f..8444582e 100644
  			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
  		}
  	}
-@@ -237,6 +278,315 @@
+@@ -237,6 +278,318 @@
  template class MVKCmdPipelineBarrier<32>;
  
  
@@ -5355,7 +5355,10 @@ index 3e9fc79f..8444582e 100644
 +				desc.inputHeight = depth.height;
 +				desc.outputWidth = output.width;
 +				desc.outputHeight = output.height;
-+				desc.requiresPrevColorTexture = NO;
++				// macOS 27's SDK property, set by name so builds with older SDKs turn it off too
++				if ([desc respondsToSelector: @selector(setRequiresPrevColorTexture:)]) {
++					[desc setValue: @NO forKey: @"requiresPrevColorTexture"];
++				}
 +				id made = [desc newFrameInterpolatorWithDevice: mtlDevice];
 +				[desc release];
 +				if (made) {
@@ -5587,7 +5590,7 @@ index 3e9fc79f..8444582e 100644
  #pragma mark -
  #pragma mark MVKCmdBindPipeline
  
-@@ -260,6 +610,14 @@
+@@ -260,6 +613,14 @@
  	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
  }
  
@@ -5602,7 +5605,7 @@ index 3e9fc79f..8444582e 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindComputePipeline
-@@ -268,6 +626,18 @@
+@@ -268,6 +629,18 @@
  	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
  }
  
@@ -5621,7 +5624,7 @@ index 3e9fc79f..8444582e 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindDescriptorSetsStatic
-@@ -279,14 +649,16 @@
+@@ -279,14 +652,16 @@
  													   uint32_t firstSet,
  													   uint32_t setCount,
  													   const VkDescriptorSet* pDescriptorSets) {
@@ -5641,7 +5644,7 @@ index 3e9fc79f..8444582e 100644
  	// Add the descriptor sets
  	_descriptorSets.clear();	// Clear for reuse
  	_descriptorSets.reserve(setCount);
-@@ -373,7 +745,7 @@
+@@ -373,7 +748,7 @@
  
  template <size_t N>
  void MVKCmdPushConstants<N>::encode(MVKCommandEncoder* cmdEncoder) {
@@ -5650,7 +5653,7 @@ index 3e9fc79f..8444582e 100644
  }
  
  template class MVKCmdPushConstants<64>;
-@@ -384,57 +756,188 @@
+@@ -384,57 +759,188 @@
  #pragma mark -
  #pragma mark MVKCmdPushDescriptorSet
  
@@ -5860,7 +5863,7 @@ index 3e9fc79f..8444582e 100644
  		}
  	}
  
-@@ -442,7 +945,11 @@
+@@ -442,7 +948,11 @@
  }
  
  void MVKCmdPushDescriptorSet::encode(MVKCommandEncoder* cmdEncoder) {
@@ -5873,7 +5876,7 @@ index 3e9fc79f..8444582e 100644
  }
  
  MVKCmdPushDescriptorSet::~MVKCmdPushDescriptorSet() {
-@@ -452,24 +959,24 @@
+@@ -452,24 +962,24 @@
  
  void MVKCmdPushDescriptorSet::clearDescriptorWrites() {
  	for (VkWriteDescriptorSet &descWrite : _descriptorWrites) {
@@ -5912,7 +5915,7 @@ index 3e9fc79f..8444582e 100644
  }
  
  
-@@ -481,11 +988,21 @@
+@@ -481,11 +991,21 @@
  														 VkPipelineLayout layout,
  														 uint32_t set,
  														 const void* pData) {
@@ -5938,7 +5941,7 @@ index 3e9fc79f..8444582e 100644
  
  	size_t oldSize = _dataSize;
  	_dataSize = _descUpdateTemplate->getSize();
-@@ -495,6 +1012,15 @@
+@@ -495,6 +1015,15 @@
  	}
  	if (_pData && pData) {
  		mvkCopy(_pData, pData, _dataSize);
@@ -5954,7 +5957,7 @@ index 3e9fc79f..8444582e 100644
  	}
  
  	return VK_SUCCESS;
-@@ -505,6 +1031,8 @@
+@@ -505,6 +1034,8 @@
  }
  
  MVKCmdPushDescriptorSetWithTemplate::~MVKCmdPushDescriptorSetWithTemplate() {
