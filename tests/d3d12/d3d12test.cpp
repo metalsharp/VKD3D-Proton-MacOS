@@ -3730,6 +3730,161 @@ float4 ps() : SV_Target { return color; }
     return true;
 }
 
+// Static samplers pick mip levels: a 2-mip texture (mip 0 blue, mip 1 white) sampled at level 1 in a compute shader
+// (SampleLevel) and a pixel shader (SampleLevel, and Sample over a quad half its size, which derives level 1). Metal
+// Shader Converter's static samplers read level 0 only.
+static bool test_static_sampler_lod()
+{
+    static const char *src = R"(
+Texture2D<float4> t : register(t0);
+SamplerState s : register(s0);
+RWStructuredBuffer<float4> o : register(u0);
+[numthreads(1, 1, 1)] void cs() { o[0] = t.SampleLevel(s, float2(0.5, 0.5), 1); }
+float4 vs(uint id : SV_VertexID, out float2 uv : TEXCOORD) : SV_Position
+{
+    uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps_level(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return t.SampleLevel(s, uv, 1); }
+float4 ps_implicit(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return t.Sample(s, uv); }
+)";
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, compile_dxc(src, "cs", "cs_6_0"));
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps_level = compile_dxc(src, "ps_level", "ps_6_0"),
+                      ps_implicit = compile_dxc(src, "ps_implicit", "ps_6_0");
+    if (!rs || !cps || vs.empty() || ps_level.empty() || ps_implicit.empty())
+        return false;
+    ID3D12PipelineState *gps[2] = {};
+    for (int i = 0; i < 2; i++)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = i ? D3D12_SHADER_BYTECODE{ ps_implicit.data(), ps_implicit.size() } : D3D12_SHADER_BYTECODE{ ps_level.data(), ps_level.size() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps[i])));
+    }
+
+    // The texture: 4x4 blue, its 2x2 mip white.
+    ID3D12Resource *upload = create_buffer(8192, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+        {
+            uint32_t blue = 0xffff0000, white = 0xffffffff;
+            memcpy(u + 256 * y + 4 * x, &blue, 4);
+            memcpy(u + 4096 + 256 * y + 4 * x, &white, 4);
+        }
+    upload->Unmap(0, nullptr);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 2;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    for (UINT mip = 0; mip < 2; mip++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = mip;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = mip * 4096;
+        srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 4u >> mip, 4u >> mip, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    g.device->CreateShaderResourceView(tex, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+
+    // Two 2x2 targets (level 1 explicit, implicit) and the compute result.
+    td.Width = 2; td.Height = 2; td.MipLevels = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt[2] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    UINT rtv_inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ID3D12Resource *out = create_buffer(16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(cps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    D3D12_VIEWPORT vp = { 0, 0, 2, 2, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 2, 2 };
+    for (int i = 0; i < 2; i++)
+    {
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt[i])));
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += i * rtv_inc;
+        g.device->CreateRenderTargetView(rt[i], nullptr, rtv);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+        g.list->SetPipelineState(gps[i]);
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.list->DrawInstanced(3, 1, 0, 0);
+    }
+    ID3D12Resource *rb;
+    const float *c = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 16, &rb);
+    if (!c)
+        return false;
+    EXPECT(c[0] > 0.99f && c[1] > 0.99f && c[2] > 0.99f, "compute SampleLevel(1) = %f %f %f, want white (mip 1)", c[0], c[1], c[2]);
+    static const char *names[2] = { "pixel shader SampleLevel(1)", "pixel shader Sample at half size" };
+    for (int i = 0; i < 2; i++)
+    {
+        ID3D12Resource *rrb = create_buffer(512, D3D12_HEAP_TYPE_READBACK);
+        transition(rt[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rrb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 2, 2, 1, 256 };
+        srcl.pResource = rt[i];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        if (!execute_and_wait())
+            return false;
+        uint32_t *px = nullptr;
+        D3D12_RANGE r = { 0, 512 };
+        rrb->Map(0, &r, (void **)&px);
+        EXPECT(px[0] == 0xffffffff, "%s = %08x, want ffffffff (mip 1)", names[i], px[0]);
+        rrb->Unmap(0, nullptr);
+        rrb->Release();
+    }
+    rb->Release(); out->Release(); rt[0]->Release(); rt[1]->Release(); rtv_heap->Release(); heap->Release(); tex->Release();
+    upload->Release(); gps[0]->Release(); gps[1]->Release(); cps->Release(); rs->Release();
+    return true;
+}
+
 // Textures: a BC1 texture (decoded colors), a 2-layer texture array with 2 mips sampled at explicit levels and
 // layers, and a copy of a texture region.
 static bool test_textures()
@@ -5030,6 +5185,7 @@ static const Test tests[] = {
     { "dynamicresources", test_dynamicresources },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
+    { "static_sampler_lod", test_static_sampler_lod },
     { "queues", test_queues },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
