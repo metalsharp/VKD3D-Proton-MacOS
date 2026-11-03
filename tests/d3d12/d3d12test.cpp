@@ -3506,7 +3506,7 @@ void main(uint t : SV_DispatchThreadID)
 // Render target basics: 4x MSAA with a resolve, a depth test, a stencil write and test (D24S8, which Metal has
 // as D32S8), and occlusion and timestamp queries.
 // Timestamps: back to back, around GPU work and from two heaps interleaved (MoltenVK samples the timestamps between
-// two Metal encoders once and resolves that into each), resolved whole and in part at an offset.
+// two Metal encoders once and resolves that into each), resolved whole and in part at an offset, in the same list.
 static bool test_timestamps()
 {
     static const char *src = R"(
@@ -3550,10 +3550,11 @@ void main(uint t : SV_DispatchThreadID)
     g.list->Dispatch(256, 1, 1);
     g.list->EndQuery(b, D3D12_QUERY_TYPE_TIMESTAMP, 6);
     g.list->EndQuery(a, D3D12_QUERY_TYPE_TIMESTAMP, 4);
-    // Resolved after the timestamps' list completes. Open bug (VKD3D lane): MoltenVK resolves stage-boundary samples
-    // correctly only once the Metal command buffer that took them has completed, so resolving in the same list reads 0.
-    if (!execute_and_wait())
-        return false;
+    // Resolved in the same list, into a default buffer (read back below) and a readback one: Metal resolves the
+    // samples only once the command buffer that took them completes (MoltenVK waits for it, or writes the readback
+    // buffer on the host then).
+    ID3D12Resource *direct = create_buffer(64, D3D12_HEAP_TYPE_READBACK);
+    g.list->ResolveQueryData(a, D3D12_QUERY_TYPE_TIMESTAMP, 0, 5, direct, 0);
     g.list->ResolveQueryData(a, D3D12_QUERY_TYPE_TIMESTAMP, 0, 5, res, 0);
     g.list->ResolveQueryData(b, D3D12_QUERY_TYPE_TIMESTAMP, 5, 2, res, 64);
     g.list->ResolveQueryData(a, D3D12_QUERY_TYPE_TIMESTAMP, 2, 3, res, 128);
@@ -3575,6 +3576,13 @@ void main(uint t : SV_DispatchThreadID)
     for (int i = 0; i < 3; i++)
         EXPECT(t[16 + i] == t[2 + i], "partial resolve %d = %llu, want %llu", i, (unsigned long long)t[16 + i],
                (unsigned long long)t[2 + i]);
+    uint64_t *d = nullptr;
+    D3D12_RANGE dr = { 0, 40 };
+    direct->Map(0, &dr, (void **)&d);
+    for (int i = 0; i < 5; i++)
+        EXPECT(d[i] == t[i], "readback heap resolve %d = %llu, want %llu", i, (unsigned long long)d[i], (unsigned long long)t[i]);
+    direct->Unmap(0, nullptr);
+    direct->Release();
     rb->Release(); res->Release(); buf->Release(); b->Release(); a->Release(); ps->Release(); rs->Release();
     return true;
 }
