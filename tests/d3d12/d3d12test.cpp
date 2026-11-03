@@ -1734,6 +1734,226 @@ static bool test_gs_streamoutput_dxbc()
                                compile_fxc(gs_so_src, "ps", "ps_5_0"));
 }
 
+// A geometry shader reading inputs packed into the components of one register: three outputs of the vertex shader
+// (a float, a float and a float2, as Forza Horizon 3's) share a location, which DXC and FXC both do. The geometry
+// shader runs as a mesh shader on MoltenVK, and its payload struct gave each component a member named after the
+// location alone, so the pipeline failed to compile (duplicate member 'in1'). The pixel shader writes the three
+// values to one render target.
+static const char *gs_packed_src = R"(
+struct V { float4 pos : SV_Position; float a : TEXCOORD0; float b : TEXCOORD2; float2 c : TANGENT0; };
+V vs(uint id : SV_VertexID)
+{
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.a = 0.25; o.b = 0.5; o.c = float2(0.75, 1.0);
+    return o;
+}
+[maxvertexcount(3)]
+void gs(triangle V v[3], inout TriangleStream<V> s)
+{
+    for (int i = 0; i < 3; i++)
+        s.Append(v[i]);
+}
+float4 ps(V v) : SV_Target { return float4(v.a, v.b, v.c); }
+)";
+
+static bool run_gs_packed(const char *kind, const std::vector<char> &vs, const std::vector<char> &gs,
+                          const std::vector<char> &ps)
+{
+    if (vs.empty() || gs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.GS = { gs.data(), gs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    HRESULT hr = g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    EXPECT(SUCCEEDED(hr), "%s: CreateGraphicsPipelineState = 0x%08lx", kind, (unsigned long)hr);
+    if (FAILED(hr))
+    {
+        rs->Release();
+        return true;
+    }
+
+    const UINT W = 16, H = 16;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_R8G8B8A8_UNORM, { 0, 0, 0, 0 } };
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 0 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+
+    ID3D12Resource *rb = create_buffer(W * H * 4, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, W * 4 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE range = { 0, W * H * 4 };
+    rb->Map(0, &range, (void **)&px);
+    uint32_t drawn = px[4 * W + 4];
+    // 0.25, 0.5, 0.75, 1.0 as UNORM8: 0x40, 0x80, 0xbf, 0xff
+    EXPECT(drawn == 0xffbf8040, "%s: drawn pixel 0x%08x, want 0xffbf8040", kind, drawn);
+    rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_gs_packed_dxil()
+{
+    return run_gs_packed("DXIL", compile_dxc(gs_packed_src, "vs", "vs_6_0"), compile_dxc(gs_packed_src, "gs", "gs_6_0"),
+                         compile_dxc(gs_packed_src, "ps", "ps_6_0"));
+}
+
+static bool test_gs_packed_dxbc()
+{
+    return run_gs_packed("DXBC", compile_fxc(gs_packed_src, "vs", "vs_5_0"), compile_fxc(gs_packed_src, "gs", "gs_5_0"),
+                         compile_fxc(gs_packed_src, "ps", "ps_5_0"));
+}
+
+// GetAttributeAtVertex (SM 6.1, with SV_Barycentrics): a triangle whose vertices output 1, 3 and 5 covers a pixel
+// whose shader returns the input at each vertex, which arrives as a PerVertexKHR input. MoltenVK builds it on MSL 4's
+// vertex_value<T> where a drawn triangle shows it works, and returns 1, 3 and 5; where the driver's vertex_value reads
+// other values (macOS 27.2 on an Apple M4) it takes the interpolated value at every vertex instead, so the pipeline
+// still compiles: three equal values between 1 and 5.
+static bool test_pervertex()
+{
+    static const char *src = R"(
+struct V { float4 pos : SV_Position; nointerpolation float a : A; };
+V vs(uint id : SV_VertexID)
+{
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.a = 1 + id * 2;
+    return o;
+}
+float4 ps(V v) : SV_Target
+{
+    return float4(GetAttributeAtVertex(v.a, 0), GetAttributeAtVertex(v.a, 1), GetAttributeAtVertex(v.a, 2), 1);
+}
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_1"), ps = compile_dxc(src, "ps", "ps_6_1");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+    if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) || !o3.BarycentricsSupported)
+    {
+        printf("  skipped: no barycentrics\n");
+        return true;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    HRESULT hr = g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    EXPECT(SUCCEEDED(hr), "CreateGraphicsPipelineState = 0x%08lx", (unsigned long)hr);
+    if (FAILED(hr))
+    {
+        rs->Release();
+        return true;
+    }
+
+    const UINT W = 4, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_R32G32B32A32_FLOAT, { 0, 0, 0, 0 } };
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 0 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+
+    ID3D12Resource *rb = create_buffer(W * H * 16, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32B32A32_FLOAT, W, H, 1, W * 16 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const float *px = nullptr;
+    D3D12_RANGE range = { 0, W * H * 16 };
+    rb->Map(0, &range, (void **)&px);
+    float a = px[0], b = px[1], c = px[2];
+    bool exact = a == 1 && b == 3 && c == 5;
+    bool approximated = a == b && b == c && a >= 1 && a <= 5;
+    printf("  the input at each vertex: %g %g %g (%s)\n", a, b, c,
+           exact ? "exact" : approximated ? "approximated by its interpolated value" : "wrong");
+    EXPECT(exact || approximated, "the input at each vertex reads %g %g %g, want 1 3 5 or one interpolated value", a, b, c);
+    rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // Predication (SetPredication): draws and dispatches skipped by the predicate buffer's value, with EQUAL_ZERO
 // and NOT_EQUAL_ZERO.
 static bool test_predication()
@@ -4108,6 +4328,9 @@ static const Test tests[] = {
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
+    { "gs_packed_dxil", test_gs_packed_dxil },
+    { "gs_packed_dxbc", test_gs_packed_dxbc },
+    { "pervertex", test_pervertex },
     { "predication", test_predication },
     { "native16bit", test_native16bit },
     { "groupshared64", test_groupshared64 },
