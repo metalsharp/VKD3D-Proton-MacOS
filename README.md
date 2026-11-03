@@ -69,6 +69,9 @@ from `env.sh`. MetalSharp writes its own; other Wines use these:
 
 A path in either variable may be a Unix path or a Windows one (`Z:/...`).
 
+MoltenVK compiles Metal pipelines on background threads, so a game's own compile threads don't wait on Metal;
+`MVK_CONFIG_DEFERRED_PIPELINES=0` compiles them where they're created instead.
+
 ## Build from source
 
 ```bash
