@@ -1345,6 +1345,95 @@ uint4 ps() : SV_Target { return uint4(0x19, 0x5a, 0xf0, 0x0f); }
     return true;
 }
 
+// WriteBufferImmediate inside a render pass: 1200 draws, each between a MARKER_IN and a MARKER_OUT write, and a
+// DEFAULT write after each, land every value in its slot. Without buffer markers MARKER_IN is batched with the rest
+// and written when the pass ends or the batch (1024 writes) fills, so the writes span more than one batch.
+static bool test_wbi_markers()
+{
+    static const char *src = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(0.1, -0.1), 0, 1);
+}
+float4 ps() : SV_Target { return float4(1, 1, 1, 1); }
+)";
+    std::vector<char> vs = compile_fxc(src, "vs", "vs_5_0"), ps = compile_fxc(src, "ps", "ps_5_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12GraphicsCommandList2 *l2 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&l2)));
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 16; td.Height = 16; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    const UINT DRAWS = 1200;
+    ID3D12Resource *markers = create_buffer(DRAWS * 12, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+                                            D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, 16, 16, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 16, 16 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_WRITEBUFFERIMMEDIATE_MODE in = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+                                          out = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    D3D12_GPU_VIRTUAL_ADDRESS va = markers->GetGPUVirtualAddress();
+    for (UINT i = 0; i < DRAWS; i++)
+    {
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER m = { va + i * 4, 0x10000 + i };
+        l2->WriteBufferImmediate(1, &m, &in);
+        g.list->DrawInstanced(3, 1, 0, 0);
+        m = { va + DRAWS * 4 + i * 4, 0x20000 + i };
+        l2->WriteBufferImmediate(1, &m, &out);
+        m = { va + DRAWS * 8 + i * 4, 0x30000 + i };
+        l2->WriteBufferImmediate(1, &m, nullptr);
+    }
+    ID3D12Resource *rb = create_buffer(DRAWS * 12, D3D12_HEAP_TYPE_READBACK);
+    transition(markers, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, markers, 0, DRAWS * 12);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *got = nullptr;
+    D3D12_RANGE r = { 0, DRAWS * 12 };
+    rb->Map(0, &r, (void **)&got);
+    for (UINT i = 0; i < DRAWS * 3; i++)
+    {
+        uint32_t want = 0x10000 * (1 + i / DRAWS) + i % DRAWS;
+        EXPECT(got[i] == want, "marker word %u = 0x%x, want 0x%x", i, got[i], want);
+    }
+    rb->Release(); markers->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release(); l2->Release();
+    return true;
+}
+
 // WaveReadLaneFirst in a pixel shader takes the first active lane that is not a helper (helper lanes complete a
 // triangle's edge quads and are not active lanes). A thin triangle leaves many helpers; each covered pixel writes
 // its own coordinates (alpha 1) and the coordinates WaveReadLaneFirst gave it, which must be a covered pixel's.
@@ -4601,6 +4690,7 @@ static const Test tests[] = {
     { "cbv_rows_robust_dxbc", test_cbv_rows_robust_dxbc },
     { "minmax", test_minmax },
     { "wave_first_helpers", test_wave_first_helpers },
+    { "wbi_markers", test_wbi_markers },
     { "predication", test_predication },
     { "native16bit", test_native16bit },
     { "groupshared64", test_groupshared64 },
