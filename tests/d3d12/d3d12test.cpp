@@ -1280,7 +1280,7 @@ static bool test_view_kinds_dxbc() { return view_kinds(true); }
 
 // Typed buffer SRVs of the three-component 32-bit formats (Buffer<float3>, Buffer<uint3>, Buffer<int3>), which
 // Metal has no texel buffer format for, starting at an element that isn't 16-byte aligned.
-static bool test_typedbuffer_rgb32()
+static bool typedbuffer_rgb32(bool dxbc)
 {
     static const char *src = R"(
 Buffer<float3> f : register(t0);
@@ -1310,7 +1310,7 @@ void main(uint i : SV_DispatchThreadID)
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
     ID3D12RootSignature *rs = create_root_signature(rsd);
-    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, dxbc ? compile_fxc(src, "main", "cs_5_0") : compile_dxc(src, "main", "cs_6_0"));
     if (!rs || !ps)
         return false;
     // Element e of the buffer is (3e, 3e + 1, 3e + 2) as each format's type; the views start at element 1.
@@ -1374,6 +1374,9 @@ void main(uint i : SV_DispatchThreadID)
     rb->Release(); out->Release(); data->Release(); upload->Release(); heap->Release(); ps->Release(); rs->Release();
     return true;
 }
+
+static bool test_typedbuffer_rgb32() { return typedbuffer_rgb32(false); }
+static bool test_typedbuffer_rgb32_dxbc() { return typedbuffer_rgb32(true); }
 
 static bool test_typedbuffer()
 {
@@ -5204,6 +5207,7 @@ static const Test tests[] = {
     { "tiled3d", test_tiled3d },
     { "typedbuffer", test_typedbuffer },
     { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
+    { "typedbuffer_rgb32_dxbc", test_typedbuffer_rgb32_dxbc },
     { "view_kinds_dxil", test_view_kinds_dxil },
     { "view_kinds_dxbc", test_view_kinds_dxbc },
     { "robust", test_robust },
