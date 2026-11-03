@@ -4428,7 +4428,7 @@ static bool test_fencelatency()
 // A chain of dispatches, each reading what the previous one wrote, separated by UAV barriers.
 // MoltenVK keeps these barriers inside one compute encoder; a missing dependency shows up as a
 // wrong sum.
-static bool test_uavchain()
+static bool uavchain(bool aliasing)
 {
     static const char *src = R"(
 cbuffer C : register(b0) { uint step; };
@@ -4463,6 +4463,13 @@ RWStructuredBuffer<uint> b : register(u0);
     D3D12_RESOURCE_BARRIER uav = {};
     uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav.UAV.pResource = buf;
+    if (aliasing)
+    {
+        // Naming no resource means any placed resource ("before" overlaps UAV.pResource, so clear it).
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        uav.Aliasing.pResourceBefore = nullptr;
+        uav.Aliasing.pResourceAfter = nullptr;
+    }
     for (UINT step = 0; step < 64; step++)
     {
         g.list->SetComputeRoot32BitConstants(0, 1, &step, 0);
@@ -4477,6 +4484,18 @@ RWStructuredBuffer<uint> b : register(u0);
         EXPECT(v[i] == i + 1, "b[%u] = %u, want %u", i, v[i], i + 1);
     rb->Release(); buf->Release(); ps->Release(); rs->Release();
     return true;
+}
+
+static bool test_uavchain()
+{
+    return uavchain(false);
+}
+
+// The same chain separated by aliasing barriers naming no resource (a global barrier on every queue stage), which
+// MoltenVK also keeps inside the compute encoder.
+static bool test_aliaschain()
+{
+    return uavchain(true);
 }
 
 // FXC shaders preserve NaN and Inf (SignedZeroInfNanPreserve), which MoltenVK compiles with the default (not
@@ -4659,6 +4678,7 @@ static const Test tests[] = {
     { "rootcbv", test_rootcbv },
     { "fencelatency", test_fencelatency },
     { "uavchain", test_uavchain },
+    { "aliaschain", test_aliaschain },
     { "draw", test_draw },
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
