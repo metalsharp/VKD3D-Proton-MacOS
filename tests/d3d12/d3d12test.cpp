@@ -1174,6 +1174,103 @@ void read()
 
 // Typed buffer views at element offsets that are not 16-byte aligned (D3D12 only requires element
 // alignment): an SRV from element 3 and a UAV from element 5 of R32_UINT buffers.
+// Typed buffer SRVs of the three-component 32-bit formats (Buffer<float3>, Buffer<uint3>, Buffer<int3>), which
+// Metal has no texel buffer format for, starting at an element that isn't 16-byte aligned.
+static bool test_typedbuffer_rgb32()
+{
+    static const char *src = R"(
+Buffer<float3> f : register(t0);
+Buffer<uint3> u : register(t1);
+Buffer<int3> s : register(t2);
+RWByteAddressBuffer o : register(u0);
+[numthreads(8, 1, 1)]
+void main(uint i : SV_DispatchThreadID)
+{
+    o.Store3(i * 36, asuint(f[i]));
+    o.Store3(i * 36 + 12, u[i]);
+    o.Store3(i * 36 + 24, asuint(s[i]));
+}
+)";
+    static const DXGI_FORMAT formats[3] = { DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT, DXGI_FORMAT_R32G32B32_SINT };
+    for (DXGI_FORMAT fmt : formats)
+    {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { fmt };
+        g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs));
+        printf("  format %d: buffer %d, shader load %d\n", fmt, !!(fs.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER),
+               !!(fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD));
+    }
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!rs || !ps)
+        return false;
+    // Element e of the buffer is (3e, 3e + 1, 3e + 2) as each format's type; the views start at element 1.
+    const UINT N = 16, size = N * 12;
+    ID3D12Resource *upload = create_buffer(3 * size, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *m = nullptr;
+    upload->Map(0, nullptr, (void **)&m);
+    for (UINT k = 0; k < 3 * N; k++)
+    {
+        ((float *)m)[k] = (float)k + 0.5f;
+        ((uint32_t *)(m + size))[k] = 100 + k;
+        ((int32_t *)(m + 2 * size))[k] = -1 - (int32_t)k;
+    }
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *data = create_buffer(3 * size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(data, 0, upload, 0, 3 * size);
+    transition(data, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource *out = create_buffer(8 * 36, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT k = 0; k < 3; k++)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = formats[k];
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.FirstElement = k * N + 1;
+        sd.Buffer.NumElements = 8;
+        g.device->CreateShaderResourceView(data, &sd, h);
+        h.ptr += inc;
+    }
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 8 * 36, &rb);
+    if (!v)
+        return false;
+    int bad = 0;
+    for (UINT i = 0; i < 8; i++)
+    {
+        for (UINT c = 0; c < 3; c++)
+        {
+            UINT k = 3 * (i + 1) + c;
+            float fv;
+            memcpy(&fv, &v[i * 9 + c], 4);
+            bool ok = fv == (float)k + 0.5f && v[i * 9 + 3 + c] == 100 + k && (int32_t)v[i * 9 + 6 + c] == -1 - (int32_t)k;
+            if (!ok && bad++ < 4)
+                printf("  FAIL: element %u.%u = %g %u %d, want %g %u %d\n", i, c, fv, v[i * 9 + 3 + c], (int32_t)v[i * 9 + 6 + c],
+                       (float)k + 0.5f, 100 + k, -1 - (int32_t)k);
+        }
+    }
+    EXPECT(!bad, "%d wrong components", bad);
+    rb->Release(); out->Release(); data->Release(); upload->Release(); heap->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 static bool test_typedbuffer()
 {
     static const char *src = R"(
@@ -4838,6 +4935,7 @@ static const Test tests[] = {
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
     { "typedbuffer", test_typedbuffer },
+    { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
     { "robust", test_robust },
     { "logicop", test_logicop },
     { "streamoutput", test_streamoutput },
