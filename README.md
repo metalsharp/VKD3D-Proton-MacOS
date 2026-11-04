@@ -21,6 +21,13 @@
 
 </div>
 
+
+___
+
+### Github Deleted all of my stars after temporarily privating this repo. Please help!
+
+___
+
 ## Capabilities
 
 Measured on an Apple M4 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
