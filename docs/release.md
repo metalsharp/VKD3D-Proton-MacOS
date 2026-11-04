@@ -34,7 +34,7 @@ repository's patches:
 - **Toolchain:** llvm-mingw, plus meson, ninja and glslang from Homebrew.
 - **Build scripts:**
   - `scripts/build-vkd3d-proton.sh` for x86_64, `scripts/build-vkd3d-proton-arm64x.sh` for ARM64X;
-  - `scripts/build-dxvk.sh` for DXGI and D3D10/11;
+  - `scripts/build-dxvk.sh` for DXGI and D3D10/11 on x86_64, `scripts/build-dxvk-arm64x.sh` for ARM64X;
   - `scripts/build-moltenvk.sh --externals` for MoltenVK, with the newest Xcode on the runner. It needs the macOS 26
     SDK or later.
 - **Metal Shader Converter:** `scripts/fetch-metal-shaderconverter.sh` downloads Apple's `libmetalirconverter.dylib`,

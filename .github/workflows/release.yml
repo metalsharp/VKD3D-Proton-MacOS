@@ -76,7 +76,11 @@ jobs:
             bash scripts/build-ngx-arm64x.sh
             rm -f "$RUNNER_TEMP/ngx-key.pem"
           fi
-          bash scripts/build-dxvk.sh
+          if [ "${{ matrix.lane }}" = x86_64 ]; then
+            bash scripts/build-dxvk.sh
+          else
+            bash scripts/build-dxvk-arm64x.sh
+          fi
 
       - name: Package
         run: |
@@ -85,10 +89,13 @@ jobs:
           [ "$GITHUB_REF_TYPE" = tag ] || VERSION="$(git rev-parse --short HEAD)"
           NAME="vkd3d-proton-$VERSION-${{ matrix.lane }}"
           ROOT="$RUNNER_TEMP/$NAME"
-          # DXVK's x86_64 DXGI and D3D10/11 in both lanes: x86_64 programs present VKD3D-Proton's swap chains with them
+          # DXVK's DXGI and D3D10/11, which present VKD3D-Proton's swap chains: x86_64 in the x86_64 lane, ARM64X in
+          # the arm64 lane (x86_64 programs load them as ARM64EC, native ARM64 programs as ARM64), in x86_64-windows,
+          # where MetalSharp Wine loads them from
+          [ "${{ matrix.lane }}" = x86_64 ] && DXVK_OUT=artifacts/build/dxvk || DXVK_OUT=artifacts/build/dxvk-arm64x
           mkdir -p "$ROOT/x86_64-windows"
-          cp artifacts/build/dxvk/x86_64-windows/dxgi.dll artifacts/build/dxvk/x86_64-windows/d3d11.dll \
-             artifacts/build/dxvk/x86_64-windows/d3d10core.dll "$ROOT/x86_64-windows/"
+          cp "$DXVK_OUT/x86_64-windows/dxgi.dll" "$DXVK_OUT/x86_64-windows/d3d11.dll" \
+             "$DXVK_OUT/x86_64-windows/d3d10core.dll" "$ROOT/x86_64-windows/"
           if [ "${{ matrix.lane }}" = x86_64 ]; then
             DIR="$ROOT/x86_64-windows"
             cp artifacts/build/vkd3d-proton/x86_64-windows/d3d12.dll artifacts/build/vkd3d-proton/x86_64-windows/d3d12core.dll "$DIR/"

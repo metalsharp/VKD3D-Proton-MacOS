@@ -69,8 +69,10 @@ from `env.sh`. MetalSharp writes its own; other Wines use these:
 
 A path in either variable may be a Unix path or a Windows one (`Z:/...`).
 
-MoltenVK compiles Metal pipelines on background threads, so a game's own compile threads don't wait on Metal;
-`MVK_CONFIG_DEFERRED_PIPELINES=0` compiles them where they're created instead.
+MoltenVK compiles each Metal pipeline on the thread that creates it. `MVK_CONFIG_DEFERRED_PIPELINES=1` compiles
+pipelines on background threads instead, and `MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment
+shader alongside its vertex shader. Both are off by default: their compiles wait on Metal from GCD worker threads,
+and a game creating pipelines from many threads can take every worker, which leaves Metal none to finish them on.
 
 ## Build from source
 
