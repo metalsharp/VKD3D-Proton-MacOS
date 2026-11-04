@@ -2407,6 +2407,42 @@ static bool test_gs_packed_dxbc()
                          compile_fxc(gs_packed_src, "ps", "ps_5_0"));
 }
 
+// A geometry shader reading fewer components than the vertex shader writes: a float4 TEXCOORD read as a float2 and a
+// float4 NORMAL as a float3, at the locations of its own outputs, as Forza Horizon 3's do. As a mesh shader on
+// MoltenVK, each input took the vertex stage's output as it was written, and the pipeline failed to compile
+// (assigning to 'float2' from incompatible type 'float4').
+static const char *gs_narrow_src = R"(
+struct V { float4 pos : SV_Position; float4 t : TEXCOORD0; float4 n : NORMAL0; };
+struct G { float4 pos : SV_Position; float2 t : TEXCOORD0; float3 n : NORMAL0; };
+V vs(uint id : SV_VertexID)
+{
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.t = float4(0.25, 0.5, 0.1, 0.1); o.n = float4(0.1, 0.2, 0.75, 0.1);
+    return o;
+}
+[maxvertexcount(3)]
+void gs(triangle G v[3], inout TriangleStream<G> s)
+{
+    for (int i = 0; i < 3; i++)
+        s.Append(v[i]);
+}
+float4 ps(G v) : SV_Target { return float4(v.t, v.n.z, 1.0); }
+)";
+
+static bool test_gs_narrow_dxil()
+{
+    return run_gs_packed("DXIL", compile_dxc(gs_narrow_src, "vs", "vs_6_0"), compile_dxc(gs_narrow_src, "gs", "gs_6_0"),
+                         compile_dxc(gs_narrow_src, "ps", "ps_6_0"));
+}
+
+static bool test_gs_narrow_dxbc()
+{
+    return run_gs_packed("DXBC", compile_fxc(gs_narrow_src, "vs", "vs_5_0"), compile_fxc(gs_narrow_src, "gs", "gs_5_0"),
+                         compile_fxc(gs_narrow_src, "ps", "ps_5_0"));
+}
+
 // GetAttributeAtVertex (SM 6.1, with SV_Barycentrics): a triangle whose vertices output 1, 3 and 5 covers a pixel
 // whose shader returns the input at each vertex, which arrives as a PerVertexKHR input. MoltenVK builds it on MSL 4's
 // vertex_value<T> where a drawn triangle shows it works, and returns 1, 3 and 5; where the driver's vertex_value reads
@@ -5217,6 +5253,8 @@ static const Test tests[] = {
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
     { "gs_packed_dxil", test_gs_packed_dxil },
     { "gs_packed_dxbc", test_gs_packed_dxbc },
+    { "gs_narrow_dxil", test_gs_narrow_dxil },
+    { "gs_narrow_dxbc", test_gs_narrow_dxbc },
     { "pervertex", test_pervertex },
     { "cbv_rows_robust_dxil", test_cbv_rows_robust_dxil },
     { "cbv_rows_robust_dxbc", test_cbv_rows_robust_dxbc },
