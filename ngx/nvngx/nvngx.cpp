@@ -13,6 +13,8 @@
 #include <dxgi.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -189,6 +191,37 @@ static void ReadCommon(const ParametersImpl *params, float &mv_x, float &mv_y, f
   reset = GetOr(params, NVNGX_Parameter_Reset, 0) != 0;
 }
 
+// METALSHARP_DLSS_SCALE: the render scale every DLSS mode gets, for a game that picks the mode itself (Minecraft's
+// ray tracing resets its upscaling option): a mode (ultra_performance, performance, balanced, quality, ultra_quality,
+// dlaa) or a fraction of the output size, from 0.25 to 1. Unset or unreadable: the mode's own scale.
+static float ScaleOverride(float scale) {
+  static const float override_scale = [] {
+    std::string value = lane::env("METALSHARP_DLSS_SCALE");
+    for (auto &c : value)
+      c = (char)tolower((unsigned char)c);
+    static const struct {
+      const char *name;
+      float scale;
+    } modes[] = {{"ultra_performance", 1.0f / 3.0f}, {"performance", 0.5f}, {"balanced", 58.0f / 100.0f},
+                 {"quality", 1.0f / 1.5f},          {"ultra_quality", 1.0f / 1.3f}, {"dlaa", 1.0f}};
+    float result = 0.0f;
+    for (const auto &mode : modes)
+      if (value == mode.name)
+        result = mode.scale;
+    if (!result && !value.empty()) {
+      char *end = nullptr;
+      float number = strtof(value.c_str(), &end);
+      if (end && !*end && number >= 0.25f && number <= 1.0f)
+        result = number;
+    }
+    if (!value.empty())
+      lane::log(result ? "info" : "warn", "METALSHARP_DLSS_SCALE=%s: %s", value.c_str(),
+                result ? "every DLSS mode renders at this scale" : "not a mode or a scale from 0.25 to 1, ignored");
+    return result;
+  }();
+  return override_scale ? override_scale : scale;
+}
+
 static NVNGX_RESULT GetOptimalSettingsCallback(NVNGXParameter *params) {
   unsigned int width, height, out_width, out_height;
   float scale;
@@ -219,6 +252,7 @@ static NVNGX_RESULT GetOptimalSettingsCallback(NVNGXParameter *params) {
     scale = 58.0f / 100.0f;
     break;
   }
+  scale = ScaleOverride(scale);
 
   out_width = std::ceil(width * scale);
   out_height = std::ceil(height * scale);
