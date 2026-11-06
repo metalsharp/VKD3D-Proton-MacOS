@@ -6800,6 +6800,144 @@ float4 ps(V v) : SV_Target
 static bool test_raster_vp_lines() { return raster_vp_lines(false); }
 static bool test_raster_vp_lines_dxbc() { return raster_vp_lines(true); }
 
+// Compute limits: 1024-thread groups (32x32) with 32 KiB of groupshared memory, each thread writing its slot and
+// reading another thread's after a barrier; Dispatch(0, 1, 1) and indirect dispatches with a zero dimension doing
+// nothing, an indirect (2, 1, 1); [WaveSize(32)] pipelines (DXIL) creating and running with 32 lanes, and [WaveSize(n)]
+// outside WaveLaneCountMin..Max failing to create.
+static bool compute_limits(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint slot; };
+RWByteAddressBuffer o : register(u0);
+groupshared uint big[8192];
+[numthreads(32, 32, 1)] void cs_big(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    for (uint i = 0; i < 8; i++)
+        big[gi * 8 + i] = gi * 8 + i + gid.x * 65536;
+    GroupMemoryBarrierWithGroupSync();
+    uint sum = 0;
+    for (uint j = 0; j < 8; j++)
+        sum += big[(1023 - gi) * 8 + j];
+    o.Store((gid.x * 1024 + gi) * 4, sum);
+}
+[numthreads(1, 1, 1)] void cs_count(uint3 gid : SV_GroupID)
+{
+    o.InterlockedAdd(8192 + slot * 4, 1);
+}
+)";
+    static const char *wave_src = R"(
+RWByteAddressBuffer o : register(u0);
+[WaveSize(32)] [numthreads(64, 1, 1)] void cs32(uint i : SV_GroupIndex)
+{
+    if (i == 0)
+        o.Store(9000 * 4, WaveGetLaneCount());
+    o.InterlockedAdd(9001 * 4, WaveActiveCountBits(true) == 32 ? 1 : 0);
+}
+[WaveSize(64)] [numthreads(64, 1, 1)] void cs64(uint i : SV_GroupIndex) { o.Store(9002 * 4, WaveGetLaneCount()); }
+[WaveSize(16)] [numthreads(64, 1, 1)] void cs16(uint i : SV_GroupIndex) { o.Store(9003 * 4, WaveGetLaneCount()); }
+)";
+    std::vector<char> big = dxbc ? compile_fxc(src, "cs_big", "cs_5_0") : compile_dxc(src, "cs_big", "cs_6_0");
+    std::vector<char> cnt = dxbc ? compile_fxc(src, "cs_count", "cs_5_0") : compile_dxc(src, "cs_count", "cs_6_0");
+    if (big.empty() || cnt.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pbig = create_compute_pipeline(rs, big), *pcnt = create_compute_pipeline(rs, cnt);
+    if (!pbig || !pcnt)
+        return false;
+    ID3D12PipelineState *p32 = nullptr;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
+    if (!dxbc)
+    {
+        std::vector<char> w32 = compile_dxc(wave_src, "cs32", "cs_6_6"), w64 = compile_dxc(wave_src, "cs64", "cs_6_6"),
+                          w16 = compile_dxc(wave_src, "cs16", "cs_6_6");
+        if (w32.empty() || w64.empty() || w16.empty())
+            return false;
+        p32 = create_compute_pipeline(rs, w32);
+        EXPECT(p32 != nullptr, "[WaveSize(32)] pipeline failed (lanes %u-%u)", o1.WaveLaneCountMin, o1.WaveLaneCountMax);
+        for (const auto &w : { std::make_pair(64u, &w64), std::make_pair(16u, &w16) })
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = rs;
+            pd.CS = { w.second->data(), w.second->size() };
+            ID3D12PipelineState *p = nullptr;
+            HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p));
+            bool in_range = w.first >= o1.WaveLaneCountMin && w.first <= o1.WaveLaneCountMax;
+            printf("  [WaveSize(%u)]: hr %#x (lanes %u-%u)\n", w.first, (unsigned)hr, o1.WaveLaneCountMin, o1.WaveLaneCountMax);
+            EXPECT(SUCCEEDED(hr) == in_range, "[WaveSize(%u)] pipeline hr %#x with lanes %u-%u", w.first, (unsigned)hr,
+                   o1.WaveLaneCountMin, o1.WaveLaneCountMax);
+            if (p)
+                p->Release();
+        }
+    }
+    ID3D12Resource *out = create_buffer(40960, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *args = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *m = nullptr;
+    args->Map(0, nullptr, (void **)&m);
+    const uint32_t a[9] = { 0, 5, 5, 2, 1, 1, 3, 0, 1 };
+    memcpy(m, a, sizeof(a));
+    args->Unmap(0, nullptr);
+    D3D12_INDIRECT_ARGUMENT_DESC iad = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+    D3D12_COMMAND_SIGNATURE_DESC csd = { 12, 1, &iad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(dev->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(pbig);
+    g.list->Dispatch(2, 1, 1);
+    g.list->SetPipelineState(pcnt);
+    for (UINT s = 0; s < 5; s++)
+    {
+        g.list->SetComputeRoot32BitConstants(1, 1, &s, 0);
+        if (s == 0)
+            g.list->Dispatch(0, 1, 1);
+        else if (s == 1)
+            g.list->Dispatch(4, 0, 2);
+        else
+            g.list->ExecuteIndirect(sig, 1, args, (s - 2) * 12, nullptr, 0);
+    }
+    if (p32)
+    {
+        g.list->SetPipelineState(p32);
+        g.list->Dispatch(2, 1, 1);
+    }
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 40960, &rb);
+    if (!r)
+        return false;
+    uint32_t bad = 0;
+    for (UINT gid = 0; gid < 2; gid++)
+        for (UINT gi = 0; gi < 1024; gi++)
+        {
+            uint32_t want = 0;
+            for (UINT j = 0; j < 8; j++)
+                want += (1023 - gi) * 8 + j + gid * 65536;
+            if (r[gid * 1024 + gi] != want && bad++ < 3)
+                printf("  group %u thread %u: %u, want %u\n", gid, gi, r[gid * 1024 + gi], want);
+        }
+    EXPECT(!bad, "1024-thread groups with 32 KiB groupshared: %u wrong", bad);
+    static const uint32_t want_counts[5] = { 0, 0, 0, 2, 0 };
+    for (UINT s = 0; s < 5; s++)
+        EXPECT(r[2048 + s] == want_counts[s], "dispatch %u ran %u groups, want %u", s, r[2048 + s], want_counts[s]);
+    if (p32)
+        EXPECT(r[9000] == 32 && r[9001] == 128, "[WaveSize(32)]: WaveGetLaneCount %u, full waves %u (want 32, 128)", r[9000], r[9001]);
+    rb->Release(); sig->Release(); args->Release(); out->Release();
+    if (p32)
+        p32->Release();
+    pbig->Release(); pcnt->Release(); rs->Release();
+    return true;
+}
+
+static bool test_compute_limits() { return compute_limits(false); }
+static bool test_compute_limits_dxbc() { return compute_limits(true); }
+
 // DXBC with its reflection stripped (D3DCOMPILER_STRIP_REFLECTION_DATA, as shipped games often are): the bridge then
 // scans the instruction stream itself (for typed buffer declarations), and must step over imad (opcode 35) and
 // customdata (53, whose length is in the next token). Draws with an imad in each stage; run with VKD3D_DEBUG=info to
@@ -14062,6 +14200,8 @@ static const Test tests[] = {
     { "dxbc_stripped", test_dxbc_stripped },
     { "raster_vp_lines", test_raster_vp_lines },
     { "raster_vp_lines_dxbc", test_raster_vp_lines_dxbc },
+    { "compute_limits", test_compute_limits },
+    { "compute_limits_dxbc", test_compute_limits_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
