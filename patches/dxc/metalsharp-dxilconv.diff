@@ -1,0 +1,462 @@
+diff --git a/projects/CMakeLists.txt b/projects/CMakeLists.txt
+index 9f361a95..fb7f1b7a 100644
+--- a/projects/CMakeLists.txt
++++ b/projects/CMakeLists.txt
+@@ -3,9 +3,9 @@ set(DXC_PROJECTS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+ 
+ if(WIN32)
+ add_subdirectory(include/Tracing) # DxcRuntimeEtw target
++endif (WIN32)
+ 
++# MetalSharp: dxilconv's converter library builds on other platforms too (dxilconv/tools/dxbcconverter-mac).
+ if(HLSL_BUILD_DXILCONV)
+   add_subdirectory(dxilconv)
+ endif (HLSL_BUILD_DXILCONV)
+-
+-endif (WIN32)
+diff --git a/projects/dxilconv/CMakeLists.txt b/projects/dxilconv/CMakeLists.txt
+index db7804dc..1ae5b2c2 100644
+--- a/projects/dxilconv/CMakeLists.txt
++++ b/projects/dxilconv/CMakeLists.txt
+@@ -19,11 +19,14 @@ macro(add_dxilconv_project_test_library name)
+ endmacro(add_dxilconv_project_test_library)
+ 
+ 
++# MetalSharp: the converter library builds on other platforms too (tools/dxbcconverter-mac).
++add_subdirectory(lib)
+ if(WIN32)
+-  add_subdirectory(lib)
+   add_subdirectory(tools)
+   if (HLSL_INCLUDE_TESTS)
+     add_subdirectory(unittests)
+     add_subdirectory(test)
+   endif (HLSL_INCLUDE_TESTS)
++else()
++  add_subdirectory(tools/dxbcconverter-mac)
+ endif()
+\ No newline at end of file
+diff --git a/projects/dxilconv/include/DxbcConverter.h b/projects/dxilconv/include/DxbcConverter.h
+index 968beaeb..1a629b19 100644
+--- a/projects/dxilconv/include/DxbcConverter.h
++++ b/projects/dxilconv/include/DxbcConverter.h
+@@ -14,6 +14,19 @@
+ 
+ #include "dxc/dxcapi.h"
+ 
++// MetalSharp: SAL annotations DXC's Windows adapter doesn't define.
++#ifndef _WIN32
++#ifndef _In_reads_bytes_
++#define _In_reads_bytes_(x)
++#endif
++#ifndef _Outptr_result_bytebuffer_maybenull_
++#define _Outptr_result_bytebuffer_maybenull_(x)
++#endif
++#ifndef _Outptr_result_maybenull_z_
++#define _Outptr_result_maybenull_z_
++#endif
++#endif
++
+ #ifndef _MSC_VER
+ extern "C"
+ #endif
+@@ -51,6 +64,11 @@ struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) IDxbcConverter
+       _Outptr_result_maybenull_z_ LPWSTR *ppDiag) = 0;
+ };
+ 
++#ifndef _WIN32
++// MetalSharp: __uuidof elsewhere, as dxcapi.h declares its interfaces.
++CROSS_PLATFORM_UUIDOF(IDxbcConverter, "5F956ED5-78D1-4B15-8247-F7187614A041")
++#endif
++
+ __declspec(selectany) extern const CLSID
+     CLSID_DxbcConverter = {/* 4900391E-B752-4EDD-A885-6FB76E25ADDB */
+                            0x4900391e,
+diff --git a/projects/dxilconv/include/Support/DXIncludes.h b/projects/dxilconv/include/Support/DXIncludes.h
+index 4ff1ea73..f07cbff1 100644
+--- a/projects/dxilconv/include/Support/DXIncludes.h
++++ b/projects/dxilconv/include/Support/DXIncludes.h
+@@ -17,6 +17,7 @@
+ // Do not add LLVM/Clang or DXIL files to this file.
+ // clang-format off
+ // Includes on Windows are highly order dependent.
++#ifdef _WIN32
+ #define NOMINMAX 1
+ #define WIN32_LEAN_AND_MEAN 1
+ #define VC_EXTRALEAN 1
+@@ -35,6 +36,15 @@
+ #ifndef DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE
+ #include "dxc\Support\d3d12TokenizedProgramFormat.hpp"
+ #endif
++#else
++// MetalSharp: elsewhere, DXC's Windows adapter and DirectX-Headers' d3dcommon.h and d3d12shader.h, as the rest of
++// DXC uses them, and the few D3D12 definitions dxilconv needs (DxilConvShims.h).
++#include "dxc/Support/WinIncludes.h"
++#include "dxc/Support/D3DReflection.h" // d3dcommon.h and d3d12shader.h, through the Windows adapter
++#include "Support/DxilConvShims.h"
++#include "DxbcSignatures.h"
++#include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
++#endif
+ 
+ #include "ShaderBinary/ShaderBinary.h"
+ // clang-format on
+diff --git a/projects/dxilconv/include/Support/DxilConvShims.h b/projects/dxilconv/include/Support/DxilConvShims.h
+new file mode 100644
+index 00000000..d571c5ec
+--- /dev/null
++++ b/projects/dxilconv/include/Support/DxilConvShims.h
+@@ -0,0 +1,89 @@
++///////////////////////////////////////////////////////////////////////////////
++// DxilConvShims.h: MetalSharp. What dxilconv uses from the Windows SDK beyond DXC's Windows adapter and
++// DirectX-Headers' d3dcommon.h and d3d12shader.h, for platforms without the SDK.
++//
++// This file is distributed under the University of Illinois Open Source License, as DirectXShaderCompiler is.
++///////////////////////////////////////////////////////////////////////////////
++#pragma once
++#ifndef _WIN32
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#ifndef INT64
++typedef int64_t INT64;
++#endif
++
++#ifndef CONST
++#define CONST const
++#endif
++#ifndef _UI8_MAX
++#define _UI8_MAX 0xffu
++#endif
++
++#ifndef __override
++#define __override
++#endif
++#ifndef __assume
++#define __assume(x) __builtin_assume(x)
++#endif
++#ifdef __cplusplus
++#include <algorithm>
++using std::max;
++using std::min;
++#endif
++
++// d3d10.h and d3d11.h limits
++#define D3D10_REQ_CONSTANT_BUFFER_ELEMENT_COUNT 4096
++#define D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT 14
++#define D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT 128
++#define D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT 16
++#define D3D11_COMMONSHADER_TEMP_REGISTER_COUNT 4096
++#define D3D11_SHADER_MAX_INTERFACES 253
++
++// SAL annotations
++#ifndef __in_range
++#define __in_range(lo, hi)
++#endif
++#ifndef __out_ecount
++#define __out_ecount(n)
++#endif
++#ifndef __in_ecount
++#define __in_ecount(n)
++#endif
++#ifndef __in
++#define __in
++#endif
++#ifndef __out
++#define __out
++#endif
++#ifndef __inout
++#define __inout
++#endif
++#ifndef __in_opt
++#define __in_opt
++#endif
++#ifndef __field_ecount_part
++#define __field_ecount_part(size, count)
++#endif
++#ifndef _Field_size_full_
++#define _Field_size_full_(n)
++#endif
++#ifndef _In_reads_bytes_
++#define _In_reads_bytes_(n)
++#endif
++
++// strsafe.h
++static inline HRESULT StringCchCopyA(char *dst, size_t cch, const char *src) {
++  if (!cch)
++    return E_INVALIDARG;
++  size_t len = strlen(src);
++  if (len >= cch) {
++    memcpy(dst, src, cch - 1);
++    dst[cch - 1] = 0;
++    return E_INVALIDARG; // STRSAFE_E_INSUFFICIENT_BUFFER
++  }
++  memcpy(dst, src, len + 1);
++  return S_OK;
++}
++#endif
+diff --git a/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt b/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
+index 9da22af3..63da465c 100644
+--- a/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
++++ b/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Build DxbcConverter.lib.
+ 
+-find_package(D3D12 REQUIRED)
++if(WIN32)
++  find_package(D3D12 REQUIRED)
++endif()
+ 
+ add_dxilconv_project_library(DxbcConverter
+   DxbcConverter.cpp
+@@ -12,7 +14,11 @@ target_link_libraries(DxbcConverter PUBLIC
+   ShaderBinary
+ )
+ 
+-add_dependencies(DxbcConverter intrinsics_gen DxcRuntimeEtw DxilConvPasses)
++if(WIN32)
++  add_dependencies(DxbcConverter intrinsics_gen DxcRuntimeEtw DxilConvPasses)
++else()
++  add_dependencies(DxbcConverter intrinsics_gen DxilConvPasses)
++endif()
+ 
+ target_include_directories(DxbcConverter
+ PUBLIC
+diff --git a/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h b/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
+index 7f19b875..00c18f9f 100644
+--- a/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
++++ b/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
+@@ -45,7 +45,9 @@
+ 
+ #include "Support/DXIncludes.h"
+ #include "dxc/Support/microcom.h"
++#ifdef _WIN32
+ #include <atlbase.h>
++#endif
+ 
+ #include "dxc/Support/FileIOHelper.h"
+ #include "dxc/dxcapi.h"
+@@ -57,7 +59,19 @@
+ 
+ #include "dxc/DxilContainer/DxilPipelineStateValidation.h"
+ 
++#ifdef _WIN32
+ #include "Tracing/DxcRuntimeEtw.h"
++#else
++// MetalSharp: no ETW tracing elsewhere; the converter's timing stats go nowhere.
++#define DxcRuntimeEtw_DxcTranslate_Start()
++#define DxcRuntimeEtw_DxcTranslate_Stop(hr)
++#define DxcRuntimeEtw_DxcTranslate_TranslateStats(...)
++#include <time.h>
++static inline BOOL QueryPerformanceCounter(LARGE_INTEGER *counter) {
++  counter->QuadPart = (LONGLONG)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++  return TRUE;
++}
++#endif
+ 
+ #include <algorithm>
+ #include <map>
+diff --git a/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt b/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
+index 386c3819..6d207503 100644
+--- a/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
++++ b/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Build ShaderBinary.lib.
+ 
+-find_package(D3D12 REQUIRED)
++if(WIN32)
++  find_package(D3D12 REQUIRED)
++endif()
+ 
+ add_dxilconv_project_library(ShaderBinary
+   ShaderBinary.cpp
+diff --git a/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h b/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
+index 360230b8..c96d672d 100644
+--- a/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
++++ b/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
+@@ -10,16 +10,28 @@
+ #pragma once
+ // clang-format off
+ // Includes on Windows are highly order dependent.
++#ifdef _WIN32
+ #include "windows.h"
+ 
+ #include <assert.h>
+ #include <float.h>
+ #include <strsafe.h>
+ #include <intsafe.h>
++#else
++// MetalSharp: DXC's Windows adapter elsewhere.
++#include "dxc/Support/WinIncludes.h"
++#include <assert.h>
++#include <float.h>
++#endif
+ #include <dxgiformat.h>
++#ifdef _WIN32
+ #include <d3d12.h>
+ #define D3DX12_NO_STATE_OBJECT_HELPERS
+ #include "dxc/Support/d3dx12.h"
++#else
++#include "dxc/Support/D3DReflection.h" // d3dcommon.h and d3d12shader.h, through the Windows adapter
++#include "Support/DxilConvShims.h"
++#endif
+ #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
+ #include "ShaderBinary/ShaderBinary.h"
+ // clang-format on
+diff --git a/projects/dxilconv/tools/dxbcconverter-mac/CMakeLists.txt b/projects/dxilconv/tools/dxbcconverter-mac/CMakeLists.txt
+new file mode 100644
+index 00000000..eb907d49
+--- /dev/null
++++ b/projects/dxilconv/tools/dxbcconverter-mac/CMakeLists.txt
+@@ -0,0 +1,20 @@
++# MetalSharp: libdxbcconverter, the DXBC to DXIL converter as a C library for MoltenVK's Metal Shader Converter bridge
++# (Metal Shader Converter takes only DXIL). Built on platforms other than Windows, where dxilconv.dll is.
++set(SHARED_LIBRARY TRUE)
++
++add_dxilconv_project_library(dxbcconverter SHARED
++  dxbcconverter-mac.cpp
++)
++
++target_link_libraries(dxbcconverter PRIVATE
++  DxbcConverter
++  LLVMBitWriter
++  LLVMDXIL
++  LLVMDxilContainer
++  LLVMDxilRootSignature
++  LLVMDxilValidation
++  LLVMMSSupport
++  LLVMScalarOpts
++)
++
++set_target_properties(dxbcconverter PROPERTIES OUTPUT_NAME "dxbcconverter")
+diff --git a/projects/dxilconv/tools/dxbcconverter-mac/dxbcconverter-mac.cpp b/projects/dxilconv/tools/dxbcconverter-mac/dxbcconverter-mac.cpp
+new file mode 100644
+index 00000000..c96a8d3a
+--- /dev/null
++++ b/projects/dxilconv/tools/dxbcconverter-mac/dxbcconverter-mac.cpp
+@@ -0,0 +1,126 @@
++///////////////////////////////////////////////////////////////////////////////
++// dxbcconverter-mac.cpp: MetalSharp's C interface to dxilconv's DXBC to DXIL converter, for platforms without
++// dxilconv.dll (MoltenVK's Metal Shader Converter bridge loads it).
++//
++//   int DxbcConverterConvertToDXIL(const void *dxbc, uint32_t dxbc_size, void **dxil, uint32_t *dxil_size,
++//                                  char **error);
++//     Converts a DXBC container (SM 4.0 to 5.1) to a DXIL container. Returns 0 and a malloc'd container, or an
++//     HRESULT and, when there is one, a malloc'd UTF-8 message. Either is freed with DxbcConverterFree. Thread-safe.
++//   void DxbcConverterFree(void *p);
++//
++// This file is distributed under the University of Illinois Open Source License, as DirectXShaderCompiler is.
++///////////////////////////////////////////////////////////////////////////////
++
++#include "dxc/Support/WinIncludes.h"
++
++#include "dxc/Support/Global.h"
++#include "dxc/Support/microcom.h"
++#include "dxc/dxcapi.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/ManagedStatic.h"
++
++#include "DxbcConverter.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++HRESULT CreateDxbcConverter(REFIID riid, LPVOID *ppv);
++
++namespace {
++std::once_flag g_init_once;
++HRESULT g_init_hr = E_FAIL;
++
++void init() {
++  g_init_hr = DxcInitThreadMalloc();
++  if (FAILED(g_init_hr))
++    return;
++  DxcSetThreadMallocToDefault();
++  if (::llvm::sys::fs::SetupPerThreadFileSystem())
++    g_init_hr = E_FAIL;
++  DxcClearThreadMalloc();
++}
++
++char *dup_message(const char *text) {
++  size_t len = strlen(text);
++  char *copy = (char *)malloc(len + 1);
++  if (copy)
++    memcpy(copy, text, len + 1);
++  return copy;
++}
++
++char *wide_to_utf8(const wchar_t *text) {
++  std::string out;
++  for (; *text; text++) {
++    uint32_t c = (uint32_t)*text;
++    if (c < 0x80)
++      out += (char)c;
++    else if (c < 0x800)
++      out += (char)(0xc0 | (c >> 6)), out += (char)(0x80 | (c & 0x3f));
++    else if (c < 0x10000)
++      out += (char)(0xe0 | (c >> 12)), out += (char)(0x80 | ((c >> 6) & 0x3f)), out += (char)(0x80 | (c & 0x3f));
++    else
++      out += (char)(0xf0 | (c >> 18)), out += (char)(0x80 | ((c >> 12) & 0x3f)),
++          out += (char)(0x80 | ((c >> 6) & 0x3f)), out += (char)(0x80 | (c & 0x3f));
++  }
++  return dup_message(out.c_str());
++}
++} // namespace
++
++extern "C" __attribute__((visibility("default"))) int
++DxbcConverterConvertToDXIL(const void *dxbc, uint32_t dxbc_size, void **dxil, uint32_t *dxil_size, char **error) {
++  *dxil = nullptr;
++  *dxil_size = 0;
++  if (error)
++    *error = nullptr;
++  std::call_once(g_init_once, init);
++  if (FAILED(g_init_hr)) {
++    if (error)
++      *error = dup_message("The DXBC converter could not initialize.");
++    return (int)g_init_hr;
++  }
++
++  HRESULT hr = S_OK;
++  LPVOID out = nullptr;
++  UINT32 out_size = 0;
++  LPWSTR diag = nullptr;
++  {
++    DxcThreadMalloc thread_malloc(nullptr);
++    try {
++      CComPtr<IDxbcConverter> converter;
++      hr = CreateDxbcConverter(__uuidof(IDxbcConverter), (void **)&converter);
++      if (SUCCEEDED(hr))
++        hr = converter->Convert(dxbc, dxbc_size, nullptr, &out, &out_size, &diag);
++    } catch (const std::exception &e) {
++      hr = E_FAIL;
++      if (error && !*error)
++        *error = dup_message(e.what());
++    } catch (...) {
++      hr = E_FAIL;
++    }
++  }
++
++  if (diag) {
++    if (error && !*error)
++      *error = wide_to_utf8(diag);
++    CoTaskMemFree(diag);
++  }
++  if (SUCCEEDED(hr) && out && out_size) {
++    void *copy = malloc(out_size);
++    if (!copy)
++      hr = E_OUTOFMEMORY;
++    else {
++      memcpy(copy, out, out_size);
++      *dxil = copy;
++      *dxil_size = out_size;
++    }
++  } else if (SUCCEEDED(hr)) {
++    hr = E_FAIL;
++  }
++  if (out)
++    CoTaskMemFree(out);
++  return SUCCEEDED(hr) ? 0 : (int)hr;
++}
++
++extern "C" __attribute__((visibility("default"))) void DxbcConverterFree(void *p) { free(p); }

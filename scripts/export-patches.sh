@@ -26,3 +26,11 @@ mkdir -p "$WS/patches/dxvk"
 rm -f "$WS"/patches/dxvk/*.patch
 git format-patch -q v2.7.1..HEAD -o "$WS/patches/dxvk"
 ls "$WS/patches/dxvk"
+# DXC: the working tree's changes on the tag fetch-sources.sh pins (new files marked intent-to-add), as one diff
+if [ -d "$WS/sources/DirectXShaderCompiler/.git" ]; then
+    cd "$WS/sources/DirectXShaderCompiler"
+    git add -N projects/dxilconv
+    mkdir -p "$WS/patches/dxc"
+    git diff > "$WS/patches/dxc/metalsharp-dxilconv.diff"
+    ls "$WS/patches/dxc"
+fi

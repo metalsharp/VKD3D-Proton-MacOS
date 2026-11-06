@@ -23915,7 +23915,7 @@ index c5b74991..8b68dba6 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..ce5d17f4 100644
+index 3aa44a44..d7862a5c 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,13 @@
@@ -24200,7 +24200,7 @@ index 3aa44a44..ce5d17f4 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +704,377 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +704,436 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -24293,6 +24293,41 @@ index 3aa44a44..ce5d17f4 100644
 +	}
 +};
 +
++// The DXBC to DXIL converter (libdxbcconverter.dylib, from DirectXShaderCompiler's dxilconv), loaded on first use from
++// next to libMoltenVK.dylib. Metal Shader Converter takes only DXIL; VKD3D-Proton hands DXBC shaders in blobs with
++// kMVKMSCBlobFlagDXBC.
++struct MVKDxbcConverter {
++	int (*convert)(const void* dxbc, uint32_t dxbcSize, void** dxil, uint32_t* dxilSize, char** error) = nullptr;
++	void (*free)(void* p) = nullptr;
++	string error;		// Why it couldn't be loaded, if it couldn't
++
++	MVKDxbcConverter() {
++		static const char* libName = "libdxbcconverter.dylib";
++		string path = libName;
++		Dl_info info;
++		if (dladdr((const void*)&MVKDxbcConverter::get, &info) && info.dli_fname) {	// libMoltenVK.dylib
++			string mvkPath = info.dli_fname;
++			size_t slash = mvkPath.rfind('/');
++			if (slash != string::npos) { path = mvkPath.substr(0, slash + 1) + libName; }
++		}
++		void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
++		if ( !lib ) {
++			const char* dlErr = dlerror();
++			error = "Could not load " + path + ": " + (dlErr ? dlErr : "unknown error");
++			return;
++		}
++		convert = (decltype(convert))dlsym(lib, "DxbcConverterConvertToDXIL");
++		free = (decltype(free))dlsym(lib, "DxbcConverterFree");
++		if ( !convert || !free ) { error = string(libName) + " lacks DxbcConverterConvertToDXIL or DxbcConverterFree."; }
++		MVK_MS_TRACE(Shader, "DXBC to DXIL converter: %s%s%s", path.c_str(), error.empty() ? "" : ": ", error.c_str());
++	}
++
++	static const MVKDxbcConverter& get() {
++		static MVKDxbcConverter conv;
++		return conv;
++	}
++};
++
 +// The blob's header (MetalSharp's docs/MSC-BRIDGE-CONTRACT.md, section 1). Version 1 ends at heapsOffset, which it
 +// has as a reserved 0: it never binds heaps.
 +typedef struct {
@@ -24312,6 +24347,8 @@ index 3aa44a44..ce5d17f4 100644
 +static constexpr size_t kMVKMSCBlobHeaderSizeV2 = 10 * sizeof(uint32_t);
 +// A pixel shader whose second output blends as source 1 (dual-source blending).
 +static constexpr uint32_t kMVKMSCBlobFlagDualSourceBlending = 0x1;
++// The container is DXBC (SM 4.x/5.x), converted to DXIL first (MVKDxbcConverter).
++static constexpr uint32_t kMVKMSCBlobFlagDXBC = 0x2;
 +
 +// A vertex blob's input table entry: the Vulkan attribute location, then the NUL-terminated semantic and index.
 +static constexpr size_t kMVKMSCVertexInputSize = 64;
@@ -24476,6 +24513,8 @@ index 3aa44a44..ce5d17f4 100644
 +	IRMetalLibBinary* metalLib = nullptr;
 +	IRShaderReflection* reflection = nullptr;
 +	IRError* irErr = nullptr;
++	uint8_t* convertedDXIL = nullptr;		// From DXBC, freed by MVKDxbcConverter
++	uint32_t convertedDXILSize = 0;
 +	rslt.error = [&]() -> string {
 +		rootSig = msc.IRRootSignatureCreateFromDescriptor(&rsDesc, &irErr);
 +		if ( !rootSig ) { return msc.takeErrorMessage(irErr, "Creating the root signature"); }
@@ -24497,7 +24536,26 @@ index 3aa44a44..ce5d17f4 100644
 +			msc.IRCompilerSetDualSourceBlendingConfiguration(compiler, IRDualSourceBlendingConfigurationForceEnabled);
 +		}
 +
-+		dxil = msc.IRObjectCreateFromDXIL(blob + hdr.dxilOffset, hdr.dxilSize, IRBytecodeOwnershipNone);
++		const uint8_t* dxilData = blob + hdr.dxilOffset;
++		size_t dxilSize = hdr.dxilSize;
++		if (hdr.flags & kMVKMSCBlobFlagDXBC) {
++			const auto& conv = MVKDxbcConverter::get();
++			if ( !conv.error.empty() ) { return conv.error; }
++			char* convErr = nullptr;
++			uint64_t convStart = mvkGetTimestamp();
++			int convRslt = conv.convert(dxilData, (uint32_t)dxilSize, (void**)&convertedDXIL, &convertedDXILSize, &convErr);
++			MVK_MS_TRACE(Shader, "DXBC to DXIL: %u bytes -> %u bytes in %.3f ms%s%s", (uint32_t)dxilSize, convertedDXILSize,
++						 mvkGetElapsedMilliseconds(convStart), convErr ? ": " : "", convErr ? convErr : "");
++			if (convRslt || !convertedDXIL) {
++				string why = "Converting the DXBC to DXIL failed (" + to_string(convRslt) + ")" + (convErr ? string(": ") + convErr : string("."));
++				if (convErr) { conv.free(convErr); }
++				return why;
++			}
++			if (convErr) { conv.free(convErr); }
++			dxilData = convertedDXIL;
++			dxilSize = convertedDXILSize;
++		}
++		dxil = msc.IRObjectCreateFromDXIL(dxilData, dxilSize, IRBytecodeOwnershipNone);
 +		if ( !dxil ) { return "Reading the DXIL failed."; }
 +		metalIR = msc.IRCompilerAllocCompileAndLink(compiler, nullptr, dxil, &irErr);
 +		if ( !metalIR ) { return msc.takeErrorMessage(irErr, "Converting the DXIL"); }
@@ -24573,12 +24631,13 @@ index 3aa44a44..ce5d17f4 100644
 +	if (metalLib) { msc.IRMetalLibBinaryDestroy(metalLib); }
 +	if (metalIR) { msc.IRObjectDestroy(metalIR); }
 +	if (dxil) { msc.IRObjectDestroy(dxil); }
++	if (convertedDXIL) { MVKDxbcConverter::get().free(convertedDXIL); }
 +	if (compiler) { msc.IRCompilerDestroy(compiler); }
 +	if (rootSig) { msc.IRRootSignatureDestroy(rootSig); }
  }
  
  
-@@ -741,4 +1268,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1327,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }

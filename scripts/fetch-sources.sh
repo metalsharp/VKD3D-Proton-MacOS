@@ -6,14 +6,17 @@
 #                         (dttdrv's ray tracing, mesh shader and fix branches, then MetalSharp's work),
 #                         with External/SPIRV-Cross at the dttdrv revision + patches/spirv-cross/metalsharp.diff
 #   sources/dxvk          DXVK 2.7.1 + patches/dxvk/*.patch (dxgi and D3D11On12 for the VKD3D lane)
-#   scripts/fetch-sources.sh [vkd3d-proton] [moltenvk] [dxvk] [nvapi]   (default: all four)
+#   sources/DirectXShaderCompiler  DXC + patches/dxc/metalsharp-dxilconv.diff: the DXBC to DXIL converter MoltenVK
+#                         loads for Metal Shader Converter (scripts/build-dxbcconverter.sh)
+#   scripts/fetch-sources.sh [vkd3d-proton] [moltenvk] [dxvk] [nvapi] [dxc]   (default: all five)
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 VKD3D_REV=ef9a02e873715c9e2da0d6db8a236aca8380b303
 MOLTENVK_REV=5189f8de
 DXVK_TAG=v2.7.1
+DXC_TAG=v1.9.2609
 mkdir -p "$WS/sources"
-WANT=" ${*:-vkd3d-proton moltenvk dxvk nvapi} "
+WANT=" ${*:-vkd3d-proton moltenvk dxvk nvapi dxc} "
 want() { [[ "$WANT" == *" $1 "* ]]; }
 
 if want vkd3d-proton && [ ! -d "$WS/sources/vkd3d-proton/.git" ]; then
@@ -51,4 +54,12 @@ if want nvapi && [ ! -d "$WS/sources/nvapi/.git" ]; then
     git clone https://github.com/NVIDIA/nvapi.git "$WS/sources/nvapi"
     git -C "$WS/sources/nvapi" checkout -q d08488fcc82eef313b0464db37d2955709691e94
 fi
-echo "sources ready; build MoltenVK with scripts/build-moltenvk.sh, DXVK with scripts/build-dxvk.sh, the NGX core and NVAPI with scripts/build-ngx-arm64x.sh"
+# Microsoft's DirectXShaderCompiler (NCSA): its dxilconv, built as libdxbcconverter.dylib. The SPIR-V submodules are
+# only for DXC's configure step; nothing of them is built.
+if want dxc && [ ! -d "$WS/sources/DirectXShaderCompiler/.git" ]; then
+    git clone --depth 1 --branch "$DXC_TAG" https://github.com/microsoft/DirectXShaderCompiler.git "$WS/sources/DirectXShaderCompiler"
+    git -C "$WS/sources/DirectXShaderCompiler" submodule update --init --depth 1 \
+        external/DirectX-Headers external/SPIRV-Headers external/SPIRV-Tools
+    git -C "$WS/sources/DirectXShaderCompiler" apply "$WS/patches/dxc/metalsharp-dxilconv.diff"
+fi
+echo "sources ready; build MoltenVK with scripts/build-moltenvk.sh, the DXBC converter with scripts/build-dxbcconverter.sh, DXVK with scripts/build-dxvk.sh, the NGX core and NVAPI with scripts/build-ngx-arm64x.sh"

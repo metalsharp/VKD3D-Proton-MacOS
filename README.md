@@ -143,7 +143,8 @@ This repository's own code, scripts and documentation are licensed under the
 [GNU Affero General Public License v3.0](LICENSE).
 
 The projects it builds keep their own licenses, and so do this repository's changes to them in `patches/`:
-VKD3D-Proton is LGPL-2.1, DXVK is zlib, and MoltenVK and SPIRV-Cross are Apache-2.0. Each release package carries
+VKD3D-Proton is LGPL-2.1, DXVK is zlib, MoltenVK and SPIRV-Cross are Apache-2.0, and DirectXShaderCompiler (whose
+DXBC to DXIL converter the MoltenVK package carries) is the University of Illinois/NCSA license. Each release package carries
 the licenses of what it contains. [Third-party licenses](#third-party-licenses) lists them, with the terms Apple's
 Metal Shader Converter library ships under.
 
@@ -156,6 +157,7 @@ Metal Shader Converter library ships under.
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |
 | Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license, see below | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |
+| [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)'s dxilconv | `libdxbcconverter.dylib` (DXBC to DXIL, for Metal Shader Converter) | University of Illinois/NCSA | `LICENSE.dxc.txt` |
 | Metal Shader Converter headers | built into `libMoltenVK.dylib` | Apache-2.0 | `sources/MoltenVK/MoltenVK/MoltenVK/MetalShaderConverter/metal_irconverter/LICENSE.txt` in MoltenVK's source |
 
 ### Apple Metal Shader Converter
