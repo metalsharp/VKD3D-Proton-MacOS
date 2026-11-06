@@ -146,12 +146,14 @@ conversion (DXIL).
   Both paths read the same values. Against a CPU reference, the sRGB, 16-bit packed, depth and stencil reads are
   exact, including D24S8, which Apple GPUs keep as D32S8. Stencil arrives in `.g`.
 - `d3d12test vtxdiff` (opt-in: `D3D12TEST_VTXDIFF=1`, writes `vtxdiff.bin` in the run directory; compare with `tests/run/vtxdiff.py`): 29 vertex
-  formats read by a vertex shader from a per-vertex and a per-instance stream (step rate 2). All 28 formats with a
-  Metal vertex format read the same on both paths, and the decodes checked against a CPU reference are exact, with
-  missing components reading 0, 0, 1. The formats checked are R32, R32G32, RGBA8 SNORM, R8, BGRA8, R10G10B10A2_UNORM
-  and R11G11B10. `R10G10B10A2_UINT` makes no pipeline on either path: Metal only has a normalized 10:10:10:2 vertex
-  format. A pipeline with no pixel shader, render target or depth target is made with rasterizer discard, and a converted
-  vertex function returns its outputs, which Metal rejects without rasterization: MoltenVK rasterizes such bridge
-  pipelines, which draw nothing (test `vs_uav_no_attachments`). An unnormalized 10:10:10:2 vertex format would need
-  the vertex shader to fetch its attributes itself, which MoltenVK does only for geometry shaders and conservative
-  rasterization; it remains unsupported.
+  formats read by a vertex shader from a per-vertex and a per-instance stream (step rate 2). All 29 formats read the
+  same on both paths, and the decodes checked against a CPU reference are exact, with missing components reading 0, 0,
+  1. The formats checked are R32, R32G32, RGBA8 SNORM, R8, BGRA8, R10G10B10A2_UNORM and R11G11B10.
+  `R10G10B10A2_UINT` has no Metal vertex format (only the normalized 10:10:10:2 one). As Mullion does, the attribute
+  is fetched as one R32_UINT word and the vertex shader unpacks it (`(word >> 10 * c) & (c == 3 ? 3 : 0x3ff)`,
+  dxil-spirv patch 0006). Such pipelines use SPIR-V, since a converted vertex function reads its attributes as they
+  are. Test `vertex_rgb10a2_uint` checks every component against a CPU unpack for DXIL `uint4`, `int4`, `uint3` and
+  `uint16_t4`, and DXBC `uint4` and `int2`, per vertex and per instance, next to an R32_UINT attribute in the same
+  stream. The format also reports `IA_VERTEX_BUFFER` support. A pipeline with no pixel shader, render target or depth
+  target is made with rasterizer discard, and a converted vertex function returns its outputs, which Metal rejects
+  without rasterization: MoltenVK rasterizes such bridge pipelines, which draw nothing (test `vs_uav_no_attachments`).

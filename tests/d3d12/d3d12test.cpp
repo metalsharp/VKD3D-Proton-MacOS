@@ -6437,10 +6437,8 @@ float4 ps() : SV_Target { return 0; }
         {
             uint32_t zero = 0;
             fwrite(&zero, 4, 1, f);
-            // Metal has no unnormalized 10:10:10:2 vertex format (MTLVertexFormatUInt1010102Normalized only).
-            bool known = fmts[k].fmt == DXGI_FORMAT_R10G10B10A2_UINT;
-            printf("  %s: no pipeline%s\n", fmts[k].name, known ? " (known: no Metal vertex format)" : "");
-            failed += !known;
+            printf("  %s: no pipeline\n", fmts[k].name);
+            failed++;
             continue;
         }
         D3D12_VERTEX_BUFFER_VIEW vbv[2] = {
@@ -6472,6 +6470,163 @@ float4 ps() : SV_Target { return 0; }
     printf("  wrote %u vertex formats\n", count);
     out->Release(); vb->Release(); rs->Release(); rt->Release(); rtv_heap->Release();
     EXPECT(!failed, "%d vertex formats have no pipeline", failed);
+    return true;
+}
+
+// R10G10B10A2_UINT vertex attributes. Metal has no such vertex format (only the normalized one), so the attribute is
+// fetched as one R32_UINT word and the vertex shader unpacks it. Checks every component against a CPU unpack, for
+// DXIL (uint4, int4, uint3 and 16-bit) and DXBC shaders, next to an R32_UINT attribute at a later offset in the same
+// stream, per vertex and per instance; and that the format reports vertex buffer support.
+static bool test_vertex_rgb10a2_uint()
+{
+    ID3D12Device *dev = g.device;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { DXGI_FORMAT_R10G10B10A2_UINT };
+    CHECK_HR(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)));
+    EXPECT(fs.Support1 & D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, "R10G10B10A2_UINT reports no vertex buffer support");
+
+    static const char *tmpl = R"(
+struct In { T a : ATTR; uint b : EXTRA; T c : INST; uint vid : SV_VertexID; uint iid : SV_InstanceID; };
+RWStructuredBuffer<uint4> o : register(u0);
+float4 main(In i) : SV_Position
+{
+    uint4 a = 0, c = 0;
+    a.SWZ = i.a.SWZ; c.SWZ = i.c.SWZ;
+    o[(i.iid * 64 + i.vid) * 3 + 0] = a;
+    o[(i.iid * 64 + i.vid) * 3 + 1] = uint4(i.b, 0, 0, 0);
+    o[(i.iid * 64 + i.vid) * 3 + 2] = c;
+    return float4(0, 0, 0, 1);
+}
+float4 ps() : SV_Target { return 0; }
+)";
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
+    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4));
+    struct Variant { const char *name, *type, *swz, *target; bool dxbc, fp16; unsigned comps; };
+    static const Variant variants[] = {
+        { "DXIL uint4", "uint4", "xyzw", "vs_6_0", false, false, 4 },
+        { "DXIL int4", "int4", "xyzw", "vs_6_0", false, false, 4 },
+        { "DXIL uint3", "uint3", "xyz", "vs_6_0", false, false, 3 },
+        { "DXIL uint16_t4", "uint16_t4", "xyzw", "vs_6_2", false, true, 4 },
+        { "DXBC uint4", "uint4", "xyzw", "vs_5_0", true, false, 4 },
+        { "DXBC int2", "int2", "xy", "vs_5_0", true, false, 2 },
+    };
+
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    std::vector<char> psb = compile_dxc((std::string("#define T uint4\n#define SWZ xyzw\n") + tmpl).c_str(), "ps", "ps_6_0");
+    if (psb.empty()) return false;
+
+    D3D12_HEAP_PROPERTIES rhp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rtd = {};
+    rtd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rtd.Width = 4; rtd.Height = 4; rtd.DepthOrArraySize = 1; rtd.MipLevels = 1;
+    rtd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtd.SampleDesc.Count = 1;
+    rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&rhp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+
+    // Stream 0: 8-byte vertices, the packed word at offset 0 and an R32_UINT at offset 4. Stream 1: per instance
+    // (step rate 1), the packed word at offset 4 of a 12-byte stride.
+    const UINT V = 64, inst = 3;
+    uint32_t words[V * 2 + inst * 3];
+    uint32_t seed = 1234;
+    for (uint32_t &w : words) { seed = seed * 1664525 + 1013904223; w = seed ^ (seed >> 13); }
+    words[0] = 0xffffffffu; words[2] = 0; words[4] = 0xc00003ffu; words[6] = 0x3ff00000u;
+    ID3D12Resource *vb = create_buffer(sizeof(words), D3D12_HEAP_TYPE_UPLOAD);
+    void *vp = nullptr;
+    vb->Map(0, nullptr, &vp);
+    memcpy(vp, words, sizeof(words));
+    vb->Unmap(0, nullptr);
+    const UINT out_size = V * inst * 3 * 16;
+    ID3D12Resource *out = create_buffer(out_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto unpack = [](uint32_t w, unsigned c) { return c == 3 ? w >> 30 : (w >> (10 * c)) & 0x3ffu; };
+
+    for (const Variant &v : variants)
+    {
+        if (v.fp16 && !o4.Native16BitShaderOpsSupported)
+        {
+            printf("  %s: skipped, no native 16-bit shader operations\n", v.name);
+            continue;
+        }
+        std::string src = std::string("#define T ") + v.type + "\n#define SWZ " + v.swz + "\n" + tmpl;
+        static const wchar_t *fp16_args[] = { L"-enable-16bit-types" };
+        std::vector<char> vsb = v.dxbc ? compile_fxc(src.c_str(), "main", v.target)
+                                       : compile_dxc(src.c_str(), "main", v.target, v.fp16 ? fp16_args : nullptr, v.fp16 ? 1 : 0);
+        if (vsb.empty()) return false;
+
+        D3D12_INPUT_ELEMENT_DESC el[3] = {
+            { "ATTR", 0, DXGI_FORMAT_R10G10B10A2_UINT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "EXTRA", 0, DXGI_FORMAT_R32_UINT, 0, 4, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "INST", 0, DXGI_FORMAT_R10G10B10A2_UINT, 1, 4, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vsb.data(), vsb.size() };
+        pd.PS = { psb.data(), psb.size() };
+        pd.InputLayout = { el, 3 };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        EXPECT(SUCCEEDED(hr), "%s: CreateGraphicsPipelineState hr %#x", v.name, (unsigned)hr);
+        if (FAILED(hr)) continue;
+
+        D3D12_VERTEX_BUFFER_VIEW vbv[2] = {
+            { vb->GetGPUVirtualAddress(), V * 8, 8 },
+            { vb->GetGPUVirtualAddress() + V * 8, inst * 12, 12 },
+        };
+        D3D12_VIEWPORT vpt = { 0, 0, 4, 4, 0, 1 };
+        D3D12_RECT sc = { 0, 0, 4, 4 };
+        g.list->RSSetViewports(1, &vpt);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetPipelineState(pso);
+        g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        g.list->IASetVertexBuffers(0, 2, vbv);
+        g.list->DrawInstanced(V, inst, 0, 0);
+        ID3D12Resource *rb = nullptr;
+        const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_size, &rb);
+        if (!r) return false;
+        int bad = 0;
+        for (UINT i = 0; i < inst; i++)
+            for (UINT j = 0; j < V; j++)
+            {
+                const uint32_t *e = r + (i * V + j) * 12;
+                uint32_t wa = words[j * 2], wb = words[j * 2 + 1], wc = words[V * 2 + i * 3 + 1];
+                for (unsigned c = 0; c < 4; c++)
+                {
+                    uint32_t want_a = c < v.comps ? unpack(wa, c) : 0, want_c = c < v.comps ? unpack(wc, c) : 0;
+                    if (e[c] != want_a || e[8 + c] != want_c)
+                    {
+                        if (bad++ < 4)
+                            printf("  %s: instance %u vertex %u component %u: %#x/%#x, want %#x/%#x\n", v.name, i, j, c,
+                                   e[c], e[8 + c], want_a, want_c);
+                    }
+                }
+                if (e[4] != wb && bad++ < 4)
+                    printf("  %s: instance %u vertex %u R32_UINT %#x, want %#x\n", v.name, i, j, e[4], wb);
+            }
+        EXPECT(!bad, "%s: %d values wrong", v.name, bad);
+        rb->Release();
+        pso->Release();
+    }
+    out->Release(); vb->Release(); rs->Release(); rt->Release(); rtv_heap->Release();
     return true;
 }
 
@@ -8573,6 +8728,7 @@ static const Test tests[] = {
     { "formatdiff", test_formatdiff },
     { "texdiff", test_texdiff },
     { "vtxdiff", test_vtxdiff },
+    { "vertex_rgb10a2_uint", test_vertex_rgb10a2_uint },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
