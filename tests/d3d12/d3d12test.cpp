@@ -5294,6 +5294,202 @@ static bool test_opdiff()
     return true;
 }
 
+// Sampler differential dump (opt-in: D3D12TEST_SAMPLEDIFF=<Windows path>): a 32x32 RGBA8 texture with 6 mips of random
+// texels and an R32_FLOAT depth-like texture, sampled with about 25 sampler descriptors from a sampler heap (filters,
+// address modes, border colors, LOD bias and clamps, comparison) at 256 coordinates in and outside [0, 1], by
+// SampleLevel, SampleGrad, Gather and SampleCmpLevelZero. tests/run/samplediff.py compares two dumps (with the Metal
+// Shader Converter bridge and without). Always passes: it's a dump.
+static bool test_samplediff()
+{
+    const char *path = getenv("D3D12TEST_SAMPLEDIFF");
+    if (!path)
+    {
+        printf("  skipped: D3D12TEST_SAMPLEDIFF not set\n");
+        return true;
+    }
+    static const char *src = R"(
+cbuffer C : register(b0) { uint sampler_index; };
+Texture2D<float4> tex : register(t0);
+Texture2D<float> depth : register(t1);
+RWStructuredBuffer<float4> o : register(u0);
+uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16; return x; }
+[numthreads(64, 1, 1)] void main(uint t : SV_DispatchThreadID)
+{
+    SamplerState s = SamplerDescriptorHeap[sampler_index];
+    SamplerComparisonState sc = SamplerDescriptorHeap[sampler_index];
+    uint h = hash(t * 4 + 1), h2 = hash(t * 4 + 2), h3 = hash(t * 4 + 3);
+    float2 uv = float2(h & 0xffff, h >> 16) / 65536.0 * 3.0 - 1.0;     // [-1, 2)
+    float lod = (h2 & 0xff) / 255.0 * 6.0 - 0.5;
+    float2 g = float2((h3 & 0xff) / 64.0, (h3 >> 8 & 0xff) / 256.0) / 32.0;   // anisotropic gradients
+    uint base = t * 4;
+    o[base + 0] = tex.SampleLevel(s, uv, lod);
+    o[base + 1] = tex.SampleGrad(s, uv, float2(g.x, 0), float2(0, g.y));
+    o[base + 2] = tex.Gather(s, uv);
+    o[base + 3] = float4(depth.SampleCmpLevelZero(sc, uv, (h2 >> 8 & 0xff) / 255.0), 0, 0, 0);
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "main", "cs_6_6");
+    if (cs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrsd = {};
+    vrsd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    D3D12_DESCRIPTOR_RANGE1 ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 2 },
+    };
+    D3D12_ROOT_PARAMETER1 rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable = { 2, ranges };
+    vrsd.Desc_1_1 = { 2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED };
+    ID3DBlob *blob = nullptr, *error = nullptr;
+    CHECK_HR(D3D12SerializeVersionedRootSignature(&vrsd, &blob, &error));
+    ID3D12RootSignature *rs = nullptr;
+    CHECK_HR(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    blob->Release();
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+
+    // Textures: RGBA8 32x32 with 6 mips of random texels; R32_FLOAT 32x32 of random depths.
+    const UINT N = 32, mips = 6;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = N; td.Height = N; td.DepthOrArraySize = 1; td.MipLevels = mips;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr, *dtex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    td.MipLevels = 1; td.Format = DXGI_FORMAT_R32_FLOAT;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dtex)));
+    ID3D12Resource *upload = create_buffer(256 * N * (mips + 1), D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *up = nullptr;
+    upload->Map(0, nullptr, (void **)&up);
+    uint32_t seed = 12345;
+    auto rnd = [&]() { seed = seed * 1664525 + 1013904223; return seed; };
+    for (UINT m = 0; m < mips; m++)
+        for (UINT y = 0; y < (N >> m); y++)
+            for (UINT x = 0; x < (N >> m); x++)
+                ((uint32_t *)(up + m * 256 * N + y * 256))[x] = rnd();
+    for (UINT y = 0; y < N; y++)
+        for (UINT x = 0; x < N; x++)
+            ((float *)(up + mips * 256 * N + y * 256))[x] = (rnd() >> 8) / 16777216.0f;
+    upload->Unmap(0, nullptr);
+    for (UINT m = 0; m <= mips; m++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = m < mips ? tex : dtex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m < mips ? m : 0;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = m * 256 * N;
+        UINT w = m < mips ? N >> m : N;
+        srcl.PlacedFootprint.Footprint = { m < mips ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT, w, w, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(dtex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    const UINT threads = 256;
+    ID3D12Resource *out = create_buffer(threads * 4 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr, *sheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c = heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateShaderResourceView(tex, nullptr, c);
+    c.ptr += inc;
+    dev->CreateShaderResourceView(dtex, nullptr, c);
+    c.ptr += inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = threads * 4;
+    uav.Buffer.StructureByteStride = 16;
+    dev->CreateUnorderedAccessView(out, nullptr, &uav, c);
+
+    // Sampler descriptors.
+    struct Cfg { D3D12_FILTER f; D3D12_TEXTURE_ADDRESS_MODE u, v; float bias; UINT aniso; float minlod, maxlod; float border[4]; D3D12_COMPARISON_FUNC cmp; };
+    const D3D12_TEXTURE_ADDRESS_MODE W_ = D3D12_TEXTURE_ADDRESS_MODE_WRAP, M_ = D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
+        C_ = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, B_ = D3D12_TEXTURE_ADDRESS_MODE_BORDER, O_ = D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    const float FMAX = D3D12_FLOAT32_MAX;
+    static std::vector<Cfg> cfgs;
+    cfgs = {
+        { D3D12_FILTER_MIN_MAG_MIP_POINT, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, M_, M_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, C_, C_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, O_, O_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, B_, B_, 0, 1, 0, FMAX, { 0, 0, 0, 0 }, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, B_, B_, 0, 1, 0, FMAX, { 0, 0, 0, 1 }, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, B_, B_, 0, 1, 0, FMAX, { 1, 1, 1, 1 }, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_POINT, W_, C_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, W_, W_, 1.5f, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, W_, W_, -2.0f, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, W_, W_, 0, 1, 1.5f, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_LINEAR, W_, W_, 0, 1, 0, 2.0f, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_MIN_MAG_MIP_POINT, W_, W_, 0, 1, 0, 0.0f, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_ANISOTROPIC, W_, W_, 0, 4, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_ANISOTROPIC, W_, W_, 0, 16, 0, FMAX, {}, D3D12_COMPARISON_FUNC_NEVER },
+        { D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, C_, C_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_LESS },
+        { D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, C_, C_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_LESS_EQUAL },
+        { D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, C_, C_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_GREATER },
+        { D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, B_, B_, 0, 1, 0, FMAX, { 1, 1, 1, 1 }, D3D12_COMPARISON_FUNC_LESS },
+        { D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, W_, W_, 0, 1, 0, FMAX, {}, D3D12_COMPARISON_FUNC_ALWAYS },
+    };
+    D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, (UINT)cfgs.size(), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    CHECK_HR(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
+    UINT sinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    for (UINT i = 0; i < cfgs.size(); i++)
+    {
+        D3D12_SAMPLER_DESC sd = {};
+        sd.Filter = cfgs[i].f;
+        sd.AddressU = cfgs[i].u; sd.AddressV = cfgs[i].v; sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sd.MipLODBias = cfgs[i].bias;
+        sd.MaxAnisotropy = cfgs[i].aniso;
+        sd.ComparisonFunc = cfgs[i].cmp;
+        memcpy(sd.BorderColor, cfgs[i].border, sizeof(sd.BorderColor));
+        sd.MinLOD = cfgs[i].minlod; sd.MaxLOD = cfgs[i].maxlod;
+        D3D12_CPU_DESCRIPTOR_HANDLE sc = sheap->GetCPUDescriptorHandleForHeapStart();
+        sc.ptr += i * sinc;
+        dev->CreateSampler(&sd, sc);
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  can't write %s\n", path); return false; }
+    UINT count = (UINT)cfgs.size();
+    fwrite(&count, 4, 1, f);
+    fwrite(&threads, 4, 1, f);
+    ID3D12DescriptorHeap *heaps[2] = { heap, sheap };
+    for (UINT i = 0; i < count; i++)
+    {
+        g.list->SetDescriptorHeaps(2, heaps);
+        g.list->SetComputeRootSignature(rs);
+        g.list->SetPipelineState(ps);
+        g.list->SetComputeRoot32BitConstant(0, i, 0);
+        g.list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->Dispatch(threads / 64, 1, 1);
+        ID3D12Resource *rb = nullptr;
+        const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, threads * 4 * 16, &rb);
+        if (!r) return false;
+        fwrite(r, 16, threads * 4, f);
+        rb->Release();
+    }
+    fclose(f);
+    printf("  wrote %u sampler configurations\n", count);
+    out->Release(); heap->Release(); sheap->Release(); tex->Release(); dtex->Release(); upload->Release();
+    ps->Release(); rs->Release();
+    return true;
+}
+
 // Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
 // a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
 // sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
@@ -7388,6 +7584,7 @@ static const Test tests[] = {
     { "dynamicresources", test_dynamicresources },
     { "dynamicresources_graphics", test_dynamicresources_graphics },
     { "opdiff", test_opdiff },
+    { "samplediff", test_samplediff },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
