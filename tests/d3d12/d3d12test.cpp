@@ -5786,6 +5786,155 @@ cbuffer C : register(b0) { uint use_uint; };
     return true;
 }
 
+// Vertex input format differential dump (opt-in: D3D12TEST_VTXDIFF=<Windows path>): for each vertex format, 64
+// points from a per-vertex stream and 4 instances from a per-instance stream (step rate 2) of random bytes, read by a
+// vertex shader that writes both attributes' bits to a UAV (missing components must read as 0, 0, 0, 1).
+// tests/run/vtxdiff.py compares two dumps.
+static bool test_vtxdiff()
+{
+    const char *path = getenv("D3D12TEST_VTXDIFF");
+    if (!path)
+    {
+        printf("  skipped: D3D12TEST_VTXDIFF not set\n");
+        return true;
+    }
+    enum Cls { F, U, I };
+    static const struct { DXGI_FORMAT fmt; Cls cls; UINT size; const char *name; } fmts[] = {
+        { DXGI_FORMAT_R32G32B32A32_FLOAT, F, 16, "R32G32B32A32_FLOAT" }, { DXGI_FORMAT_R32G32B32_FLOAT, F, 12, "R32G32B32_FLOAT" },
+        { DXGI_FORMAT_R32G32B32_UINT, U, 12, "R32G32B32_UINT" }, { DXGI_FORMAT_R32G32B32_SINT, I, 12, "R32G32B32_SINT" },
+        { DXGI_FORMAT_R32G32_FLOAT, F, 8, "R32G32_FLOAT" }, { DXGI_FORMAT_R32_FLOAT, F, 4, "R32_FLOAT" }, { DXGI_FORMAT_R32_UINT, U, 4, "R32_UINT" },
+        { DXGI_FORMAT_R16G16B16A16_FLOAT, F, 8, "R16G16B16A16_FLOAT" }, { DXGI_FORMAT_R16G16B16A16_UNORM, F, 8, "R16G16B16A16_UNORM" },
+        { DXGI_FORMAT_R16G16B16A16_SNORM, F, 8, "R16G16B16A16_SNORM" }, { DXGI_FORMAT_R16G16B16A16_UINT, U, 8, "R16G16B16A16_UINT" },
+        { DXGI_FORMAT_R16G16B16A16_SINT, I, 8, "R16G16B16A16_SINT" }, { DXGI_FORMAT_R16G16_FLOAT, F, 4, "R16G16_FLOAT" },
+        { DXGI_FORMAT_R16G16_UNORM, F, 4, "R16G16_UNORM" }, { DXGI_FORMAT_R16G16_SNORM, F, 4, "R16G16_SNORM" },
+        { DXGI_FORMAT_R16G16_SINT, I, 4, "R16G16_SINT" }, { DXGI_FORMAT_R16_UINT, U, 2, "R16_UINT" }, { DXGI_FORMAT_R16_FLOAT, F, 2, "R16_FLOAT" },
+        { DXGI_FORMAT_R8G8B8A8_UNORM, F, 4, "R8G8B8A8_UNORM" }, { DXGI_FORMAT_R8G8B8A8_SNORM, F, 4, "R8G8B8A8_SNORM" },
+        { DXGI_FORMAT_R8G8B8A8_UINT, U, 4, "R8G8B8A8_UINT" }, { DXGI_FORMAT_R8G8B8A8_SINT, I, 4, "R8G8B8A8_SINT" },
+        { DXGI_FORMAT_B8G8R8A8_UNORM, F, 4, "B8G8R8A8_UNORM" }, { DXGI_FORMAT_R10G10B10A2_UNORM, F, 4, "R10G10B10A2_UNORM" },
+        { DXGI_FORMAT_R10G10B10A2_UINT, U, 4, "R10G10B10A2_UINT" }, { DXGI_FORMAT_R11G11B10_FLOAT, F, 4, "R11G11B10_FLOAT" },
+        { DXGI_FORMAT_R8G8_UNORM, F, 2, "R8G8_UNORM" }, { DXGI_FORMAT_R8_UNORM, F, 1, "R8_UNORM" }, { DXGI_FORMAT_R8_UINT, U, 1, "R8_UINT" },
+    };
+    static const char *tmpl = R"(
+struct In { T a : ATTR; T b : INST; uint vid : SV_VertexID; uint iid : SV_InstanceID; };
+RWStructuredBuffer<uint4> o : register(u0);
+float4 main(In i) : SV_Position
+{
+    o[i.iid * 64 + i.vid] = asuint(i.a);
+    if (i.vid == 0) o[256 + i.iid] = asuint(i.b);
+    return float4(0, 0, 0, 1);
+}
+float4 ps() : SV_Target { return 0; }
+)";
+    const char *types[3] = { "float4", "uint4", "int4" };
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    // A render target and a pixel shader: a pipeline with nothing to rasterize into is made with rasterizer discard,
+    // which the bridge can't do (a converted vertex function returns its outputs), and would test SPIR-V only.
+    std::vector<char> vsb[3], psb = compile_dxc((std::string("#define T float4\n") + tmpl).c_str(), "ps", "ps_6_0");
+    for (int c = 0; c < 3; c++)
+    {
+        std::string src = std::string("#define T ") + types[c] + "\n" + tmpl;
+        vsb[c] = compile_dxc(src.c_str(), "main", "vs_6_0");
+        if (vsb[c].empty()) return false;
+    }
+    if (psb.empty()) return false;
+    D3D12_HEAP_PROPERTIES rhp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rtd = {};
+    rtd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rtd.Width = 4; rtd.Height = 4; rtd.DepthOrArraySize = 1; rtd.MipLevels = 1;
+    rtd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtd.SampleDesc.Count = 1;
+    rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&rhp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    const UINT V = 64, inst = 4;
+    ID3D12Resource *vb = create_buffer(V * 16 + 256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *vp = nullptr;
+    vb->Map(0, nullptr, (void **)&vp);
+    uint32_t seed = 99;
+    for (UINT i = 0; i < V * 16 + 256; i++) { seed = seed * 1664525 + 1013904223; vp[i] = seed >> 24; }
+    vb->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(260 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  can't write %s\n", path); return false; }
+    UINT count = sizeof(fmts) / sizeof(fmts[0]);
+    fwrite(&count, 4, 1, f);
+    int failed = 0;
+    for (UINT k = 0; k < count; k++)
+    {
+        D3D12_INPUT_ELEMENT_DESC el[2] = {
+            { "ATTR", 0, fmts[k].fmt, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "INST", 0, fmts[k].fmt, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2 },
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vsb[fmts[k].cls].data(), vsb[fmts[k].cls].size() };
+        pd.PS = { psb.data(), psb.size() };
+        pd.InputLayout = { el, 2 };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        char name[32] = {};
+        snprintf(name, sizeof(name), "%s", fmts[k].name);
+        fwrite(name, 1, 32, f);
+        uint32_t cls = fmts[k].cls;
+        if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))))
+        {
+            uint32_t zero = 0;
+            fwrite(&zero, 4, 1, f);
+            // Metal has no unnormalized 10:10:10:2 vertex format (MTLVertexFormatUInt1010102Normalized only).
+            bool known = fmts[k].fmt == DXGI_FORMAT_R10G10B10A2_UINT;
+            printf("  %s: no pipeline%s\n", fmts[k].name, known ? " (known: no Metal vertex format)" : "");
+            failed += !known;
+            continue;
+        }
+        D3D12_VERTEX_BUFFER_VIEW vbv[2] = {
+            { vb->GetGPUVirtualAddress(), V * fmts[k].size, fmts[k].size },
+            { vb->GetGPUVirtualAddress() + V * 16, 256, fmts[k].size },
+        };
+        D3D12_VIEWPORT vpt = { 0, 0, 4, 4, 0, 1 };
+        D3D12_RECT sc = { 0, 0, 4, 4 };
+        g.list->RSSetViewports(1, &vpt);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetPipelineState(pso);
+        g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        g.list->IASetVertexBuffers(0, 2, vbv);
+        g.list->DrawInstanced(V, inst, 0, 0);
+        ID3D12Resource *rb = nullptr;
+        const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 260 * 16, &rb);
+        if (!r) return false;
+        uint32_t one = 1;
+        fwrite(&one, 4, 1, f);
+        fwrite(&cls, 4, 1, f);
+        fwrite(r, 16, 260, f);
+        rb->Release();
+        pso->Release();
+    }
+    fclose(f);
+    printf("  wrote %u vertex formats\n", count);
+    out->Release(); vb->Release(); rs->Release(); rt->Release(); rtv_heap->Release();
+    EXPECT(!failed, "%d vertex formats have no pipeline", failed);
+    return true;
+}
+
 // Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
 // a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
 // sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
@@ -7883,6 +8032,7 @@ static const Test tests[] = {
     { "samplediff", test_samplediff },
     { "formatdiff", test_formatdiff },
     { "texdiff", test_texdiff },
+    { "vtxdiff", test_vtxdiff },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },

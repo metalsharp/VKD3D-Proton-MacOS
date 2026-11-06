@@ -141,3 +141,10 @@ conversion (DXIL).
 
   Both paths read the same values. Against a CPU reference, the sRGB, 16-bit packed, depth and stencil reads are
   exact, including D24S8, which Apple GPUs keep as D32S8. Stencil arrives in `.g`.
+- `d3d12test vtxdiff` (opt-in: `D3D12TEST_VTXDIFF=<Windows path>`; compare with `tests/run/vtxdiff.py`): 29 vertex
+  formats read by a vertex shader from a per-vertex and a per-instance stream (step rate 2). All 28 formats with a
+  Metal vertex format read the same on both paths, and the decodes checked against a CPU reference are exact, with
+  missing components reading 0, 0, 1. The formats checked are R32, R32G32, RGBA8 SNORM, R8, BGRA8, R10G10B10A2_UNORM
+  and R11G11B10. `R10G10B10A2_UINT` makes no pipeline on either path: Metal only has a normalized 10:10:10:2 vertex
+  format. A pipeline with no pixel shader, render target or depth target stays on SPIR-V: VKD3D-Proton makes it with
+  rasterizer discard, and a converted vertex function returns its outputs, which Metal rejects without rasterization.
