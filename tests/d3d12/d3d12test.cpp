@@ -3468,6 +3468,283 @@ static bool test_sampler_lod_bias() { return sampler_lod_bias(false); }
 static bool test_sampler_lod_bias_dxbc() { return sampler_lod_bias(true); }
 static bool test_sampler_lod_bias_late() { return sampler_lod_bias(false, true); }
 
+// Depth EQUAL across PSOs: one PSO draws 3000 random triangles writing depth (LESS), a second PSO with the same vertex
+// shader draws them again with depth EQUAL and no depth writes. Every pixel the first drew must pass the second, which
+// needs both pipelines' positions to be bit-identical (a depth pre-pass followed by the main pass). The second PSO has a
+// logic operation, which keeps it on SPIR-V, while the first may be on the bridge: the two converters must agree.
+static bool depth_equal_cross_path(bool dxbc)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+    if (!o.OutputMergerLogicOp)
+    {
+        printf("  OutputMergerLogicOp not supported\n");
+        return true;
+    }
+    static const char *src = R"(
+cbuffer C : register(b0) { float4x4 m; };
+float4 vs(float3 p : POSITION) : SV_Position
+{
+    // Displacement and skinning-like math, as pre-passes run it: transcendental, normalize, pow, rsqrt.
+    float3 n = normalize(p + float3(0.3, -0.2, 0.1));
+    float3 d = p + n * (0.02 * sin(p.x * 3.1 + p.y * 1.7) + 0.01 * cos(p.z * 2.3)) + 0.005 * pow(abs(n), 2.2) * rsqrt(1.0 + dot(p, p));
+    float4x4 m2 = m * (1.0 + 0.001 * exp2(frac(p.y)));
+    return mul(m2, float4(lerp(p, d, 0.75), 1));
+}
+uint4 ps1() : SV_Target { return uint4(1, 0, 0, 0); }
+uint4 ps2() : SV_Target { return uint4(2, 0, 0, 0); }
+)";
+    std::vector<char> vsb = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> ps1 = dxbc ? compile_fxc(src, "ps1", "ps_5_0") : compile_dxc(src, "ps1", "ps_6_0");
+    std::vector<char> ps2 = dxbc ? compile_fxc(src, "ps2", "ps_5_0") : compile_dxc(src, "ps2", "ps_6_0");
+    if (vsb.empty() || ps1.empty() || ps2.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 16;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+
+    const UINT W = 256;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rtd = {};
+    rtd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rtd.Width = W; rtd.Height = W; rtd.DepthOrArraySize = 1; rtd.MipLevels = 1;
+    rtd.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    rtd.SampleDesc.Count = 1;
+    rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cc = { DXGI_FORMAT_R8G8B8A8_UINT };
+    ID3D12Resource *rt = nullptr, *ds = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cc, IID_PPV_ARGS(&rt)));
+    D3D12_RESOURCE_DESC dsd = rtd;
+    dsd.Format = DXGI_FORMAT_D32_FLOAT;
+    dsd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE dc = { DXGI_FORMAT_D32_FLOAT };
+    dc.DepthStencil.Depth = 1.0f;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dsd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc, IID_PPV_ARGS(&ds)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 }, dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    CHECK_HR(dev->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dsv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart(), dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    dev->CreateDepthStencilView(ds, nullptr, dsv);
+
+    D3D12_INPUT_ELEMENT_DESC el = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { ps1.data(), ps1.size() };
+    pd.InputLayout = { &el, 1 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pre = nullptr, *main_pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pre)));
+    pd.PS = { ps2.data(), ps2.size() };
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    pd.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
+    pd.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_COPY;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&main_pso)));
+
+    // Random triangles in [-1.2, 1.2]^2 x [0.5, 4], through a perspective matrix with awkward values.
+    const UINT tris = 3000;
+    ID3D12Resource *vb = create_buffer(tris * 3 * 12, D3D12_HEAP_TYPE_UPLOAD);
+    float *v = nullptr;
+    vb->Map(0, nullptr, (void **)&v);
+    uint32_t seed = 7;
+    auto rnd = [&]() { seed = seed * 1664525 + 1013904223; return (seed >> 8) * (1.0f / 16777216.0f); };
+    for (UINT i = 0; i < tris; i++)
+    {
+        float cx = rnd() * 2.4f - 1.2f, cy = rnd() * 2.4f - 1.2f, cz = 0.5f + rnd() * 3.5f;
+        for (UINT k = 0; k < 3; k++)
+        {
+            v[(i * 3 + k) * 3 + 0] = (cx + (rnd() - 0.5f) * 0.4f) * cz;
+            v[(i * 3 + k) * 3 + 1] = (cy + (rnd() - 0.5f) * 0.4f) * cz;
+            v[(i * 3 + k) * 3 + 2] = cz + (rnd() - 0.5f) * 0.7f;
+        }
+    }
+    vb->Unmap(0, nullptr);
+    // Row-major for mul(m, v) with HLSL's default column-major packing: the constants are m's columns.
+    const float n = 0.1f, f = 10.0f;
+    float mat[16] = { 0.9134f, 0.0371f, 0.0f, 0.0f,
+                      -0.0283f, 1.1170f, 0.0f, 0.0f,
+                      0.0119f, -0.0077f, f / (f - n), 1.0f,
+                      0.0031f, 0.0013f, -n * f / (f - n), 0.0f };
+
+    D3D12_VIEWPORT vpt = { 0, 0, (float)W, (float)W, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)W };
+    const UINT clear[4] = {};
+    g.list->ClearRenderTargetView(rtv, (const float *)clear, 0, nullptr);
+    g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    g.list->RSSetViewports(1, &vpt);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRoot32BitConstants(0, 16, mat, 0);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress(), tris * 3 * 12, 12 };
+    g.list->IASetVertexBuffers(0, 1, &vbv);
+    g.list->SetPipelineState(pre);
+    g.list->DrawInstanced(tris * 3, 1, 0, 0);
+    g.list->SetPipelineState(main_pso);
+    g.list->DrawInstanced(tris * 3, 1, 0, 0);
+
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *rb = create_buffer(W * W * 4, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UINT, W, W, 1, W * 4 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE r = { 0, W * W * 4 };
+    rb->Map(0, &r, (void **)&px);
+    UINT drawn = 0, failed = 0;
+    for (UINT i = 0; i < W * W; i++)
+    {
+        drawn += px[i * 4] != 0;
+        failed += px[i * 4] == 1;
+    }
+    rb->Unmap(0, nullptr);
+    printf("  %u pixels drawn, %u fail depth EQUAL in the second pass\n", drawn, failed);
+    EXPECT(drawn > W * W / 2, "only %u pixels drawn", drawn);
+    EXPECT(!failed, "%u of %u pixels fail depth EQUAL with the same vertex shader in another PSO", failed, drawn);
+    rb->Release(); vb->Release(); main_pso->Release(); pre->Release(); rtv_heap->Release(); dsv_heap->Release();
+    ds->Release(); rt->Release(); rs->Release();
+    return true;
+}
+
+static bool test_depth_equal_cross_path() { return depth_equal_cross_path(false); }
+static bool test_depth_equal_cross_path_dxbc() { return depth_equal_cross_path(true); }
+
+// SRV ResourceMinLODClamp: a 64x64 texture whose mip m holds m, read through a view of mips 1 and up (MostDetailedMip 1)
+// with ResourceMinLODClamp 2.5, filtered linearly between mips. The clamp is absolute (a resource mip) and applies to
+// sampling only: SampleLevel 0 (resource LOD 1) reads 2.5, SampleLevel 3 (resource LOD 4) reads 4, SampleGrad without
+// gradients 2.5 and with view LOD 3 gradients 4, and GetDimensions still reports the view (32x32, 6 levels).
+static bool srv_min_lod_clamp(bool dxbc)
+{
+    static const char *src = R"(
+Texture2D<float> t : register(t0);
+SamplerState s : register(s0);
+RWStructuredBuffer<float4> o : register(u0);
+[numthreads(1, 1, 1)] void cs()
+{
+    uint w, h, levels;
+    t.GetDimensions(0, w, h, levels);
+    float2 uv = float2(0.3, 0.6);
+    o[0] = float4(t.SampleLevel(s, uv, 0.0), t.SampleLevel(s, uv, 3.0), t.SampleLevel(s, uv, 1.25), t.Load(int3(3, 5, 0)));
+    o[1] = float4(w, h, levels, t.SampleLevel(s, uv, 2.0));
+    // Gradients: none (LOD below the clamp), and 8 texels of the 32-texel view per step (view LOD 3).
+    o[2] = float4(t.SampleGrad(s, uv, 0.0, 0.0), t.SampleGrad(s, uv, float2(0.25, 0), float2(0, 0.25)), 0, 0);
+}
+)";
+    std::vector<char> cs = dxbc ? compile_fxc(src, "cs", "cs_5_0") : compile_dxc(src, "cs", "cs_6_0");
+    if (cs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso = create_compute_pipeline(rs, cs);
+    if (!pso)
+        return false;
+
+    const UINT mips = 7;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 64; td.Height = 64; td.DepthOrArraySize = 1; td.MipLevels = mips;
+    td.Format = DXGI_FORMAT_R16_FLOAT;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    ID3D12Resource *upload = create_buffer(mips * 256 * 64, D3D12_HEAP_TYPE_UPLOAD);
+    uint16_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    static const uint16_t halves[7] = { 0x0000, 0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600 }; // 0..6
+    for (UINT m = 0; m < mips; m++)
+        for (UINT k = 0; k < 128 * 64; k++)
+            u[m * 128 * 64 + k] = halves[m];
+    upload->Unmap(0, nullptr);
+    for (UINT m = 0; m < mips; m++)
+    {
+        UINT w = 64 >> m;
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = (UINT64)m * 256 * 64;
+        srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R16_FLOAT, w, w, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R16_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MostDetailedMip = 1;
+    sd.Texture2D.MipLevels = (UINT)-1;
+    sd.Texture2D.ResourceMinLODClamp = 2.5f;
+    dev->CreateShaderResourceView(tex, &sd, heap->GetCPUDescriptorHandleForHeapStart());
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = nullptr;
+    const float *r = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    printf("  SampleLevel 0 %g, 3 %g, 1.25 %g, 2 %g; Load mip 0 %g; GetDimensions %gx%g, %g levels\n",
+           r[0], r[1], r[2], r[7], r[3], r[4], r[5], r[6]);
+    EXPECT(fabsf(r[0] - 2.5f) < 0.02f, "SampleLevel 0 reads %g, want 2.5 (the clamp)", r[0]);
+    EXPECT(fabsf(r[1] - 4.0f) < 0.02f, "SampleLevel 3 reads %g, want 4", r[1]);
+    EXPECT(fabsf(r[2] - 2.5f) < 0.02f, "SampleLevel 1.25 reads %g, want 2.5 (the clamp)", r[2]);
+    EXPECT(fabsf(r[7] - 3.0f) < 0.02f, "SampleLevel 2 reads %g, want 3", r[7]);
+    printf("  SampleGrad none %g, view LOD 3 %g\n", r[8], r[9]);
+    EXPECT(fabsf(r[8] - 2.5f) < 0.02f, "SampleGrad without gradients reads %g, want 2.5 (the clamp)", r[8]);
+    EXPECT(fabsf(r[9] - 4.0f) < 0.02f, "SampleGrad at view LOD 3 reads %g, want 4", r[9]);
+    EXPECT(r[4] == 32.0f && r[5] == 32.0f && r[6] == 6.0f, "GetDimensions %gx%g, %g levels, want 32x32, 6", r[4], r[5], r[6]);
+    rb->Release(); out->Release(); heap->Release(); upload->Release(); tex->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
+static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
+
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
 // zero constant (the select on the address, robust_guarded_load), which this is the check of.
@@ -8921,6 +9198,10 @@ static const Test tests[] = {
     { "sampler_lod_bias", test_sampler_lod_bias },
     { "sampler_lod_bias_dxbc", test_sampler_lod_bias_dxbc },
     { "sampler_lod_bias_late", test_sampler_lod_bias_late },
+    { "depth_equal_cross_path", test_depth_equal_cross_path },
+    { "depth_equal_cross_path_dxbc", test_depth_equal_cross_path_dxbc },
+    { "srv_min_lod_clamp", test_srv_min_lod_clamp },
+    { "srv_min_lod_clamp_dxbc", test_srv_min_lod_clamp_dxbc },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },

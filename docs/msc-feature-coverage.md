@@ -87,9 +87,20 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
   SPIRV-Cross adds the bias from the sampler's emulated word (bits 16 to 31, signed 8.8): to `level()` and `bias()`, as
   `bias()` for implicit LODs, and as an `exp2()` scale of gradients. Tests `sampler_lod_bias`, `_dxbc` and `_late`
   (static and heap samplers, biases 2, 3 and -1) pass on every lane, with `METALSHARP_METAL_VERSION=3` standing in
-  for an M1 to M4. SPIR-V shaders get the emulation once the application has made a biased sampler. Pipelines compiled
-  before that ignore a heap sampler's bias. Emulating it always costs 0.5 to 5% GPU in the probe's sampling-bound
-  scenes (`MVK_CONFIG_EMULATE_SAMPLER_LOD_BIAS=1` turns it on).
+  for an M1 to M4. Every SPIR-V shader carries the emulation, so samplers made after a pipeline apply too. It measured
+  within noise in the probe's sampling scenes (`MVK_CONFIG_EMULATE_SAMPLER_LOD_BIAS=0` turns it off).
+- SRV `ResourceMinLODClamp`: MoltenVK had no `VK_EXT_image_view_min_lod`, so VKD3D-Proton moved the view's first mip to
+  `floor(clamp)`. That was wrong on both paths: every LOD read `floor(clamp) - MostDetailedMip` mips too far, and
+  `GetDimensions` reported the moved view. A streaming engine clamping to the first resident mip got every texture that
+  many mips blurrier. MoltenVK now has the extension, so views keep their mips. Shaders clamp to the view's minimum LOD:
+  - SPIR-V shaders read it from a word MoltenVK keeps next to each texture (SPIRV-Cross `emulate_image_view_min_lod`),
+    as `level(max())` and `min_lod_clamp()`. Always on: it measured within noise.
+  - Converted shaders take it from the texture entry's metadata (`IRCompatibilityFlagTextureMinLODClamp`), counted from
+    the view's first mip. The converter clamps `Sample` and `SampleGrad`, but not `SampleLevel`, which Vulkan's
+    extension (made to match D3D12) clamps. Shaders with explicit LOD samples (dxil-spirv 0008) use SPIR-V once the
+    application has made a clamped view.
+  - Test `srv_min_lod_clamp` (and `_dxbc`): MostDetailedMip 1, clamp 2.5, linear mip filtering, passing on every lane.
+  - Not covered: comparisons, gathers and `Load` aren't clamped on either path.
 - Typed SRVs of three 32-bit components have no Metal texel format. Shaders declaring one use SPIR-V (DXIL:
   dxil-spirv's meta flag; DXBC: the reflection check). A shader declaring `Buffer<float4>` (or any 32-bit typed SRV)
   may still be given such a view. Once the application makes one, PSOs reading typed buffer SRVs use SPIR-V the same
