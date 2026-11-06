@@ -23710,7 +23710,7 @@ index c5b74991..cbd94077 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..ba3579a2 100644
+index 3aa44a44..d108265f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,13 @@
@@ -23995,7 +23995,7 @@ index 3aa44a44..ba3579a2 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +704,345 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +704,357 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -24026,6 +24026,7 @@ index 3aa44a44..ba3579a2 100644
 +	MVK_MSC_FUNCTIONS(MVK_MSC_DECLARE)
 +#undef MVK_MSC_DECLARE
 +	decltype(&::IRCompilerIgnoreRootSignature) IRCompilerIgnoreRootSignature = nullptr;	// Optional
++	decltype(&::IRCompilerSetDualSourceBlendingConfiguration) IRCompilerSetDualSourceBlendingConfiguration = nullptr;	// Optional
 +	string error;		// Why it couldn't be loaded, if it couldn't
 +
 +	MVKMetalShaderConverter() {
@@ -24061,6 +24062,7 @@ index 3aa44a44..ba3579a2 100644
 +		MVK_MSC_FUNCTIONS(MVK_MSC_LOAD)
 +#undef MVK_MSC_LOAD
 +		IRCompilerIgnoreRootSignature = (decltype(IRCompilerIgnoreRootSignature))dlsym(lib, "IRCompilerIgnoreRootSignature");
++		IRCompilerSetDualSourceBlendingConfiguration = (decltype(IRCompilerSetDualSourceBlendingConfiguration))dlsym(lib, "IRCompilerSetDualSourceBlendingConfiguration");
 +	}
 +
 +	// Returns the message of the converter's error, and destroys it.
@@ -24097,8 +24099,12 @@ index 3aa44a44..ba3579a2 100644
 +	uint32_t heapsOffset;
 +	uint32_t vertexInputOffset;
 +	uint32_t vertexInputCount;
++	uint32_t flags;			// kMVKMSCBlobFlag*, version 3
 +} MVKMSCBlobHeader;
 +static constexpr size_t kMVKMSCBlobHeaderSizeV1 = 8 * sizeof(uint32_t);
++static constexpr size_t kMVKMSCBlobHeaderSizeV2 = 10 * sizeof(uint32_t);
++// A pixel shader whose second output blends as source 1 (dual-source blending).
++static constexpr uint32_t kMVKMSCBlobFlagDualSourceBlending = 0x1;
 +
 +// A vertex blob's input table entry: the Vulkan attribute location, then the NUL-terminated semantic and index.
 +static constexpr size_t kMVKMSCVertexInputSize = 64;
@@ -24124,9 +24130,10 @@ index 3aa44a44..ba3579a2 100644
 +	} else {
 +		memcpy(&hdr, _mscBlob.data(), min(codeSize, sizeof(hdr)));
 +		if (hdr.version == 1) { hdr.heapsOffset = kMVKMSCNoHeaps; hdr.vertexInputOffset = hdr.vertexInputCount = 0; }
-+		if (hdr.version != 1 && hdr.version != 2) {
++		if (hdr.version < 3) { hdr.flags = 0; }
++		if (hdr.version < 1 || hdr.version > 3) {
 +			err = "has an unsupported version";
-+		} else if (hdr.version == 2 && codeSize < sizeof(hdr)) {
++		} else if ((hdr.version == 2 && codeSize < kMVKMSCBlobHeaderSizeV2) || (hdr.version == 3 && codeSize < sizeof(hdr))) {
 +			err = "is smaller than its header";
 +		} else if (hdr.heapsOffset != kMVKMSCNoHeaps && (hdr.heapsOffset & 7)) {
 +			err = "has heap addresses at an unaligned offset";
@@ -24189,8 +24196,9 @@ index 3aa44a44..ba3579a2 100644
 +		return;
 +	}
 +
-+	MVKMSCBlobHeader hdr;
-+	memcpy(&hdr, _mscBlob.data(), sizeof(hdr));
++	MVKMSCBlobHeader hdr = {};
++	memcpy(&hdr, _mscBlob.data(), min(_mscBlob.size() * sizeof(uint32_t), sizeof(hdr)));
++	if (hdr.version < 3) { hdr.flags = 0; }
 +	const uint8_t* blob = (const uint8_t*)_mscBlob.data();
 +
 +	// The flattened root signature, as the converter's 1.1 descriptor. Its enums have D3D12's values.
@@ -24277,6 +24285,10 @@ index 3aa44a44..ba3579a2 100644
 +		if (robustness2.robustBufferAccess2 || robustness2.nullDescriptor) { compatFlags |= IRCompatibilityFlagBoundsCheck; }
 +		if (getMVKConfig().fastMathEnabled != MVK_CONFIG_FAST_MATH_ALWAYS) { compatFlags |= IRCompatibilityFlagDisableNanInfOptimization; }
 +		msc.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)compatFlags);
++		if (hdr.flags & kMVKMSCBlobFlagDualSourceBlending) {
++			if ( !msc.IRCompilerSetDualSourceBlendingConfiguration ) { return "This Metal Shader Converter can't convert dual-source blending."; }
++			msc.IRCompilerSetDualSourceBlendingConfiguration(compiler, IRDualSourceBlendingConfigurationForceEnabled);
++		}
 +
 +		dxil = msc.IRObjectCreateFromDXIL(blob + hdr.dxilOffset, hdr.dxilSize, IRBytecodeOwnershipNone);
 +		if ( !dxil ) { return "Reading the DXIL failed."; }
@@ -24341,7 +24353,7 @@ index 3aa44a44..ba3579a2 100644
  }
  
  
-@@ -741,4 +1236,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1248,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }

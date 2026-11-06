@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <algorithm>
 #include <vector>
@@ -1378,6 +1379,319 @@ void main(uint i : SV_DispatchThreadID)
 static bool test_typedbuffer_rgb32() { return typedbuffer_rgb32(false); }
 static bool test_typedbuffer_rgb32_dxbc() { return typedbuffer_rgb32(true); }
 
+// Typed buffer views of many formats at first elements that are not 16-byte aligned, read through the descriptor heap
+// (SM 6.6) and a descriptor table, with out-of-bounds reads (0) and GetDimensions; then a typed UAV at an offset
+// written and atomically incremented. The Metal Shader Converter bridge gives each such view a texel view of its own.
+static float typedbuffer_half(uint16_t h)
+{
+    uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    float v = exp ? ldexpf((float)(man | 0x400), (int)exp - 25) : ldexpf((float)man, -24);
+    return sign ? -v : v;
+}
+
+static bool typedbuffer_matrix_heap(bool table)
+{
+    static const char *src_heap = R"(
+cbuffer c : register(b0) { uint idx; uint base; uint is_uint; };
+RWByteAddressBuffer o : register(u0);
+[numthreads(8, 1, 1)]
+void main(uint i : SV_DispatchThreadID)
+{
+    uint4 v; uint d;
+    if (is_uint) { Buffer<uint4> b = ResourceDescriptorHeap[idx]; v = b[i]; b.GetDimensions(d); }
+    else { Buffer<float4> b = ResourceDescriptorHeap[idx]; v = asuint(b[i]); b.GetDimensions(d); }
+    o.Store4(base + i * 16, v);
+    if (i == 0) o.Store(base + 8 * 16, d);
+}
+)";
+    static const char *src_table = R"(
+cbuffer c : register(b0) { uint idx; uint base; uint is_uint; };
+Buffer<float4> bf[80] : register(t0);
+Buffer<uint4> bu[80] : register(t0, space1);
+RWByteAddressBuffer o : register(u0);
+[numthreads(8, 1, 1)]
+void main(uint i : SV_DispatchThreadID)
+{
+    uint4 v; uint d;
+    if (is_uint) { v = bu[idx][i]; bu[idx].GetDimensions(d); }
+    else { v = asuint(bf[idx][i]); bf[idx].GetDimensions(d); }
+    o.Store4(base + i * 16, v);
+    if (i == 0) o.Store(base + 8 * 16, d);
+}
+)";
+    struct Fmt { DXGI_FORMAT f; const char *name; uint32_t size; bool is_uint; };
+    static const Fmt fmts[] = {
+        { DXGI_FORMAT_R32_FLOAT, "R32_FLOAT", 4, false },
+        { DXGI_FORMAT_R16G16_FLOAT, "R16G16_FLOAT", 4, false },
+        { DXGI_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM", 4, false },
+        { DXGI_FORMAT_R8G8B8A8_SNORM, "R8G8B8A8_SNORM", 4, false },
+        { DXGI_FORMAT_R10G10B10A2_UNORM, "R10G10B10A2_UNORM", 4, false },
+        { DXGI_FORMAT_R16G16B16A16_FLOAT, "R16G16B16A16_FLOAT", 8, false },
+        { DXGI_FORMAT_R16G16_UNORM, "R16G16_UNORM", 4, false },
+        { DXGI_FORMAT_R32G32_FLOAT, "R32G32_FLOAT", 8, false },
+        { DXGI_FORMAT_R32G32B32A32_FLOAT, "R32G32B32A32_FLOAT", 16, false },
+        { DXGI_FORMAT_R8_UNORM, "R8_UNORM", 1, false },
+        { DXGI_FORMAT_R32_UINT, "R32_UINT", 4, true },
+        { DXGI_FORMAT_R8G8B8A8_UINT, "R8G8B8A8_UINT", 4, true },
+        { DXGI_FORMAT_R16G16B16A16_UINT, "R16G16B16A16_UINT", 8, true },
+        { DXGI_FORMAT_R32G32_UINT, "R32G32_UINT", 8, true },
+        { DXGI_FORMAT_R32G32B32A32_UINT, "R32G32B32A32_UINT", 16, true },
+        { DXGI_FORMAT_R16_UINT, "R16_UINT", 2, true },
+        { DXGI_FORMAT_R8_UINT, "R8_UINT", 1, true },
+    };
+    static const uint32_t firsts[] = { 0, 1, 3, 7 };
+    const uint32_t count = 5, nf = sizeof(fmts) / sizeof(fmts[0]), nc = nf * 4, slot = 9 * 16, buf_size = 4096;
+
+    std::vector<char> cs = compile_dxc(table ? src_table : src_heap, "main", "cs_6_6");
+    if (cs.empty())
+        return false;
+    D3D12_DESCRIPTOR_RANGE1 ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 80, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 80, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 80 },
+    };
+    D3D12_ROOT_PARAMETER1 rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 3;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[2].DescriptorTable = { 2, ranges };
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrsd = {};
+    vrsd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    vrsd.Desc_1_1 = { table ? 3u : 2u, rp, 0, nullptr, table ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED };
+    ID3DBlob *blob = nullptr, *error = nullptr;
+    CHECK_HR(D3D12SerializeVersionedRootSignature(&vrsd, &blob, &error));
+    ID3D12RootSignature *rs = nullptr;
+    CHECK_HR(g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    blob->Release();
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+    if (!ps)
+        return false;
+
+    // Data: per format, buf_size bytes. Float formats hold exact small values; the others any bytes.
+    std::vector<uint8_t> bytes(nf * buf_size);
+    for (uint32_t f = 0; f < nf; f++)
+    {
+        uint8_t *b = &bytes[f * buf_size];
+        for (uint32_t k = 0; k < buf_size; k++)
+            b[k] = (uint8_t)(k * 37 + f * 11 + 5);
+        if (fmts[f].f == DXGI_FORMAT_R32_FLOAT || fmts[f].f == DXGI_FORMAT_R32G32_FLOAT || fmts[f].f == DXGI_FORMAT_R32G32B32A32_FLOAT)
+            for (uint32_t k = 0; k < buf_size / 4; k++)
+                ((float *)b)[k] = (float)k * 0.25f - 7.0f;
+        if (fmts[f].f == DXGI_FORMAT_R16G16_FLOAT || fmts[f].f == DXGI_FORMAT_R16G16B16A16_FLOAT)
+            for (uint32_t k = 0; k < buf_size / 2; k++)
+                ((uint16_t *)b)[k] = (uint16_t)(0x3800 + (k % 512) * 3);   // 0.5 and up, finite
+    }
+    ID3D12Resource *upload = create_buffer(nf * buf_size, D3D12_HEAP_TYPE_UPLOAD);
+    void *map = nullptr;
+    upload->Map(0, nullptr, &map);
+    memcpy(map, bytes.data(), bytes.size());
+    upload->Unmap(0, nullptr);
+    std::vector<ID3D12Resource *> data(nf);
+    for (uint32_t f = 0; f < nf; f++)
+    {
+        data[f] = create_buffer(buf_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(data[f], 0, upload, f * buf_size, buf_size);
+        transition(data[f], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    ID3D12Resource *out = create_buffer(nc * slot, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 160, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    std::vector<bool> supported(nf);
+    for (uint32_t f = 0; f < nf; f++)
+    {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { fmts[f].f };
+        supported[f] = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+                       (fs.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER);
+        for (uint32_t c = 0; c < 4; c++)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.Format = fmts[f].f;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Buffer.FirstElement = firsts[c];
+            sd.Buffer.NumElements = count;
+            // Table: float views in the first 80 slots, uint views in the next 80 (space 1).
+            UINT index = (fmts[f].is_uint && table ? 80 : 0) + f * 4 + c;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += index * inc;
+            g.device->CreateShaderResourceView(supported[f] ? data[f] : nullptr, &sd, h);
+        }
+    }
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    if (table)
+        g.list->SetComputeRootDescriptorTable(2, heap->GetGPUDescriptorHandleForHeapStart());
+    for (uint32_t f = 0; f < nf; f++)
+        for (uint32_t c = 0; c < 4; c++)
+        {
+            uint32_t k[3] = { f * 4 + c, (f * 4 + c) * slot, fmts[f].is_uint };
+            g.list->SetComputeRoot32BitConstants(0, 3, k, 0);
+            g.list->Dispatch(1, 1, 1);
+        }
+    ID3D12Resource *rb = create_buffer(nc * slot, D3D12_HEAP_TYPE_READBACK);
+    transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, out, 0, nc * slot);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *o = nullptr;
+    rb->Map(0, nullptr, (void **)&o);
+    int bad = 0, cases = 0;
+    for (uint32_t f = 0; f < nf; f++)
+    {
+        if (!supported[f])
+        {
+            printf("  %s: no typed buffer support\n", fmts[f].name);
+            continue;
+        }
+        for (uint32_t c = 0; c < 4; c++)
+        {
+            const uint8_t *res = o + (f * 4 + c) * slot;
+            cases++;
+            uint32_t dims = *(const uint32_t *)(res + 8 * 16);
+            if (dims != count && bad++ < 20)
+                printf("  %s first %u: GetDimensions %u, want %u\n", fmts[f].name, firsts[c], dims, count);
+            for (uint32_t i = 0; i < 8; i++)
+            {
+                const uint8_t *e = &bytes[f * buf_size + (firsts[c] + i) * fmts[f].size];
+                float wf[4] = { 0, 0, 0, 1 };
+                uint32_t wu[4] = { 0, 0, 0, 1 };
+                if (i < count)
+                    switch (fmts[f].f)
+                    {
+                    case DXGI_FORMAT_R32_FLOAT: wf[0] = ((const float *)e)[0]; break;
+                    case DXGI_FORMAT_R32G32_FLOAT: wf[0] = ((const float *)e)[0]; wf[1] = ((const float *)e)[1]; break;
+                    case DXGI_FORMAT_R32G32B32A32_FLOAT: for (int j = 0; j < 4; j++) wf[j] = ((const float *)e)[j]; break;
+                    case DXGI_FORMAT_R16G16_FLOAT: for (int j = 0; j < 2; j++) wf[j] = typedbuffer_half(((const uint16_t *)e)[j]); break;
+                    case DXGI_FORMAT_R16G16B16A16_FLOAT: for (int j = 0; j < 4; j++) wf[j] = typedbuffer_half(((const uint16_t *)e)[j]); break;
+                    case DXGI_FORMAT_R8G8B8A8_UNORM: for (int j = 0; j < 4; j++) wf[j] = e[j] / 255.0f; break;
+                    case DXGI_FORMAT_R8G8B8A8_SNORM: for (int j = 0; j < 4; j++) wf[j] = std::max(-1.0f, (int8_t)e[j] / 127.0f); break;
+                    case DXGI_FORMAT_R8_UNORM: wf[0] = e[0] / 255.0f; break;
+                    case DXGI_FORMAT_R16G16_UNORM: for (int j = 0; j < 2; j++) wf[j] = ((const uint16_t *)e)[j] / 65535.0f; break;
+                    case DXGI_FORMAT_R10G10B10A2_UNORM:
+                    {
+                        uint32_t v = *(const uint32_t *)e;
+                        wf[0] = (v & 0x3ff) / 1023.0f; wf[1] = ((v >> 10) & 0x3ff) / 1023.0f;
+                        wf[2] = ((v >> 20) & 0x3ff) / 1023.0f; wf[3] = (v >> 30) / 3.0f;
+                        break;
+                    }
+                    case DXGI_FORMAT_R32_UINT: wu[0] = ((const uint32_t *)e)[0]; break;
+                    case DXGI_FORMAT_R32G32_UINT: wu[0] = ((const uint32_t *)e)[0]; wu[1] = ((const uint32_t *)e)[1]; break;
+                    case DXGI_FORMAT_R32G32B32A32_UINT: for (int j = 0; j < 4; j++) wu[j] = ((const uint32_t *)e)[j]; break;
+                    case DXGI_FORMAT_R8G8B8A8_UINT: for (int j = 0; j < 4; j++) wu[j] = e[j]; break;
+                    case DXGI_FORMAT_R16G16B16A16_UINT: for (int j = 0; j < 4; j++) wu[j] = ((const uint16_t *)e)[j]; break;
+                    case DXGI_FORMAT_R16_UINT: wu[0] = ((const uint16_t *)e)[0]; break;
+                    case DXGI_FORMAT_R8_UINT: wu[0] = e[0]; break;
+                    default: break;
+                    }
+                else if (fmts[f].is_uint)
+                    wu[3] = 0;
+                else
+                    wf[3] = 0;   // out of bounds: all zero
+                const uint32_t *got = (const uint32_t *)(res + i * 16);
+                for (int j = 0; j < 4; j++)
+                {
+                    bool ok;
+                    if (fmts[f].is_uint)
+                        ok = got[j] == wu[j];
+                    else
+                    {
+                        float gf;
+                        memcpy(&gf, &got[j], 4);
+                        ok = fabsf(gf - wf[j]) <= 1e-6f * std::max(1.0f, fabsf(wf[j]));
+                    }
+                    // Out of bounds, a format without alpha may read it as 1 (Vulkan robustness, as GPUs do).
+                    if (i >= count && j == 3 && (got[j] == 1 || got[j] == 0x3f800000))
+                        ok = true;
+                    if (!ok && bad++ < 20)
+                    {
+                        float gf;
+                        memcpy(&gf, &got[j], 4);
+                        printf("  %s first %u element %u.%c: got %#x (%g), want %#x (%g)\n", fmts[f].name, firsts[c], i,
+                               "xyzw"[j], got[j], gf, fmts[f].is_uint ? wu[j] : 0u, fmts[f].is_uint ? (double)wu[j] : wf[j]);
+                    }
+                }
+            }
+        }
+    }
+    EXPECT(!bad, "%d wrong values over %d typed views (%s)", bad, cases, table ? "table" : "heap");
+    rb->Unmap(0, nullptr);
+    for (auto *d : data)
+        d->Release();
+    rb->Release(); out->Release(); upload->Release(); heap->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
+static bool test_typedbuffer_matrix() { return typedbuffer_matrix_heap(false) && typedbuffer_matrix_heap(true); }
+
+// A typed UAV starting at element 3 of 16: one thread writes element 0, 64 threads atomically increment element 1,
+// element 2 gets GetDimensions; the elements around the view keep their values.
+static bool test_typedbuffer_uav_offset()
+{
+    static const char *src = R"(
+RWBuffer<uint> b : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint i : SV_DispatchThreadID)
+{
+    if (i == 0) { b[0] = 77; uint d; b.GetDimensions(d); b[2] = d; }
+    InterlockedAdd(b[1], 1);
+}
+)";
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable = { 1, &range };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!rs || !ps)
+        return false;
+    ID3D12Resource *upload = create_buffer(64, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (uint32_t i = 0; i < 16; i++)
+        u[i] = 0xa000 + i;
+    u[4] = 5;   // element 1 of the view: incremented from 5
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *buf = create_buffer(64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(buf, 0, upload, 0, 64);
+    transition(buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_R32_UINT;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    ud.Buffer.FirstElement = 3;
+    ud.Buffer.NumElements = 4;
+    g.device->CreateUnorderedAccessView(buf, nullptr, &ud, heap->GetCPUDescriptorHandleForHeapStart());
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = create_buffer(64, D3D12_HEAP_TYPE_READBACK);
+    transition(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, buf, 0, 64);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *o = nullptr;
+    rb->Map(0, nullptr, (void **)&o);
+    for (uint32_t i = 0; i < 16; i++)
+    {
+        uint32_t want = i == 3 ? 77 : i == 4 ? 5 + 64 : i == 5 ? 4 : 0xa000 + i;
+        EXPECT(o[i] == want, "element %u = %#x, want %#x", i, o[i], want);
+    }
+    rb->Unmap(0, nullptr);
+    rb->Release(); buf->Release(); upload->Release(); heap->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 static bool test_typedbuffer()
 {
     static const char *src = R"(
@@ -1546,6 +1860,189 @@ uint4 ps() : SV_Target { return uint4(0x19, 0x5a, 0xf0, 0x0f); }
     for (int c = 0; c < 4; c++)
         EXPECT(px[8 * 256 + 8 * 4 + c] == want[c], "channel %d = 0x%x, want 0x%x", c, px[8 * 256 + 8 * 4 + c], want[c]);
     rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+// Dual-source blending: SV_Target1 is the blend factor of SV_Target0 (SRC1_COLOR / INV_SRC1_COLOR). Over a white
+// target, each channel is o0 * o1 + (1 - o1).
+static bool test_dual_source_blend()
+{
+    static const char *src = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+struct PSOut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };
+PSOut ps() { PSOut o; o.c0 = float4(0.25, 0.5, 0.75, 1.0); o.c1 = float4(0.5, 0.25, 0.5, 0.0); return o; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    D3D12_RENDER_TARGET_BLEND_DESC &b = pd.BlendState.RenderTarget[0];
+    b.BlendEnable = TRUE;
+    b.SrcBlend = D3D12_BLEND_SRC1_COLOR; b.DestBlend = D3D12_BLEND_INV_SRC1_COLOR; b.BlendOp = D3D12_BLEND_OP_ADD;
+    b.SrcBlendAlpha = D3D12_BLEND_ONE; b.DestBlendAlpha = D3D12_BLEND_ZERO; b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT W = 16, H = 16;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 1, 1, 1, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * H };
+    rb->Map(0, &range, (void **)&px);
+    const float want[4] = { 0.25f * 0.5f + 0.5f, 0.5f * 0.25f + 0.75f, 0.75f * 0.5f + 0.5f, 1.0f };
+    for (int c = 0; c < 4; c++)
+    {
+        int w = (int)(want[c] * 255.0f + 0.5f), got = px[8 * 256 + 8 * 4 + c];
+        EXPECT(got >= w - 1 && got <= w + 1, "channel %d = %d, want %d", c, got, w);
+    }
+    rb->Release(); rtv_heap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+// A depth-only PSO (vertex shader, no pixel shader), as shadow and depth prepasses are: a full-screen triangle at
+// z = 0.5, then the left half at z = 0.25 and the right half at z = 0.75 with LESS, read back from D32_FLOAT.
+static bool test_depth_only()
+{
+    static const char *src = R"(
+cbuffer c : register(b0) { float z; float x0; float x1; };
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 p[6] = { float2(x0, 1), float2(x1, 1), float2(x0, -1), float2(x1, 1), float2(x1, -1), float2(x0, -1) };
+    return float4(p[id], z, 1);
+}
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0");
+    if (vs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 3;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    const UINT W = 16, H = 16;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = DXGI_FORMAT_D32_FLOAT;
+    cv.DepthStencil.Depth = 1.0f;
+    ID3D12Resource *ds = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&ds)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    ID3D12DescriptorHeap *dsv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateDepthStencilView(ds, nullptr, dsv);
+    g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const float draws[3][3] = { { 0.5f, -1, 1 }, { 0.25f, -1, 0 }, { 0.75f, 0, 1 } };
+    for (auto &d : draws)
+    {
+        g.list->SetGraphicsRoot32BitConstants(0, 3, d, 0);
+        g.list->DrawInstanced(6, 1, 0, 0);
+    }
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(ds, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, W, H, 1, 256 };
+    srcl.pResource = ds;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE range = { 0, 256 * H };
+    rb->Map(0, &range, (void **)&px);
+    int bad = 0;
+    for (UINT y = 0; y < H; y++)
+        for (UINT x = 0; x < W; x++)
+        {
+            float d = ((const float *)(px + y * 256))[x], want = x < W / 2 ? 0.25f : 0.5f;
+            if (d != want && bad++ < 4)
+                printf("  depth (%u, %u) = %g, want %g\n", x, y, d, want);
+        }
+    EXPECT(!bad, "%d of %u depth values wrong", bad, W * H);
+    rb->Release(); dsv_heap->Release(); ds->Release(); pso->Release(); rs->Release();
     return true;
 }
 
@@ -5242,12 +5739,16 @@ static const Test tests[] = {
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
     { "typedbuffer", test_typedbuffer },
+    { "typedbuffer_matrix", test_typedbuffer_matrix },
+    { "typedbuffer_uav_offset", test_typedbuffer_uav_offset },
     { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
     { "typedbuffer_rgb32_dxbc", test_typedbuffer_rgb32_dxbc },
     { "view_kinds_dxil", test_view_kinds_dxil },
     { "view_kinds_dxbc", test_view_kinds_dxbc },
     { "robust", test_robust },
     { "logicop", test_logicop },
+    { "dual_source_blend", test_dual_source_blend },
+    { "depth_only", test_depth_only },
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },

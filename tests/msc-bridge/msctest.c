@@ -599,9 +599,9 @@ int main(int argc, char** argv) {
                 int good = at == (int)first && d[first + 1] == 101 && d[first + 3] == 103 && ((uint32_t*)out.map)[0] == 4;
                 printf("  mode %d (%s) first %3u: view offset %3u, element 100 written at %3d, dims %u: %s\n", mode,
                        mode == 2 ? "exact view" : mode ? "view at 16-byte boundary" : "view at buffer start", first, off, at, ((uint32_t*)out.map)[0], good ? "ok" : "WRONG");
-                // Only views starting 16-byte aligned can be expressed (the converter ignores the offset); the rest is
-                // why VKD3D-Proton keeps typed buffers off the bridge.
-                if (mode == 2 && !good && (first * 4) % 16 == 0) failures++;
+                // The converter ignores the metadata's element offset, so VKD3D-Proton gives each typed descriptor a
+                // view of exactly the D3D12 view (mode 2), which Metal allows at any multiple of the texel size.
+                if (mode == 2 && !good) failures++;
             }
         }
     }
