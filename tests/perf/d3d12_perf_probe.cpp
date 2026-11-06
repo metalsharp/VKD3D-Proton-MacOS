@@ -2893,9 +2893,9 @@ static std::vector<Scene> feature_scenes()
             p.device->CreateUnorderedAccessView(res_d, nullptr, &ud, srv_cpu(CS_TABLE + 3));
         });
     };
-    auto buffers_frame = [](const char *entry, UINT stride) {
-        return std::function<void(UINT)>([entry, stride](UINT f) {
-            if (!pso_a) pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, entry, "cs_5_0"));
+    auto buffers_frame = [](const char *entry, UINT stride, const char *target = "cs_5_0") {
+        return std::function<void(UINT)>([entry, stride, target](UINT f) {
+            if (!pso_a) pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, entry, target));
             p.list->SetComputeRootSignature(cs_rs);
             p.list->SetPipelineState(pso_a);
             uint32_t rc[4] = { f, stride, 0, 0 };
@@ -3133,6 +3133,13 @@ static std::vector<Scene> feature_scenes()
         { "typed_buffer", "1M typed loads (RGBA8 SRV) and stores (RGBA32F UAV) at unaligned element offsets in compute", buffers_init(false), buffers_frame("cs_typed", 1) },
         { "structured_buffer", "1M structured loads and stores in compute (baseline for typed_buffer and robustness)", buffers_init(false), buffers_frame("cs_struct", 1) },
         { "robust_oob", "1M loads, half of them out of bounds, from structured and typed views (robust access)", buffers_init(false), buffers_frame("cs_robust", 2) },
+        // The DXIL is compiled at init, where the runner's prepare pass fills the DXIL cache.
+        { "structured_buffer_dxil", "structured_buffer compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_struct", "cs_6_0"));
+        }, buffers_frame("cs_struct", 1, "cs_6_0"), false, 0, true },
+        { "robust_oob_dxil", "robust_oob compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_robust", "cs_6_0"));
+        }, buffers_frame("cs_robust", 2, "cs_6_0"), false, 0, true },
         { "null_descriptors", "the same reading through a null typed descriptor", buffers_init(true), buffers_frame("cs_robust", 2) },
         { "tiled_update", "UpdateTileMappings of 256 tiles per frame on a 4096x4096 reserved texture (streaming)", tiled_init(false), [](UINT f) {
             if (!reserved) return;

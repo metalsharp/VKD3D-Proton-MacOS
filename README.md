@@ -81,6 +81,15 @@ pipelines on background threads instead, and `MVK_CONFIG_PARALLEL_STAGE_COMPILE=
 shader alongside its vertex shader. Both are off by default: their compiles wait on Metal from GCD worker threads,
 and a game creating pipelines from many threads can take every worker, which leaves Metal none to finish them on.
 
+Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
+(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
+tessellation shaders, stream output, logic operations, conservative rasterization, the depth bounds test, view
+instancing, ray queries, 64-bit atomics, barycentrics, residency feedback, min/max sampler filtering or a
+three-component 32-bit typed buffer stay on SPIR-V. `METALSHARP_MSC=0` keeps every pipeline on SPIR-V,
+`METALSHARP_MSC=compute` keeps graphics ones there, and `METALSHARP_MSC_DXBC=0` keeps DXBC (SM 4.x and 5.x)
+shaders there. `METALSHARP_METAL_VERSION=3` has MoltenVK run as it does on macOS 14 and 15 (no MSL 4.0, Metal 4
+family features, sampler reduction or sparse resources), to test the Metal 3 paths on a newer system.
+
 ## Build from source
 
 ```bash
