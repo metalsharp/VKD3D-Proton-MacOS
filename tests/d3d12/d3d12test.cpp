@@ -1387,6 +1387,135 @@ void main(uint i : SV_DispatchThreadID)
     return true;
 }
 
+// A shader declaring Buffer<float4> reads a view of three 32-bit components (R32G32B32_FLOAT): (x, y, z, 1). Its PSOs
+// (compute, and graphics reading it in the pixel shader) are made before the application's first such view; on the
+// Metal Shader Converter bridge, they draw and dispatch with their SPIR-V pipelines from then on, since Metal has no
+// texel format of three 32-bit components. (When an earlier test has made such a view, the PSOs aren't bridged.)
+static bool typedbuffer_rgb32_float4(bool dxbc)
+{
+    static const char *src = R"(
+Buffer<float4> f : register(t0);
+RWByteAddressBuffer o : register(u0);
+[numthreads(4, 1, 1)] void cs(uint i : SV_DispatchThreadID) { o.Store4(i * 16, asuint(f[i])); }
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
+float4 ps(float4 p : SV_Position) : SV_Target { return f[(uint)p.x]; }
+)";
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, dxbc ? compile_fxc(src, "cs", "cs_5_0") : compile_dxc(src, "cs", "cs_6_0"));
+    std::vector<char> vsb = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0"),
+                      psb = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (!rs || !cps || vsb.empty() || psb.empty())
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *gps = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps)));
+
+    // The PSOs exist; now the data and the view of three components.
+    ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    float *m = nullptr;
+    upload->Map(0, nullptr, (void **)&m);
+    for (UINT k = 0; k < 12; k++)
+        m[k] = (float)k * 1.5f + 0.25f;
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *data = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(data, 0, upload, 0, 48);
+    transition(data, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource *out = create_buffer(64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr, *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Buffer.NumElements = 4;
+    g.device->CreateShaderResourceView(data, &sd, heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 1; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    CHECK_HR(g.device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(cps);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 1, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 1 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(gps);
+    g.list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 1, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    ID3D12Resource *crb = nullptr;
+    const float *c = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64, &crb);
+    if (!c)
+        return false;
+    const float *px = nullptr;
+    D3D12_RANGE r = { 0, 64 };
+    rb->Map(0, &r, (void **)&px);
+    int bad = 0;
+    for (UINT i = 0; i < 4; i++)
+    {
+        float want[4] = { i * 4.5f + 0.25f, i * 4.5f + 1.75f, i * 4.5f + 3.25f, 1.0f };
+        for (UINT k = 0; k < 4; k++)
+        {
+            if (c[i * 4 + k] != want[k] && bad++ < 4)
+                printf("  compute element %u.%u = %f, want %f\n", i, k, c[i * 4 + k], want[k]);
+            if (px[i * 4 + k] != want[k] && bad++ < 4)
+                printf("  pixel %u.%u = %f, want %f\n", i, k, px[i * 4 + k], want[k]);
+        }
+    }
+    rb->Unmap(0, nullptr);
+    EXPECT(!bad, "%d wrong values reading a three-component view as float4", bad);
+    crb->Release(); rb->Release(); rt->Release(); rtv_heap->Release(); heap->Release(); out->Release(); data->Release();
+    upload->Release(); gps->Release(); cps->Release(); rs->Release();
+    return true;
+}
+
+static bool test_typedbuffer_rgb32_float4() { return typedbuffer_rgb32_float4(false); }
+static bool test_typedbuffer_rgb32_float4_dxbc() { return typedbuffer_rgb32_float4(true); }
 static bool test_typedbuffer_rgb32() { return typedbuffer_rgb32(false); }
 static bool test_typedbuffer_rgb32_dxbc() { return typedbuffer_rgb32(true); }
 
@@ -3026,7 +3155,7 @@ uint2 ps(float4 pos : SV_Position) : SV_Target
 // every filter linear, reads 0 through a minimum sampler and 1 through a maximum one, where an ordinary linear
 // sampler reads 0.5. On an Apple M4 (Apple9) Metal's sampler reduction mode has no effect, and the reducing samplers
 // average too.
-static bool minmax(bool sampler_heap)
+static bool minmax(bool sampler_heap, bool late = false)
 {
     static const char *src = R"(
 Texture2D<float> t : register(t0);
@@ -3058,13 +3187,14 @@ RWByteAddressBuffer o : register(u0);
         ss[i].MaxLOD = D3D12_FLOAT32_MAX;
         ss[i].ShaderRegister = i;
     }
-    // Heap: the same samplers in a sampler heap's table, made before the PSO is.
+    // Heap: the same samplers in a sampler heap's table, made before the PSO is (or after it, when late: a bridge PSO
+    // made before the application's first min/max sampler then dispatches with its SPIR-V pipeline).
     D3D12_ROOT_PARAMETER rph[3] = { rp[0], rp[1] };
     D3D12_DESCRIPTOR_RANGE srange = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 3, 0, 0, 0 };
     rph[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rph[2].DescriptorTable = { 1, &srange };
     ID3D12DescriptorHeap *sheap = nullptr;
-    if (sampler_heap)
+    auto make_samplers = [&]() -> bool
     {
         D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
         CHECK_HR(g.device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
@@ -3079,11 +3209,16 @@ RWByteAddressBuffer o : register(u0);
             h.ptr += i * sinc;
             g.device->CreateSampler(&sd, h);
         }
-    }
+        return true;
+    };
+    if (sampler_heap && !late && !make_samplers())
+        return false;
     D3D12_ROOT_SIGNATURE_DESC rsd = sampler_heap ? D3D12_ROOT_SIGNATURE_DESC{ 3, rph, 0, nullptr } : D3D12_ROOT_SIGNATURE_DESC{ 2, rp, 3, ss };
     ID3D12RootSignature *rs = create_root_signature(rsd);
     ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
     if (!ps)
+        return false;
+    if (sampler_heap && late && !make_samplers())
         return false;
 
     ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
@@ -3142,6 +3277,7 @@ RWByteAddressBuffer o : register(u0);
 
 static bool test_minmax() { return minmax(false); }
 static bool test_minmax_heap() { return minmax(true); }
+static bool test_minmax_heap_late() { return minmax(true, true); }
 
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
@@ -8063,6 +8199,8 @@ static const Test tests[] = {
     { "typedbuffer_uav_offset", test_typedbuffer_uav_offset },
     { "descriptor_copies", test_descriptor_copies },
     { "descriptor_lifetime", test_descriptor_lifetime },
+    { "typedbuffer_rgb32_float4", test_typedbuffer_rgb32_float4 },
+    { "typedbuffer_rgb32_float4_dxbc", test_typedbuffer_rgb32_float4_dxbc },
     { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
     { "typedbuffer_rgb32_dxbc", test_typedbuffer_rgb32_dxbc },
     { "view_kinds_dxil", test_view_kinds_dxil },
@@ -8090,6 +8228,7 @@ static const Test tests[] = {
     { "cbv_rows_robust_dxbc", test_cbv_rows_robust_dxbc },
     { "minmax", test_minmax },
     { "minmax_heap", test_minmax_heap },
+    { "minmax_heap_late", test_minmax_heap_late },
     { "wave_first_helpers", test_wave_first_helpers },
     { "wbi_markers", test_wbi_markers },
     { "predication", test_predication },

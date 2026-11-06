@@ -72,10 +72,14 @@ kept on SPIR-V before conversion) and 64-bit wave ops on some types (`Unsupporte
 These convert cleanly, but tests found them wrong or slow, so the bridge treats them specially:
 
 - `CheckAccessFullyMapped` reads false for mapped tiles (residency meta flag: SPIR-V).
-- Min/max sampler reduction reads as linear filtering on GPUs before Apple10 with macOS 26 (SPIR-V for PSOs with
-  such samplers).
-- Typed SRVs of three 32-bit components have no Metal texel format (DXIL: dxil-spirv's meta flag; DXBC: the
-  reflection check).
+- Min/max sampler reduction reads as linear filtering on GPUs before Apple10 with macOS 26. PSOs with such static
+  samplers use SPIR-V. Once the application makes a min/max sampler, PSOs that sample from tables or the heap use
+  SPIR-V too: later ones aren't bridged, and earlier ones draw and dispatch with their SPIR-V pipelines (test
+  `minmax_heap_late`).
+- Typed SRVs of three 32-bit components have no Metal texel format. Shaders declaring one use SPIR-V (DXIL:
+  dxil-spirv's meta flag; DXBC: the reflection check). A shader declaring `Buffer<float4>` (or any 32-bit typed SRV)
+  may still be given such a view. Once the application makes one, PSOs reading typed buffer SRVs use SPIR-V the same
+  way (test `typedbuffer_rgb32_float4`).
 - Out-of-bounds buffer loads are slow: the converter loads through a null pointer (offset by the index) instead of
   branching. With half its loads out of bounds, a streaming kernel takes about 1.5x the GPU time of SPIR-V (probe
   scenes `structured_buffer`, `robust_oob`, `null_descriptors`). In bounds it takes the same time
@@ -103,8 +107,8 @@ random bits. `tests/run/opdiff.py` compares a run with the bridge against one wi
 | Operation | Bridge (converter) | SPIR-V | Spec |
 | --- | --- | --- | --- |
 | `f32tof16` | round toward zero; float16 denormal results rounded to nearest (44 of 4096 inputs) | round to nearest even, and +inf from 65520 up, until this branch; now round toward zero, exact on every input | round toward zero; finite overflow gives the largest finite value (3.2.2) |
-| `frc(±inf)` | NaN | DXIL NaN; DXBC 0 | NaN |
-| `sincos(±inf)`, `sincos(NaN)` | 0 | DXIL 0; DXBC NaN | NaN |
+| `frc(±inf)` | NaN | NaN (DXBC was 0 until this branch: SPIRV-Cross now selects NaN for MSL `fract`) | NaN |
+| `sincos(±inf)`, `sincos(NaN)` | 0, NaN with `-Gis` | DXIL 0; DXBC NaN | NaN; but DXC's default (no `-Gis`) allows the fast form, which the converter (`air.fast_sin`) and SPIR-V both use for DXIL |
 | `dp2` of `0 * -0 + -0 * 0` | -0 | DXBC +0 | IEEE: -0 |
 
 Every other operation gives the same bits on both paths: float arithmetic, min/max, rounding, sqrt, rsqrt, rcp, exp2,
