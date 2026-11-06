@@ -92,3 +92,22 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
 - One pixel shader reading both perspective and noperspective `SV_Barycentrics` needs MSL 4.0. Before it, Metal takes
   one `barycentric_coord` per fragment function, so on macOS 14 and 15 (and `METALSHARP_METAL_VERSION=3`) the pipeline
   fails. SPIRV-Cross refused it on MSL 4 too, until this branch.
+
+## Op-level differential test
+
+`d3d12test opdiff` (opt-in: `D3D12TEST_OPDIFF=<Windows path prefix>`) runs 67 single-operation compute shaders as DXIL
+and 64 as DXBC on every pair of about 40 special inputs (zeros, infinities, NaNs, denormals, integer limits) and on
+random bits. `tests/run/opdiff.py` compares a run with the bridge against one without. Results on an Apple M4, macOS
+27.2, with the D3D11.3 functional spec's rules:
+
+| Operation | Bridge (converter) | SPIR-V | Spec |
+| --- | --- | --- | --- |
+| `f32tof16` | round toward zero; float16 denormal results rounded to nearest (44 of 4096 inputs) | round to nearest even, and +inf from 65520 up, until this branch; now round toward zero, exact on every input | round toward zero; finite overflow gives the largest finite value (3.2.2) |
+| `frc(±inf)` | NaN | DXIL NaN; DXBC 0 | NaN |
+| `sincos(±inf)`, `sincos(NaN)` | 0 | DXIL 0; DXBC NaN | NaN |
+| `dp2` of `0 * -0 + -0 * 0` | -0 | DXBC +0 | IEEE: -0 |
+
+Every other operation gives the same bits on both paths: float arithmetic, min/max, rounding, sqrt, rsqrt, rcp, exp2,
+log2, saturate, sign, lerp, clamp, NaN/INF tests and compares; integer arithmetic, division, shifts, bit counts, bit
+reversal, min/max/abs and compares; float/integer conversions; `f16tof32`; 64-bit integer multiply, shift and
+conversion (DXIL).

@@ -5166,6 +5166,134 @@ void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(64 + id * 4, 1); }
     return true;
 }
 
+// Op-level differential dump (opt-in: D3D12TEST_OPDIFF=<Windows path prefix>): one compute shader per operation, run
+// on every pair of about 40 special 32-bit inputs (zeros, infinities, NaNs, denormals, integer limits) and random ones,
+// compiled as DXIL (cs_6_0) and DXBC (cs_5_0). Writes <prefix>-dxil.bin and <prefix>-dxbc.bin; tests/run/opdiff.py
+// compares a run with the Metal Shader Converter bridge against one without. Always passes: it's a dump.
+static bool test_opdiff()
+{
+    const char *prefix = getenv("D3D12TEST_OPDIFF");
+    if (!prefix)
+    {
+        printf("  skipped: D3D12TEST_OPDIFF not set\n");
+        return true;
+    }
+    static const struct { const char *name, *expr; bool sm6_only; } ops[] = {
+        { "fadd", "asuint(fx + fy)" }, { "fsub", "asuint(fx - fy)" }, { "fmul", "asuint(fx * fy)" }, { "fdiv", "asuint(fx / fy)" },
+        { "fmad", "asuint(mad(fx, fy, fx))" }, { "fmin", "asuint(min(fx, fy))" }, { "fmax", "asuint(max(fx, fy))" },
+        { "fabs", "asuint(abs(fx))" }, { "fneg", "asuint(-fx)" }, { "floor", "asuint(floor(fx))" }, { "ceil", "asuint(ceil(fx))" },
+        { "frac", "asuint(frac(fx))" }, { "round", "asuint(round(fx))" }, { "trunc", "asuint(trunc(fx))" },
+        { "sqrt", "asuint(sqrt(fx))" }, { "rsqrt", "asuint(rsqrt(fx))" }, { "rcp", "asuint(rcp(fx))" }, { "exp2", "asuint(exp2(fx))" },
+        { "log2", "asuint(log2(fx))" }, { "sin", "asuint(sin(fx))" }, { "cos", "asuint(cos(fx))" }, { "saturate", "asuint(saturate(fx))" },
+        { "sign", "asuint(sign(fx))" }, { "fmod", "asuint(fmod(fx, fy))" }, { "lerp", "asuint(lerp(fx, fy, 0.25))" },
+        { "clamp", "asuint(clamp(fx, -1.0, fy))" }, { "dot2", "asuint(dot(float2(fx, fy), float2(fy, fx)))" },
+        { "isnan", "(uint)isnan(fx)" }, { "isinf", "(uint)isinf(fx)" }, { "isfinite", "(uint)isfinite(fx)" },
+        { "fcmp", "(uint)(fx < fy) | ((uint)(fx == fy) << 1) | ((uint)(fx != fy) << 2) | ((uint)(fx >= fy) << 3)" },
+        { "iadd", "x + y" }, { "isub", "x - y" }, { "imul", "x * y" }, { "udiv", "y ? x / y : 0x5eed" }, { "urem", "y ? x % y : 0x5eed" },
+        { "idiv", "(iy && !(ix == (int)0x80000000 && iy == -1)) ? asuint(ix / iy) : 0x5eed" },
+        { "irem", "(iy && !(ix == (int)0x80000000 && iy == -1)) ? asuint(ix % iy) : 0x5eed" },
+        { "and", "x & y" }, { "or", "x | y" }, { "xor", "x ^ y" }, { "not", "~x" },
+        { "shl", "x << y" }, { "shr", "x >> y" }, { "ashr", "asuint(ix >> y)" },
+        { "countbits", "countbits(x)" }, { "firstbithigh", "firstbithigh(x)" }, { "firstbithigh_s", "asuint(firstbithigh(ix))" },
+        { "firstbitlow", "firstbitlow(x)" }, { "reversebits", "reversebits(x)" },
+        { "umin", "min(x, y)" }, { "umax", "max(x, y)" }, { "imin", "asuint(min(ix, iy))" }, { "imax", "asuint(max(ix, iy))" },
+        { "iabs", "asuint(abs(ix))" }, { "ineg", "asuint(-ix)" }, { "icmp", "(uint)(ix < iy) | ((uint)(x < y) << 1) | ((uint)(x == y) << 2)" },
+        { "ftou", "(uint)fx" }, { "ftoi", "asuint((int)fx)" }, { "utof", "asuint((float)x)" }, { "itof", "asuint((float)ix)" },
+        { "f32tof16", "f32tof16(fx)" }, { "f16tof32", "asuint(f16tof32(x))" },
+        { "select", "fx > fy ? x : y" },
+        { "mulhi64", "(uint)(((uint64_t)x * (uint64_t)y) >> 32)", true }, { "add64", "(uint)(((uint64_t)x << 7) + (uint64_t)y >> 5)", true },
+        { "i64toF", "asuint((float)(int64_t)(((uint64_t)x << 32) | y))", true },
+    };
+    // Inputs: every pair of the special values, then random bits.
+    static const uint32_t special[] = {
+        0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7f800001,
+        0x7fbfffff, 0x00000001, 0x80000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff, 0x3f000000, 0x40490fdb,
+        0x4b000000, 0x4b7fffff, 0x3effffff, 0x3f7fffff, 0x47800000, 0x477fe000, 0x38800000, 0x33800000, 0x4f000000,
+        0xcf000000, 0x4f800000, 0x7fffffff, 0xffffffff, 0x00000002, 0x0000001f, 0x00000020, 0x00000021, 0x0000ffff,
+        0x00010000, 0x12345678, 0xdeadbeef, 0x3c00, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x8000,
+    };
+    const UINT ns = sizeof(special) / sizeof(special[0]), n = 4096;
+    std::vector<uint32_t> a(n), b(n);
+    uint32_t seed = 0x2545f491;
+    for (UINT i = 0; i < n; i++)
+    {
+        if (i < ns * ns) { a[i] = special[i / ns]; b[i] = special[i % ns]; }
+        else { seed = seed * 1664525 + 1013904223; a[i] = seed; seed = seed * 1664525 + 1013904223; b[i] = seed; }
+    }
+    ID3D12Resource *upload = create_buffer(n * 8, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *up = nullptr;
+    upload->Map(0, nullptr, (void **)&up);
+    memcpy(up, a.data(), n * 4);
+    memcpy(up + n * 4, b.data(), n * 4);
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *in = create_buffer(n * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(in, 0, upload, 0, n * 8);
+    transition(in, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (!execute_and_wait())
+        return false;
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    int failed = 0;
+    for (int dxbc = 0; dxbc < 2; dxbc++)
+    {
+        std::string path = std::string(prefix) + (dxbc ? "-dxbc.bin" : "-dxil.bin");
+        FILE *f = fopen(path.c_str(), "wb");
+        if (!f) { printf("  can't write %s\n", path.c_str()); return false; }
+        fwrite(&n, 4, 1, f);
+        fwrite(a.data(), 4, n, f);
+        fwrite(b.data(), 4, n, f);
+        for (auto &op : ops)
+        {
+            if (dxbc && op.sm6_only)
+                continue;
+            std::string src = std::string(
+                "ByteAddressBuffer A : register(t0); ByteAddressBuffer B : register(t1); RWByteAddressBuffer O : register(u0);\n"
+                "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) {\n"
+                "  uint x = A.Load(i * 4), y = A.Load(") + std::to_string(n * 4) + " + i * 4);\n"
+                "  float fx = asfloat(x), fy = asfloat(y); int ix = asint(x), iy = asint(y);\n"
+                "  O.Store(i * 4, " + op.expr + ");\n}\n";
+            std::vector<char> cs = dxbc ? compile_fxc(src.c_str(), "main", "cs_5_0") : compile_dxc(src.c_str(), "main", "cs_6_0");
+            ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
+            char name[32] = {};
+            snprintf(name, sizeof(name), "%s", op.name);
+            fwrite(name, 1, 32, f);
+            uint32_t ok = ps != nullptr;
+            fwrite(&ok, 4, 1, f);
+            if (!ps)
+            {
+                printf("  %s %s: no pipeline\n", dxbc ? "dxbc" : "dxil", op.name);
+                failed++;
+                continue;
+            }
+            ID3D12Resource *out = create_buffer(n * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.list->SetComputeRootSignature(rs);
+            g.list->SetPipelineState(ps);
+            g.list->SetComputeRootShaderResourceView(0, in->GetGPUVirtualAddress());
+            g.list->SetComputeRootShaderResourceView(1, in->GetGPUVirtualAddress());
+            g.list->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+            g.list->Dispatch(n / 64, 1, 1);
+            ID3D12Resource *rb = nullptr;
+            const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, n * 4, &rb);
+            if (r)
+                fwrite(r, 4, n, f);
+            else
+                failed++;
+            rb->Release(); out->Release(); ps->Release();
+        }
+        fclose(f);
+        printf("  wrote %s\n", path.c_str());
+    }
+    in->Release(); upload->Release(); rs->Release();
+    EXPECT(!failed, "%d op pipelines failed", failed);
+    return true;
+}
+
 // Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
 // a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
 // sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
@@ -7259,6 +7387,7 @@ static const Test tests[] = {
     { "executeindirect_dispatch_count", test_executeindirect_dispatch_count },
     { "dynamicresources", test_dynamicresources },
     { "dynamicresources_graphics", test_dynamicresources_graphics },
+    { "opdiff", test_opdiff },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
