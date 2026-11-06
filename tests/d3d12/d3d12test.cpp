@@ -6036,13 +6036,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
     printf("  guard band %u, depth clip on %u, off %u, scissor %u, degenerate %u; fragments with z < 0: clip on %u, off %u\n", r[0], r[1],
            r[2], r[3], r[4], r[11], r[12]);
     EXPECT(r[0] == 64, "a triangle with vertices at +-100000 covered %u pixels, want 64", r[0]);
-    // Known gap: under MoltenVK in Wine, depth clip on draws z < 0 as clip off does (and as Metal's clamp mode does),
-    // though Metal clips the same shaders natively in clip mode, and setting it right before the draw changes
-    // nothing (also with the 5.1 MoltenVK). Reported, not failed; anything else is checked.
-    if (r[1] == 64 && r[11] == 32)
-        printf("  known gap: depth clip on doesn't clip z < 0\n");
-    else
-        EXPECT(r[1] == 32, "depth clip on kept %u pixels, want 32 (0 <= z <= 1)", r[1]);
+    // MoltenVK used to put every render pass in Metal's private OpenGL mode, which clips z against -w: this drew 64.
+    EXPECT(r[1] == 32, "depth clip on kept %u pixels, want 32 (0 <= z <= 1)", r[1]);
     EXPECT(r[2] == 64, "depth clip off kept %u pixels, want 64", r[2]);
     EXPECT(r[3] == 12, "a (2, 2)-(6, 5) scissor kept %u pixels, want 12", r[3]);
     EXPECT(r[4] == 0, "a degenerate triangle drew %u pixels", r[4]);
@@ -6052,6 +6047,136 @@ float4 ps(float4 pos : SV_Position) : SV_Target
 
 static bool test_raster_clip() { return raster_clip(false); }
 static bool test_raster_clip_dxbc() { return raster_clip(true); }
+
+// Index restart against depth clipping in one render pass. Metal restarts strips at the all-ones index unless
+// MoltenVK uses its private OpenGL mode, which also moves the near clip plane to z = -w; MoltenVK now switches to
+// it only for draws that need it (strips with the cut disabled) and back for depth-clipped draws. Vertex k sits at
+// corner k % 3 of a triangle covering all 16 pixels, so a triangle of consecutive vertices covers 16 pixels and
+// one with two equal corners none. D3D lists never cut.
+static bool ia_restart(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint which; };
+RWByteAddressBuffer o : register(u1);
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    uint k = id % 3;
+    float2 p = float2(k == 1 ? 3.0 : -1.0, k == 2 ? 3.0 : -1.0);
+    return float4(p, which == 2 || which == 6 ? p.x * 0.75 : 0.5, 1);
+}
+float4 ps() : SV_Target { o.InterlockedAdd(which * 4, 1); return 1; }
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    auto make = [&](D3D12_INDEX_BUFFER_STRIP_CUT_VALUE cut) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.SampleMask = ~0u;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.IBStripCutValue = cut;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        return pso;
+    };
+    ID3D12PipelineState *cut16 = make(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF),
+                        *cut32 = make(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF),
+                        *nocut = make(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED);
+    if (!cut16 || !cut32 || !nocut)
+        return false;
+    const uint16_t i16[] = { 0, 1, 2, 0xffff, 3, 4, 5, /* 7: */ 1, 2, 0xffff };
+    const uint32_t i32[] = { 0, 1, 2, 0xffffffffu, 3, 4, 5 };
+    ID3D12Resource *ib = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *m = nullptr;
+    ib->Map(0, nullptr, (void **)&m);
+    memcpy(m, i16, sizeof(i16));
+    memcpy(m + 128, i32, sizeof(i32));
+    ib->Unmap(0, nullptr);
+    D3D12_INDEX_BUFFER_VIEW ib16 = { ib->GetGPUVirtualAddress(), sizeof(i16), DXGI_FORMAT_R16_UINT };
+    D3D12_INDEX_BUFFER_VIEW ib32 = { ib->GetGPUVirtualAddress() + 128, sizeof(i32), DXGI_FORMAT_R32_UINT };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    auto which = [&](uint32_t k) { g.list->SetGraphicsRoot32BitConstants(0, 1, &k, 0); };
+    // 0: 16-bit strip, cut: (0 1 2) (3 4 5).
+    g.list->SetPipelineState(cut16);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g.list->IASetIndexBuffer(&ib16);
+    which(0); g.list->DrawIndexedInstanced(7, 1, 0, 0, 0);
+    // 1: 16-bit strip, cut disabled: (0 1 2) (1 2 65535).
+    g.list->SetPipelineState(nocut);
+    which(1); g.list->DrawIndexedInstanced(4, 1, 0, 0, 0);
+    // 2: depth clipped (z = 0.75 x): half the pixels.
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    which(2); g.list->DrawInstanced(3, 1, 0, 0);
+    // 3: 16-bit list with the cut value set: (1 2 65535) draws.
+    g.list->SetPipelineState(cut16);
+    which(3); g.list->DrawIndexedInstanced(3, 1, 7, 0, 0);
+    // 4: 32-bit strip, cut: (0 1 2) (3 4 5). 5: cut disabled: (0 1 2) (1 2 0xffffffff).
+    g.list->SetPipelineState(cut32);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g.list->IASetIndexBuffer(&ib32);
+    which(4); g.list->DrawIndexedInstanced(7, 1, 0, 0, 0);
+    g.list->SetPipelineState(nocut);
+    which(5); g.list->DrawIndexedInstanced(4, 1, 0, 0, 0);
+    // 6: depth clipped again, after the uncut strips. 7: a non-indexed strip.
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    which(6); g.list->DrawInstanced(3, 1, 0, 0);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    which(7); g.list->DrawInstanced(4, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    printf("  strip16 cut %u, uncut %u, clip %u, list16 %u, strip32 cut %u, uncut %u, clip %u, non-indexed strip %u\n", r[0], r[1], r[2],
+           r[3], r[4], r[5], r[6], r[7]);
+    static const uint32_t want[8] = { 32, 32, 8, 16, 32, 32, 8, 32 };
+    for (uint32_t k = 0; k < 8; k++)
+        EXPECT(r[k] == want[k], "draw %u covered %u pixels, want %u", k, r[k], want[k]);
+    rb->Release(); out->Release(); rheap->Release(); rt->Release(); ib->Release();
+    cut16->Release(); cut32->Release(); nocut->Release(); rs->Release();
+    return true;
+}
+
+static bool test_ia_restart() { return ia_restart(false); }
+static bool test_ia_restart_dxbc() { return ia_restart(true); }
 
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
@@ -13204,6 +13329,8 @@ static const Test tests[] = {
     { "heap_types", test_heap_types },
     { "raster_clip", test_raster_clip },
     { "raster_clip_dxbc", test_raster_clip_dxbc },
+    { "ia_restart", test_ia_restart },
+    { "ia_restart_dxbc", test_ia_restart_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
