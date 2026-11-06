@@ -1827,6 +1827,57 @@ void main()
     return true;
 }
 
+// Descriptor lifetimes: typed views (whole-buffer and at offsets) and raw views of buffers that are released while
+// their descriptors stay in CPU and shader-visible heaps, then overwritten, copied over and destroyed with the heap,
+// thousands of times; a buffer read through a fresh descriptor afterwards still reads its data.
+static bool test_descriptor_lifetime()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC chd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_NONE };
+    D3D12_DESCRIPTOR_HEAP_DESC ghd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (UINT round = 0; round < 50; round++)
+    {
+        ID3D12DescriptorHeap *cpu = nullptr, *gpu = nullptr;
+        CHECK_HR(g.device->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cpu)));
+        CHECK_HR(g.device->CreateDescriptorHeap(&ghd, IID_PPV_ARGS(&gpu)));
+        auto at = [&](ID3D12DescriptorHeap *h, UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart(); c.ptr += i * inc; return c; };
+        for (UINT i = 0; i < 64; i++)
+        {
+            ID3D12Resource *b = create_buffer(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (i % 3 == 0) { sd.Format = DXGI_FORMAT_R32_UINT; sd.Buffer.NumElements = 1024; }          // whole buffer
+            else if (i % 3 == 1) { sd.Format = DXGI_FORMAT_R32_FLOAT; sd.Buffer.FirstElement = 1 + i; sd.Buffer.NumElements = 7; }
+            else { sd.Format = DXGI_FORMAT_R32_TYPELESS; sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW; sd.Buffer.FirstElement = 4 * i; sd.Buffer.NumElements = 16; }
+            g.device->CreateShaderResourceView(b, &sd, at(cpu, i));
+            g.device->CopyDescriptorsSimple(1, at(gpu, i), at(cpu, i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (i & 1)
+            {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+                ud.Format = DXGI_FORMAT_R32_UINT;
+                ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                ud.Buffer.FirstElement = i;
+                ud.Buffer.NumElements = 5;
+                g.device->CreateUnorderedAccessView(b, nullptr, &ud, at(gpu, (i + 32) % 64));
+            }
+            b->Release();   // the descriptors stay
+        }
+        // Overwrite half, copy over a quarter, then the heaps go with the rest.
+        D3D12_SHADER_RESOURCE_VIEW_DESC null_desc = {};
+        null_desc.Format = DXGI_FORMAT_R32_UINT;
+        null_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        null_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        for (UINT i = 0; i < 32; i++)
+            g.device->CreateShaderResourceView(nullptr, &null_desc, at(cpu, i));
+        g.device->CopyDescriptorsSimple(16, at(gpu, 0), at(cpu, 0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cpu->Release();
+        gpu->Release();
+    }
+    // Still working: the typed buffer test reads correctly after all of that.
+    return test_typedbuffer_uav_offset();
+}
+
 static bool test_typedbuffer()
 {
     static const char *src = R"(
@@ -6640,6 +6691,7 @@ static const Test tests[] = {
     { "typedbuffer_matrix", test_typedbuffer_matrix },
     { "typedbuffer_uav_offset", test_typedbuffer_uav_offset },
     { "descriptor_copies", test_descriptor_copies },
+    { "descriptor_lifetime", test_descriptor_lifetime },
     { "typedbuffer_rgb32", test_typedbuffer_rgb32 },
     { "typedbuffer_rgb32_dxbc", test_typedbuffer_rgb32_dxbc },
     { "view_kinds_dxil", test_view_kinds_dxil },
