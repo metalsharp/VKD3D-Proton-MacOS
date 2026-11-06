@@ -3982,6 +3982,125 @@ float4 ps() : SV_Target { return float4(0, 1, 0, 1); }
     return true;
 }
 
+// Predicates rewritten in the command list that uses them: three rounds of copy, barrier to PREDICATION, then a
+// predicated dispatch and draw on each of two predicates, all in one list. Each round flips the values, so a patch
+// that ran before its round's copy (hoisted too early) reads the other round's value. Without conditional rendering,
+// VKD3D-Proton starts a new command buffer sequence at the first round to keep its patching out of the render pass,
+// and patches in the list's own command buffer in later rounds; both have to see the copy.
+static bool test_predication_rewrite()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint idx; };
+RWStructuredBuffer<uint> u : register(u0);
+[numthreads(1, 1, 1)] void cs() { InterlockedAdd(u[idx], 1); }
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps() : SV_Target { InterlockedAdd(u[idx], 1); return 1; }
+)";
+    std::vector<char> csb = compile_dxc(src, "cs", "cs_6_0"), vsb = compile_dxc(src, "vs", "vs_6_0"), psb = compile_dxc(src, "ps", "ps_6_0");
+    if (csb.empty() || vsb.empty() || psb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants = { 0, 0, 1 };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, csb);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *gps = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps)));
+    if (!cps)
+        return false;
+
+    // Uploads: round r copies { r & 1, !(r & 1) } as two 64-bit predicates.
+    ID3D12Resource *upload = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint64_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    init[0] = 0; init[1] = 1; init[2] = 1; init[3] = 0;
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *pred = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *counter = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+
+    // Slot 4 * r + 2 * p (+ 1 for the draw): round r, predicate p (EQUAL_ZERO: runs when the value isn't 0).
+    for (UINT r = 0; r < 3; r++)
+    {
+        if (r)
+            transition(pred, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(pred, 0, upload, (r & 1) * 16, 16);
+        transition(pred, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+        for (UINT p = 0; p < 2; p++)
+        {
+            g.list->SetPredication(pred, p * 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            UINT slot = 4 * r + 2 * p;
+            g.list->SetComputeRootSignature(rs);
+            g.list->SetComputeRootUnorderedAccessView(0, counter->GetGPUVirtualAddress());
+            g.list->SetComputeRoot32BitConstant(1, slot, 0);
+            g.list->SetPipelineState(cps);
+            g.list->Dispatch(1, 1, 1);
+            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            g.list->RSSetViewports(1, &vp);
+            g.list->RSSetScissorRects(1, &sc);
+            g.list->SetGraphicsRootSignature(rs);
+            g.list->SetGraphicsRootUnorderedAccessView(0, counter->GetGPUVirtualAddress());
+            g.list->SetGraphicsRoot32BitConstant(1, slot + 1, 0);
+            g.list->SetPipelineState(gps);
+            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g.list->DrawInstanced(3, 1, 0, 0);
+        }
+        g.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    }
+    ID3D12Resource *crb = nullptr;
+    const uint32_t *c = read_buffer(counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64, &crb);
+    if (!c)
+        return false;
+    int bad = 0;
+    for (UINT r = 0; r < 3; r++)
+        for (UINT p = 0; p < 2; p++)
+        {
+            bool runs = ((r & 1) ? !p : p);   // the predicate's value this round
+            UINT slot = 4 * r + 2 * p;
+            if ((c[slot] != (runs ? 1u : 0u) || (runs ? c[slot + 1] != 16 : c[slot + 1] != 0)) && bad++ < 6)
+                printf("  round %u, predicate %u: dispatch ran %u times, draw shaded %u pixels; want %u and %u\n", r, p,
+                       c[slot], c[slot + 1], runs ? 1 : 0, runs ? 16 : 0);
+        }
+    EXPECT(!bad, "%d of 6 predicated rounds wrong", bad);
+    crb->Release(); counter->Release(); pred->Release(); upload->Release(); rtv_heap->Release(); rt->Release();
+    gps->Release(); cps->Release(); rs->Release();
+    return true;
+}
+
 // Native 16-bit shader operations (SM 6.2, -enable-16bit-types): half and 16-bit integer arithmetic, 16-bit loads
 // and stores of raw and structured buffers, and FP16 denormals (which D3D12 requires to be preserved).
 static const char *cs_16bit_src = R"(
@@ -7043,6 +7162,7 @@ static const Test tests[] = {
     { "wave_first_helpers", test_wave_first_helpers },
     { "wbi_markers", test_wbi_markers },
     { "predication", test_predication },
+    { "predication_rewrite", test_predication_rewrite },
     { "native16bit", test_native16bit },
     { "groupshared64", test_groupshared64 },
 };

@@ -3529,6 +3529,44 @@ static std::vector<Scene> engine_scenes()
             }
             p.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         } },
+        { "predication_one", "predication with one predicate for all 2000 draws (per-draw cost of predicated draws)", [] {
+            pso_a = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 100 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&occlusion)));
+            res_a = create_buffer(100 * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PREDICATION);
+        }, [quads](UINT f) {
+            set_quad_state(p.list, pso_a);
+            for (UINT i = 0; i < 100; i++)
+            {
+                p.list->BeginQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+                small_quad(p.list, i * 37, 0.5f);
+                p.list->EndQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+            }
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            p.list->ResolveQueryData(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 100, res_a, 0);
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+            p.list->SetPredication(res_a, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            quads(p.list, 2000, 0.01f, f);
+            p.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        } },
+        { "predication_off", "predication's queries and resolve, then its 2000 draws unpredicated (baseline for predication)", [] {
+            pso_a = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 100 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&occlusion)));
+            res_a = create_buffer(100 * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PREDICATION);
+        }, [quads](UINT f) {
+            set_quad_state(p.list, pso_a);
+            for (UINT i = 0; i < 100; i++)
+            {
+                p.list->BeginQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+                small_quad(p.list, i * 37, 0.5f);
+                p.list->EndQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+            }
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            p.list->ResolveQueryData(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 100, res_a, 0);
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+            quads(p.list, 2000, 0.01f, f);
+        } },
         { "cube_3d_array", "20 full-screen quads sampling a cube map, a 3D texture and a texture array (6 samples each)", [] {
             D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
             D3D12_RESOURCE_DESC rd = {};
