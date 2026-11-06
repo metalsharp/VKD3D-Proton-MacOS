@@ -4390,6 +4390,11 @@ int main(int argc, char **argv)
     printf("first %.3f ms\n", first);
     // Extras are per frame over the timed frames (accumulation during the serialized frames is dropped).
     for (auto &e : extras.values) printf("extra %s=%.4f\n", e.first.c_str(), e.second);
+    // The process's memory at the end of the run (what the scene, the runtime and the driver hold).
+    PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        printf("extra end_working_set_mb=%.1f\nextra peak_working_set_mb=%.1f\n", pmc.WorkingSetSize / 1048576.0,
+               pmc.PeakWorkingSetSize / 1048576.0);
     printf("D3D12_PERF_PROBE_OK %s\n", scene->name);
     return 0;
 }
