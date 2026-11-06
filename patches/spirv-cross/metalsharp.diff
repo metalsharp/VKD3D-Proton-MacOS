@@ -212,7 +212,7 @@ index 90178875..9765a986 100644
  	bool unroll_array_to_complex_store(uint32_t target_id, uint32_t source_id);
  	void convert_non_uniform_expression(std::string &expr, uint32_t ptr_id);
 diff --git a/spirv_msl.cpp b/spirv_msl.cpp
-index ff081182..1819587e 100644
+index ff081182..6b76b678 100644
 --- a/spirv_msl.cpp
 +++ b/spirv_msl.cpp
 @@ -36,6 +36,21 @@ static const uint32_t k_unknown_location = ~0u;
@@ -4156,7 +4156,17 @@ index ff081182..1819587e 100644
  	EMIT_PRECISE_OVERRIDE(Tan, "tan");
  	EMIT_PRECISE_OVERRIDE(Acos, "acos");
  	EMIT_PRECISE_OVERRIDE(Asin, "asin");
-@@ -12719,18 +15768,37 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
+@@ -12487,7 +15536,8 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
+ 		// It has to be (1/2 - 1/16) and not 1/2, or several CTS tests subtly break on Intel.
+ 		emit_op(result_type, id,
+ 		        join(to_name(stage_in_var_id), ".", to_member_name(get_stage_in_struct_type(), interface_index),
+-		             ".interpolate_at_offset(", to_expression(args[1]), " + 0.4375)", component),
++		             ".interpolate_at_offset(", to_expression(args[1]),
++		             msl_options.interpolate_at_offset_exact ? " + 0.5)" : " + 0.4375)", component),
+ 		        should_forward(args[0]) && should_forward(args[1]));
+ 		break;
+ 	}
+@@ -12719,18 +15769,37 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
  
  	if (processing_entry_point)
  	{
@@ -4199,7 +4209,7 @@ index ff081182..1819587e 100644
  
  		// append entry point args to avoid conflicts in local variable names.
  		local_variable_names.insert(resource_names.begin(), resource_names.end());
-@@ -12861,8 +15929,11 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -12861,8 +15930,11 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  		is_dynamic_img_sampler = has_extended_decoration(var->self, SPIRVCrossDecorationDynamicImageSampler);
  	}
  
@@ -4212,7 +4222,7 @@ index ff081182..1819587e 100644
  	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
  	{
  		bool is_compare = args.has_dref;
-@@ -12885,6 +15956,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -12885,6 +15957,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  	string fname;
  	if (needs_chroma_reconstruction(constexpr_sampler) && !is_dynamic_img_sampler)
  	{
@@ -4221,7 +4231,7 @@ index ff081182..1819587e 100644
  		if (constexpr_sampler->planes != 2 && constexpr_sampler->planes != 3)
  			SPIRV_CROSS_THROW("Unhandled number of color image planes!");
  		// 444 images aren't downsampled, so we don't need to do linear filtering.
-@@ -13001,6 +16074,13 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
+@@ -13001,6 +16075,13 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
  		}
  
  		fname = img_expr + ".";
@@ -4235,7 +4245,7 @@ index ff081182..1819587e 100644
  
  		// Texture function and sampler
  		if (args.base.is_fetch)
-@@ -13033,6 +16113,19 @@ static inline bool sampling_type_needs_f32_conversion(const SPIRType &type)
+@@ -13033,6 +16114,19 @@ static inline bool sampling_type_needs_f32_conversion(const SPIRType &type)
  }
  
  // Returns the function args for a texture sampling function for the specified image and sampling characteristics.
@@ -4255,7 +4265,7 @@ index ff081182..1819587e 100644
  string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool *p_forward)
  {
  	VariableID img = args.base.img;
-@@ -13053,6 +16146,17 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13053,6 +16147,17 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  	string farg_str;
  	bool forward = true;
  
@@ -4273,7 +4283,7 @@ index ff081182..1819587e 100644
  	if (!is_dynamic_img_sampler)
  	{
  		// Texture reference (for some cases)
-@@ -13393,12 +16497,90 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13393,12 +16498,90 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  		}
  	}
  
@@ -4365,7 +4375,7 @@ index ff081182..1819587e 100644
  	}
  
  	// Metal does not support LOD for 1D textures.
-@@ -13464,12 +16646,20 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13464,12 +16647,20 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  				extent = "float3(1.0)";
  				break;
  			}
@@ -4389,7 +4399,7 @@ index ff081182..1819587e 100644
  		}
  	}
  	else if (args.base.is_fetch && !lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D) &&
-@@ -13515,7 +16705,14 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13515,7 +16706,14 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  			grad_opt = "unsupported_gradient_dimension";
  			break;
  		}
@@ -4405,7 +4415,7 @@ index ff081182..1819587e 100644
  	}
  
  	if (args.min_lod)
-@@ -13524,7 +16721,15 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13524,7 +16722,15 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  			SPIRV_CROSS_THROW("min_lod_clamp() is only supported in MSL 2.2+ and up.");
  
  		forward = forward && should_forward(args.min_lod);
@@ -4422,7 +4432,7 @@ index ff081182..1819587e 100644
  	}
  
  	// Add offsets
-@@ -13598,6 +16803,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+@@ -13598,6 +16804,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
  
  	*p_forward = forward;
  
@@ -4433,7 +4443,7 @@ index ff081182..1819587e 100644
  	return farg_str;
  }
  
-@@ -14022,6 +17231,188 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
+@@ -14022,6 +17232,188 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
  		return img_expr.substr(0, index) + sampler_name_suffix + img_expr.substr(index);
  }
  
@@ -4622,7 +4632,7 @@ index ff081182..1819587e 100644
  string CompilerMSL::to_swizzle_expression(uint32_t id)
  {
  	auto *combined = maybe_get<SPIRCombinedImageSampler>(id);
-@@ -14076,11 +17467,10 @@ string CompilerMSL::to_buffer_size_expression(uint32_t id)
+@@ -14076,11 +17468,10 @@ string CompilerMSL::to_buffer_size_expression(uint32_t id)
  	{
  		if (auto var = maybe_get_backing_variable(id))
  		{
@@ -4637,7 +4647,7 @@ index ff081182..1819587e 100644
  				auto last_pos = array_expr.find_last_of(']');
  				if (last_pos != std::string::npos)
  					return buffer_expr + ".length(" + array_expr.substr(1, last_pos - 1) + ")";
-@@ -14478,8 +17868,11 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14478,8 +17869,11 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  			case BuiltInInstanceId:
  			case BuiltInInstanceIndex:
  			case BuiltInBaseInstance:
@@ -4650,7 +4660,7 @@ index ff081182..1819587e 100644
  				return string(" [[") + builtin_qualifier(builtin) + "]]";
  
  			default:
-@@ -14493,14 +17886,22 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14493,14 +17887,22 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  		else
  			locn = get_member_location(type.self, index);
  
@@ -4676,7 +4686,7 @@ index ff081182..1819587e 100644
  	if ((type.storage == StorageClassOutput || is_mesh_shader()) && use_semantic_stage_output)
  	{
  		if (is_builtin)
-@@ -14546,7 +17947,7 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+@@ -14546,7 +17948,7 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
  			return join(" [[", loc_qual, "]]");
  	}
  
@@ -4685,7 +4695,7 @@ index ff081182..1819587e 100644
  	{
  		// For this type of shader, we always arrange for it to capture its
  		// output to a buffer. For this reason, qualifiers are irrelevant here.
-@@ -14969,6 +18370,11 @@ bool CompilerMSL::entry_point_requires_const_device_buffers() const
+@@ -14969,6 +18371,11 @@ bool CompilerMSL::entry_point_requires_const_device_buffers() const
  // entry type if the current function is the entry point function
  string CompilerMSL::func_type_decl(SPIRType &type)
  {
@@ -4697,7 +4707,7 @@ index ff081182..1819587e 100644
  	// The regular function return type. If not processing the entry point function, that's all we need
  	string return_type = type_to_glsl(type) + type_to_array_glsl(type, 0);
  	if (!processing_entry_point)
-@@ -14982,13 +18388,18 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+@@ -14982,13 +18389,18 @@ string CompilerMSL::func_type_decl(SPIRType &type)
  
  	// Prepend a entry type, based on the execution model
  	string entry_type;
@@ -4718,7 +4728,7 @@ index ff081182..1819587e 100644
  		break;
  	case ExecutionModelTessellationEvaluation:
  		if (!msl_options.supports_msl_version(1, 2))
-@@ -15025,6 +18436,9 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+@@ -15025,6 +18437,9 @@ string CompilerMSL::func_type_decl(SPIRType &type)
  		break;
  	}
  
@@ -4728,7 +4738,7 @@ index ff081182..1819587e 100644
  	return entry_type + " " + return_type;
  }
  
-@@ -15052,6 +18466,11 @@ bool CompilerMSL::uses_explicit_early_fragment_test()
+@@ -15052,6 +18467,11 @@ bool CompilerMSL::uses_explicit_early_fragment_test()
  // In MSL, address space qualifiers are required for all pointer or reference variables
  string CompilerMSL::get_variable_address_space(const SPIRVariable &argument)
  {
@@ -4740,7 +4750,7 @@ index ff081182..1819587e 100644
  	const auto &type = get<SPIRType>(argument.basetype);
  	return get_type_address_space(type, argument.self, true);
  }
-@@ -15193,6 +18612,9 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
+@@ -15193,6 +18613,9 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
  			if (get_execution_model() == ExecutionModelVertex && has_decoration(type.self, DecorationBlock))
  				addr_space = "thread";
  
@@ -4750,7 +4760,7 @@ index ff081182..1819587e 100644
  			if (!addr_space)
  				addr_space = "device";
  		}
-@@ -15246,6 +18668,9 @@ const char *CompilerMSL::to_restrict(uint32_t id, bool space)
+@@ -15246,6 +18669,9 @@ const char *CompilerMSL::to_restrict(uint32_t id, bool space)
  	else
  		flags = get_decoration_bitset(id);
  
@@ -4760,7 +4770,7 @@ index ff081182..1819587e 100644
  	return flags.get(DecorationRestrict) || flags.get(DecorationRestrictPointerEXT) ?
  	       (space ? "__restrict " : "__restrict") : "";
  }
-@@ -15271,7 +18696,9 @@ string CompilerMSL::entry_point_arg_stage_in()
+@@ -15271,7 +18697,9 @@ string CompilerMSL::entry_point_arg_stage_in()
  		auto &type = get_variable_data_type(var);
  
  		add_resource_name(var.self);
@@ -4771,7 +4781,7 @@ index ff081182..1819587e 100644
  	}
  
  	return decl;
-@@ -15290,7 +18717,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15290,7 +18718,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  	case BuiltInInstanceId:
  	case BuiltInInstanceIndex:
  	case BuiltInBaseInstance:
@@ -4780,7 +4790,7 @@ index ff081182..1819587e 100644
  	// Tess. control function in
  	case BuiltInPosition:
  	case BuiltInPointSize:
-@@ -15307,6 +18734,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15307,6 +18735,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  		return false;
  	// Fragment function in
  	case BuiltInSamplePosition:
@@ -4788,7 +4798,7 @@ index ff081182..1819587e 100644
  	case BuiltInHelperInvocation:
  	case BuiltInBaryCoordKHR:
  	case BuiltInBaryCoordNoPerspKHR:
-@@ -15331,7 +18759,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
+@@ -15331,7 +18760,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
  			return false;
  		/* fallthrough */
  	case BuiltInSubgroupLocalInvocationId:
@@ -4797,7 +4807,7 @@ index ff081182..1819587e 100644
  	case BuiltInDrawIndex:
  		// Emulated
  		return false;
-@@ -15367,6 +18795,15 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15367,6 +18796,15 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  {
  	depth_clip_viewport_idx_var_name = "";
  
@@ -4813,7 +4823,7 @@ index ff081182..1819587e 100644
  	// Builtin variables
  	SmallVector<pair<SPIRVariable *, BuiltIn>, 8> active_builtins;
  	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
-@@ -15405,16 +18842,18 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15405,16 +18843,18 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  				else
  					ep_args += builtin_type_decl(bi_type, var_id) + " " + to_expression(var_id);
  
@@ -4841,7 +4851,7 @@ index ff081182..1819587e 100644
  				builtin_declaration = false;
  			}
  		}
-@@ -15487,7 +18926,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15487,7 +18927,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  	{
  		// Add parameters to hold the indirect draw parameters and the shader output. This has to be handled
  		// specially because it needs to be a pointer, not a reference.
@@ -4850,7 +4860,7 @@ index ff081182..1819587e 100644
  		{
  			if (!ep_args.empty())
  				ep_args += ", ";
-@@ -15502,8 +18941,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15502,8 +18942,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			ep_args +=
  			    join("constant uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
  		}
@@ -4860,7 +4870,7 @@ index ff081182..1819587e 100644
  		{
  			if (!ep_args.empty())
  				ep_args += ", ";
-@@ -15511,7 +18949,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15511,7 +18950,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			    join("device uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
  		}
  
@@ -4869,7 +4879,7 @@ index ff081182..1819587e 100644
  		    (active_input_builtins.get(BuiltInVertexIndex) || active_input_builtins.get(BuiltInVertexId)) &&
  		    msl_options.vertex_index_type != Options::IndexType::None)
  		{
-@@ -15533,6 +18971,25 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
+@@ -15533,6 +18972,25 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
  			}
  		}
  
@@ -4895,7 +4905,7 @@ index ff081182..1819587e 100644
  		// Tessellation control shaders get three additional parameters:
  		// a buffer to hold the per-patch data, a buffer to hold the per-patch
  		// tessellation levels, and a block of workgroup memory to hold the
-@@ -15713,7 +19170,11 @@ string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
+@@ -15713,7 +19171,11 @@ string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
  		else
  			ep_args += type_to_glsl(type) + "& " + to_restrict(id, true) + to_name(id);
  
@@ -4908,7 +4918,7 @@ index ff081182..1819587e 100644
  
  		next_metal_resource_index_buffer = max(next_metal_resource_index_buffer, buffer_binding + 1);
  	}
-@@ -15749,23 +19210,12 @@ const MSLConstexprSampler *CompilerMSL::find_constexpr_sampler(uint32_t id) cons
+@@ -15749,23 +19211,12 @@ const MSLConstexprSampler *CompilerMSL::find_constexpr_sampler(uint32_t id) cons
  	return nullptr;
  }
  
@@ -4934,7 +4944,7 @@ index ff081182..1819587e 100644
  
  	entry_point_bindings.clear();
  	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
-@@ -15819,7 +19269,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15819,7 +19270,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  						// and it's being used as an alias (so we can emit void* instead).
  						resource.discrete_descriptor_alias = resource.var;
  						// Need to promote interlocked usage so that the primary declaration is correct.
@@ -4943,7 +4953,7 @@ index ff081182..1819587e 100644
  							interlocked_resources.insert(resource.var->self);
  
  						// Aliasing with unroll just gets too messy to deal with. I sure hope this never comes up ...
-@@ -15853,7 +19303,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15853,7 +19304,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  
  			if (type.basetype == SPIRType::SampledImage)
  			{
@@ -4952,7 +4962,7 @@ index ff081182..1819587e 100644
  
  				uint32_t plane_count = 1;
  				if (constexpr_sampler && constexpr_sampler->ycbcr_conversion_enable)
-@@ -15873,7 +19323,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15873,7 +19324,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  			else if (!constexpr_sampler)
  			{
  				// constexpr samplers are not declared as resources.
@@ -4961,7 +4971,7 @@ index ff081182..1819587e 100644
  
  				// Don't allocate resource indices for aliases.
  				uint32_t resource_index = ~0u;
-@@ -15888,9 +19338,29 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15888,9 +19339,29 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  	});
  
  	stable_sort(resources.begin(), resources.end(),
@@ -4992,7 +5002,7 @@ index ff081182..1819587e 100644
  	for (auto &r : resources)
  	{
  		auto &var = *r.var;
-@@ -15927,7 +19397,11 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15927,7 +19398,11 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				ep_args += "]]";
  			}
  
@@ -5005,7 +5015,7 @@ index ff081182..1819587e 100644
  			continue;
  		}
  
-@@ -15970,10 +19444,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15970,10 +19445,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  						ep_args += ", ";
  					ep_args += get_variable_address_space(var) + " " + type_to_glsl(type) + "* " +
  							   to_restrict(var_id, true) + r.name + "_" + convert_to_string(i);
@@ -5030,7 +5040,7 @@ index ff081182..1819587e 100644
  				}
  				is_using_builtin_array = false;
  			}
-@@ -15988,10 +19472,21 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15988,10 +19473,21 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				else
  					ep_args += type_to_glsl(type) + "& " + to_restrict(var_id, true) + r.name;
  
@@ -5056,7 +5066,7 @@ index ff081182..1819587e 100644
  			}
  			break;
  		}
-@@ -15999,7 +19494,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -15999,7 +19495,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  			if (!ep_args.empty())
  				ep_args += ", ";
  			ep_args += sampler_type(type, var_id, false) + " " + r.name;
@@ -5068,7 +5078,7 @@ index ff081182..1819587e 100644
  			break;
  		case SPIRType::Image:
  		{
-@@ -16010,15 +19508,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16010,15 +19509,20 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  			const auto &basetype = get<SPIRType>(var.basetype);
  			if (!type_is_msl_framebuffer_fetch(basetype))
  			{
@@ -5098,7 +5108,7 @@ index ff081182..1819587e 100644
  			}
  			else
  			{
-@@ -16035,10 +19538,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16035,10 +19539,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				const char *cv_flags = decoration_flags_signal_volatile(flags) ? "volatile " : "";
  				ep_args += join(", ", cv_flags, "device atomic_", type_to_glsl(get<SPIRType>(basetype.image.type), 0));
  				ep_args += "* " + r.name + "_atomic";
@@ -5120,7 +5130,7 @@ index ff081182..1819587e 100644
  			}
  			break;
  		}
-@@ -16064,10 +19574,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
+@@ -16064,10 +19575,17 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
  				           type_to_glsl(type, var_id) + "& " + r.name;
  			else
  				ep_args += type_to_glsl(type, var_id) + " " + r.name;
@@ -5142,7 +5152,7 @@ index ff081182..1819587e 100644
  			break;
  		}
  	}
-@@ -16095,7 +19612,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16095,7 +19613,7 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  	// Vertex shaders shouldn't have the problems with barriers in non-uniform control flow that
  	// tessellation control shaders do, so early returns should be OK. We may need to revisit this
  	// if it ever becomes possible to use barriers from a vertex shader.
@@ -5151,7 +5161,7 @@ index ff081182..1819587e 100644
  	{
  		entry_func.fixup_hooks_in.push_back([this]() {
  			statement("if (any(", to_expression(builtin_invocation_id_id),
-@@ -16104,6 +19621,51 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16104,6 +19622,51 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  		});
  	}
  
@@ -5203,7 +5213,7 @@ index ff081182..1819587e 100644
  	if (is_mesh_shader())
  	{
  		// If shader doesn't call SetMeshOutputsEXT, nothing should be rendered.
-@@ -16118,6 +19680,27 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16118,6 +19681,27 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  		uint32_t var_id = var.self;
  		bool ssbo = has_decoration(type.self, DecorationBufferBlock);
  
@@ -5231,7 +5241,7 @@ index ff081182..1819587e 100644
  		if (var.storage == StorageClassUniformConstant && !is_hidden_variable(var))
  		{
  			if (msl_options.swizzle_texture_samples && has_sampled_images && is_sampled_image_type(type))
-@@ -16143,7 +19726,8 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16143,7 +19727,8 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				});
  			}
  		}
@@ -5241,7 +5251,7 @@ index ff081182..1819587e 100644
  		         !is_hidden_variable(var))
  		{
  			if (buffer_requires_array_length(var.self))
-@@ -16151,7 +19735,9 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16151,7 +19736,9 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				entry_func.fixup_hooks_in.push_back(
  				    [this, &type, &var, var_id]()
  				    {
@@ -5252,7 +5262,7 @@ index ff081182..1819587e 100644
  
  					    uint32_t desc_set = get_decoration(var_id, DecorationDescriptorSet);
  					    if (descriptor_set_is_argument_buffer(desc_set))
-@@ -16209,6 +19795,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16209,6 +19796,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  					          to_expression(builtin_sample_id_id), ");");
  				});
  				break;
@@ -5268,7 +5278,7 @@ index ff081182..1819587e 100644
  			case BuiltInFragCoord:
  				if (is_sample_rate())
  				{
-@@ -16312,6 +19907,19 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16312,6 +19908,19 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				});
  				break;
  			case BuiltInSubgroupLocalInvocationId:
@@ -5288,7 +5298,7 @@ index ff081182..1819587e 100644
  				if (!msl_options.emulate_subgroups)
  					break;
  				// For subgroup emulation, assume subgroups of size 1.
-@@ -16540,13 +20148,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16540,13 +20149,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  					// Since every physical device is rendering a different view,
  					// there's no need for layered rendering here.
  				}
@@ -5308,7 +5318,7 @@ index ff081182..1819587e 100644
  					});
  				}
  				else if (get_execution_model() == ExecutionModelFragment)
-@@ -16622,23 +20232,33 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16622,23 +20233,33 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  			case BuiltInVertexId:
  			case BuiltInVertexIndex:
  				// This is direct-mapped normally.
@@ -5349,7 +5359,7 @@ index ff081182..1819587e 100644
  						break;
  					}
  					builtin_declaration = false;
-@@ -16646,36 +20266,46 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16646,36 +20267,46 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  				break;
  			case BuiltInBaseVertex:
  				// This is direct-mapped normally.
@@ -5406,7 +5416,7 @@ index ff081182..1819587e 100644
  				});
  				break;
  			case BuiltInDrawIndex:
-@@ -16718,6 +20348,284 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
+@@ -16718,6 +20349,284 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
  			}
  		}
  	});
@@ -5691,7 +5701,7 @@ index ff081182..1819587e 100644
  }
  
  // Returns the Metal index of the resource of the specified type as used by the specified variable.
-@@ -16882,6 +20790,12 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16882,6 +20791,12 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	auto &var_type = get<SPIRType>(arg.type);
  	StorageClass type_storage = var_type.storage;
  
@@ -5704,7 +5714,7 @@ index ff081182..1819587e 100644
  	// Physical pointer types are passed by pointer, not reference.
  	auto physical_type = arg.alias_global_variable ?
  	                         get_extended_decoration(arg.id, SPIRVCrossDecorationPhysicalTypeID) : 0;
-@@ -16916,10 +20830,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16916,10 +20831,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	bool type_is_tlas = type.basetype == SPIRType::AccelerationStructure;
  	bool is_tlas_address_array = type_is_tlas && type_storage == StorageClassUniformConstant &&
  	                             msl_options.acceleration_structure_descriptor_as_address && is_array(type) &&
@@ -5717,7 +5727,7 @@ index ff081182..1819587e 100644
  	string decl;
  
  	// If this is a combined image-sampler for a 2D image with floating-point type,
-@@ -16960,11 +20875,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16960,11 +20876,11 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  			is_using_builtin_array = true;
  
  		if (is_using_builtin_array)
@@ -5732,7 +5742,7 @@ index ff081182..1819587e 100644
  	{
  		const auto *parent_type = &get<SPIRType>(type.parent_type);
  		auto type_name = type_to_glsl(*parent_type, arg.id);
-@@ -16973,7 +20888,19 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -16973,7 +20889,19 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  		else if (type_is_image)
  			decl = join("spvDescriptorArray<", cv_qualifier, type_name, ">");
  		else
@@ -5753,7 +5763,7 @@ index ff081182..1819587e 100644
  		address_space = "const";
  	}
  	else if ((type_storage == StorageClassUniform || type_storage == StorageClassStorageBuffer) && is_array(type))
-@@ -17003,7 +20930,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17003,7 +20931,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  		}
  		else
  		{
@@ -5762,7 +5772,7 @@ index ff081182..1819587e 100644
  		}
  	}
  
-@@ -17071,7 +20998,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17071,7 +20999,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  			decl = join(address_space, " ", decl);
  
  		// spvDescriptorArray absorbs the address space inside the template.
@@ -5771,7 +5781,7 @@ index ff081182..1819587e 100644
  		{
  			const char *argument_buffer_space = descriptor_address_space(name_id, type_storage, nullptr);
  			if (argument_buffer_space)
-@@ -17099,7 +21026,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17099,7 +21027,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  				decl += join("[", array_size, "]");
  			}
  		}
@@ -5780,7 +5790,7 @@ index ff081182..1819587e 100644
  		{
  			decl += " " + to_expression(name_id);
  		}
-@@ -17150,7 +21077,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+@@ -17150,7 +21078,7 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
  	}
  	else if (type_is_image || type_is_tlas)
  	{
@@ -5789,7 +5799,7 @@ index ff081182..1819587e 100644
  		{
  			decl = address_space + " " + decl + " " + to_expression(name_id);
  		}
-@@ -17810,6 +21737,8 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+@@ -17810,6 +21738,8 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
  		return join("patch_control_point<", type_to_glsl(get<SPIRType>(type.parent_type), id), ">");
  
  	case SPIRType::Interpolant:
@@ -5798,7 +5808,7 @@ index ff081182..1819587e 100644
  		return join("interpolant<", type_to_glsl(get<SPIRType>(type.parent_type), id), ", interpolation::",
  		            has_decoration(type.self, DecorationNoPerspective) ? "no_perspective" : "perspective", ">");
  
-@@ -18025,6 +21954,20 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
+@@ -18025,6 +21955,20 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
  		if (is_tese_shader() && is_builtin_variable(variable) && (builtin == BuiltInTessCoord || builtin == BuiltInPrimitiveId))
  			return false;
  
@@ -5819,7 +5829,7 @@ index ff081182..1819587e 100644
  		// We won't be able to catch writes to control point outputs here since variable
  		// refers to a function local pointer.
  		// This is fine, as there cannot be concurrent writers to that memory anyways,
-@@ -18218,9 +22161,12 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
+@@ -18218,9 +22162,12 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
  		break;
  	}
  
@@ -5834,7 +5844,7 @@ index ff081182..1819587e 100644
  
  	// For unsampled images, append the sample/read/write access qualifier.
  	// For kernel images, the access qualifier my be supplied directly by SPIR-V.
-@@ -18398,6 +22344,12 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
+@@ -18398,6 +22345,12 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
  	if (scope != ScopeSubgroup)
  		SPIRV_CROSS_THROW("Only subgroup scope is supported.");
  
@@ -5847,7 +5857,7 @@ index ff081182..1819587e 100644
  	switch (op)
  	{
  	case OpGroupNonUniformElect:
-@@ -18898,9 +22850,43 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
+@@ -18898,9 +22851,43 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
  			break;
  		if (is_mesh_shader())
  			break;
@@ -5892,7 +5902,7 @@ index ff081182..1819587e 100644
  		break;
  
  	case BuiltInSampleMask:
-@@ -19153,9 +23139,10 @@ string CompilerMSL::builtin_qualifier(BuiltIn builtin)
+@@ -19153,9 +23140,10 @@ string CompilerMSL::builtin_qualifier(BuiltIn builtin)
  			return "thread_index_in_simdgroup";
  		}
  		else if (execution.model == ExecutionModelKernel || execution.model == ExecutionModelGLCompute ||
@@ -5905,7 +5915,7 @@ index ff081182..1819587e 100644
  		{
  			// We are generating a Metal kernel function.
  			if (!msl_options.supports_msl_version(2))
-@@ -19258,6 +23245,8 @@ string CompilerMSL::builtin_type_decl(BuiltIn builtin, uint32_t id)
+@@ -19258,6 +23246,8 @@ string CompilerMSL::builtin_type_decl(BuiltIn builtin, uint32_t id)
  		return "uint";
  	case BuiltInSampleMask:
  		return "uint";
@@ -5914,7 +5924,7 @@ index ff081182..1819587e 100644
  	case BuiltInSamplePosition:
  		return "float2";
  	case BuiltInViewIndex:
-@@ -19734,11 +23723,14 @@ bool CompilerMSL::SampledImageScanner::handle(Op opcode, const uint32_t *args, u
+@@ -19734,11 +23724,14 @@ bool CompilerMSL::SampledImageScanner::handle(Op opcode, const uint32_t *args, u
  // If a needed custom function wasn't added before, add it and force a recompile.
  void CompilerMSL::add_spv_func_and_recompile(SPVFuncImpl spv_func)
  {
@@ -5930,7 +5940,7 @@ index ff081182..1819587e 100644
  	}
  }
  
-@@ -19903,7 +23895,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+@@ -19903,7 +23896,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
  		auto *var = self.maybe_get_backing_variable(args[2]);
  		if (var != nullptr)
  		{
@@ -5939,7 +5949,7 @@ index ff081182..1819587e 100644
  				self.buffers_requiring_array_length.insert(var->self);
  		}
  		break;
-@@ -19921,6 +23913,11 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+@@ -19921,6 +23914,11 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
  		set<SPIRExpression>(id, "", result_type, true);
  		self.register_read(id, ptr, true);
  		self.ir.ids[id].set_allow_type_rewrite();
@@ -5951,7 +5961,7 @@ index ff081182..1819587e 100644
  		break;
  	}
  
-@@ -20684,6 +24681,29 @@ bool CompilerMSL::is_supported_argument_buffer_type(const SPIRType &type) const
+@@ -20684,6 +24682,29 @@ bool CompilerMSL::is_supported_argument_buffer_type(const SPIRType &type) const
  	return is_supported_type && !type_is_msl_framebuffer_fetch(type);
  }
  
@@ -5981,7 +5991,7 @@ index ff081182..1819587e 100644
  void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &aliased_var,
                                                            const SPIRVariable &base_var)
  {
-@@ -20741,7 +24761,13 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
+@@ -20741,7 +24762,13 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
  		bool needs_post_cast_deref = !is_array(data_type);
  		string ref_type = needs_post_cast_deref ? "&" : join("(&)", type_to_array_glsl(var_type, aliased_var.self));
  
@@ -5996,7 +6006,7 @@ index ff081182..1819587e 100644
  		{
  			name = join("reinterpret_cast<",
  			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " *>(&",
-@@ -20905,6 +24931,12 @@ void CompilerMSL::analyze_argument_buffers()
+@@ -20905,6 +24932,12 @@ void CompilerMSL::analyze_argument_buffers()
  				set_needs_buffer_sizes[desc_set] = true;
  				needs_buffer_sizes = true;
  			}
@@ -6009,7 +6019,7 @@ index ff081182..1819587e 100644
  		}
  	});
  
-@@ -21028,6 +25060,10 @@ void CompilerMSL::analyze_argument_buffers()
+@@ -21028,6 +25061,10 @@ void CompilerMSL::analyze_argument_buffers()
  					r2.overlapping_var_id = r1.var->self;
  
  				set_extended_decoration(r2.var->self, SPIRVCrossDecorationOverlappingBinding, r2.overlapping_var_id);
@@ -6020,7 +6030,7 @@ index ff081182..1819587e 100644
  			}
  		}
  
-@@ -21393,6 +25429,356 @@ void CompilerMSL::activate_argument_buffer_resources()
+@@ -21393,6 +25430,356 @@ void CompilerMSL::activate_argument_buffer_resources()
  	});
  }
  
@@ -6377,7 +6387,7 @@ index ff081182..1819587e 100644
  bool CompilerMSL::using_builtin_array() const
  {
  	return msl_options.force_native_arrays || is_using_builtin_array;
-@@ -21560,9 +25946,18 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21560,9 +25947,18 @@ void CompilerMSL::emit_mesh_outputs()
  					// Declare the Clip/CullDistance as [[user(clip/cullN)]].
  					const uint32_t orig_index = get_member_decoration(type_vert.self, index, DecorationIndex);
  					access += "[" + to_string(orig_index) + "]";
@@ -6397,7 +6407,7 @@ index ff081182..1819587e 100644
  
  			statement("spvV.", to_member_name(type_vert, index), " = ", to_name(orig_var), "[spvVI]", access, ";");
  			if (options.vertex.flip_vert_y && builtin == BuiltInPosition)
-@@ -21571,6 +25966,8 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21571,6 +25967,8 @@ void CompilerMSL::emit_mesh_outputs()
  				          to_member_name(type_vert, index), ".y);", "    // Invert Y-axis for Metal");
  			}
  		}
@@ -6406,7 +6416,7 @@ index ff081182..1819587e 100644
  		statement("spvMesh.set_vertex(spvVI, spvV);");
  		end_scope();
  	}
-@@ -21643,7 +26040,11 @@ void CompilerMSL::emit_mesh_outputs()
+@@ -21643,7 +26041,11 @@ void CompilerMSL::emit_mesh_outputs()
  						access = "." + to_member_name(orig_type, orig_id);
  					}
  				}
@@ -6419,7 +6429,7 @@ index ff081182..1819587e 100644
  			}
  			statement("spvMesh.set_primitive(spvPI, spvP);");
  		}
-@@ -21666,6 +26067,27 @@ void CompilerMSL::emit_mesh_tasks(SPIRBlock &block)
+@@ -21666,6 +26068,27 @@ void CompilerMSL::emit_mesh_tasks(SPIRBlock &block)
  	statement("return;");
  }
  
@@ -6447,7 +6457,7 @@ index ff081182..1819587e 100644
  void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
  {
  	auto &type = get_variable_data_type(var);
-@@ -21704,7 +26126,7 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
+@@ -21704,7 +26127,7 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
  		statement("threadgroup uint *", var_ptr_name, " = (threadgroup uint *)&", var_name, ";");
  		statement("uint ", var_size_name, " = ", "sizeof(", var_name, ");");
  		statement("uint ", var_pos_name, " = gl_LocalInvocationIndex;");
@@ -6457,7 +6467,7 @@ index ff081182..1819587e 100644
  		statement("while (sizeof(uint) * ", var_pos_name, " < ", var_size_name, ")");
  		begin_scope();
 diff --git a/spirv_msl.hpp b/spirv_msl.hpp
-index 7d8fe5f6..ff927b73 100644
+index 7d8fe5f6..fa985fad 100644
 --- a/spirv_msl.hpp
 +++ b/spirv_msl.hpp
 @@ -30,6 +30,7 @@
@@ -6639,7 +6649,19 @@ index 7d8fe5f6..ff927b73 100644
  		// In a tessellation control shader, assume that more than one patch can be processed in a
  		// single workgroup. This requires changes to the way the InvocationId and PrimitiveId
  		// builtins are processed, but should result in more efficient usage of the GPU.
-@@ -560,6 +664,83 @@ public:
+@@ -532,6 +636,11 @@ public:
+ 		// transformed.
+ 		bool agx_manual_cube_grad_fixup = false;
+ 
++		// Metal's interpolate_at_offset measures from the pixel's upper-left corner. SPIR-V offsets are from the
++		// center, so they are moved by (1/2 - 1/16) for Intel GPUs (several CTS tests break with 1/2 there). Apple
++		// GPUs evaluate exactly at corner + offset: with this set, the offset is moved by exactly 1/2.
++		bool interpolate_at_offset_exact = false;
++
+ 		// Metal will discard fragments with side effects under certain circumstances prematurely.
+ 		// Example: CTS test dEQP-VK.fragment_operations.early_fragment.discard_no_early_fragment_tests_depth
+ 		// Test will render a full screen quad with varying depth [0,1] for each fragment.
+@@ -560,6 +669,83 @@ public:
  		// Requires MSL 3.2 or above, and has no effect with earlier MSL versions.
  		bool use_fast_math_pragmas = false;
  
@@ -6723,7 +6745,7 @@ index 7d8fe5f6..ff927b73 100644
  		bool is_ios() const
  		{
  			return platform == iOS;
-@@ -610,6 +791,59 @@ public:
+@@ -610,6 +796,59 @@ public:
  		                                     get_entry_point().model == ExecutionModelTessellationEvaluation);
  	}
  
@@ -6783,7 +6805,7 @@ index 7d8fe5f6..ff927b73 100644
  	// Provide feedback to calling API to allow it to pass an auxiliary
  	// swizzle buffer if the shader needs it.
  	bool needs_swizzle_buffer() const
-@@ -625,6 +859,9 @@ public:
+@@ -625,6 +864,9 @@ public:
  	}
  	bool needs_acceleration_structure_address_table() const { return uses_acceleration_structure_address; }
  
@@ -6793,7 +6815,7 @@ index 7d8fe5f6..ff927b73 100644
  	// Provide feedback to calling API to determine if the vertex shader writes
  	// to PointSize. This allows the API to avoid declaring a point size output
  	// when it is not needed.
-@@ -645,6 +882,25 @@ public:
+@@ -645,6 +887,25 @@ public:
  		return msl_options.multiview && !msl_options.view_index_from_device_index;
  	}
  
@@ -6819,7 +6841,7 @@ index 7d8fe5f6..ff927b73 100644
  	// Provide feedback to calling API to allow it to pass depth clip
  	// emulation state.
  	bool needs_depth_clip_state_buffer() const
-@@ -667,7 +923,14 @@ public:
+@@ -667,7 +928,14 @@ public:
  	// buffer if the shader needs it.
  	bool needs_output_buffer() const
  	{
@@ -6835,7 +6857,7 @@ index 7d8fe5f6..ff927b73 100644
  	}
  
  	// Provide feedback to calling API to allow it to pass a patch output
-@@ -853,6 +1116,7 @@ protected:
+@@ -853,6 +1121,7 @@ protected:
  		SPVFuncImplGatherCompareSwizzle,
  		SPVFuncImplGatherConstOffsets,
  		SPVFuncImplGatherCompareConstOffsets,
@@ -6843,7 +6865,7 @@ index 7d8fe5f6..ff927b73 100644
  		SPVFuncImplSubgroupBroadcast,
  		SPVFuncImplSubgroupBroadcastFirst,
  		SPVFuncImplSubgroupBallot,
-@@ -924,9 +1188,17 @@ protected:
+@@ -924,9 +1193,17 @@ protected:
  		SPVFuncImplImageFence,
  		SPVFuncImplTextureCast,
  		SPVFuncImplDepthCast,
@@ -6861,7 +6883,7 @@ index 7d8fe5f6..ff927b73 100644
  	};
  
  	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
-@@ -964,6 +1236,7 @@ protected:
+@@ -964,6 +1241,7 @@ protected:
  	void emit_mesh_outputs();
  	void emit_mesh_tasks(SPIRBlock &block) override;
  	void emit_workgroup_initialization(const SPIRVariable &var) override;
@@ -6869,7 +6891,7 @@ index 7d8fe5f6..ff927b73 100644
  
  	// Allow Metal to use the array<T> template to make arrays a value type
  	std::string type_to_array_glsl(const SPIRType &type, uint32_t variable_id) override;
-@@ -1016,6 +1289,7 @@ protected:
+@@ -1016,6 +1294,7 @@ protected:
  	                                     bool is_packed, bool relaxed) override;
  
  	bool is_tesc_shader() const;
@@ -6877,7 +6899,7 @@ index 7d8fe5f6..ff927b73 100644
  	bool is_tese_shader() const;
  	bool is_mesh_shader() const;
  
-@@ -1035,7 +1309,7 @@ protected:
+@@ -1035,7 +1314,7 @@ protected:
  	void extract_global_variables_from_function(uint32_t func_id, std::set<uint32_t> &added_arg_ids,
  	                                            std::unordered_set<uint32_t> &global_var_ids,
  	                                            std::unordered_set<uint32_t> &processed_func_ids);
@@ -6886,7 +6908,7 @@ index 7d8fe5f6..ff927b73 100644
  	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
  	uint32_t add_meshlet_block(bool per_primitive);
  
-@@ -1101,6 +1375,7 @@ protected:
+@@ -1101,6 +1380,7 @@ protected:
  	bool maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs);
  	bool is_var_runtime_size_array(const SPIRVariable &var) const;
  	uint32_t get_resource_array_size(const SPIRType &type, uint32_t id) const;
@@ -6894,7 +6916,7 @@ index 7d8fe5f6..ff927b73 100644
  
  	void fix_up_shader_inputs_outputs();
  
-@@ -1113,6 +1388,21 @@ protected:
+@@ -1113,6 +1393,21 @@ protected:
  	std::string entry_point_arg_stage_in();
  	void entry_point_args_builtin(std::string &args);
  	void entry_point_args_discrete_descriptors(std::string &args);
@@ -6916,7 +6938,7 @@ index 7d8fe5f6..ff927b73 100644
  	std::string append_member_name(const std::string &qualifier, const SPIRType &type, uint32_t index);
  	std::string ensure_valid_name(std::string name, std::string pfx);
  	std::string to_sampler_expression(uint32_t id);
-@@ -1207,6 +1497,10 @@ protected:
+@@ -1207,6 +1502,10 @@ protected:
  	void validate_cooperative_matrix_type(const SPIRType &type);
  	void validate_cooperative_matrix_types();
  	uint32_t build_constant_uint_array_pointer();
@@ -6927,7 +6949,7 @@ index 7d8fe5f6..ff927b73 100644
  	void emit_entry_point_declarations() override;
  	bool uses_explicit_early_fragment_test();
  
-@@ -1220,6 +1514,17 @@ protected:
+@@ -1220,6 +1519,17 @@ protected:
  	uint32_t builtin_base_instance_id = 0;
  	uint32_t builtin_view_idx_id = 0;
  	uint32_t builtin_layer_id = 0;
@@ -6945,7 +6967,7 @@ index 7d8fe5f6..ff927b73 100644
  	uint32_t builtin_invocation_id_id = 0;
  	uint32_t builtin_primitive_id_id = 0;
  	uint32_t builtin_subgroup_invocation_id_id = 0;
-@@ -1236,6 +1541,21 @@ protected:
+@@ -1236,6 +1546,21 @@ protected:
  	uint32_t buffer_size_buffer_id = 0;
  	uint32_t acceleration_structure_address_table_id = 0;
  	uint32_t view_mask_buffer_id = 0;
@@ -6967,7 +6989,7 @@ index 7d8fe5f6..ff927b73 100644
  	uint32_t draw_index_buffer_id = 0;
  	uint32_t dynamic_offsets_buffer_id = 0;
  	uint32_t uint_type_id = 0;
-@@ -1275,6 +1595,7 @@ protected:
+@@ -1275,6 +1600,7 @@ protected:
  	std::set<SPVFuncImpl> spv_function_implementations;
  	// Must be ordered to ensure declarations are in a specific order.
  	std::map<LocationComponentPair, MSLShaderInterfaceVariable> inputs_by_location;
@@ -6975,7 +6997,7 @@ index 7d8fe5f6..ff927b73 100644
  	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> inputs_by_builtin;
  	std::map<LocationComponentPair, MSLShaderInterfaceVariable> outputs_by_location;
  	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> outputs_by_builtin;
-@@ -1282,6 +1603,8 @@ protected:
+@@ -1282,6 +1608,8 @@ protected:
  	std::unordered_set<uint32_t> location_inputs_in_use_fallback;
  	std::unordered_set<uint32_t> location_outputs_in_use;
  	std::unordered_set<uint32_t> location_outputs_in_use_fallback;
@@ -6984,7 +7006,7 @@ index 7d8fe5f6..ff927b73 100644
  	std::unordered_map<uint32_t, uint32_t> fragment_output_components;
  	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_input_location;
  	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_output_location;
-@@ -1310,6 +1633,7 @@ protected:
+@@ -1310,6 +1638,7 @@ protected:
  	VariableID mesh_out_per_vertex = 0;
  	VariableID mesh_out_per_primitive = 0;
  	VariableID stage_out_masked_builtin_type_id = 0;
@@ -6992,7 +7014,7 @@ index 7d8fe5f6..ff927b73 100644
  
  	// Handle HLSL-style 0-based vertex/instance index.
  	enum class TriState
-@@ -1343,6 +1667,8 @@ protected:
+@@ -1343,6 +1672,8 @@ protected:
  	bool needs_helper_invocation = false;
  	bool needs_workgroup_zero_init = false;
  	bool needs_point_size_output = false;
@@ -7001,7 +7023,7 @@ index 7d8fe5f6..ff927b73 100644
  	bool writes_to_depth = false;
  	bool writes_to_point_size = false;
  	std::string qual_pos_var_name;
-@@ -1351,6 +1677,7 @@ protected:
+@@ -1351,6 +1682,7 @@ protected:
  	std::string depth_clip_viewport_idx_var_name;
  	std::string stage_in_var_name = "in";
  	std::string stage_out_var_name = "out";
@@ -7009,7 +7031,7 @@ index 7d8fe5f6..ff927b73 100644
  	std::string patch_stage_in_var_name = "patchIn";
  	std::string patch_stage_out_var_name = "patchOut";
  	std::string sampler_name_suffix = "Smplr";
-@@ -1372,11 +1699,66 @@ protected:
+@@ -1372,11 +1704,66 @@ protected:
  	const MSLConstexprSampler *find_constexpr_sampler(uint32_t id) const;
  
  	std::unordered_set<uint32_t> buffers_requiring_array_length;
@@ -7076,7 +7098,7 @@ index 7d8fe5f6..ff927b73 100644
  	SmallVector<SPIRVariable *> entry_point_bindings;
  
  	// Must be ordered since array is in a specific order.
-@@ -1399,6 +1781,8 @@ protected:
+@@ -1399,6 +1786,8 @@ protected:
  	void emit_argument_buffer_aliased_descriptor(const SPIRVariable &aliased_var,
  	                                             const SPIRVariable &base_var);
  
@@ -7085,7 +7107,7 @@ index 7d8fe5f6..ff927b73 100644
  	void analyze_argument_buffers();
  	bool descriptor_set_is_argument_buffer(uint32_t desc_set) const;
  	const MSLResourceBinding &get_argument_buffer_resource(uint32_t desc_set, uint32_t arg_idx) const;
-@@ -1407,10 +1791,14 @@ protected:
+@@ -1407,10 +1796,14 @@ protected:
  	void add_argument_buffer_padding_sampler_type(SPIRType &struct_type, uint32_t &mbr_idx, uint32_t &arg_buff_index, MSLResourceBinding &rez_bind);
  	void add_argument_buffer_padding_type(uint32_t mbr_type_id, SPIRType &struct_type, uint32_t &mbr_idx, uint32_t &arg_buff_index, uint32_t count);
  

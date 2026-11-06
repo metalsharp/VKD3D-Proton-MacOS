@@ -39,7 +39,7 @@ kept on SPIR-V before conversion) and 64-bit wave ops on some types (`Unsupporte
 - **Vertex:** `SV_ClipDistance`; `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` outputs; SM 6.8
   `SV_StartVertexLocation` and `SV_StartInstanceLocation` (through the draw parameters MoltenVK binds).
 - **Pixel:**
-  - `SV_StencilRef`; `SV_Coverage` in and out
+  - `SV_Coverage` in and out
   - `SV_Depth`; `SV_DepthGreaterEqual` and `SV_DepthLessEqual` (Metal `depth(greater)` and `depth(less)`)
   - `SV_SampleIndex`, `SV_IsFrontFace`, `SV_PrimitiveID`, `SV_RenderTargetArrayIndex` input; `SV_Barycentrics`
   - `discard`; coarse and fine derivatives; `EvaluateAttributeAtSample` and `EvaluateAttributeSnapped`
@@ -72,6 +72,10 @@ kept on SPIR-V before conversion) and 64-bit wave ops on some types (`Unsupporte
 These convert cleanly, but tests found them wrong or slow, so the bridge treats them specially:
 
 - `CheckAccessFullyMapped` reads false for mapped tiles (residency meta flag: SPIR-V).
+- `SV_StencilRef` is marked `air.StencilRef` in the converted function, where Metal's attribute is `air.stencil`, so
+  Metal ignores it and stencil REPLACE writes the API reference. Pixel shaders writing it stay on SPIR-V (matched by
+  system value in DXIL signatures and by name in DXBC ones, where FXC writes 0). Test `ps_depth_stencil_out` (and
+  `_dxbc`). The other system values' AIR attributes match what Metal's compiler emits.
 - Min/max sampler reduction reads as linear filtering on GPUs before Apple10 with macOS 26. There, PSOs with such
   static samplers use SPIR-V. Once the application makes a min/max sampler, PSOs that sample from tables or the heap
   use SPIR-V too: later ones aren't bridged, and earlier ones draw and dispatch with their SPIR-V pipelines (test
@@ -160,6 +164,24 @@ and off), except as noted.
     draws that need it. `raster_clip` and `ia_restart` cover it.
 - `heap_placement`: aliased placed buffers, overlapping buffers, GPU addresses that differ by the heap offsets, a
   placed texture, and placed upload buffers.
+
+## Third accuracy round: pixel outputs, interpolation, vertex input
+
+- `ps_depth_stencil_out`: `SV_Depth`, `SV_DepthGreaterEqual` and `SV_DepthLessEqual`, discard with a depth output,
+  `SV_StencilRef` (converter bug above: SPIR-V).
+- `interp_samples`: on a 4x target with the standard pattern, `sample` inputs and `EvaluateAttributeAtSample` read the
+  sample positions, `GetRenderTargetSamplePosition` returns them (the converter can't convert it: such shaders fail
+  over to SPIR-V), and `EvaluateAttributeSnapped(f, (4, -4))` reads center + (1/4, -1/4). On SPIR-V it read 1/16 low:
+  Metal's `interpolate_at_offset` is relative to the pixel's corner, and SPIRV-Cross added 1/2 - 1/16 (an Intel
+  correction); `interpolate_at_offset_exact` adds 1/2 on Apple GPUs. FXC 10.1 miscompiles `EvaluateAttributeSnapped`
+  (it writes all four components of a register it still needs and stores `.zw`), so `_dxbc` doesn't check it.
+- Centroid inputs read the center on fully covered pixels. Metal clips primitives to the viewport rather than
+  using a guard band, so pixels on the inner edges of a clipped primitive are partly covered by each piece, and
+  centroid moves there. A pixel shader that runs per sample evaluates centroid inputs at its sample on some pixels
+  and at the center on others; D3D leaves that to the implementation.
+- `instance_step_rate`: per-instance data at step rates 0 to 3, start instances, DrawIndexed with a base vertex and
+  ExecuteIndirect, on both paths.
+- `dxbc_stripped`: DXBC without reflection is bridged (the instruction scanner took `imad` for `customdata`).
 
 ## SPIR-V path limits found on the way
 

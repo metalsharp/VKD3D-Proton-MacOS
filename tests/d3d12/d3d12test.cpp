@@ -6178,6 +6178,533 @@ float4 ps() : SV_Target { o.InterlockedAdd(which * 4, 1); return 1; }
 static bool test_ia_restart() { return ia_restart(false); }
 static bool test_ia_restart_dxbc() { return ia_restart(true); }
 
+// Per-instance vertex data step rates (D3D12 InstanceDataStepRate): instance i of a draw starting at instance S reads
+// element S + i / rate, and element S for every instance at rate 0. SV_InstanceID doesn't include S. Slots 0-3 step at
+// rates 0, 1, 2 and 3; slot k's element e holds 100 k + e. Draw, DrawIndexed (with a base vertex) and ExecuteIndirect.
+static bool instance_step_rate(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint call; };
+RWByteAddressBuffer o : register(u1);
+float4 vs(uint iid : SV_InstanceID, uint a : A0, uint b : A1, uint c : A2, uint d : A3) : SV_Position
+{
+    o.Store4((call * 16 + iid) * 16, uint4(a, b, c, d));
+    return float4(2, 2, 0, 1);
+}
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    if (vs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_INPUT_ELEMENT_DESC el[4];
+    for (UINT k = 0; k < 4; k++)
+        el[k] = { "A", k, DXGI_FORMAT_R32_UINT, k, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, k };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.SampleMask = ~0u;
+    pd.InputLayout = { el, 4 };
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    ID3D12Resource *vb = create_buffer(4 * 32 * 4 + 256, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *m = nullptr;
+    vb->Map(0, nullptr, (void **)&m);
+    for (UINT k = 0; k < 4; k++)
+        for (UINT e = 0; e < 32; e++)
+            m[k * 32 + e] = 100 * k + e;
+    m[128] = 0;  // index buffer: one index, 0
+    // Indirect draw: 1 vertex, 8 instances, starting at vertex 0, instance 6.
+    m[129] = 1; m[130] = 8; m[131] = 0; m[132] = 6;
+    vb->Unmap(0, nullptr);
+    D3D12_VERTEX_BUFFER_VIEW vbv[4];
+    for (UINT k = 0; k < 4; k++)
+        vbv[k] = { vb->GetGPUVirtualAddress() + k * 128, 128, 4 };
+    D3D12_INDEX_BUFFER_VIEW ibv = { vb->GetGPUVirtualAddress() + 512, 4, DXGI_FORMAT_R32_UINT };
+    D3D12_INDIRECT_ARGUMENT_DESC iad = { D3D12_INDIRECT_ARGUMENT_TYPE_DRAW };
+    D3D12_COMMAND_SIGNATURE_DESC csd = { 16, 1, &iad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(dev->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+    ID3D12Resource *out = create_buffer(4 * 16 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    g.list->IASetVertexBuffers(0, 4, vbv);
+    g.list->IASetIndexBuffer(&ibv);
+    const UINT starts[4] = { 0, 5, 3, 6 };
+    for (UINT call = 0; call < 4; call++)
+    {
+        g.list->SetGraphicsRoot32BitConstants(0, 1, &call, 0);
+        if (call < 2)
+            g.list->DrawInstanced(1, 8, 0, starts[call]);
+        else if (call == 2)
+            g.list->DrawIndexedInstanced(1, 8, 0, 2, starts[call]);
+        else
+            g.list->ExecuteIndirect(sig, 1, vb, 516, nullptr, 0);
+    }
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 4 * 16 * 16, &rb);
+    if (!r)
+        return false;
+    static const char *names[4] = { "Draw", "Draw from instance 5", "DrawIndexed", "ExecuteIndirect" };
+    for (UINT call = 0; call < 4; call++)
+    {
+        uint32_t bad = 0;
+        for (UINT i = 0; i < 16; i++)
+            for (UINT k = 0; k < 4; k++)
+            {
+                uint32_t got = r[(call * 16 + i) * 4 + k];
+                uint32_t want = i < 8 ? 100 * k + starts[call] + (k ? i / k : 0) : 0;
+                if (got != want && bad++ < 4)
+                    printf("  %s: instance %u slot %u (rate %u) read %u, want %u\n", names[call], i, k, k, got, want);
+            }
+        EXPECT(!bad, "%s: %u wrong per-instance values", names[call], bad);
+    }
+    rb->Release(); out->Release(); sig->Release(); vb->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_instance_step_rate() { return instance_step_rate(false); }
+static bool test_instance_step_rate_dxbc() { return instance_step_rate(true); }
+
+// Pixel shader depth and stencil outputs into D32_FLOAT_S8X24_UINT, a 16x4 target in four 4x4 regions, cleared to
+// depth 1 and stencil 0, each drawn with a triangle at z = 0.5:
+// 0: SV_Depth = (x + 4 y) / 32 + 1/64 and SV_StencilRef = x + 4 y + 1 (stencil REPLACE);
+// 1: SV_DepthGreaterEqual = z + 0.25; 2: SV_DepthLessEqual = z - 0.25;
+// 3: SV_Depth = 0.125 with odd pixels discarded (they keep depth 1).
+static bool ps_depth_stencil_out(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint region; };
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1);
+}
+struct O0 { float d : SV_Depth; uint s : SV_StencilRef; };
+O0 ps_exact(float4 p : SV_Position)
+{
+    uint2 q = uint2(p.xy) % 4;
+    O0 o;
+    o.d = (q.x + 4 * q.y) / 32.0 + 1.0 / 64.0;
+    o.s = q.x + 4 * q.y + 1;
+    return o;
+}
+float ps_ge(noperspective centroid float4 p : SV_Position) : SV_DepthGreaterEqual { return p.z + 0.25; }
+float ps_le(noperspective centroid float4 p : SV_Position) : SV_DepthLessEqual { return p.z - 0.25; }
+float ps_discard(float4 p : SV_Position) : SV_Depth
+{
+    if ((uint(p.x) + uint(p.y)) & 1)
+        discard;
+    return 0.125;
+}
+)";
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts));
+    if (!opts.PSSpecifiedStencilRefSupported)
+    {
+        printf("  PSSpecifiedStencilRefSupported is off: skipped\n");
+        return true;
+    }
+    auto comp = [&](const char *e, const char *t) {
+        if (!dxbc)
+            return compile_dxc(src, e, t);
+        std::vector<char> b = compile_fxc(src, e, t[3] == '6' ? (t[0] == 'v' ? "vs_5_0" : "ps_5_0") : t);
+        return b.empty() ? compile_fxc(src, e, t[0] == 'v' ? "vs_5_1" : "ps_5_1") : b;
+    };
+    std::vector<char> vs = comp("vs", "vs_6_0"), ps[4] = { comp("ps_exact", "ps_6_0"), comp("ps_ge", "ps_6_0"),
+                                                         comp("ps_le", "ps_6_0"), comp("ps_discard", "ps_6_0") };
+    if (vs.empty() || ps[0].empty() || ps[1].empty() || ps[2].empty() || ps[3].empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso[4] = {};
+    for (UINT i = 0; i < 4; i++)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps[i].data(), ps[i].size() };
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.DepthStencilState.StencilEnable = i == 0;
+        pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xff;
+        D3D12_DEPTH_STENCILOP_DESC so = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE,
+                                          D3D12_COMPARISON_FUNC_ALWAYS };
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = so;
+        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.SampleDesc.Count = 1;
+        CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso[i])));
+    }
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 16; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = td.Format;
+    cv.DepthStencil = { 1.0f, 0 };
+    ID3D12Resource *ds = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&ds)));
+    D3D12_DESCRIPTOR_HEAP_DESC dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    ID3D12DescriptorHeap *dheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateDepthStencilView(ds, nullptr, dsv);
+    g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    g.list->OMSetStencilRef(0xee);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (UINT i = 0; i < 4; i++)
+    {
+        D3D12_VIEWPORT vp = { 4.0f * i, 0, 4, 4, 0, 1 };
+        D3D12_RECT sc = { (LONG)(4 * i), 0, (LONG)(4 * i + 4), 4 };
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetPipelineState(pso[i]);
+        g.list->SetGraphicsRoot32BitConstants(0, 1, &i, 0);
+        g.list->DrawInstanced(3, 1, 0, 0);
+    }
+    transition(ds, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *rb = create_buffer(2048, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {}, dst = {};
+    src_loc.pResource = ds;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, 16, 4, 1, 256 };
+    src_loc.SubresourceIndex = 0;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+    dst.PlacedFootprint.Offset = 1024;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8_TYPELESS, 16, 4, 1, 256 };
+    src_loc.SubresourceIndex = 1;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+    if (!execute_and_wait())
+        return false;
+    uint8_t *m = nullptr;
+    D3D12_RANGE range = { 0, 2048 };
+    rb->Map(0, &range, (void **)&m);
+    uint32_t bad[4] = {};
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 16; x++)
+        {
+            UINT region = x / 4, q = x % 4 + 4 * y;
+            float d = ((const float *)(m + y * 256))[x];
+            uint8_t s = m[1024 + y * 256 + x];
+            float wd = region == 0 ? q / 32.0f + 1.0f / 64.0f : region == 1 ? 0.75f : region == 2 ? 0.25f :
+                       ((x + y) & 1) ? 1.0f : 0.125f;
+            uint8_t ws = region == 0 ? (uint8_t)(q + 1) : 0;
+            if ((fabsf(d - wd) > 1e-6f || s != ws) && bad[region]++ < 3)
+                printf("  region %u pixel (%u, %u): depth %.7f stencil %u, want %.7f, %u\n", region, x % 4, y, d, s, wd, ws);
+        }
+    static const char *names[4] = { "SV_Depth + SV_StencilRef", "SV_DepthGreaterEqual", "SV_DepthLessEqual", "SV_Depth + discard" };
+    for (UINT i = 0; i < 4; i++)
+        EXPECT(!bad[i], "%s: %u wrong pixels", names[i], bad[i]);
+    rb->Release(); dheap->Release(); ds->Release();
+    for (UINT i = 0; i < 4; i++)
+        pso[i]->Release();
+    rs->Release();
+    return true;
+}
+
+static bool test_ps_depth_stencil_out() { return ps_depth_stencil_out(false); }
+static bool test_ps_depth_stencil_out_dxbc() { return ps_depth_stencil_out(true); }
+
+// Attribute interpolation at samples, on a 4x 4x4 target with the standard pattern ((-2, -6), (6, -2), (-6, 2), (2, 6)
+// sixteenths): attributes A and F hold the pixel coordinates, so at sample s of pixel (x, y) a `sample` attribute and
+// EvaluateAttributeAtSample read (x + 0.5, y + 0.5) + position s; EvaluateAttributeSnapped(f, (4, -4)) reads
+// (x + 0.75, y + 0.25); EvaluateAttributeCentroid and `centroid` read the center (every sample covered).
+// GetRenderTargetSamplePosition(s) returns position s (a second pixel shader, which the converter can't take).
+static bool interp_samples(bool dxbc)
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u1);
+struct V { float4 p : SV_Position; float4 a : A; float4 f : F; float4 c : C; };
+V vs(uint id : SV_VertexID)
+{
+    float2 n = float2(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0);
+    V v;
+    v.p = float4(n, 0.5, 1);
+    v.a = v.f = v.c = float4(float2(n.x + 1, 1 - n.y) * 2, 0, 0);
+    return v;
+}
+float4 ps(float4 p : SV_Position, sample float4 a : A, float4 f : F, centroid float4 c : C, uint s : SV_SampleIndex) : SV_Target
+{
+    uint i = ((uint(p.y) * 4 + uint(p.x)) * 4 + s) * 48;
+    o.Store4(i, asuint(float4(a.xy, EvaluateAttributeAtSample(f, s).xy)));
+    float4 snapped = EvaluateAttributeSnapped(f, int2(4, -4));
+    o.Store2(i + 16, asuint(snapped.xy));
+    return 1;
+}
+// A triangle (0, 0), (4, 0), (0, 4) in pixels: Metal clips primitives to the viewport (no guard band), so pixels
+// on the inner edges of the clipped full-screen triangle are partly covered by each piece.
+V vs_small(uint id : SV_VertexID)
+{
+    float2 n = float2(id == 1 ? 1.0 : -1.0, id == 2 ? -1.0 : 1.0);
+    V v;
+    v.p = float4(n, 0.5, 1);
+    v.a = v.f = v.c = float4(float2(n.x + 1, 1 - n.y) * 2, 0, 0);
+    return v;
+}
+// Centroid at pixel rate, on pixels the small triangle covers completely (x + y <= 2): their center. (At sample
+// rate, Apple GPUs evaluate centroid inputs at the shaded sample for some pixels and at the center for others; D3D
+// leaves that to the implementation.)
+float4 ps_centroid(float4 p : SV_Position, float4 a : A, float4 f : F, centroid float4 c : C) : SV_Target
+{
+    uint i = (uint(p.y) * 4 + uint(p.x)) * 4 * 48;
+    for (uint s = 0; s < 4; s++)
+    {
+        o.Store2(i + s * 48 + 24, asuint(EvaluateAttributeCentroid(f).xy));
+        o.Store2(i + s * 48 + 32, asuint(c.xy));
+    }
+    return 1;
+}
+float4 ps_pos(float4 p : SV_Position) : SV_Target
+{
+    if (uint(p.x) == 0 && uint(p.y) == 0)
+        for (uint s = 0; s < 4; s++)
+            o.Store2(3072 + s * 8, asuint(GetRenderTargetSamplePosition(s)));
+    return 1;
+}
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> vsm = dxbc ? compile_fxc(src, "vs_small", "vs_5_0") : compile_dxc(src, "vs_small", "vs_6_0");
+    std::vector<char> ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    std::vector<char> pp = dxbc ? compile_fxc(src, "ps_pos", "ps_5_0") : compile_dxc(src, "ps_pos", "ps_6_0");
+    std::vector<char> pc = dxbc ? compile_fxc(src, "ps_centroid", "ps_5_0") : compile_dxc(src, "ps_centroid", "ps_6_0");
+    if (vs.empty() || vsm.empty() || ps.empty() || pp.empty() || pc.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso[3] = {};
+    for (UINT i = 0; i < 3; i++)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = i == 2 ? D3D12_SHADER_BYTECODE{ vsm.data(), vsm.size() } : D3D12_SHADER_BYTECODE{ vs.data(), vs.size() };
+        const std::vector<char> &code = i == 0 ? ps : i == 1 ? pp : pc;
+        pd.PS = { code.data(), code.size() };
+        pd.SampleMask = ~0u;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 4;
+        CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso[i])));
+    }
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 4;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (UINT i = 0; i < 3; i++)
+    {
+        g.list->SetPipelineState(pso[i]);
+        g.list->DrawInstanced(3, 1, 0, 0);
+    }
+    ID3D12Resource *rb = nullptr;
+    const float *r = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 4096, &rb);
+    if (!r)
+        return false;
+    static const float pos[4][2] = { { -2, -6 }, { 6, -2 }, { -6, 2 }, { 2, 6 } };
+    static const char *what[5] = { "sample attribute", "EvaluateAttributeAtSample", "EvaluateAttributeSnapped (4, -4)",
+                                    "EvaluateAttributeCentroid", "centroid attribute" };
+    uint32_t bad[5] = {};
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+            for (UINT s = 0; s < 4; s++)
+            {
+                const float *e = r + ((y * 4 + x) * 4 + s) * 12;
+                float cx = x + 0.5f, cy = y + 0.5f, sx = cx + pos[s][0] / 16, sy = cy + pos[s][1] / 16;
+                const float want[5][2] = { { sx, sy }, { sx, sy }, { cx + 0.25f, cy - 0.25f }, { cx, cy }, { cx, cy } };
+                for (UINT k = 0; k < 5; k++)
+                    // FXC 10.1 miscompiles EvaluateAttributeSnapped: it writes all four components of the register
+                    // holding the store address and stores its .zw. Centroid: fully covered pixels only.
+                    if ((k == 2 && dxbc) || (k >= 3 && x + y > 2))
+                        continue;
+                    else if ((fabsf(e[k * 2] - want[k][0]) > 1e-3f || fabsf(e[k * 2 + 1] - want[k][1]) > 1e-3f) && bad[k]++ < 2)
+                        printf("  %s, pixel (%u, %u) sample %u: (%g, %g), want (%g, %g)\n", what[k], x, y, s, e[k * 2],
+                               e[k * 2 + 1], want[k][0], want[k][1]);
+            }
+    for (UINT k = 0; k < 5; k++)
+        EXPECT(!bad[k], "%s: %u wrong values", what[k], bad[k]);
+    uint32_t badpos = 0;
+    for (UINT s = 0; s < 4; s++)
+    {
+        const float *e = r + 768 + s * 2;
+        if (e[0] != pos[s][0] / 16 || e[1] != pos[s][1] / 16)
+        {
+            badpos++;
+            printf("  GetRenderTargetSamplePosition(%u) = (%g, %g), want (%g, %g)\n", s, e[0], e[1], pos[s][0] / 16, pos[s][1] / 16);
+        }
+    }
+    EXPECT(!badpos, "GetRenderTargetSamplePosition: %u wrong positions", badpos);
+    rb->Release(); out->Release(); rheap->Release(); rt->Release(); pso[0]->Release(); pso[1]->Release(); pso[2]->Release(); rs->Release();
+    return true;
+}
+
+static bool test_interp_samples() { return interp_samples(false); }
+static bool test_interp_samples_dxbc() { return interp_samples(true); }
+
+// DXBC with its reflection stripped (D3DCOMPILER_STRIP_REFLECTION_DATA, as shipped games often are): the bridge then
+// scans the instruction stream itself (for typed buffer declarations), and must step over imad (opcode 35) and
+// customdata (53, whose length is in the next token). Draws with an imad in each stage; run with VKD3D_DEBUG=info to
+// see that the PSO is bridged.
+static bool test_dxbc_stripped()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { int k; };
+RWByteAddressBuffer o : register(u1);
+struct V { float4 p : SV_Position; nointerpolation int v : V; };
+V vs(uint id : SV_VertexID)
+{
+    V r;
+    r.p = float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1);
+    r.v = k * (int)id + 7;
+    return r;
+}
+static const float table[4] = { 1.0, 2.0, 3.0, 4.0 };
+float4 ps(V i) : SV_Target
+{
+    int2 q = int2(i.p.xy);
+    o.InterlockedAdd((q.y * 4 + q.x) * 4, (uint)(i.v * k + q.x * q.y + (int)table[q.x & 3]));
+    return 1;
+}
+)";
+    std::vector<char> vs = compile_fxc(src, "vs", "vs_5_0"), ps = compile_fxc(src, "ps", "ps_5_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    auto strip = [](std::vector<char> &code) {
+        ID3DBlob *out = nullptr;
+        if (FAILED(D3DStripShader(code.data(), code.size(), D3DCOMPILER_STRIP_REFLECTION_DATA | D3DCOMPILER_STRIP_DEBUG_INFO, &out)))
+            return false;
+        code.assign((char *)out->GetBufferPointer(), (char *)out->GetBufferPointer() + out->GetBufferSize());
+        out->Release();
+        return true;
+    };
+    EXPECT(strip(vs) && strip(ps), "D3DStripShader failed");
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.SampleMask = ~0u;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    const int k = 3;
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRoot32BitConstants(0, 1, &k, 0);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    // The provoking vertex (0) gives v = 7.
+    uint32_t bad = 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+        {
+            uint32_t want = (uint32_t)(7 * k + x * y + (x + 1));
+            if (r[y * 4 + x] != want && bad++ < 3)
+                printf("  pixel (%d, %d): %u, want %u\n", x, y, r[y * 4 + x], want);
+        }
+    EXPECT(!bad, "%u wrong pixels", bad);
+    rb->Release(); out->Release(); rheap->Release(); rt->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
 
@@ -13326,6 +13853,13 @@ static const Test tests[] = {
     { "raster_clip_dxbc", test_raster_clip_dxbc },
     { "ia_restart", test_ia_restart },
     { "ia_restart_dxbc", test_ia_restart_dxbc },
+    { "instance_step_rate", test_instance_step_rate },
+    { "instance_step_rate_dxbc", test_instance_step_rate_dxbc },
+    { "ps_depth_stencil_out", test_ps_depth_stencil_out },
+    { "ps_depth_stencil_out_dxbc", test_ps_depth_stencil_out_dxbc },
+    { "interp_samples", test_interp_samples },
+    { "interp_samples_dxbc", test_interp_samples_dxbc },
+    { "dxbc_stripped", test_dxbc_stripped },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
