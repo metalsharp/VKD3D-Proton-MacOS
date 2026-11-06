@@ -4959,7 +4959,8 @@ uint64_t v(uint t) { return ((uint64_t)(t * 2654435761u) << 20) ^ (uint64_t)t; }
 
 // 64-bit image atomics (SM 6.6, RWTexture2D<uint64_t> on R32G32_UINT), as Nanite's visibility buffer uses them:
 // 64K threads InterlockedMax onto a 16x16 texture (256 per texel, results unused), then a shader that uses the
-// returned values of InterlockedAdd. Checked against CPU results.
+// returned values of InterlockedAdd, then compare-exchanges from 0 that only one thread per texel wins. Checked
+// against CPU results.
 static bool test_image_atomics64()
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
@@ -4975,9 +4976,11 @@ RWStructuredBuffer<uint64_t> r : register(u1);
 uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
 [numthreads(64, 1, 1)] void max_(uint i : SV_DispatchThreadID) { InterlockedMax(t[uint2(i & 15, (i >> 4) & 15)], v(i)); }
 [numthreads(64, 1, 1)] void ret(uint i : SV_DispatchThreadID) { uint64_t old; InterlockedAdd(t[uint2(i & 15, 16 + ((i >> 4) & 15))], 1ull << 32, old); r[i] = old; }
+[numthreads(64, 1, 1)] void cas(uint i : SV_DispatchThreadID) { uint64_t old; InterlockedCompareExchange(t[uint2(i & 15, 32 + ((i >> 4) & 15))], 0, ((uint64_t)(i + 1) << 32) | 1, old); r[4096 + i] = old; }
 )";
-    std::vector<char> cs_max = compile_dxc(src, "max_", "cs_6_6"), cs_ret = compile_dxc(src, "ret", "cs_6_6");
-    if (cs_max.empty() || cs_ret.empty())
+    std::vector<char> cs_max = compile_dxc(src, "max_", "cs_6_6"), cs_ret = compile_dxc(src, "ret", "cs_6_6"),
+                      cs_cas = compile_dxc(src, "cas", "cs_6_6");
+    if (cs_max.empty() || cs_ret.empty() || cs_cas.empty())
         return false;
     ID3D12Device *dev = g.device;
     D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
@@ -4988,13 +4991,14 @@ uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
     rp[1].Descriptor.ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
     ID3D12RootSignature *rs = create_root_signature(rsd);
-    ID3D12PipelineState *pmax = create_compute_pipeline(rs, cs_max), *pret = create_compute_pipeline(rs, cs_ret);
-    if (!pmax || !pret)
+    ID3D12PipelineState *pmax = create_compute_pipeline(rs, cs_max), *pret = create_compute_pipeline(rs, cs_ret),
+                         *pcas = create_compute_pipeline(rs, cs_cas);
+    if (!pmax || !pret || !pcas)
         return false;
     D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC td = {};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = 16; td.Height = 32; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Width = 16; td.Height = 48; td.DepthOrArraySize = 1; td.MipLevels = 1;
     td.Format = DXGI_FORMAT_R32G32_UINT;
     td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -5005,7 +5009,7 @@ uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
     CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
     dev->CreateUnorderedAccessView(tex, nullptr, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
     const UINT N = 65536, R = 4096;
-    ID3D12Resource *r = create_buffer(R * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *r = create_buffer(2 * R * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g.list->SetDescriptorHeaps(1, &heap);
     g.list->SetComputeRootSignature(rs);
     g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
@@ -5014,21 +5018,23 @@ uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
     g.list->Dispatch(N / 64, 1, 1);
     g.list->SetPipelineState(pret);
     g.list->Dispatch(R / 64, 1, 1);
+    g.list->SetPipelineState(pcas);
+    g.list->Dispatch(R / 64, 1, 1);
     transition(tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ID3D12Resource *rb = create_buffer(32 * 256, D3D12_HEAP_TYPE_READBACK);
+    ID3D12Resource *rb = create_buffer(48 * 256, D3D12_HEAP_TYPE_READBACK);
     D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
     dst.pResource = rb;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32_UINT, 16, 32, 1, 256 };
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32_UINT, 16, 48, 1, 256 };
     srcl.pResource = tex;
     srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
     ID3D12Resource *rrb = nullptr;
-    const uint64_t *ret = (const uint64_t *)read_buffer(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, R * 8, &rrb);
+    const uint64_t *ret = (const uint64_t *)read_buffer(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 2 * R * 8, &rrb);
     if (!ret)
         return false;
     const uint64_t *m = nullptr;
-    D3D12_RANGE rr = { 0, 32 * 256 };
+    D3D12_RANGE rr = { 0, 48 * 256 };
     rb->Map(0, &rr, (void **)&m);
     auto v = [](uint32_t i) { return ((uint64_t)(uint32_t)(i * 2654435761u) << 24) ^ (uint64_t)i; };
     uint64_t want[256] = {};
@@ -5049,10 +5055,25 @@ uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
         if ((ret[i] & 0xffffffffull) || k >= 16 || seen[texel * 16 + k]++)
             bad_ret++;
     }
+    // Compare-exchange from 0: one thread per texel finds 0 and stores its value; every other finds that value.
+    int bad_cas = 0;
+    std::vector<int> winners(256, 0);
+    for (uint32_t i = 0; i < R; i++)
+    {
+        uint32_t x = i & 15, y = (i >> 4) & 15;
+        uint64_t fin = m[(32 + y) * 32 + x], mine = ((uint64_t)(i + 1) << 32) | 1;
+        if (ret[R + i] == 0)
+            bad_cas += fin != mine || winners[y * 16 + x]++;
+        else
+            bad_cas += ret[R + i] != fin;
+    }
+    for (int w : winners)
+        bad_cas += w != 1;
     rb->Unmap(0, nullptr);
-    printf("  max: %d of 256 texels wrong; add with result: %d texels, %d returned values wrong\n", bad_max, bad_add, bad_ret);
-    EXPECT(!bad_max && !bad_add && !bad_ret, "64-bit image atomics wrong");
-    rb->Release(); rrb->Release(); r->Release(); heap->Release(); tex->Release(); pmax->Release(); pret->Release(); rs->Release();
+    printf("  max: %d of 256 texels wrong; add with result: %d texels, %d returned values wrong; compare-exchange: %d wrong\n",
+           bad_max, bad_add, bad_ret, bad_cas);
+    EXPECT(!bad_max && !bad_add && !bad_ret && !bad_cas, "64-bit image atomics wrong");
+    rb->Release(); rrb->Release(); r->Release(); heap->Release(); tex->Release(); pmax->Release(); pret->Release(); pcas->Release(); rs->Release();
     return true;
 }
 
