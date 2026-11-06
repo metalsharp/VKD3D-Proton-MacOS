@@ -5161,6 +5161,125 @@ void main()
     return true;
 }
 
+// Fences: a GPU wait released by a CPU Signal (the work must not run before it), events at values reached, skipped
+// over and never reached, an event for a value already reached, SetEventOnMultipleFenceCompletion (any and all), and
+// 100 rounds of a compute queue and the direct queue taking turns on one buffer through two fences.
+static bool test_fences()
+{
+    static const char *src = R"(
+RWByteAddressBuffer b : register(u0);
+[numthreads(1, 1, 1)] void main() { b.Store(0, b.Load(0) + 1); }
+)";
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!ps)
+        return false;
+    ID3D12CommandQueue *cq = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    CHECK_HR(g.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&cq)));
+    ID3D12CommandAllocator *ca = nullptr;
+    CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&ca)));
+    ID3D12GraphicsCommandList *cl = nullptr;
+    CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, ca, nullptr, IID_PPV_ARGS(&cl)));
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_COMMON);
+    // One list that increments the buffer, run on both queues (the direct one gets its own copy).
+    cl->SetComputeRootSignature(rs);
+    cl->SetPipelineState(ps);
+    cl->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    cl->Dispatch(1, 1, 1);
+    CHECK_HR(cl->Close());
+    ID3D12GraphicsCommandList *dl = nullptr;
+    ID3D12CommandAllocator *da = nullptr;
+    CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&da)));
+    CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, da, nullptr, IID_PPV_ARGS(&dl)));
+    dl->SetComputeRootSignature(rs);
+    dl->SetPipelineState(ps);
+    dl->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    dl->Dispatch(1, 1, 1);
+    CHECK_HR(dl->Close());
+
+    ID3D12Fence *gate = nullptr, *done = nullptr, *a = nullptr, *b = nullptr;
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)));
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&a)));
+    CHECK_HR(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&b)));
+    HANDLE ev[3] = { CreateEventA(nullptr, FALSE, FALSE, nullptr), CreateEventA(nullptr, FALSE, FALSE, nullptr),
+                     CreateEventA(nullptr, FALSE, FALSE, nullptr) };
+
+    // 1. The compute queue waits for 5 on gate, which the CPU signals after 100 ms.
+    ID3D12CommandList *lists[1] = { cl };
+    CHECK_HR(cq->Wait(gate, 5));
+    cq->ExecuteCommandLists(1, lists);
+    CHECK_HR(cq->Signal(done, 1));
+    Sleep(100);
+    EXPECT(done->GetCompletedValue() == 0, "work waiting on a fence ran before it was signaled (done = %llu)",
+           (unsigned long long)done->GetCompletedValue());
+    CHECK_HR(gate->Signal(5));
+    CHECK_HR(done->SetEventOnCompletion(1, ev[0]));
+    EXPECT(WaitForSingleObject(ev[0], 5000) == WAIT_OBJECT_0, "the CPU signal didn't release the GPU wait");
+
+    // 2. Events at 2 (passed over), 3 (reached) and 10 (never), with the queue signaling 3.
+    CHECK_HR(done->SetEventOnCompletion(2, ev[0]));
+    CHECK_HR(done->SetEventOnCompletion(3, ev[1]));
+    CHECK_HR(done->SetEventOnCompletion(10, ev[2]));
+    CHECK_HR(cq->Signal(done, 3));
+    EXPECT(WaitForSingleObject(ev[0], 5000) == WAIT_OBJECT_0, "the event at a passed-over value didn't fire");
+    EXPECT(WaitForSingleObject(ev[1], 5000) == WAIT_OBJECT_0, "the event at the signaled value didn't fire");
+    EXPECT(WaitForSingleObject(ev[2], 100) == WAIT_TIMEOUT, "the event at a value never reached fired");
+    EXPECT(done->GetCompletedValue() == 3, "completed value %llu, want 3", (unsigned long long)done->GetCompletedValue());
+    // 3. A value already reached fires at once.
+    CHECK_HR(done->SetEventOnCompletion(2, ev[0]));
+    EXPECT(WaitForSingleObject(ev[0], 1000) == WAIT_OBJECT_0, "the event at a value already reached didn't fire");
+
+    // 4. Multiple fences: any (a reaches 1) and all (then b reaches 1).
+    ID3D12Device1 *dev1 = nullptr;
+    if (SUCCEEDED(g.device->QueryInterface(IID_PPV_ARGS(&dev1))))
+    {
+        ID3D12Fence *ab[2] = { a, b };
+        UINT64 ones[2] = { 1, 1 };
+        CHECK_HR(dev1->SetEventOnMultipleFenceCompletion(ab, ones, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, ev[0]));
+        CHECK_HR(dev1->SetEventOnMultipleFenceCompletion(ab, ones, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ev[1]));
+        CHECK_HR(cq->Signal(a, 1));
+        EXPECT(WaitForSingleObject(ev[0], 5000) == WAIT_OBJECT_0, "the any-wait didn't fire when one fence was reached");
+        EXPECT(WaitForSingleObject(ev[1], 100) == WAIT_TIMEOUT, "the all-wait fired with one fence reached");
+        CHECK_HR(g.queue->Signal(b, 1));
+        EXPECT(WaitForSingleObject(ev[1], 5000) == WAIT_OBJECT_0, "the all-wait didn't fire when both were reached");
+        dev1->Release();
+    }
+
+    // 5. Ping-pong: round r, compute waits a = r and signals b = r; direct waits b = r and signals a = r + 1.
+    ID3D12CommandList *dlists[1] = { dl };
+    const UINT rounds = 100;
+    for (UINT r = 1; r <= rounds; r++)
+    {
+        CHECK_HR(cq->Wait(a, r));
+        cq->ExecuteCommandLists(1, lists);
+        CHECK_HR(cq->Signal(b, r + 1));
+        CHECK_HR(g.queue->Wait(b, r + 1));
+        g.queue->ExecuteCommandLists(1, dlists);
+        CHECK_HR(g.queue->Signal(a, r + 1));
+    }
+    CHECK_HR(a->SetEventOnCompletion(rounds + 1, ev[0]));
+    EXPECT(WaitForSingleObject(ev[0], 10000) == WAIT_OBJECT_0, "the ping-pong didn't finish");
+    ID3D12Resource *rbuf;
+    const uint32_t *v = read_buffer(buf, D3D12_RESOURCE_STATE_COMMON, 256, &rbuf);
+    if (!v)
+        return false;
+    // Case 1's run, then two per round.
+    EXPECT(v[0] == 1 + 2 * rounds, "the buffer holds %u, want %u", v[0], 1 + 2 * rounds);
+    rbuf->Release();
+    for (HANDLE h : ev)
+        CloseHandle(h);
+    gate->Release(); done->Release(); a->Release(); b->Release();
+    dl->Release(); da->Release(); cl->Release(); ca->Release(); cq->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 // Queues: a copy queue fills a buffer, a compute queue (waiting on the copy's fence) doubles it, and the direct
 // queue (waiting on the compute fence) reads it back.
 static bool test_queues()
@@ -6341,6 +6460,7 @@ static const Test tests[] = {
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
     { "queues", test_queues },
+    { "fences", test_fences },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "viewinstancing", test_viewinstancing },
