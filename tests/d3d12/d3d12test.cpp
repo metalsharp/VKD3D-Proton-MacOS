@@ -18,6 +18,7 @@
 #include <set>
 #include <map>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <vector>
 #include <algorithm>
@@ -5052,6 +5053,166 @@ uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
     printf("  max: %d of 256 texels wrong; add with result: %d texels, %d returned values wrong\n", bad_max, bad_add, bad_ret);
     EXPECT(!bad_max && !bad_add && !bad_ret, "64-bit image atomics wrong");
     rb->Release(); rrb->Release(); r->Release(); heap->Release(); tex->Release(); pmax->Release(); pret->Release(); rs->Release();
+    return true;
+}
+
+// A geometry shader on an indexed triangle strip with strip cuts (0xffff): 4 indices, a cut, 3 indices, a cut, 5
+// indices make 2 + 1 + 3 triangles. Each GS invocation records its SV_PrimitiveID and its vertex IDs in order: a
+// triangle spanning a cut must not run, primitive IDs count only whole triangles, and odd triangles (counted from
+// their strip's start) swap their last two corners (n, n + 2, n + 1). Then a 300-index strip cut every 9th index
+// (several threadgroups of batched input primitives), the same strip with the cut disabled (0xffff is vertex 65535),
+// and a draw of 100 points (the last batch partial).
+static bool test_gs_strip_cut()
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u1);
+struct V { uint id : VID; };
+V vs(uint id : SV_VertexID) { V v; v.id = id; return v; }
+struct D { float4 pos : SV_Position; };
+[maxvertexcount(1)] void gs(triangle V i[3], uint prim : SV_PrimitiveID, inout PointStream<D> s)
+{
+    uint n; o.InterlockedAdd(0, 1, n);
+    if (n < 255) o.Store4(16 + n * 16, uint4(prim, i[0].id, i[1].id, i[2].id));
+    D d; d.pos = float4(2, 2, 0, 1); s.Append(d);
+}
+[maxvertexcount(1)] void gs_pt(point V i[1], uint prim : SV_PrimitiveID, inout PointStream<D> s)
+{
+    o.InterlockedAdd(4, 1); o.InterlockedAdd(8, prim + 1000 * i[0].id);
+    D d; d.pos = float4(2, 2, 0, 1); s.Append(d);
+}
+float4 ps() : SV_Target { return 0; }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), gs = compile_dxc(src, "gs", "gs_6_0"),
+                      gs_pt = compile_dxc(src, "gs_pt", "gs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || gs.empty() || gs_pt.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.GS = { gs.data(), gs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *strip = nullptr, *uncut = nullptr, *points = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&strip)));
+    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&uncut)));
+    pd.GS = { gs_pt.data(), gs_pt.size() };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&points)));
+    std::vector<uint16_t> idx = { 0, 1, 2, 3, 0xffff, 10, 11, 12, 0xffff, 20, 21, 22, 23, 24 };
+    const uint32_t long_first = (uint32_t)idx.size(), long_count = 300;
+    for (uint32_t i = 0; i < long_count; i++)
+        idx.push_back(i % 9 == 8 ? 0xffff : uint16_t(100 + i));
+    const uint32_t uncut_first = (uint32_t)idx.size();
+    for (uint16_t v : { 0, 1, 0xffff, 3 })
+        idx.push_back(v);
+    ID3D12Resource *ib = create_buffer(idx.size() * 2, D3D12_HEAP_TYPE_UPLOAD);
+    void *m = nullptr;
+    ib->Map(0, nullptr, &m);
+    memcpy(m, idx.data(), idx.size() * 2);
+    ib->Unmap(0, nullptr);
+    const uint32_t region = 4096;
+    ID3D12Resource *out = create_buffer(region * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    g.list->SetGraphicsRootSignature(rs);
+    D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), (UINT)idx.size() * 2, DXGI_FORMAT_R16_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g.list->SetPipelineState(strip);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->DrawIndexedInstanced(14, 1, 0, 0, 0);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress() + region);
+    g.list->DrawIndexedInstanced(long_count, 1, long_first, 0, 0);
+    g.list->SetPipelineState(uncut);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress() + 2 * region);
+    g.list->DrawIndexedInstanced(4, 1, uncut_first, 0, 0);
+    g.list->SetPipelineState(points);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress() + 3 * region);
+    g.list->DrawInstanced(100, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, region * 4, &rb);
+    if (!r)
+        return false;
+    // The triangles a strip with cuts makes, by primitive ID.
+    auto expect = [](const uint16_t *ix, uint32_t count, bool cuts) {
+        std::map<uint32_t, std::array<uint32_t, 3>> want;
+        std::vector<uint32_t> seg;
+        uint32_t prim = 0;
+        for (uint32_t i = 0; i <= count; i++)
+        {
+            if (i < count && !(cuts && ix[i] == 0xffff))
+            {
+                seg.push_back(ix[i]);
+                continue;
+            }
+            for (uint32_t t = 0; t + 2 < seg.size(); t++)
+            {
+                uint32_t odd = t & 1;
+                want[prim++] = { seg[t], seg[t + 1 + odd], seg[t + 2 - odd] };
+            }
+            seg.clear();
+        }
+        return want;
+    };
+    auto got = [&](uint32_t base) {
+        std::map<uint32_t, std::array<uint32_t, 3>> m;
+        const uint32_t *b = r + base / 4;
+        for (uint32_t k = 0; k < std::min(b[0], 255u); k++)
+        {
+            const uint32_t *e = b + 4 + k * 4;
+            m[e[0]] = { e[1], e[2], e[3] };
+        }
+        return std::make_pair(b[0], m);
+    };
+    struct Case { const char *name; uint32_t base, first, count; bool cuts; } cases[] = {
+        { "short strip with cuts", 0, 0, 14, true },
+        { "300-index strip cut every 9th", region, long_first, long_count, true },
+        { "strip with the cut disabled", 2 * region, uncut_first, 4, false },
+    };
+    for (const Case &c : cases)
+    {
+        auto want = expect(idx.data() + c.first, c.count, c.cuts);
+        auto [n, m] = got(c.base);
+        uint32_t wrong = 0, shown = 0;
+        for (auto &[p, v] : want)
+        {
+            auto it = m.find(p);
+            if (it == m.end() || it->second != v)
+            {
+                if (shown++ < 3)
+                    printf("  %s: primitive %u got (%d %d %d), want (%u %u %u)\n", c.name, p,
+                           it == m.end() ? -1 : (int)it->second[0], it == m.end() ? -1 : (int)it->second[1],
+                           it == m.end() ? -1 : (int)it->second[2], v[0], v[1], v[2]);
+                wrong++;
+            }
+        }
+        printf("  %s: %u invocations, want %zu, %u wrong\n", c.name, n, want.size(), wrong);
+        EXPECT(n == want.size() && m.size() == want.size() && !wrong, "%s: wrong triangles, primitive IDs or winding", c.name);
+    }
+    // 100 points: SV_PrimitiveID p reads vertex p.
+    const uint32_t *pt = r + 3 * region / 4;
+    uint32_t want_sum = 0;
+    for (uint32_t p = 0; p < 100; p++)
+        want_sum += p + 1000 * p;
+    EXPECT(pt[1] == 100 && pt[2] == want_sum, "100 points ran %u invocations with sum %u, want 100 and %u", pt[1], pt[2], want_sum);
+    rb->Release(); out->Release(); ib->Release(); strip->Release(); uncut->Release(); points->Release(); rs->Release();
     return true;
 }
 
@@ -10672,6 +10833,7 @@ static const Test tests[] = {
     { "tess_domains_dxbc", test_tess_domains_dxbc },
     { "gs_features", test_gs_features },
     { "gs_features_dxbc", test_gs_features_dxbc },
+    { "gs_strip_cut", test_gs_strip_cut },
     { "executeindirect", test_executeindirect },
     { "executeindirect_dispatch_count", test_executeindirect_dispatch_count },
     { "dynamicresources", test_dynamicresources },
