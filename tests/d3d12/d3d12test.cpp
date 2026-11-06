@@ -2678,6 +2678,148 @@ float4 ps(V v) : SV_Target { return 1.0; }
     return true;
 }
 
+// SV_Barycentrics (SM 6.1), perspective-correct and noperspective: one triangle with corners at (-1, 1), (1, 1) and
+// (-1, -1) in NDC and w = 1, 2 and 4, drawn into a 16x16 RGBA32F target twice: a perspective pipeline writes b.xy to
+// red and green, a noperspective one bn.xy to blue and alpha. They're checked against screen-space barycentrics l (bn)
+// and l_i / w_i normalized (b), with x weighting the first vertex. Then a third pipeline reads both in one shader, which
+// Metal takes from MSL 4.0 (before it, one barycentric_coord per function, and the pipeline fails): checked when it
+// can be made.
+static bool test_barycentrics()
+{
+    static const char *src = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 p[3] = { float2(-1, 1), float2(1, 1), float2(-1, -1) };
+    float w[3] = { 1, 2, 4 };
+    return float4(p[id] * w[id], 0, w[id]);
+}
+float4 ps_p(float4 pos : SV_Position, float3 b : SV_Barycentrics) : SV_Target { return float4(b.xy, 0, 0); }
+float4 ps_n(float4 pos : SV_Position, noperspective float3 bn : SV_Barycentrics) : SV_Target { return float4(0, 0, bn.xy); }
+float4 ps_both(float3 b : SV_Barycentrics, noperspective float3 bn : SV_Barycentrics1) : SV_Target { return float4(b.xy, bn.xy); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_1"), ps_p = compile_dxc(src, "ps_p", "ps_6_1"),
+                      ps_n = compile_dxc(src, "ps_n", "ps_6_1"), ps_both = compile_dxc(src, "ps_both", "ps_6_1");
+    if (vs.empty() || ps_p.empty() || ps_n.empty() || ps_both.empty())
+        return false;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+    if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) || !o3.BarycentricsSupported)
+    {
+        printf("  skipped: no barycentrics\n");
+        return true;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    const UINT W = 16, H = 16;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    const UINT pitch = W * 16;
+    ID3D12Resource *rb = create_buffer(pitch * H, D3D12_HEAP_TYPE_READBACK);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps_p.data(), ps_p.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr, *pso_n = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    pd.PS = { ps_n.data(), ps_n.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_BLUE | D3D12_COLOR_WRITE_ENABLE_ALPHA;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_n)));
+    ID3D12PipelineState *pso_both = nullptr;
+    pd.PS = { ps_both.data(), ps_both.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_both))))
+        printf("  one shader with both barycentrics: no pipeline (Metal before MSL 4.0)\n");
+    int bad = 0, checked = 0;
+    for (int pass = 0; pass < (pso_both ? 2 : 1); pass++)
+    {
+        float clear[4] = { -1, -1, -1, -1 };
+        g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+        D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (pass)
+        {
+            g.list->SetPipelineState(pso_both);
+            g.list->DrawInstanced(3, 1, 0, 0);
+        }
+        else
+        {
+            g.list->SetPipelineState(pso);
+            g.list->DrawInstanced(3, 1, 0, 0);
+            g.list->SetPipelineState(pso_n);
+            g.list->DrawInstanced(3, 1, 0, 0);
+        }
+        transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32B32A32_FLOAT, W, H, 1, pitch };
+        srcl.pResource = rt;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        if (!execute_and_wait())
+            return false;
+        const uint8_t *data = nullptr;
+        D3D12_RANGE r = { 0, pitch * H };
+        rb->Map(0, &r, (void **)&data);
+        static const float w[3] = { 1, 2, 4 };
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++)
+            {
+                float X = (x + 0.5f) / (W / 2) - 1, Y = 1 - (y + 0.5f) / (H / 2);
+                float l[3] = { 0, (X + 1) / 2, (1 - Y) / 2 };
+                l[0] = 1 - l[1] - l[2];
+                if (l[0] < 0.05f)   // outside, or too close to the edge to be sure it's covered
+                    continue;
+                float s = l[0] / w[0] + l[1] / w[1] + l[2] / w[2];
+                float want[4] = { l[0] / w[0] / s, l[1] / w[1] / s, l[0], l[1] };
+                const float *got = (const float *)(data + y * pitch + x * 16);
+                checked++;
+                for (int c = 0; c < 4; c++)
+                    if (fabsf(got[c] - want[c]) > 2e-3f)
+                    {
+                        if (bad++ < 6)
+                            printf("  %s, pixel (%u, %u): (%f %f %f %f), want (%f %f %f %f)\n", pass ? "one shader" : "two shaders",
+                                   x, y, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                        break;
+                    }
+            }
+        rb->Unmap(0, nullptr);
+        // Only when another pass follows: a barrier left in the list would run with the next test, after rt is gone.
+        if (!pass && pso_both)
+            transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    EXPECT(checked > 50 && !bad, "%d of %d covered pixels' barycentrics wrong", bad, checked);
+    if (pso_both)
+        pso_both->Release();
+    pso->Release(); pso_n->Release(); rb->Release(); rtv_heap->Release(); rt->Release(); rs->Release();
+    return true;
+}
+
 static bool test_cull_clip_distance_dxil() { return cull_clip_distance(false); }
 static bool test_cull_clip_distance_dxbc() { return cull_clip_distance(true); }
 
@@ -6885,6 +7027,7 @@ static const Test tests[] = {
     { "culling_dxbc", test_culling_dxbc },
     { "cull_clip_distance_dxil", test_cull_clip_distance_dxil },
     { "cull_clip_distance_dxbc", test_cull_clip_distance_dxbc },
+    { "barycentrics", test_barycentrics },
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
