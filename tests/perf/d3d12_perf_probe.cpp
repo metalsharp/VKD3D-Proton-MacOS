@@ -15,6 +15,7 @@
 // ("extra name=value"), then D3D12_PERF_PROBE_OK SCENE.
 // Shaders are DXBC (d3dcompiler_47), like PEAK's; the salt makes compiles cold.
 #include <windows.h>
+#include <psapi.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -1045,6 +1046,24 @@ static std::vector<Scene> base_scenes()
                 p.device->CopyDescriptorsSimple(1, srv_cpu(4000 + i), staging_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             extras.add("us_per_view", (t1 - t) * 1000.0 / 5000);
             extras.add("us_per_copy", (qpc_ms() - t1) * 1000.0 / 5000);
+        } },
+        { "typed_view_churn", "5000 typed buffer SRVs per frame into the shader-visible heap, each at a first element not used before (ring-buffer views)", base, [](UINT f) {
+            UINT64 elements = p.upload_ring->GetDesc().Width / 4;
+            double t = qpc_ms();
+            for (UINT i = 0; i < 5000; i++)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = DXGI_FORMAT_R32_FLOAT;
+                sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Buffer.FirstElement = ((UINT64)f * 5000 + i) % (elements - 64);
+                sd.Buffer.NumElements = 64;
+                p.device->CreateShaderResourceView(p.upload_ring, &sd, srv_cpu(4000 + (i % 1000)));
+            }
+            extras.add("us_per_view", (qpc_ms() - t) * 1000.0 / 5000);
+            PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                extras.add("working_set_mb", pmc.WorkingSetSize / 1048576.0);
         } },
         { "fence_sync", "8 mid-frame submissions, each waited on by the CPU (readback-style stalls)", [] {
             flat = create_pso({});
