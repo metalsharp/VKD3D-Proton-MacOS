@@ -6942,6 +6942,162 @@ static bool test_compute_limits_dxbc() { return compute_limits(true); }
 // R8G8B8A8_UINT texture (0x123 keeps its low 8 bits, 0x23) and one array slice / mip of a texture array;
 // ClearUnorderedAccessViewFloat on R16G16B16A16_FLOAT with a rect and on R8G8B8A8_UNORM (0.5 rounds to 128);
 // ClearRenderTargetView with two rects. Everything outside a view or rect keeps its sentinel.
+// Resolve modes: 4x 4x4 targets where sample s of pixel p holds 10 (s + 1) + p (R32_FLOAT and R32_UINT) and
+// 85 s (R8G8B8A8_UNORM). ResolveSubresource averages (25 + p; UNORM 127 or 128); ResolveSubresourceRegion with
+// D3D12_RESOLVE_MODE_MIN / MAX on R32_UINT takes 10 + p / 40 + p, and with a (1, 1)-(3, 3) source rect writes a 2x2
+// region at destination (2, 1), leaving the rest of the destination as it was (cleared to 0xdead first).
+static bool test_resolve_modes()
+{
+    static const char *src = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1); }
+struct O { float a : SV_Target0; uint b : SV_Target1; float4 c : SV_Target2; };
+O ps(float4 p : SV_Position, uint s : SV_SampleIndex)
+{
+    uint px = uint(p.y) * 4 + uint(p.x);
+    O o;
+    o.a = 10 * (s + 1) + px;
+    o.b = 10 * (s + 1) + px;
+    o.c = s * 85 / 255.0;
+    return o;
+}
+)";
+    ID3D12GraphicsCommandList1 *list1 = nullptr;
+    if (FAILED(g.list->QueryInterface(IID_PPV_ARGS(&list1))))
+    {
+        printf("  no ID3D12GraphicsCommandList1: skipped\n");
+        return true;
+    }
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 0, nullptr, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    const DXGI_FORMAT fmts[3] = { DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UNORM };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.SampleMask = ~0u;
+    for (UINT i = 0; i < 3; i++)
+    {
+        pd.BlendState.RenderTarget[i].RenderTargetWriteMask = 0xf;
+        pd.RTVFormats[i] = fmts[i];
+    }
+    pd.NumRenderTargets = 3;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 4;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    auto tex = [&](DXGI_FORMAT f, UINT samples, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st) {
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = f;
+        td.SampleDesc.Count = samples;
+        td.Flags = flags;
+        ID3D12Resource *r = nullptr;
+        dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, st, nullptr, IID_PPV_ARGS(&r));
+        return r;
+    };
+    ID3D12Resource *ms[3], *dst[5];
+    for (UINT i = 0; i < 3; i++)
+        ms[i] = tex(fmts[i], 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // dst: 0 float average, 1 unorm average, 2 uint min, 3 uint max, 4 uint max region (cleared to 0xdead).
+    const DXGI_FORMAT dfmt[5] = { fmts[0], fmts[2], fmts[1], fmts[1], fmts[1] };
+    for (UINT i = 0; i < 5; i++)
+        dst[i] = tex(dfmt[i], 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    const UINT rinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4];
+    for (UINT i = 0; i < 4; i++)
+    {
+        rtv[i] = rheap->GetCPUDescriptorHandleForHeapStart();
+        rtv[i].ptr += i * rinc;
+        dev->CreateRenderTargetView(i < 3 ? ms[i] : dst[4], nullptr, rtv[i]);
+    }
+    const float dead[4] = { (float)0xdead, 0, 0, 0 };
+    D3D12_RENDER_TARGET_VIEW_DESC uv = {};
+    uv.Format = DXGI_FORMAT_R32_UINT;
+    uv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(dst[4], &uv, rtv[3]);
+    g.list->ClearRenderTargetView(rtv[3], dead, 0, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(3, rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    for (UINT i = 0; i < 3; i++)
+        transition(ms[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    for (UINT i = 0; i < 5; i++)
+        transition(dst[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    g.list->ResolveSubresource(dst[0], 0, ms[0], 0, fmts[0]);
+    g.list->ResolveSubresource(dst[1], 0, ms[2], 0, fmts[2]);
+    list1->ResolveSubresourceRegion(dst[2], 0, 0, 0, ms[1], 0, nullptr, fmts[1], D3D12_RESOLVE_MODE_MIN);
+    list1->ResolveSubresourceRegion(dst[3], 0, 0, 0, ms[1], 0, nullptr, fmts[1], D3D12_RESOLVE_MODE_MAX);
+    D3D12_RECT region = { 1, 1, 3, 3 };
+    list1->ResolveSubresourceRegion(dst[4], 0, 2, 1, ms[1], 0, &region, fmts[1], D3D12_RESOLVE_MODE_MAX);
+    ID3D12Resource *rb = create_buffer(5 * 1024, D3D12_HEAP_TYPE_READBACK);
+    for (UINT i = 0; i < 5; i++)
+    {
+        transition(dst[i], D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION s = {}, t = {};
+        s.pResource = dst[i]; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        t.pResource = rb; t.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        t.PlacedFootprint.Offset = i * 1024;
+        t.PlacedFootprint.Footprint = { dfmt[i], 4, 4, 1, 256 };
+        g.list->CopyTextureRegion(&t, 0, 0, 0, &s, nullptr);
+    }
+    if (!execute_and_wait())
+        return false;
+    uint8_t *p = nullptr;
+    D3D12_RANGE range = { 0, 5 * 1024 };
+    rb->Map(0, &range, (void **)&p);
+    uint32_t bad[5] = {};
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+        {
+            UINT px = y * 4 + x;
+            float f = ((const float *)(p + y * 256))[x];
+            if (f != 25.0f + px && bad[0]++ < 2)
+                printf("  float average (%u, %u): %g, want %g\n", x, y, f, 25.0f + px);
+            uint8_t u = p[1024 + y * 256 + x * 4];
+            if ((u != 127 && u != 128) && bad[1]++ < 2)
+                printf("  unorm average (%u, %u): %u, want 127 or 128\n", x, y, u);
+            uint32_t mn = ((const uint32_t *)(p + 2048 + y * 256))[x], mx = ((const uint32_t *)(p + 3072 + y * 256))[x];
+            if (mn != 10 + px && bad[2]++ < 2)
+                printf("  uint min (%u, %u): %u, want %u\n", x, y, mn, 10 + px);
+            if (mx != 40 + px && bad[3]++ < 2)
+                printf("  uint max (%u, %u): %u, want %u\n", x, y, mx, 40 + px);
+            uint32_t rg = ((const uint32_t *)(p + 4096 + y * 256))[x];
+            bool in = x >= 2 && y >= 1 && y < 3;
+            uint32_t want = in ? 40 + (y - 1 + 1) * 4 + (x - 2 + 1) : 0xdead;
+            if (rg != want && bad[4]++ < 2)
+                printf("  uint max region (%u, %u): %#x, want %#x\n", x, y, rg, want);
+        }
+    static const char *names[5] = { "R32_FLOAT average", "R8G8B8A8_UNORM average", "R32_UINT min", "R32_UINT max", "R32_UINT max of a rect" };
+    for (UINT i = 0; i < 5; i++)
+        EXPECT(!bad[i], "%s: %u wrong pixels", names[i], bad[i]);
+    rb->Unmap(0, nullptr);
+    rb->Release(); rheap->Release();
+    for (UINT i = 0; i < 3; i++)
+        ms[i]->Release();
+    for (UINT i = 0; i < 5; i++)
+        dst[i]->Release();
+    pso->Release(); rs->Release(); list1->Release();
+    return true;
+}
+
 static bool test_clear_views()
 {
     ID3D12Device *dev = g.device;
@@ -14397,6 +14553,7 @@ static const Test tests[] = {
     { "compute_limits", test_compute_limits },
     { "compute_limits_dxbc", test_compute_limits_dxbc },
     { "clear_views", test_clear_views },
+    { "resolve_modes", test_resolve_modes },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
