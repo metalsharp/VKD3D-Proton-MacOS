@@ -12212,7 +12212,7 @@ index 00000000..ab022613
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
-index 9b6a7351..83e32eb0 100644
+index 9b6a7351..04526fb4 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.h
 @@ -22,6 +22,7 @@
@@ -12257,13 +12257,37 @@ index 9b6a7351..83e32eb0 100644
      std::mutex _lock;
  };
  
-@@ -139,4 +151,3 @@ protected:
+@@ -117,6 +129,12 @@ public:
+     /** Returns a Metal texture that overlays this buffer view. */
+     id<MTLTexture> getMTLTexture();
+ 
++    /**
++     * Returns the MTLResourceID of a texture view of this buffer view: a slot of the device's texture view pool
++     * where there is one (no texture object), else its texture's. For argument buffers that only hold the ID.
++     */
++    uint64_t getGPUResourceID();
++
+ 
+ #pragma mark Construction
+ 
+@@ -129,6 +147,7 @@ public:
+ protected:
+ 	void propagateDebugName() override;
+ 	void detachMemory();
++	MTLTextureDescriptor* newMTLTextureDescriptor();
+ 
+ 	MVKBuffer* _buffer;
+ 	NSUInteger _offset;
+@@ -138,5 +157,6 @@ protected:
+ 	NSUInteger _mtlBytesPerRow;
  	VkExtent2D _textureSize;
  	std::mutex _lock;
++	int32_t _poolIndex = -1;
++	uint64_t _poolResourceID = 0;
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
-index a00c09bd..cfb245e4 100644
+index a00c09bd..30f94dc8 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 @@ -17,6 +17,7 @@
@@ -12487,7 +12511,70 @@ index a00c09bd..cfb245e4 100644
  
  #pragma mark -
  #pragma mark MVKBufferView
-@@ -280,7 +420,9 @@
+@@ -256,6 +396,44 @@
+ 
+ #pragma mark Metal
+ 
++// The descriptor of a texture overlaying this buffer view (autoreleased).
++MTLTextureDescriptor* MVKBufferView::newMTLTextureDescriptor() {
++	MTLTextureUsage usage = MTLTextureUsageShaderRead;
++	if ( mvkIsAnyFlagEnabled(_usage, VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT) ) {
++		usage |= MTLTextureUsageShaderWrite;
++		if (getMetalFeatures().nativeTextureAtomics && (_mtlPixelFormat == MTLPixelFormatR32Sint || _mtlPixelFormat == MTLPixelFormatR32Uint))
++			usage |= MTLTextureUsageShaderAtomic;
++	}
++	id<MTLBuffer> mtlBuff = _buffer->getMTLBuffer();
++	MTLResourceOptions opts = (mtlBuff.cpuCacheMode << MTLResourceCPUCacheModeShift) | (mtlBuff.storageMode << MTLResourceStorageModeShift);
++	return [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat: _mtlPixelFormat
++																  width: _textureSize.width
++														resourceOptions: opts
++																  usage: usage];
++}
++
++uint64_t MVKBufferView::getGPUResourceID() {
++	if ( !_mtlPixelFormat ) { return 0; }
++	{
++		lock_guard<mutex> lock(_lock);
++		if (_poolIndex >= 0) { return _poolResourceID; }
++		if ( !_mtlTexture ) {
++			@autoreleasepool {
++				uint64_t rid = 0;
++				int32_t index = _device->acquireTexelBufferView(_buffer->getMTLBuffer(), newMTLTextureDescriptor(),
++																_buffer->getMTLBufferOffset() + _offset, _mtlBytesPerRow, &rid);
++				if (index >= 0) {
++					_poolIndex = index;
++					_poolResourceID = rid;
++					return rid;
++				}
++			}
++		}
++	}
++	id<MTLTexture> tex = getMTLTexture();
++	return tex ? tex.gpuResourceID._impl : 0;
++}
++
+ id<MTLTexture> MVKBufferView::getMTLTexture() {
+ 	if (!_mtlTexture && _mtlPixelFormat) {
+ 
+@@ -263,24 +441,16 @@
+ 		lock_guard<mutex> lock(_lock);
+ 		if (_mtlTexture) { return _mtlTexture; }
+ 
+-		MTLTextureUsage usage = MTLTextureUsageShaderRead;
+-		if ( mvkIsAnyFlagEnabled(_usage, VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT) ) {
+-			usage |= MTLTextureUsageShaderWrite;
+-			if (getMetalFeatures().nativeTextureAtomics && (_mtlPixelFormat == MTLPixelFormatR32Sint || _mtlPixelFormat == MTLPixelFormatR32Uint))
+-				usage |= MTLTextureUsageShaderAtomic;
+-		}
+ 		id<MTLBuffer> mtlBuff = _buffer->getMTLBuffer();
+ 		VkDeviceSize mtlBuffOffset = _buffer->getMTLBufferOffset() + _offset;
+ 		@autoreleasepool {
+-			MTLResourceOptions opts = (mtlBuff.cpuCacheMode << MTLResourceCPUCacheModeShift) | (mtlBuff.storageMode << MTLResourceStorageModeShift);
+-			MTLTextureDescriptor* mtlTexDesc = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat: _mtlPixelFormat
+-				                                                                                      width: _textureSize.width
+-				                                                                            resourceOptions: opts
+-				                                                                                      usage: usage];
++			MTLTextureDescriptor* mtlTexDesc = newMTLTextureDescriptor();
  			id<MTLTexture> tex = [mtlBuff newTextureWithDescriptor: mtlTexDesc
  			                                                offset: mtlBuffOffset
  			                                           bytesPerRow: _mtlBytesPerRow];
@@ -12498,8 +12585,14 @@ index a00c09bd..cfb245e4 100644
  			_device->getLiveResources().add(tex);
  			_mtlTexture = tex;
  			propagateDebugName();
-@@ -340,7 +482,6 @@
+@@ -338,9 +508,12 @@
+ 
+ // Potentially called twice, from destroy() and destructor, so ensure everything is nulled out.
  void MVKBufferView::detachMemory() {
++	if (_poolIndex >= 0) {
++		_device->releaseTexelBufferView(_poolIndex);
++		_poolIndex = -1;
++	}
  	if (id<MTLTexture> tex = _mtlTexture) {
  		_device->getLiveResources().remove(tex);
 -		_device->removeResidency(tex);
@@ -14079,7 +14172,7 @@ index 3cdc6234..4c15129c 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..b7444dd4 100644
+index 534a414f..5166d471 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,13 @@
@@ -14258,7 +14351,7 @@ index 534a414f..b7444dd4 100644
  	VkResult createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  								   const VkAllocationCallbacks* pAllocator,
  								   VkPrivateDataSlot* pPrivateDataSlot);
-@@ -868,7 +948,41 @@ public:
+@@ -868,7 +948,52 @@ public:
  #pragma mark Operations
  
  	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
@@ -14291,6 +14384,17 @@ index 534a414f..b7444dd4 100644
 +	 * type means that imageView holds a VkBufferView, whose texture's ID is returned.
 +	 */
 +	uint64_t getImageViewHandle(const VkImageViewHandleInfoNVX* pInfo);
++
++	/**
++	 * Takes a slot of the device's texture view pool (macOS 26, not in Metal 3 mode) for a lightweight view of a
++	 * buffer, setting resourceID to the view's MTLResourceID. Returns the slot, or -1 when there is no pool or it
++	 * is full. A pool view is a third the cost of a texture made from the buffer (Apple M6).
++	 */
++	int32_t acquireTexelBufferView(id<MTLBuffer> buffer, MTLTextureDescriptor* desc, NSUInteger offset,
++								   NSUInteger bytesPerRow, uint64_t* resourceID);
++
++	/** Returns a slot that acquireTexelBufferView() took. */
++	void releaseTexelBufferView(int32_t index);
 +	void advanceAccelerationStructureStateSerial() {
 +		_accelerationStructureStateSerial.fetch_add(1, std::memory_order_release);
 +	}
@@ -14301,7 +14405,7 @@ index 534a414f..b7444dd4 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -925,6 +1039,13 @@ public:
+@@ -925,6 +1050,13 @@ public:
  	/** Fetches a visibility buffer from the shared pool. */
  	MVKVisibilityBuffer getVisibilityBuffer();
  
@@ -14315,7 +14419,7 @@ index 534a414f..b7444dd4 100644
  	/** Returns a visibility buffer to the shared pool. */
  	void returnVisibilityBuffer(MVKVisibilityBuffer&& buffer);
  
-@@ -943,6 +1064,24 @@ public:
+@@ -943,6 +1075,24 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -14340,7 +14444,7 @@ index 534a414f..b7444dd4 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -979,23 +1118,57 @@ public:
+@@ -979,23 +1129,57 @@ public:
  
  #if !MVK_XCODE_16
  	void makeResident(id allocation) {}
@@ -14407,7 +14511,7 @@ index 534a414f..b7444dd4 100644
  	}
  #endif
  
-@@ -1011,6 +1184,41 @@ public:
+@@ -1011,6 +1195,41 @@ public:
  #endif
  	}
  
@@ -14449,7 +14553,7 @@ index 534a414f..b7444dd4 100644
  	bool hasResidencySet() {
  #if MVK_XCODE_16
  		return _residencySet != nil;
-@@ -1050,12 +1258,33 @@ public:
+@@ -1050,12 +1269,33 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -14483,7 +14587,7 @@ index 534a414f..b7444dd4 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1076,6 +1305,8 @@ protected:
+@@ -1076,6 +1316,8 @@ protected:
  	void getDescriptorVariableDescriptorCountLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
@@ -14492,7 +14596,7 @@ index 534a414f..b7444dd4 100644
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
-@@ -1093,11 +1324,29 @@ protected:
+@@ -1093,11 +1335,29 @@ protected:
  
  	id<MTLFence> _barrierFences[kMVKBarrierStageCount][kMVKBarrierFenceCount];
  
@@ -14522,10 +14626,15 @@ index 534a414f..b7444dd4 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1354,63 @@ protected:
+@@ -1105,16 +1365,68 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
++	id _texelBufferViewPool = nil;	// id<MTLTextureViewPool>
++	MVKSmallVector<uint32_t> _texelBufferViewFree;
++	uint32_t _texelBufferViewNext = 0;
++	bool _texelBufferViewPoolTried = false;
++	std::mutex _texelBufferViewLock;
 +	std::mutex _accelerationStructureDescriptorLock;
 +	std::mutex _emptyAccelerationStructureLock;
 +	id<MTLAccelerationStructure> _emptyAccelerationStructure = nil;
@@ -14586,7 +14695,7 @@ index 534a414f..b7444dd4 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1461,15 @@ public:
+@@ -1165,12 +1477,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -14604,7 +14713,7 @@ index 534a414f..b7444dd4 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1574,50 @@ protected:
+@@ -1275,6 +1590,50 @@ protected:
  };
  
  
@@ -14656,7 +14765,7 @@ index 534a414f..b7444dd4 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..e425a752 100644
+index 359f8a2b..59148164 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -15818,7 +15927,7 @@ index 359f8a2b..e425a752 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5263,415 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5263,460 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -16151,6 +16260,52 @@ index 359f8a2b..e425a752 100644
 +	mvkRemoveFirstOccurance(_gpuAddressableAccelerationStructures, accelerationStructure);
 +}
 +
++static constexpr uint32_t kMVKTexelBufferViewPoolSize = 1u << 18;
++
++int32_t MVKDevice::acquireTexelBufferView(id<MTLBuffer> buffer, MTLTextureDescriptor* desc, NSUInteger offset,
++										  NSUInteger bytesPerRow, uint64_t* resourceID) {
++	if (@available(macOS 26.0, iOS 26.0, *)) {
++		uint32_t index;
++		{
++			lock_guard<mutex> lock(_texelBufferViewLock);
++			if ( !_texelBufferViewPoolTried ) {
++				_texelBufferViewPoolTried = true;
++				const char* env = getenv("MVK_CONFIG_TEXEL_BUFFER_VIEW_POOL");
++				if ( !mvkMetal3Only() && (!env || strcmp(env, "0")) ) {
++					MTLResourceViewPoolDescriptor* poolDesc = [MTLResourceViewPoolDescriptor new];
++					poolDesc.resourceViewCount = kMVKTexelBufferViewPoolSize;
++					poolDesc.label = @"MoltenVK texel buffer views";
++					_texelBufferViewPool = [getPhysicalDevice()->getMTLDevice() newTextureViewPoolWithDescriptor: poolDesc error: nil];
++					[poolDesc release];
++				}
++			}
++			if ( !_texelBufferViewPool ) { return -1; }
++			if ( !_texelBufferViewFree.empty() ) {
++				index = _texelBufferViewFree.back();
++				_texelBufferViewFree.pop_back();
++			} else if (_texelBufferViewNext < kMVKTexelBufferViewPoolSize) {
++				index = _texelBufferViewNext++;
++			} else {
++				return -1;
++			}
++		}
++		MTLResourceID rid = [(id<MTLTextureViewPool>)_texelBufferViewPool setTextureViewFromBuffer: buffer
++																						descriptor: desc
++																							offset: offset
++																					   bytesPerRow: bytesPerRow
++																						   atIndex: index];
++		*resourceID = rid._impl;
++		return (int32_t)index;
++	}
++	return -1;
++}
++
++void MVKDevice::releaseTexelBufferView(int32_t index) {
++	if (index < 0) { return; }
++	lock_guard<mutex> lock(_texelBufferViewLock);
++	_texelBufferViewFree.push_back((uint32_t)index);
++}
++
 +uint64_t MVKDevice::getImageViewHandle(const VkImageViewHandleInfoNVX* pInfo) {
 +	if ( !pInfo ) { return 0; }
 +	switch (pInfo->descriptorType) {
@@ -16171,8 +16326,7 @@ index 359f8a2b..e425a752 100644
 +		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
 +			// Not in the extension: the Metal Shader Converter bridge passes a VkBufferView in imageView.
 +			auto* bufferView = (MVKBufferView*)(uintptr_t)pInfo->imageView;
-+			id<MTLTexture> mtlTex = bufferView ? bufferView->getMTLTexture() : nil;
-+			return mtlTex ? mtlTex.gpuResourceID._impl : 0;
++			return bufferView ? bufferView->getGPUResourceID() : 0;
 +		}
 +		default:
 +			return 0;
@@ -16237,7 +16391,7 @@ index 359f8a2b..e425a752 100644
  	}
  }
  
-@@ -4696,6 +5720,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4696,6 +5765,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  								   MVKCommandUse cmdUse) {
  	if (!mvkIsAnyFlagEnabled(barrier.dstStageMask, VK_PIPELINE_STAGE_HOST_BIT) ||
  		!mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT) ) { return; }
@@ -16246,7 +16400,7 @@ index 359f8a2b..e425a752 100644
  	lock_guard<mutex> lock(_rezLock);
  	for (auto& rez : _resources) {
  		rez->applyMemoryBarrier(barrier, cmdEncoder, cmdUse);
-@@ -4841,6 +5867,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4841,6 +5912,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -16254,7 +16408,7 @@ index 359f8a2b..e425a752 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4917,11 +5944,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,11 +5989,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		// typically have stricter alignment requirements due to it being a 2-component format.
  		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
  	}
@@ -16301,7 +16455,7 @@ index 359f8a2b..e425a752 100644
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
-@@ -4967,6 +6028,99 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +6073,99 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -16401,7 +16555,7 @@ index 359f8a2b..e425a752 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +6142,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +6187,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -16430,7 +16584,7 @@ index 359f8a2b..e425a752 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,17 +6164,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,17 +6209,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -16461,7 +16615,7 @@ index 359f8a2b..e425a752 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6420,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6465,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -16739,7 +16893,7 @@ index 359f8a2b..e425a752 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6702,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6747,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -16752,7 +16906,7 @@ index 359f8a2b..e425a752 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5575,7 +7014,58 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +7059,59 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -16796,6 +16950,7 @@ index 359f8a2b..e425a752 100644
 +}
 +
  MVKDevice::~MVKDevice() {
++	[_texelBufferViewPool release];
 +	removeResidency(_emptyAccelerationStructure);
 +	removeResidency(_emptyAccelerationStructureReference);
 +	[_emptyAccelerationStructure release];
@@ -16811,7 +16966,7 @@ index 359f8a2b..e425a752 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +7081,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +7127,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
