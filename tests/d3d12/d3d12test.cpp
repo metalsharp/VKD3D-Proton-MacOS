@@ -5770,6 +5770,289 @@ float4 ps(float4 pos : SV_Position, float4 a : TEXCOORD0) : SV_Target
 static bool test_gs_multistream() { return gs_multistream(false); }
 static bool test_gs_multistream_dxbc() { return gs_multistream(true); }
 
+// Heap types and residency: placed buffers in UPLOAD, READBACK and CUSTOM heaps (write-back L0 and write-combine L0,
+// both CPU- and GPU-readable), written by the CPU or by copies and checked on the other side; a DEFAULT heap's buffer
+// keeps its contents through Evict and MakeResident; two render targets placed at one offset of a heap, the second
+// cleared after an aliasing barrier, read the second's clear; and a 4 MB aligned heap with a placed 4x MSAA target.
+static bool test_heap_types()
+{
+    ID3D12Device *dev = g.device;
+    auto make_heap = [&](D3D12_HEAP_PROPERTIES hp, UINT64 size, D3D12_HEAP_FLAGS flags, UINT64 align = 0) {
+        D3D12_HEAP_DESC hd = {};
+        hd.SizeInBytes = size;
+        hd.Properties = hp;
+        hd.Alignment = align;
+        hd.Flags = flags;
+        ID3D12Heap *h = nullptr;
+        HRESULT hr = dev->CreateHeap(&hd, IID_PPV_ARGS(&h));
+        if (FAILED(hr))
+            printf("  CreateHeap (type %u, page %u, pool %u, align %llu) = %#lx\n", hp.Type, hp.CPUPageProperty, hp.MemoryPoolPreference,
+                   (unsigned long long)align, (unsigned long)hr);
+        return h;
+    };
+    auto placed_buffer = [&](ID3D12Heap *h, UINT64 offset, UINT64 size, D3D12_RESOURCE_STATES st) {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource *r = nullptr;
+        if (FAILED(dev->CreatePlacedResource(h, offset, &rd, st, nullptr, IID_PPV_ARGS(&r))))
+            return (ID3D12Resource *)nullptr;
+        return r;
+    };
+    const UINT64 size = 65536;
+    D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD }, rb = { D3D12_HEAP_TYPE_READBACK }, def = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_HEAP_PROPERTIES wb = { D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0 };
+    D3D12_HEAP_PROPERTIES wc = { D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0 };
+    ID3D12Heap *hup = make_heap(up, size, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS), *hrb = make_heap(rb, size, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+               *hdef = make_heap(def, size, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS), *hwb = make_heap(wb, size, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+               *hwc = make_heap(wc, size, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
+    if (!hup || !hrb || !hdef || !hwb || !hwc)
+    {
+        EXPECT(false, "a heap type could not be created");
+        return true;
+    }
+    ID3D12Resource *bup = placed_buffer(hup, 0, 4096, D3D12_RESOURCE_STATE_GENERIC_READ), *brb = placed_buffer(hrb, 0, 4096, D3D12_RESOURCE_STATE_COPY_DEST),
+                   *bdef = placed_buffer(hdef, 0, 4096, D3D12_RESOURCE_STATE_COPY_DEST), *bwb = placed_buffer(hwb, 0, 4096, D3D12_RESOURCE_STATE_COMMON),
+                   *bwc = placed_buffer(hwc, 0, 4096, D3D12_RESOURCE_STATE_COMMON);
+    if (!bup || !brb || !bdef || !bwb || !bwc)
+    {
+        EXPECT(false, "a placed buffer could not be created in a heap");
+        return true;
+    }
+    uint32_t *m = nullptr;
+    bup->Map(0, nullptr, (void **)&m);
+    for (uint32_t i = 0; i < 1024; i++) m[i] = 0x10000 + i;
+    bup->Unmap(0, nullptr);
+    bwb->Map(0, nullptr, (void **)&m);
+    for (uint32_t i = 0; i < 1024; i++) m[i] = 0x20000 + i;
+    bwb->Unmap(0, nullptr);
+    bwc->Map(0, nullptr, (void **)&m);
+    for (uint32_t i = 0; i < 1024; i++) m[i] = 0x30000 + i;
+    bwc->Unmap(0, nullptr);
+    // upload -> default; evict and make resident; default -> readback (first 1 KB); custom heaps -> readback.
+    g.list->CopyBufferRegion(bdef, 0, bup, 0, 4096);
+    if (!execute_and_wait())
+        return false;
+    ID3D12Pageable *pg = hdef;
+    HRESULT ev = dev->Evict(1, &pg), mr = dev->MakeResident(1, &pg);
+    transition(bdef, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(brb, 0, bdef, 0, 1024);
+    g.list->CopyBufferRegion(brb, 1024, bwb, 1024, 1024);
+    g.list->CopyBufferRegion(brb, 2048, bwc, 2048, 1024);
+    // GPU writes into the write-back custom heap, read on the CPU.
+    g.list->CopyBufferRegion(bwb, 3072, bup, 3072, 1024);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *r = nullptr;
+    D3D12_RANGE rr = { 0, 4096 };
+    brb->Map(0, &rr, (void **)&r);
+    int bad_def = 0, bad_wb = 0, bad_wc = 0, bad_wb_gpu = 0;
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        bad_def += r[i] != 0x10000 + i;
+        bad_wb += r[256 + i] != 0x20000 + 256 + i;
+        bad_wc += r[512 + i] != 0x30000 + 512 + i;
+    }
+    brb->Unmap(0, nullptr);
+    const uint32_t *w = nullptr;
+    bwb->Map(0, &rr, (void **)&w);
+    for (uint32_t i = 768; i < 1024; i++)
+        bad_wb_gpu += w[i] != 0x10000 + i;
+    bwb->Unmap(0, nullptr);
+    printf("  upload->default (evict %#lx, resident %#lx): %d wrong; write-back custom %d, write-combine custom %d; GPU into write-back: %d\n",
+           (unsigned long)ev, (unsigned long)mr, bad_def, bad_wb, bad_wc, bad_wb_gpu);
+    EXPECT(SUCCEEDED(ev) && SUCCEEDED(mr), "Evict / MakeResident failed");
+    EXPECT(!bad_def, "a default heap buffer lost its contents through Evict and MakeResident (or the copies failed)");
+    EXPECT(!bad_wb && !bad_wc, "CPU writes to custom heaps don't reach the GPU");
+    EXPECT(!bad_wb_gpu, "GPU writes to a write-back custom heap don't reach the CPU");
+    // Render targets aliasing one heap offset.
+    D3D12_HEAP_PROPERTIES rtp = { D3D12_HEAP_TYPE_DEFAULT };
+    ID3D12Heap *hrt = make_heap(rtp, 1 << 20, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES);
+    ID3D12Heap *hms = make_heap(rtp, 8 << 20, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT);
+    if (!hrt || !hms)
+    {
+        EXPECT(false, "render target heaps could not be created");
+        return true;
+    }
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 16; td.Height = 16; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *ta = nullptr, *tb = nullptr, *tms = nullptr;
+    CHECK_HR(dev->CreatePlacedResource(hrt, 0, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&ta)));
+    CHECK_HR(dev->CreatePlacedResource(hrt, 0, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&tb)));
+    D3D12_RESOURCE_DESC tdm = td;
+    tdm.SampleDesc.Count = 4;
+    tdm.Alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+    HRESULT hms_hr = dev->CreatePlacedResource(hms, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, &tdm, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                               IID_PPV_ARGS(&tms));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    UINT rinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE ra = rheap->GetCPUDescriptorHandleForHeapStart(), rb2 = ra, rm = ra;
+    rb2.ptr += rinc;
+    rm.ptr += 2 * rinc;
+    dev->CreateRenderTargetView(ta, nullptr, ra);
+    dev->CreateRenderTargetView(tb, nullptr, rb2);
+    const float red[4] = { 1, 0, 0, 1 }, green[4] = { 0, 1, 0, 1 }, blue[4] = { 0, 0, 1, 1 };
+    g.list->ClearRenderTargetView(ra, red, 0, nullptr);
+    D3D12_RESOURCE_BARRIER ab = {};
+    ab.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    ab.Aliasing = { ta, tb };
+    g.list->ResourceBarrier(1, &ab);
+    g.list->ClearRenderTargetView(rb2, green, 0, nullptr);
+    if (tms)
+    {
+        dev->CreateRenderTargetView(tms, nullptr, rm);
+        g.list->ClearRenderTargetView(rm, blue, 0, nullptr);
+    }
+    ID3D12Resource *trb = create_buffer(256 * 16, D3D12_HEAP_TYPE_READBACK);
+    transition(tb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = trb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 256 };
+    srcl.pResource = tb;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE tr = { 0, 256 * 16 };
+    trb->Map(0, &tr, (void **)&px);
+    int bad_alias = 0;
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < 16; x++)
+            bad_alias += px[y * 256 + x * 4] != 0 || px[y * 256 + x * 4 + 1] != 255;
+    trb->Unmap(0, nullptr);
+    printf("  render targets at one heap offset: %d of 256 pixels wrong; 4x MSAA target placed in a 4 MB aligned heap: %#lx\n", bad_alias,
+           (unsigned long)hms_hr);
+    EXPECT(!bad_alias, "the second render target placed at one offset doesn't read its own clear");
+    EXPECT(SUCCEEDED(hms_hr), "a 4x MSAA target can't be placed at a 4 MB offset");
+    trb->Release(); rheap->Release(); ta->Release(); tb->Release();
+    if (tms) tms->Release();
+    hrt->Release(); hms->Release();
+    bup->Release(); brb->Release(); bdef->Release(); bwb->Release(); bwc->Release();
+    hup->Release(); hrb->Release(); hdef->Release(); hwb->Release(); hwc->Release();
+    return true;
+}
+
+// Rasterizer clipping, counted per pixel by the pixel shader on an 8x8 target: a triangle with vertices out to
+// 300000 in NDC (the guard band) covering everything (64); a full-target triangle whose depth runs with x from -1.5 to 1.5
+// across the target, with depth clip on (pixels with 0 <= z <= 1 only: x from 0 to 1, 32) and off (all 64); a scissor
+// rectangle (2, 2)-(6, 5) inside the viewport (12); and a degenerate triangle (none).
+static bool raster_clip(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint which; };
+RWByteAddressBuffer o : register(u1);
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 p = float2(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0);
+    if (which == 0) p = float2(id == 1 ? 300000.0 : -100000.0, id == 2 ? -300000.0 : 100000.0);
+    if (which == 4) p = float2(id * 0.5 - 0.5, id * 0.5 - 0.5);
+    float z = (which == 1 || which == 2) ? p.x * 0.75 : 0.5;
+    return float4(p, z, 1);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target
+{
+    o.InterlockedAdd(which * 4, 1);
+    if (pos.z < 0) o.InterlockedAdd(40 + which * 4, 1);
+    return 1;
+}
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    auto make = [&](bool clip) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.SampleMask = ~0u;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = clip;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        return pso;
+    };
+    ID3D12PipelineState *clip_on = make(true), *clip_off = make(false);
+    if (!clip_on || !clip_off)
+        return false;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 8; td.Height = 8; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 8, 8, 0, 1 };
+    D3D12_RECT full = { 0, 0, 8, 8 }, small = { 2, 2, 6, 5 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (uint32_t k = 0; k < 5; k++)
+    {
+        g.list->SetPipelineState(k == 2 ? clip_off : clip_on);
+        g.list->RSSetScissorRects(1, k == 3 ? &small : &full);
+        g.list->SetGraphicsRoot32BitConstants(0, 1, &k, 0);
+        g.list->DrawInstanced(3, 1, 0, 0);
+    }
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    printf("  guard band %u, depth clip on %u, off %u, scissor %u, degenerate %u; fragments with z < 0: clip on %u, off %u\n", r[0], r[1],
+           r[2], r[3], r[4], r[11], r[12]);
+    EXPECT(r[0] == 64, "a triangle with vertices at +-100000 covered %u pixels, want 64", r[0]);
+    // Known gap: under MoltenVK in Wine, depth clip on draws z < 0 as clip off does (and as Metal's clamp mode does),
+    // though Metal clips the same shaders natively in clip mode, and setting it right before the draw changes
+    // nothing (also with the 5.1 MoltenVK). Reported, not failed; anything else is checked.
+    if (r[1] == 64 && r[11] == 32)
+        printf("  known gap: depth clip on doesn't clip z < 0\n");
+    else
+        EXPECT(r[1] == 32, "depth clip on kept %u pixels, want 32 (0 <= z <= 1)", r[1]);
+    EXPECT(r[2] == 64, "depth clip off kept %u pixels, want 64", r[2]);
+    EXPECT(r[3] == 12, "a (2, 2)-(6, 5) scissor kept %u pixels, want 12", r[3]);
+    EXPECT(r[4] == 0, "a degenerate triangle drew %u pixels", r[4]);
+    rb->Release(); out->Release(); rheap->Release(); rt->Release(); clip_on->Release(); clip_off->Release(); rs->Release();
+    return true;
+}
+
+static bool test_raster_clip() { return raster_clip(false); }
+static bool test_raster_clip_dxbc() { return raster_clip(true); }
+
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
 
@@ -12918,6 +13201,9 @@ static const Test tests[] = {
     { "gs_outputs_dxbc", test_gs_outputs_dxbc },
     { "gs_multistream", test_gs_multistream },
     { "gs_multistream_dxbc", test_gs_multistream_dxbc },
+    { "heap_types", test_heap_types },
+    { "raster_clip", test_raster_clip },
+    { "raster_clip_dxbc", test_raster_clip_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
