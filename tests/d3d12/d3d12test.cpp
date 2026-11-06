@@ -2400,7 +2400,7 @@ uint2 ps(float4 pos : SV_Position) : SV_Target
 // every filter linear, reads 0 through a minimum sampler and 1 through a maximum one, where an ordinary linear
 // sampler reads 0.5. On an Apple M4 (Apple9) Metal's sampler reduction mode has no effect, and the reducing samplers
 // average too.
-static bool test_minmax()
+static bool minmax(bool sampler_heap)
 {
     static const char *src = R"(
 Texture2D<float> t : register(t0);
@@ -2432,7 +2432,29 @@ RWByteAddressBuffer o : register(u0);
         ss[i].MaxLOD = D3D12_FLOAT32_MAX;
         ss[i].ShaderRegister = i;
     }
-    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 3, ss };
+    // Heap: the same samplers in a sampler heap's table, made before the PSO is.
+    D3D12_ROOT_PARAMETER rph[3] = { rp[0], rp[1] };
+    D3D12_DESCRIPTOR_RANGE srange = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 3, 0, 0, 0 };
+    rph[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rph[2].DescriptorTable = { 1, &srange };
+    ID3D12DescriptorHeap *sheap = nullptr;
+    if (sampler_heap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+        CHECK_HR(g.device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
+        UINT sinc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        for (UINT i = 0; i < 3; i++)
+        {
+            D3D12_SAMPLER_DESC sd = {};
+            sd.Filter = filters[i];
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sd.MaxLOD = D3D12_FLOAT32_MAX;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = sheap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += i * sinc;
+            g.device->CreateSampler(&sd, h);
+        }
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd = sampler_heap ? D3D12_ROOT_SIGNATURE_DESC{ 3, rph, 0, nullptr } : D3D12_ROOT_SIGNATURE_DESC{ 2, rp, 3, ss };
     ID3D12RootSignature *rs = create_root_signature(rsd);
     ID3D12PipelineState *ps = create_compute_pipeline(rs, cs);
     if (!ps)
@@ -2465,10 +2487,13 @@ RWByteAddressBuffer o : register(u0);
     g.device->CreateShaderResourceView(tex, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
     ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g.list->SetDescriptorHeaps(1, &heap);
+    ID3D12DescriptorHeap *heaps[2] = { heap, sheap };
+    g.list->SetDescriptorHeaps(sheap ? 2 : 1, heaps);
     g.list->SetComputeRootSignature(rs);
     g.list->SetPipelineState(ps);
     g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    if (sheap)
+        g.list->SetComputeRootDescriptorTable(2, sheap->GetGPUDescriptorHandleForHeapStart());
     g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
     g.list->Dispatch(1, 1, 1);
     ID3D12Resource *rb = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
@@ -2484,8 +2509,13 @@ RWByteAddressBuffer o : register(u0);
     EXPECT(got[1] == 1.0f, "the maximum filter reads %g, want 1", got[1]);
     EXPECT(got[2] == 0.5f, "the linear filter reads %g, want 0.5", got[2]);
     rb->Release(); out->Release(); heap->Release(); tex->Release(); upload->Release(); ps->Release(); rs->Release();
+    if (sheap)
+        sheap->Release();
     return true;
 }
+
+static bool test_minmax() { return minmax(false); }
+static bool test_minmax_heap() { return minmax(true); }
 
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
@@ -6098,6 +6128,7 @@ static const Test tests[] = {
     { "cbv_rows_robust_dxil", test_cbv_rows_robust_dxil },
     { "cbv_rows_robust_dxbc", test_cbv_rows_robust_dxbc },
     { "minmax", test_minmax },
+    { "minmax_heap", test_minmax_heap },
     { "wave_first_helpers", test_wave_first_helpers },
     { "wbi_markers", test_wbi_markers },
     { "predication", test_predication },
