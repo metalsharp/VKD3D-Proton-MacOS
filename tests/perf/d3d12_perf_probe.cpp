@@ -34,7 +34,7 @@
 
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("error: %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); exit(3); } } while (0)
 
-static const UINT W = 1920, H = 1080, FRAMES_IN_FLIGHT = 3, HEAP_SIZE = 16384;
+static const UINT W = 1920, H = 1080, FRAMES_IN_FLIGHT = 3, HEAP_SIZE = 32768;
 static const DXGI_FORMAT BACKBUFFER_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 static const DXGI_FORMAT HDR_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -3373,7 +3373,7 @@ static std::vector<Scene> engine_scenes()
     static ID3D12QueryHeap *occlusion;
     static std::vector<char> library_blob;
     static std::string eng_src;
-    enum { RTV_MRT = FRAMES_IN_FLIGHT + 10, SRV_MRT = 12000, SRV_CUBE3D = 12010, UAV_ENGINE = 12020, CBV_RING = 12100, CPU_UAV = 15200 };
+    enum { RTV_MRT = FRAMES_IN_FLIGHT + 10, SRV_MRT = 12000, SRV_CUBE3D = 12010, UAV_ENGINE = 12020, CBV_RING = 16384, CPU_UAV = 15200 };   // the ring: 3 frames x 3000
     eng_src = std::string(common_hlsl) + engine_hlsl_tail;
 
     auto quads = [](ID3D12GraphicsCommandList *l, UINT n, float scale, UINT frame) {
