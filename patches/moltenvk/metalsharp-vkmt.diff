@@ -24212,7 +24212,7 @@ index c5b74991..d4672547 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..17dd5bf3 100644
+index 3aa44a44..e3d5ed00 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,13 @@
@@ -24497,7 +24497,7 @@ index 3aa44a44..17dd5bf3 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +704,514 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +704,515 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -24890,7 +24890,8 @@ index 3aa44a44..17dd5bf3 100644
 +		// metadata (as IRDescriptorTableSetSampler does) to the LOD of each sample.
 +		if ( !getMetalFeatures().samplerMipLodBias ) { compatFlags |= IRCompatibilityFlagSamplerLODBias; }
 +		// Image views' minimum LOD (ResourceMinLODClamp), which VKD3D-Proton puts in the texture entry's metadata.
-+		if (getEnabledImageViewMinLodFeatures().minLod) { compatFlags |= IRCompatibilityFlagTextureMinLODClamp; }
++		static const bool minLod = mvkGetEnvVarNumber("MVK_CONFIG_EMULATE_IMAGE_VIEW_MIN_LOD", 1) != 0;
++		if (getEnabledImageViewMinLodFeatures().minLod && minLod) { compatFlags |= IRCompatibilityFlagTextureMinLODClamp; }
 +		msc.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)compatFlags);
 +		if (hdr.flags & kMVKMSCBlobFlagDualSourceBlending) {
 +			if ( !msc.IRCompilerSetDualSourceBlendingConfiguration ) { return "This Metal Shader Converter can't convert dual-source blending."; }
@@ -25012,7 +25013,7 @@ index 3aa44a44..17dd5bf3 100644
  }
  
  
-@@ -741,4 +1405,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1406,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }
