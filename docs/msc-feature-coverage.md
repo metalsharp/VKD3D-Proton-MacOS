@@ -95,7 +95,7 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
 
 ## Op-level differential test
 
-`d3d12test opdiff` (opt-in: `D3D12TEST_OPDIFF=<Windows path prefix>`) runs 67 single-operation compute shaders as DXIL
+`d3d12test opdiff` (opt-in: `D3D12TEST_OPDIFF=1`; writes `opdiff-dxil.bin` and `opdiff-dxbc.bin` in the run directory) runs 67 single-operation compute shaders as DXIL
 and 64 as DXBC on every pair of about 40 special inputs (zeros, infinities, NaNs, denormals, integer limits) and on
 random bits. `tests/run/opdiff.py` compares a run with the bridge against one without. Results on an Apple M4, macOS
 27.2, with the D3D11.3 functional spec's rules:
@@ -114,7 +114,7 @@ conversion (DXIL).
 
 ## Sampler and typed buffer format differential tests
 
-- `d3d12test samplediff` (opt-in: `D3D12TEST_SAMPLEDIFF=<Windows path>`; compare with `tests/run/samplediff.py`): 25
+- `d3d12test samplediff` (opt-in: `D3D12TEST_SAMPLEDIFF=1`, writes `samplediff.bin` in the run directory; compare with `tests/run/samplediff.py`): 25
   sampler descriptors from the sampler heap, covering:
   - point, linear and mixed filters; anisotropic 4x and 16x
   - wrap, mirror, clamp, border with three border colors, and mirror once
@@ -123,7 +123,7 @@ conversion (DXIL).
 
   Each is used by `SampleLevel`, `SampleGrad`, `Gather` and `SampleCmpLevelZero` at 256 coordinates inside and outside
   [0, 1]. The converter and SPIR-V give the same results to 1e-4, on Metal 4 and on Metal 3.
-- `d3d12test formatdiff` (opt-in: `D3D12TEST_FORMATDIFF=<Windows path>`; compare with `tests/run/formatdiff.py`): 39
+- `d3d12test formatdiff` (opt-in: `D3D12TEST_FORMATDIFF=1`, writes `formatdiff.bin` in the run directory; compare with `tests/run/formatdiff.py`): 39
   typed buffer formats, read from random bytes through a typed SRV and written through a typed UAV. Both paths load and
   store the same values. The decodes of these formats match a CPU reference exactly:
   - RGBA16F
@@ -132,7 +132,7 @@ conversion (DXIL).
   - RG16 SNORM
 
   SNORM maps -128 (and -32768) to -1, as D3D requires.
-- `d3d12test texdiff` (opt-in: `D3D12TEST_TEXDIFF=<Windows path>`; compare with `tests/run/texdiff.py`): 29 texture
+- `d3d12test texdiff` (opt-in: `D3D12TEST_TEXDIFF=1`, writes `texdiff.bin` in the run directory; compare with `tests/run/texdiff.py`): 29 texture
   formats read texel by texel with `Load` through an SRV:
   - sRGB RGBA8, BGRA8 and BC1/BC7
   - BGRX8, RGB9E5, B5G6R5, B5G5R5A1, B4G4R4A4, A8
@@ -141,7 +141,7 @@ conversion (DXIL).
 
   Both paths read the same values. Against a CPU reference, the sRGB, 16-bit packed, depth and stencil reads are
   exact, including D24S8, which Apple GPUs keep as D32S8. Stencil arrives in `.g`.
-- `d3d12test vtxdiff` (opt-in: `D3D12TEST_VTXDIFF=<Windows path>`; compare with `tests/run/vtxdiff.py`): 29 vertex
+- `d3d12test vtxdiff` (opt-in: `D3D12TEST_VTXDIFF=1`, writes `vtxdiff.bin` in the run directory; compare with `tests/run/vtxdiff.py`): 29 vertex
   formats read by a vertex shader from a per-vertex and a per-instance stream (step rate 2). All 28 formats with a
   Metal vertex format read the same on both paths, and the decodes checked against a CPU reference are exact, with
   missing components reading 0, 0, 1. The formats checked are R32, R32G32, RGBA8 SNORM, R8, BGRA8, R10G10B10A2_UNORM

@@ -10,6 +10,15 @@
 #include <string.h>
 #include <math.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Creates (or truncates) a file for writing, owner-only (0600) and not through a symlink. */
+static FILE* create_owner_file(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "w");
+}
+
 
 static const int W = 64, H = 64;
 typedef struct { float x, y; } V2;
@@ -93,8 +102,8 @@ int main(int argc, char** argv) {
     // Shaders
     static const char* vsSrc = "#version 450\nlayout(location=0) in vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.5, 1.0); }\n";
     static const char* fsSrc = "#version 450\nlayout(location=0) out vec4 color;\nvoid main(){ color = vec4(1,0,0,1); }\n";
-    FILE* f = fopen("/tmp/vk-cr-vs.vert","w"); fputs(vsSrc,f); fclose(f);
-    f = fopen("/tmp/vk-cr-fs.frag","w"); fputs(fsSrc,f); fclose(f);
+    FILE* f = create_owner_file("/tmp/vk-cr-vs.vert"); fputs(vsSrc,f); fclose(f);
+    f = create_owner_file("/tmp/vk-cr-fs.frag"); fputs(fsSrc,f); fclose(f);
     system("glslangValidator -V /tmp/vk-cr-vs.vert -o /tmp/vk-cr-vert.spv >/dev/null 2>&1");
     system("glslangValidator -V /tmp/vk-cr-fs.frag -o /tmp/vk-cr-frag.spv >/dev/null 2>&1");
     FILE* vf = fopen("/tmp/vk-cr-vert.spv","rb"); FILE* ff = fopen("/tmp/vk-cr-frag.spv","rb");
@@ -283,7 +292,7 @@ int main(int argc, char** argv) {
     }
     printf("gpuCov=%d refCov=%d over=%d under=%d\n", gpuCov, refCov, over, under);
     if (getenv("DUMP_PPM")) {
-        FILE* f = fopen("/tmp/vkcr-gpu.ppm","w"); fprintf(f,"P3\n%d %d\n255\n",W,H);
+        FILE* f = create_owner_file("/tmp/vkcr-gpu.ppm"); fprintf(f,"P3\n%d %d\n255\n",W,H);
         for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
             uint32_t v=px[y*W+x];
             fprintf(f,"%d %d %d\n", v&0xff, (v>>8)&0xff, (v>>16)&0xff);

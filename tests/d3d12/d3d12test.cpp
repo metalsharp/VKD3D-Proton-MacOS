@@ -9,6 +9,9 @@
 #include <d3dcompiler.h>
 #include <dxcapi.h>
 #include <stdio.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <string>
 #include <algorithm>
@@ -55,6 +58,14 @@ static std::string cache_path(const char *source, const char *entry, const char 
     return std::string(dir) + name;
 }
 
+
+// Creates (or truncates) a file for writing, readable and writable by its owner only.
+static FILE *create_file(const char *name)
+{
+    int fd = _open(name, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    return fd < 0 ? nullptr : _fdopen(fd, "wb");
+}
+
 static std::vector<char> compile_dxc_uncached(const char *source, const char *entry, const char *target, const wchar_t *const *extra, int extra_count);
 
 static std::vector<char> compile_dxc(const char *source, const char *entry, const char *target, const wchar_t *const *extra = nullptr, int extra_count = 0)
@@ -75,7 +86,7 @@ static std::vector<char> compile_dxc(const char *source, const char *entry, cons
     }
     std::vector<char> out = compile_dxc_uncached(source, entry, target, extra, extra_count);
     if (!out.empty() && !path.empty())
-        if (FILE *f = fopen(path.c_str(), "wb"))
+        if (FILE *f = create_file(path.c_str()))
         {
             fwrite(out.data(), 1, out.size(), f);
             fclose(f);
@@ -5166,14 +5177,14 @@ void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(64 + id * 4, 1); }
     return true;
 }
 
-// Op-level differential dump (opt-in: D3D12TEST_OPDIFF=<Windows path prefix>): one compute shader per operation, run
-// on every pair of about 40 special 32-bit inputs (zeros, infinities, NaNs, denormals, integer limits) and random ones,
-// compiled as DXIL (cs_6_0) and DXBC (cs_5_0). Writes <prefix>-dxil.bin and <prefix>-dxbc.bin; tests/run/opdiff.py
-// compares a run with the Metal Shader Converter bridge against one without. Always passes: it's a dump.
+// Op-level differential dump (opt-in: D3D12TEST_OPDIFF=1): one compute shader per operation, run on every pair of
+// about 40 special 32-bit inputs (zeros, infinities, NaNs, denormals, integer limits) and random ones, compiled as DXIL
+// (cs_6_0) and DXBC (cs_5_0). Writes opdiff-dxil.bin and opdiff-dxbc.bin in the current directory (the run's, with
+// tests/run/d3d12test.sh); tests/run/opdiff.py compares a run with the Metal Shader Converter bridge against one
+// without.
 static bool test_opdiff()
 {
-    const char *prefix = getenv("D3D12TEST_OPDIFF");
-    if (!prefix)
+    if (!getenv("D3D12TEST_OPDIFF"))
     {
         printf("  skipped: D3D12TEST_OPDIFF not set\n");
         return true;
@@ -5241,9 +5252,9 @@ static bool test_opdiff()
     int failed = 0;
     for (int dxbc = 0; dxbc < 2; dxbc++)
     {
-        std::string path = std::string(prefix) + (dxbc ? "-dxbc.bin" : "-dxil.bin");
-        FILE *f = fopen(path.c_str(), "wb");
-        if (!f) { printf("  can't write %s\n", path.c_str()); return false; }
+        const char *path = dxbc ? "opdiff-dxbc.bin" : "opdiff-dxil.bin";
+        FILE *f = create_file(path);
+        if (!f) { printf("  can't write %s\n", path); return false; }
         fwrite(&n, 4, 1, f);
         fwrite(a.data(), 4, n, f);
         fwrite(b.data(), 4, n, f);
@@ -5287,22 +5298,22 @@ static bool test_opdiff()
             rb->Release(); out->Release(); ps->Release();
         }
         fclose(f);
-        printf("  wrote %s\n", path.c_str());
+        printf("  wrote %s\n", path);
     }
     in->Release(); upload->Release(); rs->Release();
     EXPECT(!failed, "%d op pipelines failed", failed);
     return true;
 }
 
-// Sampler differential dump (opt-in: D3D12TEST_SAMPLEDIFF=<Windows path>): a 32x32 RGBA8 texture with 6 mips of random
-// texels and an R32_FLOAT depth-like texture, sampled with about 25 sampler descriptors from a sampler heap (filters,
-// address modes, border colors, LOD bias and clamps, comparison) at 256 coordinates in and outside [0, 1], by
-// SampleLevel, SampleGrad, Gather and SampleCmpLevelZero. tests/run/samplediff.py compares two dumps (with the Metal
-// Shader Converter bridge and without). Always passes: it's a dump.
+// Sampler differential dump (opt-in: D3D12TEST_SAMPLEDIFF=1, writes samplediff.bin in the current directory): a 32x32
+// RGBA8 texture with 6 mips of random texels and an R32_FLOAT depth-like texture, sampled with about 25 sampler
+// descriptors from a sampler heap (filters, address modes, border colors, LOD bias and clamps, comparison) at 256
+// coordinates in and outside [0, 1], by SampleLevel, SampleGrad, Gather and SampleCmpLevelZero. tests/run/samplediff.py
+// compares two dumps (with the Metal Shader Converter bridge and without). Always passes: it's a dump.
 static bool test_samplediff()
 {
-    const char *path = getenv("D3D12TEST_SAMPLEDIFF");
-    if (!path)
+    const char *path = "samplediff.bin";
+    if (!getenv("D3D12TEST_SAMPLEDIFF"))
     {
         printf("  skipped: D3D12TEST_SAMPLEDIFF not set\n");
         return true;
@@ -5463,7 +5474,7 @@ uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b
         dev->CreateSampler(&sd, sc);
     }
 
-    FILE *f = fopen(path, "wb");
+    FILE *f = create_file(path);
     if (!f) { printf("  can't write %s\n", path); return false; }
     UINT count = (UINT)cfgs.size();
     fwrite(&count, 4, 1, f);
@@ -5490,14 +5501,14 @@ uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b
     return true;
 }
 
-// Typed buffer format differential dump (opt-in: D3D12TEST_FORMATDIFF=<Windows path>): for each format a buffer of
-// random bytes is read through a typed SRV (Buffer<float4>, <uint4> or <int4> by the format's class) and values made
-// from it are written through a typed UAV; both the loaded values and the stored bytes are dumped.
-// tests/run/formatdiff.py compares two dumps (with the Metal Shader Converter bridge and without).
+// Typed buffer format differential dump (opt-in: D3D12TEST_FORMATDIFF=1, writes formatdiff.bin in the current
+// directory): for each format a buffer of random bytes is read through a typed SRV (Buffer<float4>, <uint4> or <int4>
+// by the format's class) and values made from it are written through a typed UAV; both the loaded values and the stored
+// bytes are dumped. tests/run/formatdiff.py compares two dumps (with the Metal Shader Converter bridge and without).
 static bool test_formatdiff()
 {
-    const char *path = getenv("D3D12TEST_FORMATDIFF");
-    if (!path)
+    const char *path = "formatdiff.bin";
+    if (!getenv("D3D12TEST_FORMATDIFF"))
     {
         printf("  skipped: D3D12TEST_FORMATDIFF not set\n");
         return true;
@@ -5562,7 +5573,7 @@ RWStructuredBuffer<uint4> loaded : register(u1);
     ID3D12DescriptorHeap *heap = nullptr;
     CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
     UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    FILE *f = fopen(path, "wb");
+    FILE *f = create_file(path);
     if (!f) { printf("  can't write %s\n", path); return false; }
     UINT count = sizeof(fmts) / sizeof(fmts[0]);
     fwrite(&count, 4, 1, f);
@@ -5618,13 +5629,14 @@ RWStructuredBuffer<uint4> loaded : register(u1);
     return true;
 }
 
-// Texture format differential dump (opt-in: D3D12TEST_TEXDIFF=<Windows path>): 16x16 textures of random data in
-// color formats (sRGB, packed 16-bit, shared exponent, BC1 to BC7) and depth/stencil formats, every texel read with
-// Load through an SRV (depth and stencil planes through their plane formats). tests/run/texdiff.py compares two dumps.
+// Texture format differential dump (opt-in: D3D12TEST_TEXDIFF=1, writes texdiff.bin in the current directory): 16x16
+// textures of random data in color formats (sRGB, packed 16-bit, shared exponent, BC1 to BC7) and depth/stencil
+// formats, every texel read with Load through an SRV (depth and stencil planes through their plane formats).
+// tests/run/texdiff.py compares two dumps.
 static bool test_texdiff()
 {
-    const char *path = getenv("D3D12TEST_TEXDIFF");
-    if (!path)
+    const char *path = "texdiff.bin";
+    if (!getenv("D3D12TEST_TEXDIFF"))
     {
         printf("  skipped: D3D12TEST_TEXDIFF not set\n");
         return true;
@@ -5690,7 +5702,7 @@ cbuffer C : register(b0) { uint use_uint; };
     ID3D12DescriptorHeap *heap = nullptr;
     CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
     UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    FILE *f = fopen(path, "wb");
+    FILE *f = create_file(path);
     if (!f) { printf("  can't write %s\n", path); return false; }
     UINT count = sizeof(fmts) / sizeof(fmts[0]);
     fwrite(&count, 4, 1, f);
@@ -5786,14 +5798,14 @@ cbuffer C : register(b0) { uint use_uint; };
     return true;
 }
 
-// Vertex input format differential dump (opt-in: D3D12TEST_VTXDIFF=<Windows path>): for each vertex format, 64
-// points from a per-vertex stream and 4 instances from a per-instance stream (step rate 2) of random bytes, read by a
-// vertex shader that writes both attributes' bits to a UAV (missing components must read as 0, 0, 0, 1).
-// tests/run/vtxdiff.py compares two dumps.
+// Vertex input format differential dump (opt-in: D3D12TEST_VTXDIFF=1, writes vtxdiff.bin in the current directory): for
+// each vertex format, 64 points from a per-vertex stream and 4 instances from a per-instance stream (step rate 2) of
+// random bytes, read by a vertex shader that writes both attributes' bits to a UAV (missing components must read as 0,
+// 0, 0, 1). tests/run/vtxdiff.py compares two dumps.
 static bool test_vtxdiff()
 {
-    const char *path = getenv("D3D12TEST_VTXDIFF");
-    if (!path)
+    const char *path = "vtxdiff.bin";
+    if (!getenv("D3D12TEST_VTXDIFF"))
     {
         printf("  skipped: D3D12TEST_VTXDIFF not set\n");
         return true;
@@ -5864,7 +5876,7 @@ float4 ps() : SV_Target { return 0; }
     vb->Unmap(0, nullptr);
     ID3D12Resource *out = create_buffer(260 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    FILE *f = fopen(path, "wb");
+    FILE *f = create_file(path);
     if (!f) { printf("  can't write %s\n", path); return false; }
     UINT count = sizeof(fmts) / sizeof(fmts[0]);
     fwrite(&count, 4, 1, f);

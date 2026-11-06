@@ -2,8 +2,10 @@
  * comparing what different DXIL becomes, and prints how many top-level resources its reflection lists. No root signature: the converter's default layout. Compatibility flags as
  * MoltenVK sets them with robust buffer access (bounds checked, NaN and Inf kept).
  *   mscconv <in.dxil> <out.metallib>   (libmetalirconverter.dylib from DYLD_LIBRARY_PATH) */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <metal_irconverter.h>
 
 int main(int argc, char **argv)
@@ -42,7 +44,11 @@ int main(int argc, char **argv)
     size = IRMetalLibGetBytecodeSize(lib);
     bytes = malloc(size);
     IRMetalLibGetBytecode(lib, bytes);
-    if (!(f = fopen(argv[2], "wb")) || fwrite(bytes, 1, size, f) != size) { perror(argv[2]); return 1; }
-    fclose(f);
+    {
+        /* Not world-writable: 0644 at most. */
+        int fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write(fd, bytes, size) != (ssize_t)size) { perror(argv[2]); return 1; }
+        close(fd);
+    }
     return 0;
 }
