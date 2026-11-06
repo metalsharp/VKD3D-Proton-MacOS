@@ -1077,6 +1077,23 @@ static std::vector<Scene> base_scenes()
             if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
                 extras.add("working_set_mb", pmc.WorkingSetSize / 1048576.0);
         } },
+        { "typed_view_ring", "5000 typed buffer SRVs per frame from a ring of 2000 ranges that wraps every 0.4 frames (dynamic typed buffers)", base, [](UINT f) {
+            double t = qpc_ms();
+            for (UINT i = 0; i < 5000; i++)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = DXGI_FORMAT_R32_FLOAT;
+                sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Buffer.FirstElement = (((UINT64)f * 5000 + i) % 2000) * 64;
+                sd.Buffer.NumElements = 64;
+                p.device->CreateShaderResourceView(p.upload_ring, &sd, srv_cpu(4000 + (i % 1000)));
+            }
+            extras.add("us_per_view", (qpc_ms() - t) * 1000.0 / 5000);
+            PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                extras.add("working_set_mb", pmc.WorkingSetSize / 1048576.0);
+        } },
         { "fence_sync", "8 mid-frame submissions, each waited on by the CPU (readback-style stalls)", [] {
             flat = create_pso({});
             for (int i = 0; i < 2; i++)
