@@ -111,3 +111,24 @@ Every other operation gives the same bits on both paths: float arithmetic, min/m
 log2, saturate, sign, lerp, clamp, NaN/INF tests and compares; integer arithmetic, division, shifts, bit counts, bit
 reversal, min/max/abs and compares; float/integer conversions; `f16tof32`; 64-bit integer multiply, shift and
 conversion (DXIL).
+
+## Sampler and typed buffer format differential tests
+
+- `d3d12test samplediff` (opt-in: `D3D12TEST_SAMPLEDIFF=<Windows path>`; compare with `tests/run/samplediff.py`): 25
+  sampler descriptors from the sampler heap, covering:
+  - point, linear and mixed filters; anisotropic 4x and 16x
+  - wrap, mirror, clamp, border with three border colors, and mirror once
+  - LOD bias, minimum and maximum LOD
+  - comparison functions
+
+  Each is used by `SampleLevel`, `SampleGrad`, `Gather` and `SampleCmpLevelZero` at 256 coordinates inside and outside
+  [0, 1]. The converter and SPIR-V give the same results to 1e-4, on Metal 4 and on Metal 3.
+- `d3d12test formatdiff` (opt-in: `D3D12TEST_FORMATDIFF=<Windows path>`; compare with `tests/run/formatdiff.py`): 39
+  typed buffer formats, read from random bytes through a typed SRV and written through a typed UAV. Both paths load and
+  store the same values. The decodes of these formats match a CPU reference exactly:
+  - RGBA16F
+  - R10G10B10A2_UNORM, R11G11B10_FLOAT
+  - RGBA8 UNORM and SNORM, BGRA8
+  - RG16 SNORM
+
+  SNORM maps -128 (and -32768) to -1, as D3D requires.

@@ -5490,6 +5490,134 @@ uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b
     return true;
 }
 
+// Typed buffer format differential dump (opt-in: D3D12TEST_FORMATDIFF=<Windows path>): for each format a buffer of
+// random bytes is read through a typed SRV (Buffer<float4>, <uint4> or <int4> by the format's class) and values made
+// from it are written through a typed UAV; both the loaded values and the stored bytes are dumped.
+// tests/run/formatdiff.py compares two dumps (with the Metal Shader Converter bridge and without).
+static bool test_formatdiff()
+{
+    const char *path = getenv("D3D12TEST_FORMATDIFF");
+    if (!path)
+    {
+        printf("  skipped: D3D12TEST_FORMATDIFF not set\n");
+        return true;
+    }
+    enum Cls { F, U, I };
+    static const struct { DXGI_FORMAT fmt; Cls cls; UINT size; const char *name; } fmts[] = {
+        { DXGI_FORMAT_R32G32B32A32_FLOAT, F, 16, "R32G32B32A32_FLOAT" }, { DXGI_FORMAT_R32G32B32A32_UINT, U, 16, "R32G32B32A32_UINT" },
+        { DXGI_FORMAT_R32G32B32A32_SINT, I, 16, "R32G32B32A32_SINT" }, { DXGI_FORMAT_R16G16B16A16_FLOAT, F, 8, "R16G16B16A16_FLOAT" },
+        { DXGI_FORMAT_R16G16B16A16_UNORM, F, 8, "R16G16B16A16_UNORM" }, { DXGI_FORMAT_R16G16B16A16_SNORM, F, 8, "R16G16B16A16_SNORM" },
+        { DXGI_FORMAT_R16G16B16A16_UINT, U, 8, "R16G16B16A16_UINT" }, { DXGI_FORMAT_R16G16B16A16_SINT, I, 8, "R16G16B16A16_SINT" },
+        { DXGI_FORMAT_R32G32_FLOAT, F, 8, "R32G32_FLOAT" }, { DXGI_FORMAT_R32G32_UINT, U, 8, "R32G32_UINT" }, { DXGI_FORMAT_R32G32_SINT, I, 8, "R32G32_SINT" },
+        { DXGI_FORMAT_R10G10B10A2_UNORM, F, 4, "R10G10B10A2_UNORM" }, { DXGI_FORMAT_R10G10B10A2_UINT, U, 4, "R10G10B10A2_UINT" },
+        { DXGI_FORMAT_R11G11B10_FLOAT, F, 4, "R11G11B10_FLOAT" }, { DXGI_FORMAT_R8G8B8A8_UNORM, F, 4, "R8G8B8A8_UNORM" },
+        { DXGI_FORMAT_R8G8B8A8_SNORM, F, 4, "R8G8B8A8_SNORM" }, { DXGI_FORMAT_R8G8B8A8_UINT, U, 4, "R8G8B8A8_UINT" },
+        { DXGI_FORMAT_R8G8B8A8_SINT, I, 4, "R8G8B8A8_SINT" }, { DXGI_FORMAT_B8G8R8A8_UNORM, F, 4, "B8G8R8A8_UNORM" },
+        { DXGI_FORMAT_R16G16_FLOAT, F, 4, "R16G16_FLOAT" }, { DXGI_FORMAT_R16G16_UNORM, F, 4, "R16G16_UNORM" },
+        { DXGI_FORMAT_R16G16_SNORM, F, 4, "R16G16_SNORM" }, { DXGI_FORMAT_R16G16_UINT, U, 4, "R16G16_UINT" },
+        { DXGI_FORMAT_R16G16_SINT, I, 4, "R16G16_SINT" }, { DXGI_FORMAT_R32_FLOAT, F, 4, "R32_FLOAT" },
+        { DXGI_FORMAT_R32_UINT, U, 4, "R32_UINT" }, { DXGI_FORMAT_R32_SINT, I, 4, "R32_SINT" },
+        { DXGI_FORMAT_R8G8_UNORM, F, 2, "R8G8_UNORM" }, { DXGI_FORMAT_R8G8_SNORM, F, 2, "R8G8_SNORM" }, { DXGI_FORMAT_R8G8_UINT, U, 2, "R8G8_UINT" },
+        { DXGI_FORMAT_R16_FLOAT, F, 2, "R16_FLOAT" }, { DXGI_FORMAT_R16_UNORM, F, 2, "R16_UNORM" }, { DXGI_FORMAT_R16_SNORM, F, 2, "R16_SNORM" },
+        { DXGI_FORMAT_R16_UINT, U, 2, "R16_UINT" }, { DXGI_FORMAT_R16_SINT, I, 2, "R16_SINT" },
+        { DXGI_FORMAT_R8_UNORM, F, 1, "R8_UNORM" }, { DXGI_FORMAT_R8_SNORM, F, 1, "R8_SNORM" }, { DXGI_FORMAT_R8_UINT, U, 1, "R8_UINT" },
+        { DXGI_FORMAT_R8_SINT, I, 1, "R8_SINT" },
+    };
+    static const char *tmpl = R"(
+Buffer<T> src : register(t0);
+RWBuffer<T> dst : register(u0);
+RWStructuredBuffer<uint4> loaded : register(u1);
+[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID)
+{
+    T v = src[i];
+    loaded[i] = asuint(v);
+    dst[i] = STORE;
+}
+)";
+    const char *stores[3] = { "v * 0.75 - float4(0.1, 0.2, -0.3, 0.05) + float4(i, i, i, i) * 0.003", "v * 3u + i", "v * -3 + int(i)" };
+    const char *types[3] = { "float4", "uint4", "int4" };
+    const UINT n = 256;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1 } };
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable = { 2, ranges };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso[3] = {};
+    for (int c = 0; c < 3; c++)
+    {
+        std::string src = std::string("#define T ") + types[c] + "\n#define STORE " + stores[c] + "\n" + tmpl;
+        pso[c] = create_compute_pipeline(rs, compile_dxc(src.c_str(), "main", "cs_6_0"));
+        if (!pso[c]) return false;
+    }
+    ID3D12Resource *upload = create_buffer(n * 16, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *up = nullptr;
+    upload->Map(0, nullptr, (void **)&up);
+    uint32_t seed = 777;
+    for (UINT i = 0; i < n * 16; i++) { seed = seed * 1664525 + 1013904223; up[i] = seed >> 24; }
+    // Keep 16- and 32-bit floats finite and not too large: clear the top exponent bits in some elements.
+    upload->Unmap(0, nullptr);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  can't write %s\n", path); return false; }
+    UINT count = sizeof(fmts) / sizeof(fmts[0]);
+    fwrite(&count, 4, 1, f);
+    fwrite(&n, 4, 1, f);
+    for (UINT k = 0; k < count; k++)
+    {
+        ID3D12Resource *srcb = create_buffer(n * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource *dstb = create_buffer(n * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource *ldb = create_buffer(n * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g.list->CopyBufferRegion(srcb, 0, upload, 0, n * 16);
+        transition(srcb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_CPU_DESCRIPTOR_HANDLE c = heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = fmts[k].fmt;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.NumElements = n;
+        dev->CreateShaderResourceView(srcb, &sd, c);
+        c.ptr += inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = fmts[k].fmt;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = n;
+        dev->CreateUnorderedAccessView(dstb, nullptr, &ud, c);
+        c.ptr += inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ld = {};
+        ld.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ld.Buffer.NumElements = n;
+        ld.Buffer.StructureByteStride = 16;
+        dev->CreateUnorderedAccessView(ldb, nullptr, &ld, c);
+        g.list->SetDescriptorHeaps(1, &heap);
+        g.list->SetComputeRootSignature(rs);
+        g.list->SetPipelineState(pso[fmts[k].cls]);
+        g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->Dispatch(n / 64, 1, 1);
+        ID3D12Resource *rb1 = nullptr, *rb2 = nullptr;
+        const uint32_t *lv = read_buffer(ldb, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, n * 16, &rb1);
+        const uint32_t *sv = read_buffer(dstb, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, n * 16, &rb2);
+        if (!lv || !sv) return false;
+        char name[32] = {};
+        snprintf(name, sizeof(name), "%s", fmts[k].name);
+        fwrite(name, 1, 32, f);
+        fwrite(&fmts[k].size, 4, 1, f);
+        fwrite(&fmts[k].cls, 4, 1, f);
+        fwrite(lv, 16, n, f);
+        fwrite(sv, 1, n * fmts[k].size, f);
+        rb1->Release(); rb2->Release(); srcb->Release(); dstb->Release(); ldb->Release();
+    }
+    fclose(f);
+    printf("  wrote %u formats\n", count);
+    heap->Release(); upload->Release(); rs->Release();
+    for (auto *p : pso) p->Release();
+    return true;
+}
+
 // Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
 // a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
 // sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
@@ -7585,6 +7713,7 @@ static const Test tests[] = {
     { "dynamicresources_graphics", test_dynamicresources_graphics },
     { "opdiff", test_opdiff },
     { "samplediff", test_samplediff },
+    { "formatdiff", test_formatdiff },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
