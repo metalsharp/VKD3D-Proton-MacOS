@@ -5105,6 +5105,671 @@ cbuffer C : register(b0) { uint k; };
     return true;
 }
 
+// SM 6.4 to 6.6 operations without other tests, one wave of 32 lanes, against a CPU reference: WaveMatch,
+// WaveMultiPrefixSum and CountBits, WaveActiveBitAnd/Or/Xor, WaveActiveProduct, WaveActiveCountBits,
+// WaveActiveAllEqual, WavePrefixProduct, a 64-bit WaveActiveSum, dot4add_u8packed and _i8packed, pack_u8 and
+// pack_clamp_s8.
+static bool test_sm6_ops()
+{
+    static const char *src = R"(
+RWStructuredBuffer<uint> o : register(u0);
+[numthreads(32, 1, 1)] void cs(uint l : SV_GroupIndex)
+{
+    uint b = l * 16;
+    uint4 m = WaveMatch(l % 5);
+    o[b + 0] = m.x;
+    o[b + 1] = WaveMultiPrefixSum(l + 1, m);
+    o[b + 2] = WaveMultiPrefixCountBits((l & 1) != 0, m);
+    o[b + 3] = WaveActiveBitAnd(l | 0xF0u);
+    o[b + 4] = WaveActiveBitOr(1u << (l & 15));
+    o[b + 5] = WaveActiveBitXor(l * 0x9E3779B1u);
+    o[b + 6] = WaveActiveProduct(l < 4 ? l + 2 : 1);
+    o[b + 7] = WaveActiveCountBits(l % 3 == 0) | (WaveGetLaneCount() << 16);
+    o[b + 8] = (WaveActiveAllEqual(l / 32) ? 1u : 0u) | (WaveActiveAllEqual(l) ? 2u : 0u);
+    o[b + 9] = WavePrefixProduct(l < 6 ? 2 : 1);
+    uint64_t big = (uint64_t)l * 0x100000001ull + 7;
+    uint64_t sum = WaveActiveSum(big);
+    o[b + 10] = (uint)sum;
+    o[b + 11] = (uint)(sum >> 32);
+    o[b + 12] = dot4add_u8packed(0x01020304u, l * 0x01010101u, 5u);
+    o[b + 13] = asuint(dot4add_i8packed(0xFF02FE04u, l * 0x01010101u, -3));
+    o[b + 14] = pack_u8(uint4(l, l + 300, 255 + l, l * 2));
+    o[b + 15] = (uint)pack_clamp_s8(int4((int)l * 10 - 160, -200, 200, (int)l));
+}
+)";
+    std::vector<char> cs = compile_dxc(src, "cs", "cs_6_6");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso = create_compute_pipeline(rs, cs);
+    if (!pso)
+        return false;
+    ID3D12Resource *out = create_buffer(32 * 16 * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 32 * 16 * 4, &rb);
+    if (!r)
+        return false;
+    uint32_t lanes = r[7] >> 16;
+    if (lanes != 32)
+    {
+        printf("  skipped: wave size %u, not 32\n", lanes);
+        rb->Release(); out->Release(); pso->Release(); rs->Release();
+        return true;
+    }
+    const char *names[16] = { "WaveMatch", "WaveMultiPrefixSum", "WaveMultiPrefixCountBits", "WaveActiveBitAnd", "WaveActiveBitOr",
+                              "WaveActiveBitXor", "WaveActiveProduct", "WaveActiveCountBits", "WaveActiveAllEqual", "WavePrefixProduct",
+                              "64-bit WaveActiveSum (low)", "64-bit WaveActiveSum (high)", "dot4add_u8packed", "dot4add_i8packed",
+                              "pack_u8", "pack_clamp_s8" };
+    uint32_t xr = 0;
+    for (uint32_t l = 0; l < 32; l++)
+        xr ^= l * 0x9E3779B1u;
+    int bad[16] = {}, total = 0;
+    for (uint32_t l = 0; l < 32; l++)
+    {
+        uint32_t want[16];
+        uint32_t mask = 0, psum = 0, pcnt = 0;
+        for (uint32_t j = 0; j < 32; j++)
+            if (j % 5 == l % 5)
+            {
+                mask |= 1u << j;
+                if (j < l) { psum += j + 1; pcnt += j & 1; }
+            }
+        want[0] = mask; want[1] = psum; want[2] = pcnt;
+        want[3] = 0xF0; want[4] = 0xFFFF; want[5] = xr; want[6] = 120; want[7] = 11 | (32u << 16); want[8] = 1;
+        want[9] = 1u << std::min(l, 6u);
+        want[10] = 720; want[11] = 496;
+        want[12] = 5 + 10 * l;
+        want[13] = (uint32_t)(-3 + 3 * (int)l);
+        want[14] = (l & 255) | (((l + 300) & 255) << 8) | (((255 + l) & 255) << 16) | (((2 * l) & 255) << 24);
+        auto c8 = [](int v) { return (uint32_t)(uint8_t)(int8_t)std::min(std::max(v, -128), 127); };
+        want[15] = c8((int)l * 10 - 160) | c8(-200) << 8 | c8(200) << 16 | c8((int)l) << 24;
+        for (int k = 0; k < 16; k++)
+            if (r[l * 16 + k] != want[k] && !bad[k]++)
+            {
+                printf("  %s, lane %u: %#x, want %#x\n", names[k], l, r[l * 16 + k], want[k]);
+                total++;
+            }
+    }
+    printf("  %d of 16 operations wrong\n", total);
+    EXPECT(!total, "SM 6.4-6.6 wave, dot and pack operations wrong");
+    rb->Release(); out->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+// Geometry shader input assembly of every adjacency topology, against D3D's (and Vulkan's) vertex order: each GS
+// invocation records its draw's case, SV_PrimitiveID, the instance and its input vertex IDs. Cases: a line list with
+// adjacency; a line strip with adjacency from start vertex 2; an indexed triangle list with adjacency at base vertex
+// 100; triangle strips with adjacency of 10 and of 6 vertices (first, middle and last triangles take their own
+// neighbours, odd ones swap); indexed triangle and line strips with adjacency cut by 0xffff (each strip assembles on its
+// own, primitive IDs run on); 3 instances from start instance 4 (SV_InstanceID 0 to 2); and an ExecuteIndirect draw.
+static bool gs_topologies(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint which; };
+RWByteAddressBuffer o : register(u1);
+struct V { uint vid : VID; uint iid : IID; };
+V vs(uint val : VAL, uint iid : SV_InstanceID) { V v; v.vid = val; v.iid = iid; return v; }
+struct D { float4 pos : SV_Position; };
+void record(uint prim, uint iid, uint4 a, uint2 b)
+{
+    uint n;
+    o.InterlockedAdd(0, 1, n);
+    if (n < 256)
+    {
+        o.Store4(16 + n * 48, uint4(which, prim, iid, a.x));
+        o.Store4(16 + n * 48 + 16, uint4(a.yzw, b.x));
+        o.Store4(16 + n * 48 + 32, uint4(b.y, 0, 0, 0));
+    }
+}
+[maxvertexcount(1)] void gs_line(lineadj V i[4], uint prim : SV_PrimitiveID, inout PointStream<D> s)
+{
+    record(prim, i[0].iid, uint4(i[0].vid, i[1].vid, i[2].vid, i[3].vid), uint2(~0u, ~0u));
+    D d; d.pos = float4(2, 2, 0, 1); s.Append(d);
+}
+[maxvertexcount(1)] void gs_tri(triangleadj V i[6], uint prim : SV_PrimitiveID, inout PointStream<D> s)
+{
+    record(prim, i[0].iid, uint4(i[0].vid, i[1].vid, i[2].vid, i[3].vid), uint2(i[4].vid, i[5].vid));
+    D d; d.pos = float4(2, 2, 0, 1); s.Append(d);
+}
+float4 ps() : SV_Target { return 0; }
+)";
+    auto comp = [&](const char *e, const char *t5, const char *t6) { return dxbc ? compile_fxc(src, e, t5) : compile_dxc(src, e, t6); };
+    std::vector<char> vs = comp("vs", "vs_5_0", "vs_6_0"), gl = comp("gs_line", "gs_5_0", "gs_6_0"), gt = comp("gs_tri", "gs_5_0", "gs_6_0"),
+                      ps = comp("ps", "ps_5_0", "ps_6_0");
+    if (vs.empty() || gl.empty() || gt.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    // Vertex k's VAL attribute is k: fetches must honor the start vertex and the base vertex (SV_VertexID doesn't
+    // include them).
+    const D3D12_INPUT_ELEMENT_DESC el = { "VAL", 0, DXGI_FORMAT_R32_UINT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    auto make = [&](bool tri, bool cut) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.GS = tri ? D3D12_SHADER_BYTECODE{ gt.data(), gt.size() } : D3D12_SHADER_BYTECODE{ gl.data(), gl.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.SampleMask = ~0u;
+        pd.InputLayout = { &el, 1 };
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = tri ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        pd.IBStripCutValue = cut ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        return pso;
+    };
+    ID3D12PipelineState *line = make(false, false), *line_cut = make(false, true), *tri = make(true, false), *tri_cut = make(true, true);
+    if (!line || !line_cut || !tri || !tri_cut)
+    {
+        printf("  pipeline creation failed\n");
+        return false;
+    }
+    // Index buffers: case 2 (triangle list with adjacency, 12 indices), case 5 (triangle strip with adjacency, 10, a
+    // cut, 8), case 6 (line strip with adjacency, 6, a cut, 5).
+    std::vector<uint16_t> idx;
+    const uint32_t i2 = 0;
+    for (uint16_t v : { 5, 4, 3, 2, 1, 0, 11, 10, 9, 8, 7, 6 }) idx.push_back(v);
+    const uint32_t i5 = (uint32_t)idx.size();
+    for (uint16_t v = 0; v < 10; v++) idx.push_back(v);
+    idx.push_back(0xffff);
+    for (uint16_t v = 20; v < 28; v++) idx.push_back(v);
+    const uint32_t n5 = (uint32_t)idx.size() - i5, i6 = (uint32_t)idx.size();
+    for (uint16_t v = 0; v < 6; v++) idx.push_back(v);
+    idx.push_back(0xffff);
+    for (uint16_t v = 10; v < 15; v++) idx.push_back(v);
+    const uint32_t n6 = (uint32_t)idx.size() - i6, i9 = (uint32_t)idx.size();
+    // Case 9: 200 indexes of triangle strips with adjacency cut every 13th (strips of 12: several threadgroups).
+    for (uint32_t k = 0; k < 200; k++)
+        idx.push_back(k % 13 == 12 ? 0xffff : (uint16_t)(k % 256));
+    const uint32_t n9 = 200;
+    ID3D12Resource *ib = create_buffer(idx.size() * 2 + 64, D3D12_HEAP_TYPE_UPLOAD);
+    void *m = nullptr;
+    ib->Map(0, nullptr, &m);
+    memcpy(m, idx.data(), idx.size() * 2);
+    ib->Unmap(0, nullptr);
+    // Indirect: a line list with adjacency, 8 vertices, 2 instances.
+    ID3D12Resource *args = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    args->Map(0, nullptr, &m);
+    const uint32_t draw_args[4] = { 8, 2, 0, 0 };
+    memcpy(m, draw_args, sizeof(draw_args));
+    args->Unmap(0, nullptr);
+    D3D12_INDIRECT_ARGUMENT_DESC iad = { D3D12_INDIRECT_ARGUMENT_TYPE_DRAW };
+    D3D12_COMMAND_SIGNATURE_DESC csd = { 16, 1, &iad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(dev->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+    transition(args, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *vb = create_buffer(256 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    vb->Map(0, nullptr, &m);
+    for (uint32_t k = 0; k < 256; k++)
+        ((uint32_t *)m)[k] = k;
+    vb->Unmap(0, nullptr);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress(), 256 * 4, 4 };
+    ID3D12Resource *out = create_buffer(16 + 256 * 48, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), (UINT)idx.size() * 2, DXGI_FORMAT_R16_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    g.list->IASetVertexBuffers(0, 1, &vbv);
+    auto setc = [&](uint32_t c) { g.list->SetGraphicsRoot32BitConstants(0, 1, &c, 0); };
+    g.list->SetPipelineState(line);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ);
+    setc(0); g.list->DrawInstanced(8, 1, 0, 0);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ);
+    setc(1); g.list->DrawInstanced(7, 1, 2, 0);
+    g.list->SetPipelineState(tri);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ);
+    setc(2); g.list->DrawIndexedInstanced(12, 1, i2, 100, 0);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+    setc(3); g.list->DrawInstanced(10, 1, 0, 0);
+    setc(4); g.list->DrawInstanced(6, 1, 0, 0);
+    g.list->SetPipelineState(tri_cut);
+    setc(5); g.list->DrawIndexedInstanced(n5, 1, i5, 0, 0);
+    setc(9); g.list->DrawIndexedInstanced(n9, 1, i9, 0, 0);
+    g.list->SetPipelineState(line_cut);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ);
+    setc(6); g.list->DrawIndexedInstanced(n6, 1, i6, 0, 0);
+    g.list->SetPipelineState(tri);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ);
+    setc(7); g.list->DrawInstanced(6, 3, 0, 4);
+    g.list->SetPipelineState(line);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ);
+    setc(8); g.list->ExecuteIndirect(sig, 1, args, 0, nullptr, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 16 + 256 * 48, &rb);
+    if (!r)
+        return false;
+    // Expected records: case, prim, instance, 6 vertex IDs (~0 for unused).
+    typedef std::array<uint32_t, 9> Rec;
+    std::multiset<Rec> want, got;
+    const uint32_t X = ~0u;
+    auto add = [&](uint32_t c, uint32_t p_, uint32_t iid, std::vector<uint32_t> v) {
+        Rec rec = { c, p_, iid, X, X, X, X, X, X };
+        for (size_t k = 0; k < v.size(); k++) rec[3 + k] = v[k];
+        want.insert(rec);
+    };
+    add(0, 0, 0, { 0, 1, 2, 3 }); add(0, 1, 0, { 4, 5, 6, 7 });
+    for (uint32_t p_ = 0; p_ < 4; p_++) add(1, p_, 0, { 2 + p_, 3 + p_, 4 + p_, 5 + p_ });
+    add(2, 0, 0, { 105, 104, 103, 102, 101, 100 }); add(2, 1, 0, { 111, 110, 109, 108, 107, 106 });
+    // Triangle strips with adjacency (Vulkan's table, D3D's order): triangle i of n over vertices s[].
+    auto strip_adj = [&](uint32_t c, const std::vector<uint32_t> &sv, uint32_t &prim) {
+        uint32_t n = sv.size() >= 6 ? (uint32_t)(sv.size() - 4) / 2 : 0;
+        for (uint32_t i = 0; i < n; i++)
+        {
+            std::vector<uint32_t> t;
+            if (n == 1) t = { 0, 1, 2, 5, 4, 3 };
+            else if (i == 0) t = { 0, 1, 2, 6, 4, 3 };
+            else if (i == n - 1) t = (i & 1) ? std::vector<uint32_t>{ 2 * i + 2, 2 * i - 2, 2 * i, 2 * i + 3, 2 * i + 4, 2 * i + 5 }
+                                             : std::vector<uint32_t>{ 2 * i, 2 * i - 2, 2 * i + 2, 2 * i + 5, 2 * i + 4, 2 * i + 3 };
+            else t = (i & 1) ? std::vector<uint32_t>{ 2 * i + 2, 2 * i - 2, 2 * i, 2 * i + 3, 2 * i + 4, 2 * i + 6 }
+                             : std::vector<uint32_t>{ 2 * i, 2 * i - 2, 2 * i + 2, 2 * i + 6, 2 * i + 4, 2 * i + 3 };
+            for (auto &k : t) k = sv[k];
+            add(c, prim++, 0, t);
+        }
+    };
+    std::vector<uint32_t> s10, s6, sa, sb;
+    for (uint32_t v = 0; v < 10; v++) s10.push_back(v);
+    for (uint32_t v = 0; v < 6; v++) s6.push_back(v);
+    for (uint32_t v = 20; v < 28; v++) sb.push_back(v);
+    uint32_t pr = 0;
+    strip_adj(3, s10, pr);
+    pr = 0;
+    strip_adj(4, s6, pr);
+    pr = 0;
+    strip_adj(5, s10, pr);
+    strip_adj(5, sb, pr);
+    {
+        std::vector<uint32_t> seg;
+        pr = 0;
+        for (uint32_t k = 0; k <= n9; k++)
+        {
+            if (k < n9 && idx[i9 + k] != 0xffff) { seg.push_back(idx[i9 + k]); continue; }
+            strip_adj(9, seg, pr);
+            seg.clear();
+        }
+    }
+    for (uint32_t p_ = 0; p_ < 3; p_++) add(6, p_, 0, { p_, p_ + 1, p_ + 2, p_ + 3 });
+    for (uint32_t p_ = 0; p_ < 2; p_++) add(6, 3 + p_, 0, { 10 + p_, 11 + p_, 12 + p_, 13 + p_ });
+    for (uint32_t i = 0; i < 3; i++) add(7, 0, i, { 0, 1, 2, 3, 4, 5 });
+    for (uint32_t i = 0; i < 2; i++) { add(8, 0, i, { 0, 1, 2, 3 }); add(8, 1, i, { 4, 5, 6, 7 }); }
+    uint32_t n = std::min(r[0], 256u);
+    for (uint32_t k = 0; k < n; k++)
+    {
+        const uint32_t *e = r + 4 + k * 12;
+        Rec rec = { e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8] };
+        if (e[0] == 0 || e[0] == 1 || e[0] == 6 || e[0] == 8)
+            rec[7] = rec[8] = X;
+        got.insert(rec);
+    }
+    const char *names[10] = { "line list adj", "line strip adj", "indexed triangle list adj (base vertex)", "triangle strip adj (10)",
+                             "triangle strip adj (6)", "cut triangle strip adj", "cut line strip adj", "instanced", "ExecuteIndirect", "200-index cut triangle strip adj" };
+    int bad_cases = 0;
+    for (uint32_t c = 0; c < 10; c++)
+    {
+        std::multiset<Rec> w, g_;
+        for (auto &x : want) if (x[0] == c) w.insert(x);
+        for (auto &x : got) if (x[0] == c) g_.insert(x);
+        if (w != g_)
+        {
+            bad_cases++;
+            printf("  %s: %zu invocations, want %zu\n", names[c], g_.size(), w.size());
+            int shown = 0;
+            for (auto &x : g_)
+                if (!w.count(x) && shown++ < 3)
+                    printf("    got  prim %u inst %u: %d %d %d %d %d %d\n", x[1], x[2], (int)x[3], (int)x[4], (int)x[5], (int)x[6], (int)x[7], (int)x[8]);
+            shown = 0;
+            for (auto &x : w)
+                if (!g_.count(x) && shown++ < 3)
+                    printf("    want prim %u inst %u: %d %d %d %d %d %d\n", x[1], x[2], (int)x[3], (int)x[4], (int)x[5], (int)x[6], (int)x[7], (int)x[8]);
+        }
+    }
+    printf("  %u invocations, %d of 10 cases wrong\n", n, bad_cases);
+    EXPECT(!bad_cases, "geometry shader adjacency input assembly wrong");
+    rb->Release(); out->Release(); vb->Release(); args->Release(); sig->Release(); ib->Release();
+    line->Release(); line_cut->Release(); tri->Release(); tri_cut->Release(); rs->Release();
+    return true;
+}
+
+static bool test_gs_topologies() { return gs_topologies(false); }
+static bool test_gs_topologies_dxbc() { return gs_topologies(true); }
+
+// Geometry shader outputs, counted by the pixel shader per draw on an 8x8 target from one input point: a line strip
+// along row 2 (8 pixels); 5 points at pixel centres; incomplete triangle strips (2 vertices, a cut, 1 vertex: nothing);
+// a full-target triangle clipped by SV_ClipDistance on its left half (32 pixels); 64 points carrying three more
+// float4 attributes each (a large output, which isn't batched), every attribute checked (64 pixels, 64 right); and
+// [instance(4)] writing SV_RenderTargetArrayIndex into a 4-slice target (each slice 64 pixels).
+static bool gs_outputs(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint which; };
+RWByteAddressBuffer o : register(u1);
+struct V { float4 pos : SV_Position; };
+V vs() { V v; v.pos = 0; return v; }
+float4 px(float x, float y) { return float4((x + 0.5) / 4 - 1, 1 - (y + 0.5) / 4, 0.5, 1); }
+struct P { float4 pos : SV_Position; };
+[maxvertexcount(2)] void gs_line(point V i[1], inout LineStream<P> s)
+{
+    P p; p.pos = float4(-1.5, 1 - 2.5 / 4, 0.5, 1); s.Append(p);
+    p.pos = float4(1.5, 1 - 2.5 / 4, 0.5, 1); s.Append(p);
+}
+[maxvertexcount(5)] void gs_points(point V i[1], inout PointStream<P> s)
+{
+    for (uint k = 0; k < 5; k++) { P p; p.pos = px(k, k); s.Append(p); }
+}
+[maxvertexcount(3)] void gs_incomplete(point V i[1], inout TriangleStream<P> s)
+{
+    P p; p.pos = float4(-1, 1, 0.5, 1); s.Append(p);
+    p.pos = float4(3, 1, 0.5, 1); s.Append(p);
+    s.RestartStrip();
+    p.pos = float4(-1, -3, 0.5, 1); s.Append(p);
+}
+struct PC { float4 pos : SV_Position; float clip : SV_ClipDistance0; };
+[maxvertexcount(3)] void gs_clip(point V i[1], inout TriangleStream<PC> s)
+{
+    PC p;
+    p.pos = float4(-1, 1, 0.5, 1); p.clip = p.pos.x; s.Append(p);
+    p.pos = float4(3, 1, 0.5, 1); p.clip = p.pos.x; s.Append(p);
+    p.pos = float4(-1, -3, 0.5, 1); p.clip = p.pos.x; s.Append(p);
+}
+struct PB { float4 pos : SV_Position; float4 a : A; float4 b : B; float4 c : C; };
+[maxvertexcount(64)] void gs_big(point V i[1], inout PointStream<PB> s)
+{
+    for (uint k = 0; k < 64; k++)
+    {
+        PB p; uint x = k % 8, y = k / 8;
+        p.pos = px(x, y); p.a = float4(x, y, k, 1); p.b = float4(k * 2, k * 3, k * 4, k * 5); p.c = float4(-1.0 * k, 0.5, 100 + k, 7);
+        s.Append(p);
+    }
+}
+struct PL { float4 pos : SV_Position; uint layer : SV_RenderTargetArrayIndex; };
+[instance(4)] [maxvertexcount(3)] void gs_layers(point V i[1], uint id : SV_GSInstanceID, inout TriangleStream<PL> s)
+{
+    PL p; p.layer = id;
+    p.pos = float4(-1, 1, 0.5, 1); s.Append(p);
+    p.pos = float4(3, 1, 0.5, 1); s.Append(p);
+    p.pos = float4(-1, -3, 0.5, 1); s.Append(p);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target { o.InterlockedAdd(which * 4, 1); return 1; }
+float4 ps_big(PB p) : SV_Target
+{
+    o.InterlockedAdd(which * 4, 1);
+    uint x = (uint)p.pos.x, y = (uint)p.pos.y, k = y * 8 + x;
+    bool ok = all(p.a == float4(x, y, k, 1)) && all(p.b == float4(k * 2, k * 3, k * 4, k * 5)) && all(p.c == float4(-1.0 * k, 0.5, 100 + k, 7));
+    if (ok) o.InterlockedAdd(60, 1);
+    return 1;
+}
+float4 ps_layers(float4 pos : SV_Position, uint layer : SV_RenderTargetArrayIndex) : SV_Target { o.InterlockedAdd(64 + layer * 4, 1); return 1; }
+)";
+    auto comp = [&](const char *e, const char *t5, const char *t6) { return dxbc ? compile_fxc(src, e, t5) : compile_dxc(src, e, t6); };
+    std::vector<char> vs = comp("vs", "vs_5_0", "vs_6_0"), ps = comp("ps", "ps_5_0", "ps_6_0"), ps_big = comp("ps_big", "ps_5_0", "ps_6_0"),
+                      ps_layers = comp("ps_layers", "ps_5_0", "ps_6_0");
+    const char *gss[6] = { "gs_line", "gs_points", "gs_incomplete", "gs_clip", "gs_big", "gs_layers" };
+    std::vector<char> gs[6];
+    for (int k = 0; k < 6; k++)
+        if ((gs[k] = comp(gss[k], "gs_5_0", "gs_6_0")).empty())
+            return false;
+    if (vs.empty() || ps.empty() || ps_big.empty() || ps_layers.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *psos[6] = {};
+    for (int k = 0; k < 6; k++)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.GS = { gs[k].data(), gs[k].size() };
+        const std::vector<char> &p_ = k == 4 ? ps_big : k == 5 ? ps_layers : ps;
+        pd.PS = { p_.data(), p_.size() };
+        pd.SampleMask = ~0u;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psos[k]))))
+        {
+            printf("  %s: pipeline creation failed\n", gss[k]);
+            return false;
+        }
+    }
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 8; td.Height = 8; td.DepthOrArraySize = 4; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 8, 8, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 8, 8 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    for (uint32_t k = 0; k < 6; k++)
+    {
+        g.list->SetGraphicsRoot32BitConstants(0, 1, &k, 0);
+        g.list->SetPipelineState(psos[k]);
+        g.list->DrawInstanced(1, 1, 0, 0);
+    }
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    printf("  line strip %u, points %u, incomplete strips %u, clipped %u, large output %u (%u right), layers %u %u %u %u\n",
+           r[0], r[1], r[2], r[3], r[4], r[15], r[16], r[17], r[18], r[19]);
+    EXPECT(r[0] == 8, "a line strip across row 2 lit %u pixels, want 8", r[0]);
+    EXPECT(r[1] == 5, "5 points lit %u pixels", r[1]);
+    EXPECT(r[2] == 0, "incomplete triangle strips lit %u pixels, want none", r[2]);
+    EXPECT(r[3] == 32, "SV_ClipDistance from the geometry shader left %u pixels, want 32", r[3]);
+    EXPECT(r[4] == 64 && r[15] == 64, "a 64-point output with three more attributes lit %u pixels, %u with the right attributes", r[4], r[15]);
+    EXPECT(r[16] == 64 && r[17] == 64 && r[18] == 64 && r[19] == 64, "[instance(4)] layers drew %u %u %u %u pixels, want 64 each",
+           r[16], r[17], r[18], r[19]);
+    rb->Release(); out->Release(); rheap->Release(); rt->Release(); rs->Release();
+    for (auto *p_ : psos) p_->Release();
+    return true;
+}
+
+static bool test_gs_outputs() { return gs_outputs(false); }
+static bool test_gs_outputs_dxbc() { return gs_outputs(true); }
+
+// Two geometry shader streams: from each of 4 points, stream 0 writes two vertices (id, row, 0, 1) at pixels (id, 0)
+// and (id, 1) to stream output buffer 0 and to the rasterizer (8 pixels), and stream 1 one vertex (id, 0, 0, 2) to
+// buffer 1 only. SO statistics per stream. (D3D12 matches the pixel shader to stream 0 whatever the rasterized
+// stream, so only stream 0 is rasterized in practice.)
+static bool gs_multistream(bool dxbc)
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u1);
+struct V { float4 pos : SV_Position; uint id : ID; };
+V vs(uint id : SV_VertexID) { V v; v.pos = float4(0, 0, 0, 1); v.id = id; return v; }
+struct S0 { float4 pos : SV_Position; float4 a : TEXCOORD0; };
+struct S1 { float4 pos : SV_Position; float4 b : TEXCOORD1; };
+[maxvertexcount(3)]
+void gs(point V i[1], inout PointStream<S0> s0, inout PointStream<S1> s1)
+{
+    for (uint r = 0; r < 2; r++)
+    {
+        S0 x; x.pos = float4((i[0].id + 0.5) / 2 - 1, 1 - (r + 0.5) / 2, 0.5, 1); x.a = float4(i[0].id, r, 0, 1); s0.Append(x);
+    }
+    S1 y; y.pos = float4(0, 0, 0.5, 1); y.b = float4(i[0].id, 0, 0, 2); s1.Append(y);
+}
+float4 ps(float4 pos : SV_Position, float4 a : TEXCOORD0) : SV_Target
+{
+    o.InterlockedAdd(0, 1);
+    if ((uint)pos.x == (uint)a.x && (uint)pos.y == (uint)a.y && a.w == 1) o.InterlockedAdd(4, 1);
+    return 1;
+}
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> gs = dxbc ? compile_fxc(src, "gs", "gs_5_0") : compile_dxc(src, "gs", "gs_6_0");
+    std::vector<char> ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || gs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_SO_DECLARATION_ENTRY decl[2] = { { 0, "TEXCOORD", 0, 0, 4, 0 }, { 1, "TEXCOORD", 1, 0, 4, 1 } };
+    UINT strides[2] = { 16, 16 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.GS = { gs.data(), gs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.StreamOutput = { decl, 2, strides, 2, 0 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    if (FAILED(hr))
+    {
+        printf("  pipeline creation failed: %#lx\n", (unsigned long)hr);
+        EXPECT(false, "two-stream geometry shader with stream output: no pipeline");
+        rs->Release();
+        return true;
+    }
+    const UINT64 size = 4096;
+    ID3D12Resource *upload = create_buffer(size, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *init = nullptr;
+    upload->Map(0, nullptr, (void **)&init);
+    for (UINT i = 0; i < size / 4; i++)
+        init[i] = 0xdeadbeef;
+    memset(init, 0, 16);
+    memset(init + 64, 0, 16);
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *so = create_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(so, 0, upload, 0, size);
+    transition(so, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    D3D12_QUERY_HEAP_DESC qhd = { D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 2 };
+    ID3D12QueryHeap *qh = nullptr;
+    CHECK_HR(dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)));
+    ID3D12Resource *qres = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *cnt = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(0, cnt->GetGPUVirtualAddress());
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW views[2] = { { so->GetGPUVirtualAddress() + 512, 1024, so->GetGPUVirtualAddress() },
+                                                 { so->GetGPUVirtualAddress() + 2048, 1024, so->GetGPUVirtualAddress() + 256 } };
+    g.list->SOSetTargets(0, 2, views);
+    g.list->BeginQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    g.list->BeginQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
+    g.list->DrawInstanced(4, 1, 0, 0);
+    g.list->EndQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    g.list->EndQuery(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
+    g.list->SOSetTargets(0, 0, nullptr);
+    g.list->ResolveQueryData(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 1, qres, 0);
+    g.list->ResolveQueryData(qh, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1, 1, qres, 16);
+    transition(cnt, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *crb = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+    g.list->CopyBufferRegion(crb, 0, cnt, 0, 256);
+    ID3D12Resource *sorb = nullptr;
+    const uint32_t *d = read_buffer(so, D3D12_RESOURCE_STATE_STREAM_OUT, size, &sorb);
+    if (!d)
+        return false;
+    const uint32_t *c = nullptr;
+    D3D12_RANGE cr = { 0, 16 };
+    crb->Map(0, &cr, (void **)&c);
+    const UINT64 *q = nullptr;
+    D3D12_RANGE qr = { 0, 32 };
+    qres->Map(0, &qr, (void **)&q);
+    int bad0 = 0, bad1 = 0;
+    std::multiset<std::pair<int, int>> s0, s1, w0, w1;
+    for (UINT k = 0; k < 4; k++)
+    {
+        const float *v1 = (const float *)&d[(2048 + 16 * k) / 4];
+        s1.insert({ (int)v1[0], (int)(v1[3] * 10) });
+        w1.insert({ (int)k, 20 });
+        for (UINT r = 0; r < 2; r++)
+        {
+            const float *v = (const float *)&d[(512 + 16 * (k * 2 + r)) / 4];
+            s0.insert({ (int)v[0] * 10 + (int)v[1], (int)(v[3] * 10) });
+            w0.insert({ (int)k * 10 + (int)r, 10 });
+        }
+    }
+    bad0 = s0 != w0;
+    bad1 = s1 != w1;
+    printf("  filled sizes %u / %u; SO statistics stream 0 %llu/%llu, stream 1 %llu/%llu; rasterized stream 0: %u pixels, %u right\n",
+           d[0], d[64], (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3], c[0], c[1]);
+    EXPECT(d[0] == 8 * 16 && !bad0, "stream 0: filled size %u, %s", d[0], bad0 ? "wrong vertices" : "vertices right");
+    EXPECT(d[64] == 4 * 16 && !bad1, "stream 1: filled size %u, %s", d[64], bad1 ? "wrong vertices" : "vertices right");
+    EXPECT(q[0] == 8 && q[1] == 8 && q[2] == 4 && q[3] == 4, "SO statistics per stream wrong");
+    EXPECT(c[0] == 8 && c[1] == 8, "rasterized stream 0 drew %u pixels (%u right), want 8", c[0], c[1]);
+    crb->Unmap(0, nullptr);
+    crb->Release(); cnt->Release(); rheap->Release(); rt->Release();
+    qres->Release(); qh->Release(); sorb->Release(); so->Release(); upload->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_gs_multistream() { return gs_multistream(false); }
+static bool test_gs_multistream_dxbc() { return gs_multistream(true); }
+
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
 
@@ -12246,6 +12911,13 @@ static const Test tests[] = {
     { "dispatch_ids_dxbc", test_dispatch_ids_dxbc },
     { "msaa_samples", test_msaa_samples },
     { "split_enhanced_barriers", test_split_enhanced_barriers },
+    { "sm6_ops", test_sm6_ops },
+    { "gs_topologies", test_gs_topologies },
+    { "gs_topologies_dxbc", test_gs_topologies_dxbc },
+    { "gs_outputs", test_gs_outputs },
+    { "gs_outputs_dxbc", test_gs_outputs_dxbc },
+    { "gs_multistream", test_gs_multistream },
+    { "gs_multistream_dxbc", test_gs_multistream_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },

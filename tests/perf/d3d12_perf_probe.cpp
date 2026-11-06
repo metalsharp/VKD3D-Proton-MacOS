@@ -2671,6 +2671,26 @@ V vs_point(uint id : SV_VertexID)
     for (uint k = 0; k < 4; k++) { V o = i[0]; o.pos.xy += float2(k & 1, k >> 1) * 0.008; o.uv = float2(k & 1, k >> 1); s.Append(o); }
 }
 [maxvertexcount(3)] void gs_pass(triangle V i[3], inout TriangleStream<V> s) { for (uint k = 0; k < 3; k++) s.Append(i[k]); }
+// A cube shadow map's caster pass: 20000 small triangles, each to the 6 faces of a depth cube (array slices).
+float4 vs_caster(uint id : SV_VertexID) : SV_Position
+{
+    uint t = id / 3, c = id % 3;
+    float2 p = float2(t % 200, t / 200 % 100) / float2(100, 50) - 1 + float2(c == 1, c == 2) * 0.012;
+    return float4(p, 0.25 + 0.5 * frac(t * 0.618), 1);
+}
+struct VL { float4 pos : SV_Position; uint layer : SV_RenderTargetArrayIndex; };
+[maxvertexcount(18)] void gs_cube(triangle float4 i[3] : SV_Position, inout TriangleStream<VL> s)
+{
+    for (uint f = 0; f < 6; f++)
+    {
+        for (uint k = 0; k < 3; k++) { VL o; o.pos = i[k]; o.pos.x = -o.pos.x * (f & 1 ? 1 : -1); o.layer = f; s.Append(o); }
+        s.RestartStrip();
+    }
+}
+[instance(6)] [maxvertexcount(3)] void gs_cube_inst(triangle float4 i[3] : SV_Position, uint f : SV_GSInstanceID, inout TriangleStream<VL> s)
+{
+    for (uint k = 0; k < 3; k++) { VL o; o.pos = i[k]; o.pos.x = -o.pos.x * (f & 1 ? 1 : -1); o.layer = f; s.Append(o); }
+}
 struct TV { float2 pos : POS; };
 TV vs_patch(uint id : SV_VertexID)
 {
@@ -2973,6 +2993,64 @@ static std::vector<Scene> feature_scenes()
             pso_a = create_pso(d);
         });
     };
+    // Cube shadow maps: a 512x512 D32 array of 6 slices, a DSV of all of them and one per slice.
+    static ID3D12Resource *cube_depth;
+    static ID3D12DescriptorHeap *cube_dsv_heap;
+    auto cube_init = [](const char *gs) {
+        return std::function<void()>([gs] {
+            PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_caster"; d.ps = nullptr; d.num_rt = 0; d.depth = true;
+            d.dsv = DXGI_FORMAT_D32_FLOAT; d.gs = gs;
+            pso_a = create_pso(d);
+            D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+            D3D12_RESOURCE_DESC td = {};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = 512; td.Height = 512; td.DepthOrArraySize = 6; td.MipLevels = 1;
+            td.Format = DXGI_FORMAT_D32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_D32_FLOAT };
+            cv.DepthStencil.Depth = 1.0f;
+            CHECK(p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&cube_depth)));
+            D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 7 };
+            CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cube_dsv_heap)));
+            UINT inc = p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            for (UINT k = 0; k < 7; k++)
+            {
+                D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
+                dd.Format = DXGI_FORMAT_D32_FLOAT;
+                dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                dd.Texture2DArray.FirstArraySlice = k == 6 ? 0 : k;
+                dd.Texture2DArray.ArraySize = k == 6 ? 6 : 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+                h.ptr += k * inc;
+                p.device->CreateDepthStencilView(cube_depth, &dd, h);
+            }
+        });
+    };
+    auto cube_frame = [](bool six_passes) {
+        UINT inc = p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE all = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        all.ptr += 6 * inc;
+        p.list->ClearDepthStencilView(all, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        D3D12_VIEWPORT vp = { 0, 0, 512, 512, 0, 1 };
+        D3D12_RECT sc = { 0, 0, 512, 512 };
+        p.list->RSSetViewports(1, &vp);
+        p.list->RSSetScissorRects(1, &sc);
+        set_quad_state(p.list, pso_a);
+        if (!six_passes)
+        {
+            p.list->OMSetRenderTargets(0, nullptr, FALSE, &all);
+            p.list->DrawInstanced(60000, 1, 0, 0);
+            return;
+        }
+        for (UINT f = 0; f < 6; f++)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += f * inc;
+            p.list->OMSetRenderTargets(0, nullptr, FALSE, &h);
+            p.list->DrawInstanced(60000, 1, 0, 0);
+        }
+    };
     // Tessellation (hull and domain shaders run in compute and mesh stages on Metal).
     auto tess_init = [](const char *vs_target) {
         return std::function<void()>([vs_target] {
@@ -3146,6 +3224,11 @@ static std::vector<Scene> feature_scenes()
           [](UINT f) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST); p.list->DrawInstanced(20000, 1, 0, 0); }, false, 0, true },
         { "gs_passthrough", "a pass-through geometry shader on 5000 small triangles (compare draws)", gs_init("gs_pass", "vs_quad", "vs_5_0", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE),
           [quads](UINT f) { set_quad_state(p.list, pso_a); quads(5000, 0.01f, f); } },
+        { "gs_cube_shadow", "a cube shadow map: 20000 triangles to 6 depth slices by a geometry shader (SV_RenderTargetArrayIndex)", cube_init("gs_cube"),
+          [cube_frame](UINT) { cube_frame(false); } },
+        { "gs_cube_instanced", "the same with [instance(6)], one face per invocation", cube_init("gs_cube_inst"), [cube_frame](UINT) { cube_frame(false); } },
+        { "cube_shadow_6pass", "the same without a geometry shader: 6 draws, one per slice (baseline for gs_cube_*)", cube_init(nullptr),
+          [cube_frame](UINT) { cube_frame(true); } },
         { "tess_dxbc", "1000 triangle patches at tessellation factor 16 (256000 triangles), DXBC", tess_init("vs_5_0"),
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); } },
         { "tess_dxil", "the same compiled as DXIL", tess_init("vs_6_0"),
