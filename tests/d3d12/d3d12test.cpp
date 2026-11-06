@@ -4248,6 +4248,120 @@ float4 ps() : SV_Target { InterlockedAdd(u[idx], 1); return 1; }
     return true;
 }
 
+// ExecuteIndirect with a root constant per command, the command signatures made before the PSOs (as engines do at
+// startup): a compute signature (constant, dispatch) and a graphics one (constant, draw), each run for 4 commands
+// that write their constant to a UAV slot of their own. On the Metal Shader Converter bridge the PSOs compile the
+// SPIR-V pipeline such ExecuteIndirects use when they're made.
+static bool test_executeindirect_template_first()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint value; };
+RWByteAddressBuffer o : register(u0);
+[numthreads(1, 1, 1)] void cs() { o.Store((value & 15) * 4, value); }
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
+float4 ps(float4 p : SV_Position) : SV_Target { if (p.x < 1 && p.y < 1) o.Store(64 + (value & 15) * 4, value); return 0; }
+)";
+    std::vector<char> csb = compile_dxc(src, "cs", "cs_6_0"), vsb = compile_dxc(src, "vs", "vs_6_0"), psb = compile_dxc(src, "ps", "ps_6_0");
+    if (csb.empty() || vsb.empty() || psb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    struct CsCmd { uint32_t value; D3D12_DISPATCH_ARGUMENTS dispatch; };
+    struct GfxCmd { uint32_t value; D3D12_DRAW_ARGUMENTS draw; };
+    D3D12_INDIRECT_ARGUMENT_DESC cs_args[2] = {}, gfx_args[2] = {};
+    cs_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    cs_args[0].Constant = { 0, 0, 1 };
+    cs_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    gfx_args[0] = cs_args[0];
+    gfx_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(CsCmd), 2, cs_args, 0 }, gsd = { sizeof(GfxCmd), 2, gfx_args, 0 };
+    ID3D12CommandSignature *cs_sig = nullptr, *gfx_sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, rs, IID_PPV_ARGS(&cs_sig)));
+    CHECK_HR(g.device->CreateCommandSignature(&gsd, rs, IID_PPV_ARGS(&gfx_sig)));
+    // Now the PSOs.
+    ID3D12PipelineState *cps = create_compute_pipeline(rs, csb);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *gps = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&gps)));
+    if (!cps)
+        return false;
+
+    ID3D12Resource *args = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *a = nullptr;
+    args->Map(0, nullptr, (void **)&a);
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        CsCmd c = { 0x100 * (i + 1) + i, { 1, 1, 1 } };
+        GfxCmd d = { 0x1000 * (i + 1) + 4 + i, { 3, 1, 0, 0 } };
+        memcpy(a + i * sizeof(CsCmd), &c, sizeof(c));
+        memcpy(a + 128 + i * sizeof(GfxCmd), &d, sizeof(d));
+    }
+    args->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(cps);
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->ExecuteIndirect(cs_sig, 4, args, 0, nullptr, 0);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(gps);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->ExecuteIndirect(gfx_sig, 4, args, 128, nullptr, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    int bad = 0;
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        uint32_t want_cs = 0x100 * (i + 1) + i, want_gfx = 0x1000 * (i + 1) + 4 + i;
+        if (v[i] != want_cs && bad++ < 4)
+            printf("  dispatch %u wrote 0x%x, want 0x%x\n", i, v[i], want_cs);
+        if (v[16 + 4 + i] != want_gfx && bad++ < 4)
+            printf("  draw %u wrote 0x%x, want 0x%x\n", i, v[16 + 4 + i], want_gfx);
+    }
+    EXPECT(!bad, "%d ExecuteIndirect commands read the wrong root constant", bad);
+    rb->Release(); rtv_heap->Release(); rt->Release(); out->Release(); args->Release();
+    gps->Release(); cps->Release(); gfx_sig->Release(); cs_sig->Release(); rs->Release();
+    return true;
+}
+
 // Native 16-bit shader operations (SM 6.2, -enable-16bit-types): half and 16-bit integer arithmetic, 16-bit loads
 // and stores of raw and structured buffers, and FP16 denormals (which D3D12 requires to be preserved).
 static const char *cs_16bit_src = R"(
@@ -8189,6 +8303,7 @@ static const Test tests[] = {
     { "wave_ops_compute", test_wave_ops_compute },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
+    { "executeindirect_template_first", test_executeindirect_template_first },
     { "viewinstancing", test_viewinstancing },
     { "d3d11on12", test_d3d11on12 },
     { "samplerfeedback", test_samplerfeedback },
