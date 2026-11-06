@@ -6938,6 +6938,200 @@ RWByteAddressBuffer o : register(u0);
 static bool test_compute_limits() { return compute_limits(false); }
 static bool test_compute_limits_dxbc() { return compute_limits(true); }
 
+// Clears of views: ClearUnorderedAccessViewUint on a typed buffer view (elements 4-11 of R32_UINT), a raw view, an
+// R8G8B8A8_UINT texture (0x123 keeps its low 8 bits, 0x23) and one array slice / mip of a texture array;
+// ClearUnorderedAccessViewFloat on R16G16B16A16_FLOAT with a rect and on R8G8B8A8_UNORM (0.5 rounds to 128);
+// ClearRenderTargetView with two rects. Everything outside a view or rect keeps its sentinel.
+static bool test_clear_views()
+{
+    ID3D12Device *dev = g.device;
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *gpu_heap = nullptr, *cpu_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu_heap)));
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cpu_heap)));
+    auto cpu = [&](ID3D12DescriptorHeap *h, UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart(); c.ptr += i * inc; return c; };
+    auto gpuh = [&](UINT i) { D3D12_GPU_DESCRIPTOR_HANDLE c = gpu_heap->GetGPUDescriptorHandleForHeapStart(); c.ptr += i * inc; return c; };
+    auto uav = [&](ID3D12Resource *r, const D3D12_UNORDERED_ACCESS_VIEW_DESC &d, UINT i) {
+        dev->CreateUnorderedAccessView(r, nullptr, &d, cpu(gpu_heap, i));
+        dev->CreateUnorderedAccessView(r, nullptr, &d, cpu(cpu_heap, i));
+    };
+    auto tex = [&](DXGI_FORMAT f, UINT w, UINT h, UINT layers, UINT mips, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st) {
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = (UINT16)layers; td.MipLevels = (UINT16)mips;
+        td.Format = f;
+        td.SampleDesc.Count = 1;
+        td.Flags = flags;
+        ID3D12Resource *r = nullptr;
+        dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, st, nullptr, IID_PPV_ARGS(&r));
+        return r;
+    };
+    // Sentinels: buffers from an upload copy, textures by a first clear of everything.
+    ID3D12Resource *buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *init = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *m = nullptr;
+    init->Map(0, nullptr, (void **)&m);
+    for (UINT i = 0; i < 64; i++)
+        m[i] = 0xdead0000 + i;
+    init->Unmap(0, nullptr);
+    g.list->CopyBufferRegion(buf, 0, init, 0, 256);
+    transition(buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t_uint = tex(DXGI_FORMAT_R8G8B8A8_UINT, 4, 4, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t_half = tex(DXGI_FORMAT_R16G16B16A16_FLOAT, 4, 4, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t_unorm = tex(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t_arr = tex(DXGI_FORMAT_R32_UINT, 4, 4, 3, 2, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t_rt = tex(DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!buf || !t_uint || !t_half || !t_unorm || !t_arr || !t_rt)
+        return false;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
+    d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    d.Format = DXGI_FORMAT_R32_UINT;
+    d.Buffer.FirstElement = 4;
+    d.Buffer.NumElements = 8;
+    uav(buf, d, 0);
+    d.Format = DXGI_FORMAT_R32_TYPELESS;
+    d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    d.Buffer.FirstElement = 32;
+    d.Buffer.NumElements = 8;
+    uav(buf, d, 1);
+    d = {};
+    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    uav(t_uint, d, 2);
+    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    uav(t_half, d, 3);
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav(t_unorm, d, 4);
+    d = {};
+    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    d.Format = DXGI_FORMAT_R32_UINT;
+    d.Texture2DArray = { 0, 0, 3, 0 };
+    uav(t_arr, d, 5);  // everything, mip 0
+    d.Texture2DArray = { 1, 0, 3, 0 };
+    uav(t_arr, d, 6);  // mip 1, all slices (sentinel)
+    d.Texture2DArray = { 1, 1, 1, 0 };
+    uav(t_arr, d, 7);  // mip 1, slice 1
+    g.list->SetDescriptorHeaps(1, &gpu_heap);
+    const UINT zero4[4] = { 7, 7, 7, 7 };
+    const float zf[4] = { -1, -1, -1, -1 };
+    g.list->ClearUnorderedAccessViewUint(gpuh(2), cpu(cpu_heap, 2), t_uint, zero4, 0, nullptr);
+    g.list->ClearUnorderedAccessViewFloat(gpuh(3), cpu(cpu_heap, 3), t_half, zf, 0, nullptr);
+    g.list->ClearUnorderedAccessViewFloat(gpuh(4), cpu(cpu_heap, 4), t_unorm, zf, 0, nullptr);
+    g.list->ClearUnorderedAccessViewUint(gpuh(5), cpu(cpu_heap, 5), t_arr, zero4, 0, nullptr);
+    g.list->ClearUnorderedAccessViewUint(gpuh(6), cpu(cpu_heap, 6), t_arr, zero4, 0, nullptr);
+    D3D12_RESOURCE_BARRIER ub = {};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    g.list->ResourceBarrier(1, &ub);
+    // The clears under test.
+    const UINT v_buf[4] = { 0x11111111, 2, 3, 4 }, v_raw[4] = { 0x22222222, 0, 0, 0 }, v_uint[4] = { 0x123, 0x45, 0x1ff, 0x100 },
+               v_arr[4] = { 99, 0, 0, 0 };
+    const float v_half[4] = { 1.5f, -2.0f, 0.25f, 65504.0f }, v_unorm[4] = { 0.5f, 1.0f, 0.0f, 0.2f };
+    D3D12_RECT rect = { 1, 1, 3, 3 };
+    g.list->ClearUnorderedAccessViewUint(gpuh(0), cpu(cpu_heap, 0), buf, v_buf, 0, nullptr);
+    g.list->ClearUnorderedAccessViewUint(gpuh(1), cpu(cpu_heap, 1), buf, v_raw, 0, nullptr);
+    g.list->ClearUnorderedAccessViewUint(gpuh(2), cpu(cpu_heap, 2), t_uint, v_uint, 0, nullptr);
+    g.list->ClearUnorderedAccessViewFloat(gpuh(3), cpu(cpu_heap, 3), t_half, v_half, 1, &rect);
+    g.list->ClearUnorderedAccessViewFloat(gpuh(4), cpu(cpu_heap, 4), t_unorm, v_unorm, 0, nullptr);
+    g.list->ClearUnorderedAccessViewUint(gpuh(7), cpu(cpu_heap, 7), t_arr, v_arr, 0, nullptr);
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(t_rt, nullptr, rtv);
+    const float black[4] = { 0, 0, 0, 0 }, white[4] = { 1, 1, 1, 1 };
+    D3D12_RECT rr[2] = { { 0, 0, 2, 2 }, { 5, 6, 8, 8 } };
+    g.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    g.list->ClearRenderTargetView(rtv, white, 2, rr);
+    // Read back: buffer, then each texture subresource into one readback buffer, 256-byte rows.
+    ID3D12Resource *rb = create_buffer(65536, D3D12_HEAP_TYPE_READBACK);
+    transition(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, buf, 0, 256);
+    struct { ID3D12Resource *r; UINT sub; DXGI_FORMAT f; UINT w, h; UINT64 off; } copies[] = {
+        { t_uint, 0, DXGI_FORMAT_R8G8B8A8_UINT, 4, 4, 1024 }, { t_half, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 4, 4, 2048 },
+        { t_unorm, 0, DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 3072 }, { t_arr, 1, DXGI_FORMAT_R32_UINT, 2, 2, 4096 },
+        { t_arr, 3, DXGI_FORMAT_R32_UINT, 2, 2, 5120 }, { t_arr, 5, DXGI_FORMAT_R32_UINT, 2, 2, 6144 },
+        { t_arr, 2, DXGI_FORMAT_R32_UINT, 4, 4, 7168 }, { t_rt, 0, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, 8192 },
+    };
+    for (auto &c : copies)
+    {
+        bool rtx = c.r == t_rt;
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = { c.r, c.sub, rtx ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE };
+        g.list->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION s = {}, t = {};
+        s.pResource = c.r; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = c.sub;
+        t.pResource = rb; t.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        t.PlacedFootprint.Offset = c.off;
+        t.PlacedFootprint.Footprint = { c.f, c.w, c.h, 1, 256 };
+        g.list->CopyTextureRegion(&t, 0, 0, 0, &s, nullptr);
+    }
+    if (!execute_and_wait())
+        return false;
+    uint8_t *p = nullptr;
+    D3D12_RANGE range = { 0, 65536 };
+    rb->Map(0, &range, (void **)&p);
+    const uint32_t *b32 = (const uint32_t *)p;
+    uint32_t bad = 0;
+    for (UINT i = 0; i < 64; i++)
+    {
+        uint32_t want = (i >= 4 && i < 12) ? 0x11111111 : (i >= 32 && i < 40) ? 0x22222222 : 0xdead0000 + i;
+        if (b32[i] != want && bad++ < 3)
+            printf("  buffer element %u: %#x, want %#x\n", i, b32[i], want);
+    }
+    EXPECT(!bad, "buffer view clears: %u wrong elements", bad);
+    const uint8_t *tu = p + 1024;
+    EXPECT(tu[0] == 0x23 && tu[1] == 0x45 && tu[2] == 0xff && tu[3] == 0x00,
+           "R8G8B8A8_UINT clear (0x123, 0x45, 0x1ff, 0x100): (%#x, %#x, %#x, %#x), want the low 8 bits", tu[0], tu[1], tu[2], tu[3]);
+    bad = 0;
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+        {
+            const uint16_t *h = (const uint16_t *)(p + 2048 + y * 256 + x * 8);
+            bool in = x >= 1 && x < 3 && y >= 1 && y < 3;
+            const uint16_t want_in[4] = { 0x3e00, 0xc000, 0x3400, 0x7bff }, want_out = 0xbc00;
+            for (UINT c = 0; c < 4; c++)
+                if (h[c] != (in ? want_in[c] : want_out) && bad++ < 3)
+                    printf("  R16G16B16A16_FLOAT (%u, %u).%u: %#x, want %#x\n", x, y, c, h[c], in ? want_in[c] : want_out);
+        }
+    EXPECT(!bad, "R16G16B16A16_FLOAT rect clear: %u wrong", bad);
+    const uint8_t *un = p + 3072;
+    EXPECT(un[0] == 128 && un[1] == 255 && un[2] == 0 && un[3] == 51, "R8G8B8A8_UNORM clear (0.5, 1, 0, 0.2): (%u, %u, %u, %u), want (128, 255, 0, 51)",
+           un[0], un[1], un[2], un[3]);
+    // t_arr subresources (mip + slice * 2): 1 = slice 0 mip 1 (7), 3 = slice 1 mip 1 (99), 5 = slice 2 mip 1 (7),
+    // 2 = slice 1 mip 0 (7).
+    static const struct { UINT64 off; UINT n; uint32_t want; const char *what; } arr[] = {
+        { 4096, 2, 7, "slice 0 mip 1" }, { 5120, 2, 99, "slice 1 mip 1" }, { 6144, 2, 7, "slice 2 mip 1" }, { 7168, 4, 7, "slice 1 mip 0" },
+    };
+    for (auto &a : arr)
+    {
+        bad = 0;
+        for (UINT y = 0; y < a.n; y++)
+            for (UINT x = 0; x < a.n; x++)
+                if (((const uint32_t *)(p + a.off + y * 256))[x] != a.want)
+                    bad++;
+        EXPECT(!bad, "array UAV clear, %s: %u texels aren't %u", a.what, bad, a.want);
+    }
+    bad = 0;
+    for (UINT y = 0; y < 8; y++)
+        for (UINT x = 0; x < 8; x++)
+        {
+            bool in = (x < 2 && y < 2) || (x >= 5 && y >= 6);
+            uint32_t v = ((const uint32_t *)(p + 8192 + y * 256))[x];
+            if (v != (in ? 0xffffffffu : 0u) && bad++ < 3)
+                printf("  RTV rect clear (%u, %u): %#x\n", x, y, v);
+        }
+    EXPECT(!bad, "ClearRenderTargetView with two rects: %u wrong pixels", bad);
+    rb->Unmap(0, nullptr);
+    rb->Release(); rheap->Release(); init->Release(); buf->Release(); t_uint->Release(); t_half->Release(); t_unorm->Release();
+    t_arr->Release(); t_rt->Release(); gpu_heap->Release(); cpu_heap->Release();
+    return true;
+}
+
 // DXBC with its reflection stripped (D3DCOMPILER_STRIP_REFLECTION_DATA, as shipped games often are): the bridge then
 // scans the instruction stream itself (for typed buffer declarations), and must step over imad (opcode 35) and
 // customdata (53, whose length is in the next token). Draws with an imad in each stage; run with VKD3D_DEBUG=info to
@@ -14202,6 +14396,7 @@ static const Test tests[] = {
     { "raster_vp_lines_dxbc", test_raster_vp_lines_dxbc },
     { "compute_limits", test_compute_limits },
     { "compute_limits_dxbc", test_compute_limits_dxbc },
+    { "clear_views", test_clear_views },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
