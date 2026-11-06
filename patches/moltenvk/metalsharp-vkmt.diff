@@ -468,10 +468,10 @@ index 00000000..afb24da7
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdAccelerationStructure.mm b/MoltenVK/MoltenVK/Commands/MVKCmdAccelerationStructure.mm
 new file mode 100644
-index 00000000..d3133725
+index 00000000..ade6fc13
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdAccelerationStructure.mm
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,751 @@
 +/*
 + * MVKCmdAccelerationStructure.mm
 + *
@@ -764,6 +764,47 @@ index 00000000..d3133725
 +			continue;
 +		}
 +
++		// Vertices Metal can't read where they are (an offset that isn't a multiple of 4, a stride of zero or one that
++		// isn't a multiple of 4) are copied to a temporary buffer it can: otherwise their triangles are wrong or missing.
++		if (buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
++			NSArray* repackDescriptors = ((MTLPrimitiveAccelerationStructureDescriptor*)descriptor).geometryDescriptors;
++			for (uint32_t geomIdx = 0; geomIdx < buildInfo.geometryCount && geomIdx < repackDescriptors.count; geomIdx++) {
++				const VkAccelerationStructureGeometryKHR& geometry = buildInfo.pGeometries
++					? buildInfo.pGeometries[geomIdx] : *buildInfo.ppGeometries[geomIdx];
++				if (geometry.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR) { continue; }
++				const auto& triangles = geometry.geometry.triangles;
++				MTLAccelerationStructureTriangleGeometryDescriptor* triangleDescriptor = repackDescriptors[geomIdx];
++				id<MTLBuffer> srcBuffer = triangleDescriptor.vertexBuffer;
++				NSUInteger srcOffset = triangleDescriptor.vertexBufferOffset;
++				NSUInteger stride = triangleDescriptor.vertexStride;
++				uint32_t elementSize = cmdEncoder->getPixelFormats()->getBytesPerBlock(triangles.vertexFormat);
++				bool indexed = triangles.indexType != VK_INDEX_TYPE_NONE_KHR;
++				uint64_t count = indexed ? uint64_t(triangles.maxVertex) + 1 : uint64_t(triangleDescriptor.triangleCount) * 3;
++				bool repack = srcBuffer && elementSize && count && triangleDescriptor.triangleCount &&
++					((srcOffset % 4) || !stride || (stride % 4) || stride < elementSize);
++				if (!repack) { continue; }
++				uint32_t dstStride = (elementSize + 3) & ~3u;
++				const MVKMTLBufferAllocation* tmpBuffer = cmdEncoder->getTempMTLBuffer(count * dstStride, true);
++				id<MTLComputePipelineState> repackState =
++					cmdEncoder->getCommandEncodingPool()->getCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState();
++				id<MTLComputeCommandEncoder> repackEncoder =
++					cmdEncoder->getMTLComputeEncoder(kMVKCommandUseBuildAccelerationStructureConvertBuffers);
++				if (!tmpBuffer || !tmpBuffer->_mtlBuffer || !repackState || !repackEncoder || count > UINT32_MAX) { continue; }
++				struct { uint32_t srcDelta, srcStride, elementSize, dstStride, count; } params = {
++					uint32_t(srcOffset & 3), uint32_t(stride), elementSize, dstStride, uint32_t(count) };
++				auto& state = cmdEncoder->getMtlCompute();
++				state.bindPipeline(repackEncoder, repackState);
++				state.bindBuffer(repackEncoder, srcBuffer, srcOffset & ~NSUInteger(3), 0);
++				state.bindBuffer(repackEncoder, tmpBuffer->_mtlBuffer, tmpBuffer->_offset, 1);
++				cmdEncoder->setComputeBytes(repackEncoder, &params, sizeof(params), 2);
++				[repackEncoder dispatchThreadgroups:MTLSizeMake(mvkCeilingDivide<NSUInteger>(count, repackState.threadExecutionWidth), 1, 1)
++				              threadsPerThreadgroup:MTLSizeMake(repackState.threadExecutionWidth, 1, 1)];
++				triangleDescriptor.vertexBuffer = tmpBuffer->_mtlBuffer;
++				triangleDescriptor.vertexBufferOffset = tmpBuffer->_offset;
++				triangleDescriptor.vertexStride = dstStride;
++			}
++		}
++
 +		bool validTransforms = true;
 +        if (buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
 +            NSArray* geometryDescriptors = ((MTLPrimitiveAccelerationStructureDescriptor*)descriptor).geometryDescriptors;
@@ -990,9 +1031,15 @@ index 00000000..d3133725
 +		requiredNativeSize = std::min(
 +			requiredNativeSize, _dstMVKAccelerationStructure->getSize());
 +	}
++	// The destination gets memory of its own, never its placement in the app's memory. An app sizes a copy's
++	// destination from a query (compacted or current size), which reports the structure's own size, not the
++	// Metal heap's size and alignment that placing it needs (which a build's size from
++	// vkGetAccelerationStructureBuildSizesKHR includes): placed, a copy runs past the destination's range into the
++	// next structure, as VKD3D's D3D12 games pack compacted BLASes, and breaks it (missing or wrong geometry, or a
++	// traversal that never ends).
 +	MVKAccelerationStructureStorageGeneration* dstGeneration = nullptr;
 +	VkResult result = _dstMVKAccelerationStructure->retainFullWriteGeneration(
-+		requiredNativeSize, instanceMetadataSize, dstGeneration);
++		requiredNativeSize, instanceMetadataSize, dstGeneration, true);
 +	id<MTLBuffer> srcInstanceMetadata = srcGeneration->getInstanceMetadataMTLBuffer();
 +	id<MTLBuffer> dstInstanceMetadata = dstGeneration
 +		? dstGeneration->getInstanceMetadataMTLBuffer()
@@ -9129,7 +9176,7 @@ index 199172a0..d1f85583 100644
  		case CommandEncoderClass::Graphics:
  			if (bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE)
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
-index e8b7f3e1..881efbac 100644
+index e8b7f3e1..c33d2703 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.h
 @@ -127,6 +127,9 @@ public:
@@ -9142,7 +9189,7 @@ index e8b7f3e1..881efbac 100644
  	/** Returns a MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
  	id<MTLComputePipelineState> getCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed);
  
-@@ -142,6 +145,42 @@ public:
+@@ -142,6 +145,43 @@ public:
  	/** Returns a MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
  	id<MTLComputePipelineState> getConvertUint8IndicesMTLComputePipelineState();
  
@@ -9179,13 +9226,14 @@ index e8b7f3e1..881efbac 100644
 +	id<MTLComputePipelineState> getCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdSerializeAccelerationStructureGatherMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState();
++	id<MTLComputePipelineState> getCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdDeserializeAccelerationStructureInstancesMTLComputePipelineState();
 +	id<MTLComputePipelineState> getCmdTraceRaysIndirectConvertMTLComputePipelineState();
 +
  	/** Deletes all the internal resources. */
  	void clear();
  
-@@ -179,9 +218,25 @@ protected:
+@@ -179,9 +219,26 @@ protected:
  	id<MTLComputePipelineState> _mtlDrawIndirectConvertBuffersComputePipelineState[2] = {nil, nil};
  	id<MTLComputePipelineState> _mtlDrawIndirectCountConvertBuffersComputePipelineState[2] = {nil, nil};
  	id<MTLComputePipelineState> _mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState = nil;
@@ -9208,11 +9256,12 @@ index e8b7f3e1..881efbac 100644
 +	id<MTLComputePipelineState> _mtlBuildAccStructConvertComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlSerializeAccStructGatherComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlBuildAccStructConvertTransformComputePipelineState = nil;
++	id<MTLComputePipelineState> _mtlBuildAccStructRepackVerticesComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlDeserializeAccStructInstancesComputePipelineState = nil;
 +	id<MTLComputePipelineState> _mtlTraceRaysIndirectConvertComputePipelineState = nil;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
-index d7fa57c3..8b167a80 100644
+index d7fa57c3..40cc4d4a 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncodingPool.mm
 @@ -148,6 +148,10 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
@@ -9226,7 +9275,7 @@ index d7fa57c3..8b167a80 100644
  id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdDrawIndirectCopyZeroDivisorVertexBuffersMTLComputePipelineState() {
  	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState, newCmdDrawIndirectCopyZeroDivisorVertexBuffersMTLComputePipelineState(_commandPool));
  }
-@@ -172,6 +176,66 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -172,6 +176,70 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
  	MVK_ENC_REZ_ACCESS(_mtlConvertUint8IndicesComputePipelineState, newConvertUint8IndicesMTLComputePipelineState(_commandPool));
  }
  
@@ -9278,6 +9327,10 @@ index d7fa57c3..8b167a80 100644
 +	MVK_ENC_REZ_ACCESS(_mtlSerializeAccStructGatherComputePipelineState, newCmdSerializeAccelerationStructureGatherMTLComputePipelineState(_commandPool));
 +}
 +
++id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState() {
++	MVK_ENC_REZ_ACCESS(_mtlBuildAccStructRepackVerticesComputePipelineState, newCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState(_commandPool));
++}
++
 +id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState() {
 +	MVK_ENC_REZ_ACCESS(_mtlBuildAccStructConvertTransformComputePipelineState, newCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState(_commandPool));
 +}
@@ -9293,7 +9346,7 @@ index d7fa57c3..8b167a80 100644
  void MVKCommandEncodingPool::clear() {
  	lock_guard<mutex> lock(_lock);
  	destroyMetalResources();
-@@ -254,6 +318,9 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -254,6 +322,9 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
      [_mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState release];
      _mtlDrawIndirectCopyZeroDivisorVertexBuffersComputePipelineState = nil;
  
@@ -9303,7 +9356,7 @@ index d7fa57c3..8b167a80 100644
      [_mtlDrawIndirectTessConvertBuffersComputePipelineState[0] release];
      [_mtlDrawIndirectTessConvertBuffersComputePipelineState[1] release];
      _mtlDrawIndirectTessConvertBuffersComputePipelineState[0] = nil;
-@@ -272,4 +339,41 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
+@@ -272,4 +343,43 @@ static constexpr uint32_t getRenderpassLoadStoreStateIndex(MVKFormatType type, b
  
      [_mtlConvertUint8IndicesComputePipelineState release];
      _mtlConvertUint8IndicesComputePipelineState = nil;
@@ -9338,6 +9391,8 @@ index d7fa57c3..8b167a80 100644
 +
 +	[_mtlBuildAccStructConvertTransformComputePipelineState release];
 +	_mtlBuildAccStructConvertTransformComputePipelineState = nil;
++	[_mtlBuildAccStructRepackVerticesComputePipelineState release];
++	_mtlBuildAccStructRepackVerticesComputePipelineState = nil;
 +
 +	[_mtlDeserializeAccStructInstancesComputePipelineState release];
 +	_mtlDeserializeAccStructInstancesComputePipelineState = nil;
@@ -9346,7 +9401,7 @@ index d7fa57c3..8b167a80 100644
 +	_mtlTraceRaysIndirectConvertComputePipelineState = nil;
  }
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
-index 9a72cc2a..5cc733b5 100644
+index 9a72cc2a..7e6ed391 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 @@ -359,6 +359,30 @@ kernel void cmdDrawIndexedIndirectCountConvertBuffers(const device char* srcBuff
@@ -9447,7 +9502,7 @@ index 9a72cc2a..5cc733b5 100644
  	destBuff[i] = srcBuff[params.indexStart + i];
  }
  
-@@ -503,21 +533,417 @@ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [
+@@ -503,23 +533,419 @@ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [
                                              constant uint& numQueries [[buffer(3)]],
                                              constant uint& flags [[buffer(4)]],
                                              constant QueryStatus* availability [[buffer(5)]],
@@ -9761,9 +9816,9 @@ index 9a72cc2a..5cc733b5 100644
 +	} else {
 +		// VkDrawIndirectCommand: { vertexCount, instanceCount, firstVertex, firstInstance }.
 +		cmd.draw_primitives(prim, args[2], args[0], args[1], args[3]);
-+	}
-+}
-+
+ 	}
+ }
+ 
 +// Dispatches: each counted sequence becomes an indirect command buffer dispatch with every buffer the pipeline uses
 +// (captured on the CPU) and its own push constants, and the buffer runs only the counted ones.
 +typedef struct {
@@ -9855,7 +9910,7 @@ index 9a72cc2a..5cc733b5 100644
 +	} else {
 +		const device auto& src = *reinterpret_cast<const device MTLDrawPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
 +		count = src.vertexCount; instanceCount = src.instanceCount; first = src.vertexStart; firstInstance = src.baseInstance;
- 	}
++	}
 +	device char* dest = destBuff + idx * (sizeof(MTLStageInRegionIndirectArguments) + sizeof(MTLDispatchThreadgroupsIndirectArguments));
 +	device auto& si = *reinterpret_cast<device MTLStageInRegionIndirectArguments*>(dest);
 +	device auto& dispatch = *reinterpret_cast<device MTLDispatchThreadgroupsIndirectArguments*>(dest + sizeof(MTLStageInRegionIndirectArguments));
@@ -9868,10 +9923,12 @@ index 9a72cc2a..5cc733b5 100644
 +	dispatch.threadgroupsPerGrid[0] = (count + threadWidth - 1) / threadWidth;
 +	dispatch.threadgroupsPerGrid[1] = instanceCount;
 +	dispatch.threadgroupsPerGrid[2] = 1;
- }
- 
++}
++
  kernel void accumulateOcclusionQueryResults(uint pos [[thread_position_in_grid]],
-@@ -547,4 +973,246 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
+                                             const device QueryResultOffsets* offsets  [[buffer(0)]],
+                                             device AtomicVisibilityBuffer* dst_buffer [[buffer(1)]],
+@@ -547,4 +973,270 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
  	uint8_t idx = src[pos];
  	dst[pos] = idx;
  }
@@ -9945,7 +10002,9 @@ index 9a72cc2a..5cc733b5 100644
 +		}
 +	}
 +	#if MVK_USE_INDIRECT_ACCELERATION_STRUCTURE_DESCRIPTORS
-+	return reinterpret_cast<const device MVKAccelerationStructureReference*>(mapped ? mapped : address)->resourceID;
++	// Every structure is in the table: an address that is not names none, and its instance is inactive (mask 0)
++	// rather than one whose structure is read from memory that does not hold one.
++	return mapped ? reinterpret_cast<const device MVKAccelerationStructureReference*>(mapped)->resourceID : 0;
 +	#else
 +	return mapped;
 +	#endif
@@ -9981,6 +10040,28 @@ index 9a72cc2a..5cc733b5 100644
 +	MVKAccelerationStructureConvertTransform,
 +	MVKAccelerationStructureDeserializeInstances,
 +} MVKAccelerationStructureConversionType;
++
++// A bottom-level structure's vertices as Metal reads them: from an offset that is a multiple of 4, each a multiple
++// of 4 bytes apart. Vulkan (and Direct3D 12) allow 16-bit components at any even address and a stride of zero (every
++// vertex the same element); they are copied, element by element, to `dst`, `dstStride` apart.
++struct MVKAccelerationStructureVertexRepack {
++	uint srcDelta;      // from the aligned offset `src` is bound at
++	uint srcStride;     // 0: one element, repeated
++	uint elementSize;
++	uint dstStride;
++	uint count;
++};
++
++kernel void cmdBuildAccelerationStructureRepackVertices(
++    const device uchar* src [[buffer(0)]],
++    device uchar* dst [[buffer(1)]],
++    constant MVKAccelerationStructureVertexRepack& repack [[buffer(2)]],
++    uint idx [[thread_position_in_grid]]) {
++	if (idx >= repack.count) { return; }
++	const device uchar* from = src + repack.srcDelta + ulong(idx) * repack.srcStride;
++	device uchar* to = dst + ulong(idx) * repack.dstStride;
++	for (uint b = 0; b < repack.dstStride; b++) { to[b] = b < repack.elementSize ? from[b] : 0; }
++}
 +
 +kernel void cmdBuildAccelerationStructureConvertTransforms(
 +    const device char* srcBuff [[buffer(0)]],
@@ -10245,7 +10326,7 @@ index 3aeed65b..10e52654 100644
 -
 -
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
-index fef56feb..11026786 100644
+index fef56feb..3bf8413e 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.h
 @@ -368,6 +368,12 @@ public:
@@ -10261,7 +10342,7 @@ index fef56feb..11026786 100644
  	/** Returns a new MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
  	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
  																				 MVKVulkanAPIDeviceObject* owner);
-@@ -385,6 +391,44 @@ public:
+@@ -385,6 +391,45 @@ public:
  	/** Returns a new MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
  	id<MTLComputePipelineState> newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
  
@@ -10297,6 +10378,7 @@ index fef56feb..11026786 100644
 +	id<MTLComputePipelineState> newCmdBuildAccelerationStructureConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdSerializeAccelerationStructureGatherMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdBuildAccelerationStructureConvertTransformsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
++	id<MTLComputePipelineState> newCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdDeserializeAccelerationStructureInstancesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLComputePipelineState> newCmdTraceRaysIndirectConvertMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 +	id<MTLLibrary> newRayTracingDispatcherMTLLibrary(NSString* source,
@@ -10306,7 +10388,7 @@ index fef56feb..11026786 100644
  
  #pragma mark Construction
  
-@@ -394,18 +438,22 @@ public:
+@@ -394,18 +439,22 @@ public:
  
  protected:
  	void initMTLLibrary();
@@ -10332,7 +10414,7 @@ index fef56feb..11026786 100644
  	MVKDeviceMemory* _transferImageMemory;
  };
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
-index 48fc9879..e206964e 100644
+index 48fc9879..66f0947a 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandResourceFactory.mm
 @@ -593,6 +593,10 @@
@@ -10393,7 +10475,7 @@ index 48fc9879..e206964e 100644
  id<MTLComputePipelineState> MVKCommandResourceFactory::newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
  #if MVK_USE_METAL_PRIVATE_API
  	if (getMVKConfig().useMetalPrivateAPI) {
-@@ -633,15 +677,41 @@
+@@ -633,15 +677,46 @@
  	return newMTLComputePipelineState("convertUint8Indices", owner);
  }
  
@@ -10404,6 +10486,11 @@ index 48fc9879..e206964e 100644
 +
 +id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdSerializeAccelerationStructureGatherMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
 +	return newMTLComputePipelineState("cmdSerializeAccelerationStructureGather", owner,
++		_mtlAccelerationStructureLibrary);
++}
++
++id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdBuildAccelerationStructureRepackVerticesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
++	return newMTLComputePipelineState("cmdBuildAccelerationStructureRepackVertices", owner,
 +		_mtlAccelerationStructureLibrary);
 +}
 +
@@ -10437,7 +10524,7 @@ index 48fc9879..e206964e 100644
  	[nsFuncName release];														// temp release
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
  	return mtlFunc;
-@@ -683,8 +753,9 @@
+@@ -683,8 +758,9 @@
  }
  
  id<MTLComputePipelineState> MVKCommandResourceFactory::newMTLComputePipelineState(const char* funcName,
@@ -10449,7 +10536,7 @@ index 48fc9879..e206964e 100644
  	// Providing a function directly may cause issues with Metal shader validation layer object
  	// management for some reason, so create a temporary pipeline descriptor to provide instead.
  	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];		// temp retain
-@@ -702,9 +773,46 @@
+@@ -702,9 +778,46 @@
  
  MVKCommandResourceFactory::MVKCommandResourceFactory(MVKDevice* device) : MVKBaseDeviceObject(device) {
  	initMTLLibrary();
@@ -10496,7 +10583,7 @@ index 48fc9879..e206964e 100644
  // Initializes the Metal shaders used for command activity.
  void MVKCommandResourceFactory::initMTLLibrary() {
      @autoreleasepool {
-@@ -730,6 +838,9 @@
+@@ -730,6 +843,9 @@
  }
  
  MVKCommandResourceFactory::~MVKCommandResourceFactory() {
@@ -10748,10 +10835,10 @@ index 6175f58a..79716d25 100644
      union { id<MTLBuffer> mtlBuffer = nil; id<MTLBuffer> mtlResource; }; // aliases
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.h b/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.h
 new file mode 100644
-index 00000000..18ffcf6a
+index 00000000..5a409c9e
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.h
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,227 @@
 +/*
 + * MVKAccelerationStructure.h
 + *
@@ -10808,6 +10895,8 @@ index 00000000..18ffcf6a
 +	void relinquishReferenceResidency() { _ownsReferenceResidency = false; }
 +	uint64_t getNativeCapacity() const { return _nativeCapacity; }
 +	uint64_t getMetadataCapacity() const { return _metadataCapacity; }
++	/** Whether this structure is placed in the app's memory (in its range of a placement heap). */
++	bool isPlaced() const { return _heap != nil; }
 +
 +	uint64_t getNativeSize();
 +	bool isCompacted();
@@ -10871,7 +10960,8 @@ index 00000000..18ffcf6a
 +	VkResult retainFullWriteGeneration(uint64_t nativeCapacity,
 +									 uint64_t requiredNativeSize,
 +									 uint64_t requiredMetadataSize,
-+									 MVKAccelerationStructureStorageGeneration*& generation);
++									 MVKAccelerationStructureStorageGeneration*& generation,
++									 bool unplaced = false);
 +	bool publishGeneration(MVKAccelerationStructureStorageGeneration* generation);
 +
 +protected:
@@ -10923,9 +11013,11 @@ index 00000000..18ffcf6a
 +
 +	VkResult retainFullWriteGeneration(uint64_t requiredNativeSize,
 +									 MVKAccelerationStructureStorageGeneration*& generation);
++	/** unplaced: a generation of its own memory, never one placed in the app's (see MVKCmdCopyAccelerationStructure). */
 +	VkResult retainFullWriteGeneration(uint64_t requiredNativeSize,
 +	                                     uint64_t requiredMetadataSize,
-+	                                     MVKAccelerationStructureStorageGeneration*& generation);
++	                                     MVKAccelerationStructureStorageGeneration*& generation,
++	                                     bool unplaced = false);
 +
 +	bool publishGeneration(MVKAccelerationStructureStorageGeneration* generation);
 +
@@ -10976,10 +11068,10 @@ index 00000000..18ffcf6a
 +};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.mm b/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.mm
 new file mode 100644
-index 00000000..793644e2
+index 00000000..ab022613
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKAccelerationStructure.mm
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,947 @@
 +/*
 + * MVKAccelerationStructure.mm
 + *
@@ -11034,7 +11126,7 @@ index 00000000..793644e2
 +	return encoder;
 +}
 +
-+static bool encodeAccelerationStructureReference(id<MTLDevice> device,
++bool encodeAccelerationStructureReference(id<MTLDevice> device,
 +                                                  id<MTLBuffer> referenceBuffer,
 +                                                  id<MTLAccelerationStructure> accelerationStructure,
 +                                                  id<MTLBuffer> instanceMetadataBuffer) {
@@ -11343,13 +11435,15 @@ index 00000000..793644e2
 +	uint64_t nativeCapacity,
 +	uint64_t requiredNativeSize,
 +	uint64_t requiredMetadataSize,
-+	MVKAccelerationStructureStorageGeneration*& generation) {
++	MVKAccelerationStructureStorageGeneration*& generation,
++	bool unplaced) {
 +	generation = nullptr;
 +	if (requiredNativeSize > nativeCapacity) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 +	std::lock_guard<std::mutex> lock(_lock);
 +	if (!_currentGeneration ||
 +		_currentGeneration->getNativeCapacity() < nativeCapacity ||
-+		_currentGeneration->getMetadataCapacity() < requiredMetadataSize) {
++		_currentGeneration->getMetadataCapacity() < requiredMetadataSize ||
++		(unplaced && _currentGeneration->isPlaced())) {
 +		generation = newGeneration(nativeCapacity, false, 0, requiredMetadataSize);
 +		if (!generation) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 +		return VK_SUCCESS;
@@ -11840,7 +11934,8 @@ index 00000000..793644e2
 +VkResult MVKAccelerationStructure::retainFullWriteGeneration(
 +	uint64_t requiredNativeSize,
 +	uint64_t requiredMetadataSize,
-+	MVKAccelerationStructureStorageGeneration*& generation) {
++	MVKAccelerationStructureStorageGeneration*& generation,
++	bool unplaced) {
 +	generation = nullptr;
 +	if (!_isMaterialized.load(std::memory_order_acquire)) {
 +		bool materialized = false;
@@ -11853,6 +11948,13 @@ index 00000000..793644e2
 +	if (requiredNativeSize > nativeCapacity) {
 +		if (requiredNativeSize > _size) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 +		nativeCapacity = requiredNativeSize;
++	}
++	// Of its own memory, a generation needs only what is written to it, not the placement's whole capacity (for a
++	// VKD3D structure, the rest of its D3D12 buffer).
++	if (unplaced) {
++		if (requiredNativeSize > _size) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
++		return _storage->retainFullWriteGeneration(requiredNativeSize, requiredNativeSize, requiredMetadataSize,
++												   generation, true);
 +	}
 +	if (requiredMetadataSize > _metadataCapacity) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 +	VkResult result = _storage->retainFullWriteGeneration(
@@ -13721,7 +13823,7 @@ index 3cdc6234..e932be3b 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..b6d3fd92 100644
+index 534a414f..6962d901 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,13 @@
@@ -13892,7 +13994,7 @@ index 534a414f..b6d3fd92 100644
  	VkResult createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  								   const VkAllocationCallbacks* pAllocator,
  								   VkPrivateDataSlot* pPrivateDataSlot);
-@@ -868,7 +940,39 @@ public:
+@@ -868,7 +940,41 @@ public:
  #pragma mark Operations
  
  	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
@@ -13907,6 +14009,8 @@ index 534a414f..b6d3fd92 100644
 +	                                          MVKSmallVector<uint64_t, 32>& table,
 +	                                          MVKSmallVector<id<MTLResource>, 16>& resources,
 +	                                          MVKSmallVector<id<MTLAccelerationStructure>, 16>& instances);
++	/** The reference of an instance structure of nothing, which every ray misses: what a null or unknown address finds. */
++	id<MTLBuffer> getEmptyAccelerationStructureReference(id<MTLAccelerationStructure>* accelerationStructure);
 +	bool usesIndirectAccelerationStructureInstanceDescriptors() const;
 +	MTLAccelerationStructureInstanceDescriptorType getAccelerationStructureInstanceDescriptorType() const;
 +	NSUInteger getAccelerationStructureInstanceDescriptorSize() const;
@@ -13933,7 +14037,7 @@ index 534a414f..b6d3fd92 100644
  
  	/** Adds the specified host semaphore to be woken upon device loss. */
  	void addSemaphore(MVKSemaphoreImpl* sem4);
-@@ -925,6 +1029,13 @@ public:
+@@ -925,6 +1031,13 @@ public:
  	/** Fetches a visibility buffer from the shared pool. */
  	MVKVisibilityBuffer getVisibilityBuffer();
  
@@ -13947,7 +14051,7 @@ index 534a414f..b6d3fd92 100644
  	/** Returns a visibility buffer to the shared pool. */
  	void returnVisibilityBuffer(MVKVisibilityBuffer&& buffer);
  
-@@ -943,6 +1054,24 @@ public:
+@@ -943,6 +1056,24 @@ public:
  	 */
  	id<MTLBuffer> getDummyBlitMTLBuffer();
  
@@ -13972,7 +14076,7 @@ index 534a414f..b6d3fd92 100644
  	/**
  	 * Returns whether MTLCommandBuffers can be prefilled.
  	 *
-@@ -979,23 +1108,57 @@ public:
+@@ -979,23 +1110,57 @@ public:
  
  #if !MVK_XCODE_16
  	void makeResident(id allocation) {}
@@ -14039,7 +14143,7 @@ index 534a414f..b6d3fd92 100644
  	}
  #endif
  
-@@ -1011,6 +1174,35 @@ public:
+@@ -1011,6 +1176,35 @@ public:
  #endif
  	}
  
@@ -14075,7 +14179,7 @@ index 534a414f..b6d3fd92 100644
  	bool hasResidencySet() {
  #if MVK_XCODE_16
  		return _residencySet != nil;
-@@ -1050,12 +1242,33 @@ public:
+@@ -1050,12 +1244,33 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -14109,7 +14213,7 @@ index 534a414f..b6d3fd92 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1076,6 +1289,8 @@ protected:
+@@ -1076,6 +1291,8 @@ protected:
  	void getDescriptorVariableDescriptorCountLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
@@ -14118,7 +14222,7 @@ index 534a414f..b6d3fd92 100644
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
-@@ -1093,11 +1308,29 @@ protected:
+@@ -1093,11 +1310,29 @@ protected:
  
  	id<MTLFence> _barrierFences[kMVKBarrierStageCount][kMVKBarrierFenceCount];
  
@@ -14148,11 +14252,15 @@ index 534a414f..b6d3fd92 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1338,58 @@ protected:
+@@ -1105,16 +1340,62 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
 +	std::mutex _accelerationStructureDescriptorLock;
++	std::mutex _emptyAccelerationStructureLock;
++	id<MTLAccelerationStructure> _emptyAccelerationStructure = nil;
++	id<MTLBuffer> _emptyAccelerationStructureReference = nil;
++	bool _emptyAccelerationStructureTried = false;
  	std::mutex _sem4Lock;
      std::mutex _perfLock;
  	std::mutex _vizLock;
@@ -14207,7 +14315,7 @@ index 534a414f..b6d3fd92 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1440,15 @@ public:
+@@ -1165,12 +1446,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -14225,7 +14333,7 @@ index 534a414f..b6d3fd92 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1553,50 @@ protected:
+@@ -1275,6 +1559,50 @@ protected:
  };
  
  
@@ -14277,7 +14385,7 @@ index 534a414f..b6d3fd92 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..9977d8fc 100644
+index 359f8a2b..566ffd94 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -15373,7 +15481,7 @@ index 359f8a2b..9977d8fc 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5240,348 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5240,415 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -15460,6 +15568,65 @@ index 359f8a2b..9977d8fc 100644
 +	return value ^ (value >> 31);
 +}
 +
++bool encodeAccelerationStructureReference(id<MTLDevice> device,
++                                          id<MTLBuffer> referenceBuffer,
++                                          id<MTLAccelerationStructure> accelerationStructure,
++                                          id<MTLBuffer> instanceMetadataBuffer);
++
++// Built once, on a queue of its own, the first time a table needs it.
++id<MTLBuffer> MVKDevice::getEmptyAccelerationStructureReference(id<MTLAccelerationStructure>* accelerationStructure) {
++	std::lock_guard<std::mutex> lock(_emptyAccelerationStructureLock);
++	if (!_emptyAccelerationStructureTried) {
++		_emptyAccelerationStructureTried = true;
++		@autoreleasepool {
++			id<MTLDevice> mtlDevice = _physicalDevice->getMTLDevice();
++			NSUInteger instanceSize = getAccelerationStructureInstanceDescriptorSize();
++			MTLInstanceAccelerationStructureDescriptor* descriptor = [MTLInstanceAccelerationStructureDescriptor descriptor];
++			descriptor.instanceDescriptorType = getAccelerationStructureInstanceDescriptorType();
++			descriptor.instanceCount = 0;
++			// Metal wants a buffer of instances also when it reads none.
++			descriptor.instanceDescriptorBuffer = [[mtlDevice newBufferWithLength:instanceSize
++			                                                              options:MTLResourceStorageModePrivate] autorelease];
++			descriptor.instanceDescriptorStride = instanceSize;
++			if (!usesIndirectAccelerationStructureInstanceDescriptors()) { descriptor.instancedAccelerationStructures = @[]; }
++			MTLAccelerationStructureSizes sizes = [mtlDevice accelerationStructureSizesWithDescriptor:descriptor];
++			id<MTLAccelerationStructure> structure =
++				[mtlDevice newAccelerationStructureWithSize:std::max<NSUInteger>(sizes.accelerationStructureSize, 256)];
++			id<MTLBuffer> scratch = [[mtlDevice newBufferWithLength:std::max<NSUInteger>(sizes.buildScratchBufferSize, 256)
++			                                                options:MTLResourceStorageModePrivate] autorelease];
++			id<MTLBuffer> reference = [mtlDevice newBufferWithLength:256 options:MTLResourceStorageModeShared];
++			id<MTLCommandQueue> queue = [[mtlDevice newCommandQueue] autorelease];
++			id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
++			id<MTLAccelerationStructureCommandEncoder> encoder = [commandBuffer accelerationStructureCommandEncoder];
++			bool built = structure && scratch && reference && commandBuffer && encoder;
++			if (built) {
++				[encoder buildAccelerationStructure:structure descriptor:descriptor scratchBuffer:scratch scratchBufferOffset:0];
++				[encoder endEncoding];
++				[commandBuffer commit];
++				[commandBuffer waitUntilCompleted];
++				std::memset(reference.contents, 0, reference.length);
++				built = commandBuffer.status == MTLCommandBufferStatusCompleted &&
++					encodeAccelerationStructureReference(mtlDevice, reference, structure, nil);
++			} else if (encoder) {
++				[encoder endEncoding];
++			}
++			if (built) {
++				_emptyAccelerationStructure = structure;
++				_emptyAccelerationStructureReference = reference;
++				makeResident(structure);
++				makeResident(reference);
++			} else {
++				reportWarning(VK_ERROR_INITIALIZATION_FAILED,
++					"The empty acceleration structure for null and unknown addresses could not be built.");
++				[structure release];
++				[reference release];
++			}
++		}
++	}
++	if (accelerationStructure) { *accelerationStructure = _emptyAccelerationStructure; }
++	return _emptyAccelerationStructureReference;
++}
++
 +void MVKDevice::getAccelerationStructureAddressTable(
 +	MVKCommandEncoder* commandEncoder,
 +	MVKSmallVector<uint64_t, 32>& table,
@@ -15497,9 +15664,9 @@ index 359f8a2b..9977d8fc 100644
 +				instances.push_back(native);
 +			}
 +			commandEncoder->retainAccelerationStructureGeneration(generation);
-+			if (mapped) {
-+				candidates.push_back({ address, referenceAddress });
-+			}
++			// Every structure, so that a miss is an address that has none: a structure that is not mapped is its
++			// own reference.
++			candidates.push_back({ address, mapped ? referenceAddress : address });
 +		} else if (generation) {
 +			generation->release();
 +		}
@@ -15523,9 +15690,17 @@ index 359f8a2b..9977d8fc 100644
 +	size_t requiredCapacity = entries.size() * 2;
 +	size_t capacity = 1;
 +	while (capacity < requiredCapacity) { capacity *= 2; }
-+	table.assign((capacity + 1) * 2, 0);
++	// The header, the slots, then the reference that a null or unknown address finds.
++	table.assign((capacity + 2) * 2, 0);
 +	table[0] = capacity - 1;
 +	table[1] = entries.size();
++	id<MTLAccelerationStructure> emptyAccelerationStructure = nil;
++	id<MTLBuffer> emptyReference = getEmptyAccelerationStructureReference(&emptyAccelerationStructure);
++	if (emptyReference) {
++		table[(capacity + 1) * 2 + 1] = emptyReference.gpuAddress;
++		addResource(emptyReference);
++		addResource((id<MTLResource>)emptyAccelerationStructure);
++	}
 +	for (const auto& entry : entries) {
 +		size_t slot = mvkAccelerationStructureAddressHash(entry.address) &
 +			(capacity - 1);
@@ -15633,9 +15808,7 @@ index 359f8a2b..9977d8fc 100644
 +}
 +
 +void MVKDevice::removeGPUAddressableAccelerationStructure(MVKAccelerationStructure* accelerationStructure) {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	mvkRemoveFirstOccurance(_gpuAddressableAccelerationStructures, accelerationStructure);
 +}
 +
@@ -15668,7 +15841,9 @@ index 359f8a2b..9977d8fc 100644
 +}
 +
 +MVKBuffer* MVKDevice::getBufferAtAddress(VkDeviceAddress address, VkDeviceSize& offset, VkDeviceSize requiredSize) {
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	for (;;) {
 +		if (_gpuAddressableBufferIndexDirty) {
 +			_gpuAddressableBufferIndex.clear();
@@ -15725,7 +15900,7 @@ index 359f8a2b..9977d8fc 100644
  	}
  }
  
-@@ -4696,6 +5630,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4696,6 +5697,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  								   MVKCommandUse cmdUse) {
  	if (!mvkIsAnyFlagEnabled(barrier.dstStageMask, VK_PIPELINE_STAGE_HOST_BIT) ||
  		!mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT) ) { return; }
@@ -15734,7 +15909,7 @@ index 359f8a2b..9977d8fc 100644
  	lock_guard<mutex> lock(_rezLock);
  	for (auto& rez : _resources) {
  		rez->applyMemoryBarrier(barrier, cmdEncoder, cmdUse);
-@@ -4841,6 +5777,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4841,6 +5844,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -15742,7 +15917,7 @@ index 359f8a2b..9977d8fc 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4917,11 +5854,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,11 +5921,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		// typically have stricter alignment requirements due to it being a 2-component format.
  		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
  	}
@@ -15789,7 +15964,7 @@ index 359f8a2b..9977d8fc 100644
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
-@@ -4967,6 +5938,99 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +6005,99 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -15889,7 +16064,7 @@ index 359f8a2b..9977d8fc 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +6052,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +6119,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -15918,7 +16093,7 @@ index 359f8a2b..9977d8fc 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,17 +6074,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,17 +6141,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -15949,7 +16124,7 @@ index 359f8a2b..9977d8fc 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6330,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6397,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -16227,7 +16402,7 @@ index 359f8a2b..9977d8fc 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6612,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6679,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -16240,7 +16415,7 @@ index 359f8a2b..9977d8fc 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5575,7 +6924,54 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +6991,58 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -16284,6 +16459,10 @@ index 359f8a2b..9977d8fc 100644
 +}
 +
  MVKDevice::~MVKDevice() {
++	removeResidency(_emptyAccelerationStructure);
++	removeResidency(_emptyAccelerationStructureReference);
++	[_emptyAccelerationStructure release];
++	[_emptyAccelerationStructureReference release];
 +	for (auto& entry : _metalFXScalers) {
 +		[entry.second.scaler release];
 +		[entry.second.fence release];
@@ -16295,7 +16474,7 @@ index 359f8a2b..9977d8fc 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +6987,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +7058,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
@@ -29211,7 +29390,7 @@ index 6e58d48c..b3f614c8 100644
  }
  #endif
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-index 7a6272ca..b7afb76f 100644
+index 7a6272ca..3dbe6540 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 +++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 @@ -17,6 +17,7 @@
@@ -29222,7 +29401,7 @@ index 7a6272ca..b7afb76f 100644
  #include "MVKCommonEnvironment.h"
  #include "MVKStrings.h"
  #include "FileSupport.h"
-@@ -28,6 +29,668 @@ using namespace std;
+@@ -28,6 +29,671 @@ using namespace std;
  using namespace spv;
  using namespace SPIRV_CROSS_NAMESPACE;
  
@@ -29235,8 +29414,11 @@ index 7a6272ca..b7afb76f 100644
 +
 +template<typename T>
 +static inline device const ulong* spvAccelerationStructureFromAddress(ulong key, T table) {
-+	if (!key) return nullptr;
-+	if (table && table[0].y) {
++	if (!table) return key ? reinterpret_cast<device const ulong*>(key) : nullptr;
++	// After the slots: the reference of a structure of nothing, which every ray misses. Every structure is in the
++	// table, so an address that is not names none (a null one, or one never built).
++	ulong empty = table[table[0].x + 2].y;
++	if (key && table[0].y) {
 +		ulong mask = table[0].x, hash = key;
 +		hash = (hash ^ (hash >> 30)) * 0xbf58476d1ce4e5b9ul;
 +		hash = (hash ^ (hash >> 27)) * 0x94d049bb133111ebul;
@@ -29248,7 +29430,7 @@ index 7a6272ca..b7afb76f 100644
 +			if (!entry.x) break;
 +		}
 +	}
-+	return reinterpret_cast<device const ulong*>(key);
++	return reinterpret_cast<device const ulong*>(empty ? empty : key);
 +}
 +)MVKRT";
 +	return source;
@@ -29891,7 +30073,7 @@ index 7a6272ca..b7afb76f 100644
  
  #pragma mark -
  #pragma mark SPIRVToMSLConversionConfiguration
-@@ -48,8 +711,15 @@ bool containsMatching(const vector<T>& vec, const T& val) {
+@@ -48,8 +714,15 @@ bool containsMatching(const vector<T>& vec, const T& val) {
  
  MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionOptions::matches(const SPIRVToMSLConversionOptions& other) const {
  	if (memcmp(&mslOptions, &other.mslOptions, sizeof(mslOptions)) != 0) { return false; }
@@ -29907,7 +30089,7 @@ index 7a6272ca..b7afb76f 100644
  	if (tessPatchKind != other.tessPatchKind) { return false; }
  	if (numTessControlPoints != other.numTessControlPoints) { return false; }
  	if (shouldFlipVertexY != other.shouldFlipVertexY) { return false; }
-@@ -91,6 +761,25 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
+@@ -91,6 +764,25 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
  	mslOptions.pad_fragment_output_components = true;
  }
  
@@ -29933,7 +30115,7 @@ index 7a6272ca..b7afb76f 100644
  MVK_PUBLIC_SYMBOL bool mvk::MSLShaderInterfaceVariable::matches(const mvk::MSLShaderInterfaceVariable& other) const {
  	if (memcmp(&shaderVar, &other.shaderVar, sizeof(shaderVar)) != 0) { return false; }
  	if (binding != other.binding) { return false; }
-@@ -190,7 +879,7 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConversionConfiguration::markAllInterfaceVarsAn
+@@ -190,7 +882,7 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConversionConfiguration::markAllInterfaceVarsAn
  // and shaderInputs and shaderOutputs are populated before each stage, so neither needs to be filtered by stage here.
  MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToMSLConversionConfiguration& other) const {
  
@@ -29942,7 +30124,7 @@ index 7a6272ca..b7afb76f 100644
  
  	for (const auto& si : shaderInputs) {
  		if (si.outIsUsedByShader && !containsMatching(other.shaderInputs, si)) { return false; }
-@@ -210,6 +899,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+@@ -210,6 +902,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
  		if (db.stage == options.entryPointStage &&
  			!containsMatching(other.dynamicBufferDescriptors, db)) { return false; }
  	}
@@ -29953,7 +30135,7 @@ index 7a6272ca..b7afb76f 100644
  
  	for (const auto& db : other.dynamicBufferDescriptors) {
  		if (db.stage == options.entryPointStage &&
-@@ -219,6 +912,9 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+@@ -219,6 +915,9 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
  	for (uint32_t dsIdx : discreteDescriptorSets) {
  		if ( !contains(other.discreteDescriptorSets, dsIdx)) { return false; }
  	}
@@ -29963,7 +30145,7 @@ index 7a6272ca..b7afb76f 100644
  
  	for (uint32_t dsIdx : other.discreteDescriptorSets) {
  		if ( !contains(discreteDescriptorSets, dsIdx)) { return false; }
-@@ -288,7 +984,12 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -288,7 +987,12 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  		pMSLCompiler = new CompilerMSL(_spirv);
  
  		if (shaderConfig.options.hasEntryPoint()) {
@@ -29977,7 +30159,7 @@ index 7a6272ca..b7afb76f 100644
  		}
  
  		// Set up tessellation parameters if needed.
-@@ -302,9 +1003,50 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -302,9 +1006,50 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  			}
  		}
  
@@ -30028,7 +30210,7 @@ index 7a6272ca..b7afb76f 100644
  
  		auto scOpts = pMSLCompiler->get_common_options();
  		scOpts.vertex.flip_vert_y = shaderConfig.options.shouldFlipVertexY;
-@@ -325,6 +1067,15 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -325,6 +1070,15 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  			auto& rbb = rb.resourceBinding;
  			if (rbb.stage == shaderConfig.options.entryPointStage) {
  				pMSLCompiler->add_msl_resource_binding(rbb);
@@ -30044,7 +30226,7 @@ index 7a6272ca..b7afb76f 100644
  				if (rb.requiresConstExprSampler) {
  					pMSLCompiler->remap_constexpr_sampler_by_binding(rbb.desc_set, rbb.binding, rb.constExprSampler);
  				}
-@@ -346,7 +1097,14 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -346,7 +1100,14 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  				}
  			}
  		}
@@ -30059,7 +30241,7 @@ index 7a6272ca..b7afb76f 100644
  
          if (shouldLogMSL) { logSource(conversionResult.resultLog, conversionResult.msl, "MSL", "Converted"); }
  
-@@ -371,13 +1129,22 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -371,13 +1132,22 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  	conversionResult.resultInfo.needsOutputBuffer = pMSLCompiler && pMSLCompiler->needs_output_buffer();
  	conversionResult.resultInfo.needsPatchOutputBuffer = pMSLCompiler && pMSLCompiler->needs_patch_output_buffer();
  	conversionResult.resultInfo.needsBufferSizeBuffer = pMSLCompiler && pMSLCompiler->needs_buffer_size_buffer();
@@ -30082,7 +30264,7 @@ index 7a6272ca..b7afb76f 100644
  
  	// When using Metal argument buffers, if the shader is provided with dynamic buffer offsets,
  	// then it needs a buffer to hold these dynamic offsets.
-@@ -390,29 +1157,31 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+@@ -390,29 +1160,31 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
  		}
  	}
  
@@ -30137,7 +30319,7 @@ index 7a6272ca..b7afb76f 100644
  
      // To check GLSL conversion
      if (shouldLogGLSL) {
-@@ -513,7 +1282,9 @@ void SPIRVToMSLConverter::logSource(string& log, string& src, const char* srcLan
+@@ -513,7 +1285,9 @@ void SPIRVToMSLConverter::logSource(string& log, string& src, const char* srcLan
  // Although LocalSizeId is the modern mechanism, the Builtin takes precedence if it is present.
  static void getWorkgroupSize(Compiler* pCompiler, SPIREntryPoint& spvEP, uint32_t& x, uint32_t& y, uint32_t& z) {
  	auto& wgSz = spvEP.workgroup_size;
@@ -30148,7 +30330,7 @@ index 7a6272ca..b7afb76f 100644
  		x = wgSz.id_x ? pCompiler->get_constant(wgSz.id_x).scalar() : 0;
  		y = wgSz.id_y ? pCompiler->get_constant(wgSz.id_y).scalar() : 0;
  		z = wgSz.id_z ? pCompiler->get_constant(wgSz.id_z).scalar() : 0;
-@@ -541,7 +1312,7 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
+@@ -541,7 +1315,7 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
  
  	SPIREntryPoint spvEP;
  	if (options.hasEntryPoint()) {
@@ -30157,7 +30339,7 @@ index 7a6272ca..b7afb76f 100644
  	} else {
  		const auto& entryPoints = pMSLCompiler->get_entry_points_and_stages();
  		if ( !entryPoints.empty() ) {
-@@ -558,6 +1329,11 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
+@@ -558,6 +1332,11 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
  
  	SpecializationConstant widthSC, heightSC, depthSC;
  	pMSLCompiler->get_work_group_size_specialization_constants(widthSC, heightSC, depthSC);
@@ -30169,7 +30351,7 @@ index 7a6272ca..b7afb76f 100644
  
  	auto& wgSize = entryPoint.workgroupSize;
  	populateWorkgroupDimension(wgSize.width,  x, widthSC);
-@@ -574,6 +1350,12 @@ bool SPIRVToMSLConverter::usesPhysicalStorageBufferAddressesCapability(Compiler*
+@@ -574,6 +1353,12 @@ bool SPIRVToMSLConverter::usesPhysicalStorageBufferAddressesCapability(Compiler*
  			}
  		}
  	}
