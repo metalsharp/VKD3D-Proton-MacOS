@@ -2628,6 +2628,24 @@ RWStructuredBuffer<float4> sb_dst : register(u1);
 [numthreads(64, 1, 1)] void cs_typed(uint t : SV_DispatchThreadID) { typed_dst[t] = typed_src[t] * 2 + rc.x; }
 [numthreads(64, 1, 1)] void cs_struct(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t] * 2 + rc.x; }
 [numthreads(64, 1, 1)] void cs_robust(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t * rc.y] * 2 + typed_src[t * rc.y]; }
+// cs_struct within the SRV's bounds (it has half the elements): the cost of the loads without the robustness path.
+[numthreads(64, 1, 1)] void cs_struct_in(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t & ((1u << 19) - 1)] * 2 + rc.x; }
+// A particle update: position and velocity (two float4s) read, integrated with drag, gravity and a bounce, written back.
+[numthreads(64, 1, 1)] void cs_particles(uint t : SV_DispatchThreadID)
+{
+    uint i = t * 2;
+    if (i + 1 >= (1u << 20) / 2) return;
+    float4 pos = sb_src[i], vel = sb_src[i + 1];
+    float dt = 0.016 + rc.x * 1e-6;
+    float3 acc = float3(0, -9.8, 0) - vel.xyz * (0.1 + 0.01 * dot(vel.xyz, vel.xyz));
+    vel.xyz += acc * dt;
+    pos.xyz += vel.xyz * dt;
+    if (pos.y < 0) { pos.y = -pos.y; vel.y = -vel.y * 0.8; }
+    vel.w = sqrt(dot(vel.xyz, vel.xyz));
+    pos.w = saturate(pos.w - dt * 0.25) + sin(pos.x * 3.1) * cos(pos.z * 1.7) * 1e-3;
+    sb_dst[i] = pos;
+    sb_dst[i + 1] = vel;
+}
 )";
 
 // Graphics root signature like p.root_signature, with a given static sampler filter and flags.
@@ -3150,7 +3168,7 @@ static std::vector<Scene> feature_scenes()
             PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_cull"; d.ps = "ps_cull"; pso_a = create_pso(d);
         }, [bind, quads](UINT f) { bind(nullptr, pso_a); quads(5000, 0.01f, f); } },
         { "typed_buffer", "1M typed loads (RGBA8 SRV) and stores (RGBA32F UAV) at unaligned element offsets in compute", buffers_init(false), buffers_frame("cs_typed", 1) },
-        { "structured_buffer", "1M structured loads and stores in compute (baseline for typed_buffer and robustness)", buffers_init(false), buffers_frame("cs_struct", 1) },
+        { "structured_buffer", "1M structured loads and stores in compute, half the loads out of the view's bounds", buffers_init(false), buffers_frame("cs_struct", 1) },
         { "robust_oob", "1M loads, half of them out of bounds, from structured and typed views (robust access)", buffers_init(false), buffers_frame("cs_robust", 2) },
         // The DXIL is compiled at init, where the runner's prepare pass fills the DXIL cache.
         { "structured_buffer_dxil", "structured_buffer compiled as DXIL", [buffers_init] {
@@ -3160,6 +3178,11 @@ static std::vector<Scene> feature_scenes()
             buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_robust", "cs_6_0"));
         }, buffers_frame("cs_robust", 2, "cs_6_0"), false, 0, true },
         { "null_descriptors", "the same reading through a null typed descriptor", buffers_init(true), buffers_frame("cs_robust", 2) },
+        { "structured_inbounds", "structured_buffer with every load in bounds (structured_buffer reads half out of bounds)", buffers_init(false), buffers_frame("cs_struct_in", 1) },
+        { "particles", "1M structured float4 particle updates: two loads, about 30 ALU ops, two stores (a typical compute pass)", buffers_init(false), buffers_frame("cs_particles", 1) },
+        { "particles_dxil", "particles compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_particles", "cs_6_0"));
+        }, buffers_frame("cs_particles", 1, "cs_6_0"), false, 0, true },
         { "tiled_update", "UpdateTileMappings of 256 tiles per frame on a 4096x4096 reserved texture (streaming)", tiled_init(false), [](UINT f) {
             if (!reserved) return;
             std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords(256);

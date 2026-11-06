@@ -76,8 +76,11 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
   such samplers).
 - Typed SRVs of three 32-bit components have no Metal texel format (DXIL: dxil-spirv's meta flag; DXBC: the
   reflection check).
-- `StructuredBuffer<float4>` accesses become four 4-byte loads or stores even with `rawBufferLoad` alignment 16: about
-  1.5x the GPU time of SPIR-V on streaming kernels. It isn't fixable from the DXIL.
+- Out-of-bounds buffer loads are slow: the converter loads through a null pointer (offset by the index) instead of
+  branching. With half its loads out of bounds, a streaming kernel takes about 1.5x the GPU time of SPIR-V (probe
+  scenes `structured_buffer`, `robust_oob`, `null_descriptors`). In bounds it takes the same time
+  (`structured_inbounds`, `particles`). `StructuredBuffer<float4>` accesses also become four 4-byte loads or stores,
+  even with `rawBufferLoad` alignment 16, but that measured no slower.
 - Metal `sin` and `cos` return 0 for infinite or NaN arguments, on either path.
 - `SV_Barycentrics` (perspective) reads wrong values when it's the fragment function's only stage input (Apple M4,
   macOS 27.2: `(l0, l1 / 2, l2 + l1 / 2)` for a triangle with w = 1, 2 and 4), and the converter passes Metal's
