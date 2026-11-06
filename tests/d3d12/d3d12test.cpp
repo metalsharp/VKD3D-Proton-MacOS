@@ -2046,6 +2046,168 @@ float4 vs(uint id : SV_VertexID) : SV_Position
     return true;
 }
 
+// Draw parameters as D3D12 defines them: SV_InstanceID counts from 0 whatever StartInstanceLocation is, and
+// SV_VertexID from 0 whatever StartVertexLocation is (indexed: the index, without BaseVertexLocation). Metal's vertex
+// and instance ids include them, so converted shaders read the draw's parameters to take them off. Each draw writes one pixel per vertex
+// and instance into a UAV through the pixel shader: point i of instance j stores (vertex id, instance id) at a slot.
+// Draws: DrawInstanced(4, 2, start vertex 3, start instance 5), DrawIndexedInstanced(4, 2, start index 1, base vertex
+// 10, start instance 7), and the same two through ExecuteIndirect.
+static bool draw_params(bool sm68)
+{
+    // SM 6.8: SV_StartVertexLocation and SV_StartInstanceLocation as well, stored past the ids (+ 0x100).
+    static const char *src = R"(
+cbuffer c : register(b0) { uint draw; };
+RWByteAddressBuffer o : register(u0);
+struct V { float4 pos : SV_Position; nointerpolation uint4 id : ID; };
+V vs(uint vid : SV_VertexID, uint iid : SV_InstanceID
+#if SM68
+     , uint sv : SV_StartVertexLocation, uint si : SV_StartInstanceLocation
+#endif
+     )
+{
+    V v;
+    v.pos = float4(-1.0 + (2.0 * (vid % 16) + 1.0) / 16.0, 1.0 - (2.0 * (iid % 4) + 1.0) / 4.0, 0, 1);
+#if SM68
+    v.id = uint4(vid, iid, sv, si);
+#else
+    v.id = uint4(vid, iid, 0, 0);
+#endif
+    return v;
+}
+float4 ps(V v) : SV_Target
+{
+    uint slot = draw * 64 + (v.id.y % 4) * 16 + v.id.x % 16;
+    o.Store4(slot * 16, v.id + 1);
+    return 1;
+}
+)";
+    static const wchar_t *sm68_define[] = { L"-D", L"SM68=1" };
+    std::vector<char> vs = compile_dxc(src, "vs", sm68 ? "vs_6_8" : "vs_6_0", sm68 ? sm68_define : nullptr, sm68 ? 2 : 0),
+                      ps = compile_dxc(src, "ps", sm68 ? "ps_6_8" : "ps_6_0", sm68 ? sm68_define : nullptr, sm68 ? 2 : 0);
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    D3D12_INDIRECT_ARGUMENT_DESC ad[2] = {};
+    ad[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    ad[0].Constant = { 0, 0, 1 };
+    ad[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC csd = { 4 * 5, 2, ad };
+    ID3D12CommandSignature *sig_draw = nullptr, *sig_indexed = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, rs, IID_PPV_ARGS(&sig_draw)));
+    ad[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    csd.ByteStride = 4 * 6;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, rs, IID_PPV_ARGS(&sig_indexed)));
+
+    ID3D12Resource *upload = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    const uint16_t indices[5] = { 99, 0, 1, 2, 3 };   // start index 1: 0..3
+    memcpy(u, indices, sizeof(indices));
+    const uint32_t ind_draw[5] = { 2, 4, 2, 3, 5 };    // draw 2: DrawInstanced(4, 2, 3, 5)
+    const uint32_t ind_indexed[6] = { 3, 4, 2, 1, 10, 7 };   // draw 3: DrawIndexedInstanced(4, 2, 1, 10, 7)
+    memcpy(u + 256, ind_draw, sizeof(ind_draw));
+    memcpy(u + 512, ind_indexed, sizeof(ind_indexed));
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *args = create_buffer(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(args, 0, upload, 0, 4096);
+    D3D12_RESOURCE_BARRIER bs[1] = {};
+    bs[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bs[0].Transition.pResource = args;
+    bs[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    bs[0].Transition.StateAfter = (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    g.list->ResourceBarrier(1, bs);
+    ID3D12Resource *out = create_buffer(4 * 64 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const UINT W = 16, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    D3D12_INDEX_BUFFER_VIEW ibv = { args->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R16_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    g.list->SetGraphicsRoot32BitConstant(0, 0, 0);
+    g.list->DrawInstanced(4, 2, 3, 5);
+    g.list->SetGraphicsRoot32BitConstant(0, 1, 0);
+    g.list->DrawIndexedInstanced(4, 2, 1, 10, 7);
+    g.list->ExecuteIndirect(sig_draw, 1, args, 256, nullptr, 0);
+    g.list->ExecuteIndirect(sig_indexed, 1, args, 512, nullptr, 0);
+    ID3D12Resource *rb = create_buffer(4 * 64 * 16, D3D12_HEAP_TYPE_READBACK);
+    transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(rb, 0, out, 0, 4 * 64 * 16);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *o = nullptr;
+    rb->Map(0, nullptr, (void **)&o);
+    int bad = 0;
+    for (uint32_t d = 0; d < 4; d++)
+        for (uint32_t i = 0; i < 2; i++)
+            for (uint32_t v = 0; v < 4; v++)
+            {
+                uint32_t vid = v;   // indexed: index v (base vertex 10 not included); else vertex v (start 3 not included)
+                uint32_t slot = d * 64 + i * 16 + vid % 16;
+                // StartVertexLocation is the base vertex for indexed draws (D3D12's SV_StartVertexLocation).
+                uint32_t sv = sm68 ? ((d & 1) ? 10 : 3) : 0, si = sm68 ? ((d & 1) ? 7 : 5) : 0;
+                const uint32_t *e = o + slot * 4;
+                if ((e[0] != vid + 1 || e[1] != i + 1 || e[2] != sv + 1 || e[3] != si + 1) && bad++ < 8)
+                    printf("  draw %u instance %u vertex %u: slot holds (%d, %d, %d, %d), want (%u, %u, %u, %u)\n", d, i, v,
+                           (int)e[0] - 1, (int)e[1] - 1, (int)e[2] - 1, (int)e[3] - 1, vid, i, sv, si);
+            }
+    EXPECT(!bad, "%d of 32 vertex/instance ids wrong", bad);
+    if (bad && getenv("D3D12TEST_VERBOSE"))
+        for (uint32_t k = 0; k < 4 * 64; k++)
+            if (o[k * 4] || o[k * 4 + 1])
+                printf("  slot %u: (%d, %d, %d, %d)\n", k, (int)o[k * 4] - 1, (int)o[k * 4 + 1] - 1, (int)o[k * 4 + 2] - 1,
+                       (int)o[k * 4 + 3] - 1);
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); rt->Release(); out->Release(); args->Release(); upload->Release();
+    sig_draw->Release(); sig_indexed->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_draw_params() { return draw_params(false); }
+static bool test_draw_params_sm68() { return draw_params(true); }
+
 // WriteBufferImmediate inside a render pass: 1200 draws, each between a MARKER_IN and a MARKER_OUT write, and a
 // DEFAULT write after each, land every value in its slot. Without buffer markers MARKER_IN is batched with the rest
 // and written when the pass ends or the batch (1024 writes) fills, so the writes span more than one batch.
@@ -5910,6 +6072,8 @@ static const Test tests[] = {
     { "logicop", test_logicop },
     { "dual_source_blend", test_dual_source_blend },
     { "depth_only", test_depth_only },
+    { "draw_params", test_draw_params },
+    { "draw_params_sm68", test_draw_params_sm68 },
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },
