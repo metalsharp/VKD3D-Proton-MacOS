@@ -116,6 +116,20 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
   `barycentric_coord` straight through. Barycentric shaders stay on SPIR-V (meta flag). There, SPIRV-Cross gives such a
   fragment function a `[[position]]` input, which makes them right. Test `barycentrics`.
 
+## Converter compatibility flags
+
+MoltenVK sets `BoundsCheck` (with robustness), `DisableNanInfOptimization` (unless fast math is always on),
+`SamplerLODBias` (where Metal samplers have no LOD bias) and `TextureMinLODClamp` (with `VK_EXT_image_view_min_lod`).
+The others, checked on an Apple M6 against D3D's rules on both paths (DXIL and DXBC, Metal 4 and 3):
+
+- `PositionInvariance` strips fast-math flags from position math. Without it, a bridge depth pre-pass and a SPIR-V main
+  pass with the same vertex shader (transcendentals, `normalize`, `pow`, `rsqrt`) still match to the bit
+  (`depth_equal_cross_path`). Not set.
+- `SampleNanToZero`: NaN sample coordinates already read as 0 (`sample_nan_coords`). Not set.
+- `TexWriteRoundingRTZ`: render target and typed UAV writes already round toward zero into float16, float11 and
+  float10 (70000 stores the largest finite value) and to nearest into UNORM (`rt_float_conversion`,
+  `uav_float_conversion`). Not set.
+
 ## SPIR-V path limits found on the way
 
 - One pixel shader reading both perspective and noperspective `SV_Barycentrics` needs MSL 4.0. Before it, Metal takes
