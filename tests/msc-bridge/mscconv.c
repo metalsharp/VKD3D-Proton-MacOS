@@ -1,6 +1,6 @@
 /* Converts DXIL with the Metal Shader Converter and writes the metallib, to read its AIR (metal-objdump -d) when
  * comparing what different DXIL becomes, and prints how many top-level resources its reflection lists. No root signature: the converter's default layout. Compatibility flags as
- * MoltenVK sets them with robust buffer access (bounds checked, NaN and Inf kept).
+ * MoltenVK sets them with robust buffer access (bounds checked, NaN and Inf kept), or MSCCONV_COMPAT_FLAGS (a number).
  *   mscconv <in.dxil> <out.metallib>   (libmetalirconverter.dylib from DYLD_LIBRARY_PATH) */
 #include <fcntl.h>
 #include <stdio.h>
@@ -26,7 +26,9 @@ int main(int argc, char **argv)
     fclose(f);
 
     compiler = IRCompilerCreate();
-    IRCompilerSetCompatibilityFlags(compiler, IRCompatibilityFlagBoundsCheck | IRCompatibilityFlagDisableNanInfOptimization);
+    const char *flags = getenv("MSCCONV_COMPAT_FLAGS");
+    IRCompilerSetCompatibilityFlags(compiler, flags ? (IRCompatibilityFlags)strtoul(flags, NULL, 0) :
+            IRCompatibilityFlagBoundsCheck | IRCompatibilityFlagDisableNanInfOptimization);
     dxil = IRObjectCreateFromDXIL(data, size, IRBytecodeOwnershipNone);
     if (!(ir = IRCompilerAllocCompileAndLink(compiler, NULL, dxil, &err)))
     {

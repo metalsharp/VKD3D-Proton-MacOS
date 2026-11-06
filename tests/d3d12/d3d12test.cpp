@@ -3279,6 +3279,195 @@ static bool test_minmax() { return minmax(false); }
 static bool test_minmax_heap() { return minmax(true); }
 static bool test_minmax_heap_late() { return minmax(true, true); }
 
+// Sampler MipLODBias: a 64x64 texture whose mip m holds m, sampled with point filters from a 64x64 pixel grid (LOD 0)
+// through a static sampler (bias 2) and two heap samplers (bias 3 and -1): Sample, SampleLevel 1, SampleBias 1 and
+// SampleGrad (LOD 0) read the mip of the LOD plus the bias, clamped to the mip range. Metal samplers have a LOD bias only
+// on Apple10 GPUs with macOS 26; elsewhere converted shaders add it from the sampler's descriptor entry, except to
+// gradient samples, and SPIR-V shaders from the word MoltenVK keeps next to the sampler. Late: the heap samplers are
+// made after the PSO, and the static sampler has no bias (a bridge PSO with gradient samples then draws with SPIR-V).
+static bool sampler_lod_bias(bool dxbc, bool late = false)
+{
+    static const char *src = R"(
+Texture2D<float> t : register(t0);
+SamplerState s0 : register(s0);
+SamplerState s1 : register(s1);
+SamplerState s2 : register(s2);
+RWStructuredBuffer<float4> o : register(u1);
+float4 reads(SamplerState s, float2 uv)
+{
+    return float4(t.Sample(s, uv), t.SampleLevel(s, uv, 1.0), t.SampleBias(s, uv, 1.0), t.SampleGrad(s, uv, ddx(uv), ddy(uv)));
+}
+float4 ps(float4 p : SV_Position) : SV_Target
+{
+    float2 uv = p.xy / 64.0;
+    // Every pixel reads the same mips, so every pixel writes them: the samples stay in uniform control flow (a store
+    // under a branch would take them into it, where implicit derivatives are undefined).
+    o[0] = reads(s0, uv); o[1] = reads(s1, uv); o[2] = reads(s2, uv);
+    return 0;
+}
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0, 1);
+}
+)";
+    std::vector<char> vsb = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> psb = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vsb.empty() || psb.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    const float biases[3] = { late ? 0.0f : 2.0f, 3.0f, -1.0f };
+
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_DESCRIPTOR_RANGE srange = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 2, 1, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    // u1: DXBC pixel shaders number UAVs after their render targets.
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable = { 1, &srange };
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[2].Descriptor.ShaderRegister = 1;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MipLODBias = biases[0];
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+
+    D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *sheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
+    UINT sinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    for (UINT i = 0; i < 2 && !late; i++)
+    {
+        D3D12_SAMPLER_DESC sd = {};
+        sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sd.MipLODBias = biases[1 + i];
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = sheap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * sinc;
+        dev->CreateSampler(&sd, h);
+    }
+
+    // The texture: 7 mips, mip m filled with m.
+    const UINT mips = 7;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 64; td.Height = 64; td.DepthOrArraySize = 1; td.MipLevels = mips;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    ID3D12Resource *upload = create_buffer(mips * 256 * 64, D3D12_HEAP_TYPE_UPLOAD);
+    float *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT m = 0; m < mips; m++)
+        for (UINT k = 0; k < 64 * 64; k++)
+            u[m * 64 * 64 + k] = (float)m;
+    upload->Unmap(0, nullptr);
+    for (UINT m = 0; m < mips; m++)
+    {
+        UINT w = 64 >> m;
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = (UINT64)m * 64 * 64 * 4;
+        srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, w, w, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    dev->CreateShaderResourceView(tex, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_RESOURCE_DESC rtd = td;
+    rtd.MipLevels = 1;
+    rtd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    for (UINT i = 0; i < 2 && late; i++)
+    {
+        D3D12_SAMPLER_DESC sd = {};
+        sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sd.MipLODBias = biases[1 + i];
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = sheap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * sinc;
+        dev->CreateSampler(&sd, h);
+    }
+
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vpt = { 0, 0, 64, 64, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 64, 64 };
+    ID3D12DescriptorHeap *heaps[2] = { heap, sheap };
+    g.list->SetDescriptorHeaps(2, heaps);
+    g.list->RSSetViewports(1, &vpt);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetGraphicsRootDescriptorTable(1, sheap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetGraphicsRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const float *got = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!got)
+        return false;
+    static const char *names[4] = { "Sample", "SampleLevel 1", "SampleBias 1", "SampleGrad" };
+    const float lods[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+    for (UINT i = 0; i < 3; i++)
+    {
+        printf("  bias %g (%s): %g %g %g %g\n", biases[i], i ? "heap" : "static", got[i * 4], got[i * 4 + 1],
+               got[i * 4 + 2], got[i * 4 + 3]);
+        for (UINT k = 0; k < 4; k++)
+        {
+            float want = std::min(std::max(lods[k] + biases[i], 0.0f), (float)(mips - 1));
+            EXPECT(got[i * 4 + k] == want, "%s through a %s sampler with bias %g reads mip %g, want %g", names[k],
+                   i ? "heap" : "static", biases[i], got[i * 4 + k], want);
+        }
+    }
+    rb->Release(); out->Release(); pso->Release(); rtv_heap->Release(); rt->Release(); heap->Release();
+    upload->Release(); tex->Release(); sheap->Release(); rs->Release();
+    return true;
+}
+
+static bool test_sampler_lod_bias() { return sampler_lod_bias(false); }
+static bool test_sampler_lod_bias_dxbc() { return sampler_lod_bias(true); }
+static bool test_sampler_lod_bias_late() { return sampler_lod_bias(false, true); }
+
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
 // zero constant (the select on the address, robust_guarded_load), which this is the check of.
@@ -8729,6 +8918,9 @@ static const Test tests[] = {
     { "texdiff", test_texdiff },
     { "vtxdiff", test_vtxdiff },
     { "vertex_rgb10a2_uint", test_vertex_rgb10a2_uint },
+    { "sampler_lod_bias", test_sampler_lod_bias },
+    { "sampler_lod_bias_dxbc", test_sampler_lod_bias_dxbc },
+    { "sampler_lod_bias_late", test_sampler_lod_bias_late },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },

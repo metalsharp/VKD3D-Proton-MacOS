@@ -72,10 +72,24 @@ kept on SPIR-V before conversion) and 64-bit wave ops on some types (`Unsupporte
 These convert cleanly, but tests found them wrong or slow, so the bridge treats them specially:
 
 - `CheckAccessFullyMapped` reads false for mapped tiles (residency meta flag: SPIR-V).
-- Min/max sampler reduction reads as linear filtering on GPUs before Apple10 with macOS 26. PSOs with such static
-  samplers use SPIR-V. Once the application makes a min/max sampler, PSOs that sample from tables or the heap use
-  SPIR-V too: later ones aren't bridged, and earlier ones draw and dispatch with their SPIR-V pipelines (test
-  `minmax_heap_late`).
+- Min/max sampler reduction reads as linear filtering on GPUs before Apple10 with macOS 26. There, PSOs with such
+  static samplers use SPIR-V. Once the application makes a min/max sampler, PSOs that sample from tables or the heap
+  use SPIR-V too: later ones aren't bridged, and earlier ones draw and dispatch with their SPIR-V pipelines (test
+  `minmax_heap_late`). Where Metal samplers reduce natively (Apple10 with macOS 26, this M6), they stay on the bridge.
+  VKD3D-Proton learns which from `VK_KHR_portability_subset`'s `samplerMipLodBias`, which MoltenVK sets under the same
+  condition.
+- Sampler `MipLODBias`: Metal samplers have a LOD bias only on Apple10 GPUs with macOS 26. Before this branch the
+  bias was ignored elsewhere (M1 to M4, and macOS 14 and 15) on both paths. Now the bridge puts the bias in each sampler
+  descriptor entry's metadata, as `IRDescriptorTableSetSampler` does. With `IRCompatibilityFlagSamplerLODBias`, the
+  converter adds it to `Sample`, `SampleLevel` and `SampleBias` (checked in the AIR: it loads the entry's third word
+  and adds it to the bias or level). It doesn't add it to `SampleGrad`. So shaders with gradient samples (dxil-spirv
+  0007) stay on SPIR-V where a biased static sampler, or once a biased heap sampler exists, can reach them. On SPIR-V,
+  SPIRV-Cross adds the bias from the sampler's emulated word (bits 16 to 31, signed 8.8): to `level()` and `bias()`, as
+  `bias()` for implicit LODs, and as an `exp2()` scale of gradients. Tests `sampler_lod_bias`, `_dxbc` and `_late`
+  (static and heap samplers, biases 2, 3 and -1) pass on every lane, with `METALSHARP_METAL_VERSION=3` standing in
+  for an M1 to M4. SPIR-V shaders get the emulation once the application has made a biased sampler. Pipelines compiled
+  before that ignore a heap sampler's bias. Emulating it always costs 0.5 to 5% GPU in the probe's sampling-bound
+  scenes (`MVK_CONFIG_EMULATE_SAMPLER_LOD_BIAS=1` turns it on).
 - Typed SRVs of three 32-bit components have no Metal texel format. Shaders declaring one use SPIR-V (DXIL:
   dxil-spirv's meta flag; DXBC: the reflection check). A shader declaring `Buffer<float4>` (or any 32-bit typed SRV)
   may still be given such a view. Once the application makes one, PSOs reading typed buffer SRVs use SPIR-V the same
