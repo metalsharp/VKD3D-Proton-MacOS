@@ -1122,6 +1122,39 @@ static std::vector<Scene> base_scenes()
             }
             extras.add("submit_wait_ms_each", wait / 8);
         } },
+        { "fence_spin", "fence_sync's submissions, each waited on by polling GetCompletedValue (wait latency floor)", [] {
+            flat = create_pso({});
+            for (int i = 0; i < 2; i++)
+            {
+                CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&extra_allocs[i])));
+                CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, extra_allocs[i], nullptr, IID_PPV_ARGS(&extra_lists[i])));
+                CHECK(extra_lists[i]->Close());
+            }
+        }, [](UINT f) {
+            double wait = 0;
+            for (UINT k = 0; k < 8; k++)
+            {
+                ID3D12GraphicsCommandList *l = extra_lists[0];
+                CHECK(extra_allocs[0]->Reset());
+                CHECK(l->Reset(extra_allocs[0], nullptr));
+                auto h = rtv(FRAMES_IN_FLIGHT);
+                barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+                viewport(l);
+                set_quad_state(l, flat);
+                for (UINT i = 0; i < 200; i++) small_quad(l, i, f * 0.01f);
+                barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                double t = qpc_ms();
+                CHECK(l->Close());
+                ID3D12CommandList *lists[] = { l };
+                p.queue->ExecuteCommandLists(1, lists);
+                UINT64 v = signal_queue();
+                while (p.fence->GetCompletedValue() < v)
+                    YieldProcessor();
+                wait += qpc_ms() - t;
+            }
+            extras.add("submit_wait_ms_each", wait / 8);
+        } },
         { "readback", "a 1080p target copied to a readback buffer, waited for and mapped each frame", [] {
             readback = create_buffer((UINT64)W * H * 8, D3D12_HEAP_TYPE_READBACK);
             CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&extra_allocs[0])));
