@@ -1,0 +1,181 @@
+From cabbb3bec85c2914e05bec16a02b7de99541b8a6 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 09:57:00 -0700
+Subject: [PATCH 9/9] MetalSharp: pow2 tessellator partitioning
+
+SPIR-V has no pow2 spacing, and pow2 hull shaders tessellated as integer ones (a
+factor of 5 gave 5 segments, not 8). Patch constant stores of the tess factors now
+round them up to a power of 2 in [1, 64] (factors that cull the patch stay as they
+are), with integer spacing. dxbc-spirv's IR folds pow2 into integer, so the DXBC
+adapter finds the declaration in the shader's tokens.
+---
+ bc/module_dxbc_ir.cpp              | 38 +++++++++++++++++++++++++++---
+ dxil_converter.cpp                 |  3 ++-
+ opcodes/converter_impl.hpp         |  3 +++
+ opcodes/dxil/dxil_tessellation.cpp | 35 +++++++++++++++++++++++++++
+ 4 files changed, 75 insertions(+), 4 deletions(-)
+
+diff --git a/bc/module_dxbc_ir.cpp b/bc/module_dxbc_ir.cpp
+index 6b2614e4..ac43e2bb 100644
+--- a/bc/module_dxbc_ir.cpp
++++ b/bc/module_dxbc_ir.cpp
+@@ -37,6 +37,8 @@
+ #include "ir/ir.h"
+ #include "ir/ir_builder.h"
+ #include "dxbc/dxbc_api.h"
++#include "dxbc/dxbc_container.h"
++#include "dxbc/dxbc_parser.h"
+ #include "util/util_log.h"
+ using namespace dxbc_spv;
+ 
+@@ -516,6 +518,9 @@ public:
+ 	ParseContext(LLVMContext &context_, ir::Builder &builder_, Module &module_)
+ 	    : context(context_), builder(builder_), module(module_) {}
+ 
++	// MetalSharp: the hull shader declares pow2 partitioning, which dxbc-spirv's IR folds into integer.
++	bool pow2_partitioning = false;
++
+ 	bool emit_metadata();
+ 	bool emit_entry_point();
+ 	bool emit_function_bodies();
+@@ -3177,7 +3182,9 @@ MDOperand *ParseContext::create_entry_point_meta(Function *patch_control_func)
+ 		    create_constant_uint_meta(input_control_points),
+ 		    create_constant_uint_meta(output_control_points),
+ 		    create_constant_uint_meta(uint32_t(convert_hull_domain(domain))),
+-		    create_constant_uint_meta(uint32_t(convert_hull_partitioning(partitioning))),
++		    create_constant_uint_meta(uint32_t(pow2_partitioning && partitioning == ir::TessPartitioning::eInteger ?
++		                                       DXIL::TessellatorPartitioning::Pow2 :
++		                                       convert_hull_partitioning(partitioning))),
+ 		    create_constant_uint_meta(uint32_t(convert_hull_output_primitive(prim, winding)))));
+ 	}
+ 	else if (shader_stage == ir::ShaderStage::eDomain)
+@@ -3958,10 +3965,11 @@ MDString *ParseContext::create_string_meta(const String &str)
+ }
+ 
+ // Parses the highly simplified and SSA-ified IR coming from dxbc-spirv.
+-Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder)
++static Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder, bool pow2_partitioning)
+ {
+ 	auto *module = context.construct<Module>(context);
+ 	ParseContext ctx(context, builder, *module);
++	ctx.pow2_partitioning = pow2_partitioning;
+ 	if (!ctx.emit_entry_point())
+ 		return nullptr;
+ 	if (!ctx.emit_metadata())
+@@ -3971,6 +3979,30 @@ Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder)
+ 	return module;
+ }
+ 
++Module *parseDXBCIR(LLVMContext &context, ir::Builder &builder)
++{
++	return parseDXBCIR(context, builder, false);
++}
++
++// MetalSharp: whether a hull shader declares pow2 partitioning (dcl_tessellator_partitioning partitioning_pow2).
++static bool dxbc_declares_pow2_partitioning(const void *data, size_t size)
++{
++	dxbc::Container container(data, size);
++	auto code = container.getCodeChunk();
++	if (!code)
++		return false;
++	dxbc::Parser parser(code);
++	while (parser)
++	{
++		auto op = parser.parseInstruction();
++		if (!op)
++			break;
++		if (op.getOpToken().getOpCode() == dxbc::OpCode::eDclTessPartitioning)
++			return op.getOpToken().getTessellatorPartitioning() == dxbc::TessPartitioning::ePow2;
++	}
++	return false;
++}
++
+ Module *parseDXBCBinary(LLVMContext &context, const void* data, size_t size)
+ {
+ 	ScopedLogger logger;
+@@ -4028,7 +4060,7 @@ Module *parseDXBCBinary(LLVMContext &context, const void* data, size_t size)
+ 	if (!builder)
+ 		return nullptr;
+ 
+-	return parseDXBCIR(context, *builder);
++	return parseDXBCIR(context, *builder, dxbc_declares_pow2_partitioning(data, size));
+ }
+ 
+ }
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 938ee5b4..e8e66f3b 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -7193,7 +7193,8 @@ bool Converter::Impl::emit_execution_modes_hull()
+ 			break;
+ 
+ 		case DXIL::TessellatorPartitioning::Pow2:
+-			LOGE("Emulating Pow2 spacing as Integer.\n");
++			// Integer spacing of factors rounded up to a power of 2 (emit_store_patch_constant_instruction).
++			execution_mode_meta.tess_pow2_partitioning = true;
+ 			builder.addExecutionMode(func, spv::ExecutionModeSpacingEqual);
+ 			break;
+ 
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 7044978c..716e5af7 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -394,6 +394,9 @@ struct Converter::Impl
+ 		bool per_sample_shading = false;
+ 		bool waveops_include_helper_lanes = false;
+ 		bool needs_quad_derivatives = false;
++		// MetalSharp: pow2 partitioning, which SPIR-V lacks: tess factors are rounded up to a power of 2 as they
++		// are stored, and the shader uses integer spacing.
++		bool tess_pow2_partitioning = false;
+ 		String entry_point_name;
+ 
+ 		// Eventually, we should use Vulkan memory model across the board,
+diff --git a/opcodes/dxil/dxil_tessellation.cpp b/opcodes/dxil/dxil_tessellation.cpp
+index f66094ed..bc972fd1 100644
+--- a/opcodes/dxil/dxil_tessellation.cpp
++++ b/opcodes/dxil/dxil_tessellation.cpp
+@@ -145,6 +145,41 @@ bool emit_store_patch_constant_instruction(Converter::Impl &impl, const llvm::Ca
+ 		store_value = min_op->id;
+ 	}
+ 
++	// Pow2 partitioning: D3D rounds each factor up to a power of 2 in [1, 64] before integer spacing. Factors that
++	// cull the patch (not above 0, NaN) are stored as they are.
++	if (impl.execution_mode_meta.tess_pow2_partitioning &&
++	    impl.spirv_module.query_builtin_shader_input(meta.id, &builtin) &&
++	    (builtin == spv::BuiltInTessLevelInner || builtin == spv::BuiltInTessLevelOuter) &&
++	    storage_type->isFloatingPointTy() && !type_is_16bit(storage_type) && !type_is_64bit(storage_type))
++	{
++		if (!impl.glsl_std450_ext)
++			impl.glsl_std450_ext = builder.import("GLSL.std.450");
++		spv::Id float_type = builder.makeFloatType(32);
++		auto ext = [&](GLSLstd450 inst, std::initializer_list<spv::Id> args) {
++			auto *ext_op = impl.allocate(spv::OpExtInst, float_type);
++			ext_op->add_id(impl.glsl_std450_ext);
++			ext_op->add_literal(inst);
++			for (spv::Id arg : args)
++				ext_op->add_id(arg);
++			impl.add(ext_op);
++			return ext_op->id;
++		};
++		spv::Id clamped = ext(GLSLstd450FClamp, { store_value, builder.makeFloatConstant(1.0f), builder.makeFloatConstant(64.0f) });
++		spv::Id rounded = ext(GLSLstd450Exp2, { ext(GLSLstd450Ceil, { ext(GLSLstd450Log2, { clamped }) }) });
++
++		auto *positive = impl.allocate(spv::OpFOrdGreaterThan, builder.makeBoolType());
++		positive->add_id(store_value);
++		positive->add_id(builder.makeFloatConstant(0.0f));
++		impl.add(positive);
++
++		auto *select = impl.allocate(spv::OpSelect, float_type);
++		select->add_id(positive->id);
++		select->add_id(rounded);
++		select->add_id(store_value);
++		impl.add(select);
++		store_value = select->id;
++	}
++
+ 	Operation *op = impl.allocate(spv::OpStore);
+ 	op->add_id(ptr_id);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

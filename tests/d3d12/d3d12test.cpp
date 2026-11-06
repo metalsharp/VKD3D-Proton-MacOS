@@ -15,6 +15,8 @@
 #include <string.h>
 #include <string>
 #include <algorithm>
+#include <set>
+#include <map>
 #include <vector>
 #include <algorithm>
 #include <vector>
@@ -4063,6 +4065,288 @@ RWTexture2D<float4> c : register(u2);
 
 static bool test_uav_float_conversion() { return uav_float_conversion(false); }
 static bool test_uav_float_conversion_dxbc() { return uav_float_conversion(true); }
+
+// Tessellator output, checked without depending on its order. The domain shader appends each domain location it
+// evaluates to a UAV, and places the domain over a 64x64 target (quad: the square; tri: (u, v) over the lower-left
+// half), where the pixel shader adds 1 per fragment. For each domain, partitioning and set of factors: the distinct
+// points where their count is known, the points on each edge (edge factor + 1 after rounding: integer rounds up, pow2
+// to a power of 2, fractional_odd and fractional_even up to the next odd or even count, all clamped to [1, 64]), every
+// pixel of the domain covered exactly once, culled patches (a zero edge factor), and windings: drawn again with back
+// faces culled, triangle_cw and triangle_ccw cover all of it or none, oppositely. Isolines: density lines of detail
+// segments, each line's points evenly spaced.
+struct TessCase
+{
+    const char *domain, *partitioning, *topology;
+    float outer[4], inner[2];
+    int points;           // expected distinct domain points, or -1 when not checked
+    int edges[4];         // expected points on each edge (quad: u=0, v=0, u=1, v=1; tri: u=0, v=0, w=0), or 0
+};
+
+static bool tess_domains(bool dxbc)
+{
+    static const TessCase cases[] = {
+        { "quad", "integer", "triangle_cw", { 4, 4, 4, 4 }, { 4, 4 }, 25, { 5, 5, 5, 5 } },
+        { "quad", "integer", "triangle_cw", { 1, 2, 3, 4 }, { 3, 2 }, -1, { 2, 3, 4, 5 } },
+        { "quad", "integer", "triangle_ccw", { 4, 4, 4, 4 }, { 4, 4 }, 25, { 5, 5, 5, 5 } },
+        { "quad", "integer", "triangle_cw", { 2.3f, 2.3f, 2.3f, 2.3f }, { 2.3f, 2.3f }, 16, { 4, 4, 4, 4 } },
+        { "quad", "pow2", "triangle_cw", { 5, 5, 5, 5 }, { 5, 5 }, 81, { 9, 9, 9, 9 } },
+        { "quad", "fractional_odd", "triangle_cw", { 3, 3, 3, 3 }, { 3, 3 }, 16, { 4, 4, 4, 4 } },
+        { "quad", "fractional_odd", "triangle_cw", { 2.5f, 2.5f, 2.5f, 2.5f }, { 2.5f, 2.5f }, 16, { 4, 4, 4, 4 } },
+        { "quad", "fractional_even", "triangle_cw", { 2.5f, 2.5f, 2.5f, 2.5f }, { 2.5f, 2.5f }, 25, { 5, 5, 5, 5 } },
+        { "quad", "integer", "triangle_cw", { 64, 64, 64, 64 }, { 64, 64 }, 4225, { 65, 65, 65, 65 } },
+        { "quad", "integer", "triangle_cw", { 100, 100, 100, 100 }, { 100, 100 }, 4225, { 65, 65, 65, 65 } },
+        { "tri", "integer", "triangle_cw", { 4, 4, 4, 0 }, { 4, 0 }, 19, { 5, 5, 5, 0 } }, // rings of 12, 6 and 1
+        { "tri", "integer", "triangle_cw", { 1, 3, 5, 0 }, { 2, 0 }, -1, { 2, 4, 6, 0 } },
+        { "tri", "fractional_even", "triangle_ccw", { 3, 3, 3, 0 }, { 3, 0 }, -1, { 5, 5, 5, 0 } },
+        { "tri", "integer", "triangle_cw", { 0, 4, 4, 0 }, { 4, 0 }, 0, { 0, 0, 0, 0 } },
+        { "quad", "integer", "triangle_cw", { 4, 4, 4, 4 }, { 0, 4 }, -1, { 5, 5, 5, 5 } },
+        { "isoline", "integer", "line", { 3, 4, 0, 0 }, { 0, 0 }, 15, { 0, 0, 0, 0 } },
+    };
+    static const char *tmpl = R"(
+cbuffer F : register(b0) { float4 outer; float2 inner; };
+RWByteAddressBuffer o : register(u0);
+struct VSOut { float2 p : P; };
+VSOut vs(uint id : SV_VertexID) { VSOut v; v.p = float2(id, 0); return v; }
+#if ISOLINE
+struct HSConst { float e[2] : SV_TessFactor; };
+HSConst hsc() { HSConst c; c.e[0] = outer.x; c.e[1] = outer.y; return c; }
+#elif QUAD
+struct HSConst { float e[4] : SV_TessFactor; float i[2] : SV_InsideTessFactor; };
+HSConst hsc() { HSConst c; c.e[0] = outer.x; c.e[1] = outer.y; c.e[2] = outer.z; c.e[3] = outer.w; c.i[0] = inner.x; c.i[1] = inner.y; return c; }
+#else
+struct HSConst { float e[3] : SV_TessFactor; float i : SV_InsideTessFactor; };
+HSConst hsc() { HSConst c; c.e[0] = outer.x; c.e[1] = outer.y; c.e[2] = outer.z; c.i = inner.x; return c; }
+#endif
+[domain(DOMAIN)] [partitioning(PART)] [outputtopology(TOPO)] [outputcontrolpoints(1)] [patchconstantfunc("hsc")]
+VSOut hs(InputPatch<VSOut, 1> ip, uint i : SV_OutputControlPointID) { return ip[0]; }
+struct DSOut { float4 pos : SV_Position; };
+void note(float3 l)
+{
+    uint n; o.InterlockedAdd(0, 1, n);
+    if (n < 60000) o.Store3(16 + n * 12, asuint(l));
+}
+[domain(DOMAIN)]
+#if ISOLINE || QUAD
+DSOut ds(HSConst c, float2 l : SV_DomainLocation, const OutputPatch<VSOut, 1> op)
+{
+    note(float3(l, 0));
+    DSOut d; d.pos = float4(l.x * 2 - 1, 1 - l.y * 2, 0, 1); return d;
+}
+#else
+DSOut ds(HSConst c, float3 l : SV_DomainLocation, const OutputPatch<VSOut, 1> op)
+{
+    note(l);
+    DSOut d; d.pos = float4(l.x * 2 - 1, 1 - l.y * 2, 0, 1); return d;
+}
+#endif
+float4 ps() : SV_Target { return 1; }
+)";
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 8;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    const UINT out_size = 16 + 60000 * 12, W = 64;
+    ID3D12Resource *out = create_buffer(out_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *zero = create_buffer(16, D3D12_HEAP_TYPE_UPLOAD);
+    void *zp = nullptr;
+    zero->Map(0, nullptr, &zp);
+    memset(zp, 0, 16);
+    zero->Unmap(0, nullptr);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rtd = {};
+    rtd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rtd.Width = W; rtd.Height = W; rtd.DepthOrArraySize = 1; rtd.MipLevels = 1;
+    rtd.Format = DXGI_FORMAT_R16_FLOAT;
+    rtd.SampleDesc.Count = 1;
+    rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rts[2] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2];
+    for (UINT k = 0; k < 2; k++)
+    {
+        CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rts[k])));
+        rtvs[k] = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtvs[k].ptr += k * dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        dev->CreateRenderTargetView(rts[k], nullptr, rtvs[k]);
+    }
+    ID3D12Resource *rb = create_buffer(2 * W * 256, D3D12_HEAP_TYPE_READBACK);
+    int cull_state[2] = { -1, -1 }; // per topology (cw, ccw): 1 drawn, 0 culled
+    for (const TessCase &c : cases)
+    {
+        bool iso = !strcmp(c.domain, "isoline"), quad = !strcmp(c.domain, "quad");
+        std::string src = std::string("#define DOMAIN \"") + c.domain + "\"\n#define PART \"" + c.partitioning +
+                "\"\n#define TOPO \"" + c.topology + "\"\n#define ISOLINE " + (iso ? "1" : "0") + "\n#define QUAD " +
+                (quad ? "1" : "0") + "\n" + tmpl;
+        std::vector<char> vs = dxbc ? compile_fxc(src.c_str(), "vs", "vs_5_0") : compile_dxc(src.c_str(), "vs", "vs_6_0");
+        std::vector<char> hs = dxbc ? compile_fxc(src.c_str(), "hs", "hs_5_0") : compile_dxc(src.c_str(), "hs", "hs_6_0");
+        std::vector<char> ds = dxbc ? compile_fxc(src.c_str(), "ds", "ds_5_0") : compile_dxc(src.c_str(), "ds", "ds_6_0");
+        std::vector<char> ps = dxbc ? compile_fxc(src.c_str(), "ps", "ps_5_0") : compile_dxc(src.c_str(), "ps", "ps_6_0");
+        if (vs.empty() || hs.empty() || ds.empty() || ps.empty())
+            return false;
+        char label[96];
+        snprintf(label, sizeof(label), "%s %s %s (%g %g %g %g / %g %g)", c.domain, c.partitioning, c.topology,
+                 c.outer[0], c.outer[1], c.outer[2], c.outer[3], c.inner[0], c.inner[1]);
+        ID3D12PipelineState *pso[2] = {};
+        for (UINT k = 0; k < 2; k++)
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = rs;
+            pd.VS = { vs.data(), vs.size() };
+            pd.HS = { hs.data(), hs.size() };
+            pd.DS = { ds.data(), ds.size() };
+            pd.PS = { ps.data(), ps.size() };
+            pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+            pd.BlendState.RenderTarget[0].SrcBlend = pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+            pd.BlendState.RenderTarget[0].SrcBlendAlpha = pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+            pd.BlendState.RenderTarget[0].BlendOp = pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            pd.NumRenderTargets = 1;
+            pd.RTVFormats[0] = DXGI_FORMAT_R16_FLOAT;
+            pd.SampleMask = ~0u;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = k ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = TRUE;
+            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+            pd.SampleDesc.Count = 1;
+            HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso[k]));
+            // Metal's tessellator has triangle and quad domains only, and MoltenVK has no isoline emulation.
+            if (FAILED(hr) && iso)
+            {
+                printf("  %s: no pipeline (known: no isoline tessellation on Metal)\n", label);
+                break;
+            }
+            EXPECT(SUCCEEDED(hr), "%s: CreateGraphicsPipelineState hr %#x", label, (unsigned)hr);
+            if (FAILED(hr))
+                return true;
+        }
+        if (!pso[1])
+        {
+            if (pso[0]) pso[0]->Release();
+            continue;
+        }
+        transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(out, 0, zero, 0, 16);
+        transition(out, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const float clear[4] = {};
+        float consts[8] = { c.outer[0], c.outer[1], c.outer[2], c.outer[3], c.inner[0], c.inner[1], 0, 0 };
+        D3D12_VIEWPORT vpt = { 0, 0, (float)W, (float)W, 0, 1 };
+        D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)W };
+        g.list->RSSetViewports(1, &vpt);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetGraphicsRoot32BitConstants(0, 8, consts, 0);
+        g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST);
+        for (UINT k = 0; k < 2; k++)
+        {
+            g.list->ClearRenderTargetView(rtvs[k], clear, 0, nullptr);
+            g.list->OMSetRenderTargets(1, &rtvs[k], FALSE, nullptr);
+            g.list->SetPipelineState(pso[k]);
+            g.list->DrawInstanced(1, 1, 0, 0);
+        }
+        for (UINT k = 0; k < 2; k++)
+        {
+            transition(rts[k], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+            dst.pResource = rb;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = k * W * 256;
+            dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R16_FLOAT, W, W, 1, 256 };
+            srcl.pResource = rts[k];
+            srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+            transition(rts[k], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        ID3D12Resource *orb = nullptr;
+        const uint8_t *r = (const uint8_t *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_size, &orb);
+        if (!r)
+            return false;
+        uint32_t n = std::min(*(const uint32_t *)r, 60000u);
+        const float *t = (const float *)(r + 16);
+        std::set<std::pair<int, int>> points;
+        auto key = [](float x) { return (int)lroundf(x * 1048576.0f); };
+        int outside = 0;
+        for (uint32_t k = 0; k < n; k++)
+        {
+            float u = t[k * 3], v = t[k * 3 + 1];
+            if (u < -1e-6f || v < -1e-6f || u > 1 + 1e-6f || v > 1 + 1e-6f || (!quad && !iso && u + v > 1 + 1e-5f))
+                outside++;
+            points.insert({ key(u), key(v) });
+        }
+        int edge_points[4] = {};
+        std::map<int, int> per_line;
+        for (auto &pt : points)
+        {
+            float u = pt.first / 1048576.0f, v = pt.second / 1048576.0f;
+            edge_points[0] += u == 0.0f; edge_points[1] += v == 0.0f;
+            if (quad) { edge_points[2] += u == 1.0f; edge_points[3] += v == 1.0f; }
+            else edge_points[2] += fabsf(1.0f - u - v) < 2.0f / 1048576.0f;
+            per_line[pt.second]++;
+        }
+        // Coverage: pixel (x, y) center at u = (x + 0.5) / W, v = (y + 0.5) / W.
+        const uint8_t *m = nullptr;
+        D3D12_RANGE rr = { 0, 2 * W * 256 };
+        rb->Map(0, &rr, (void **)&m);
+        int wrong = 0, culled_drawn = 0, inside = 0;
+        for (UINT y = 0; y < W; y++)
+            for (UINT x = 0; x < W; x++)
+            {
+                uint16_t a, b;
+                memcpy(&a, m + y * 256 + x * 2, 2);
+                memcpy(&b, m + W * 256 + y * 256 + x * 2, 2);
+                float u = (x + 0.5f) / W, v = (y + 0.5f) / W;
+                bool in = quad ? true : (u + v < 1.0f - 0.5f / W);
+                bool edge = !quad && fabsf(u + v - 1.0f) <= 0.5f / W;
+                if (iso || edge)
+                    continue;
+                uint16_t want = (in && c.points != 0) ? 0x3c00 : 0;
+                inside += in;
+                wrong += a != want;
+                culled_drawn += b != 0;
+            }
+        rb->Unmap(0, nullptr);
+        printf("  %s: %zu points (%u evaluations), edges %d %d %d %d, %d wrongly covered pixels, %d drawn of %d with back faces culled\n",
+               label, points.size(), n, edge_points[0], edge_points[1], edge_points[2], edge_points[3], wrong, culled_drawn, inside);
+        if (c.points >= 0)
+            EXPECT((int)points.size() == c.points, "%s: %zu distinct points, want %d", label, points.size(), c.points);
+        EXPECT(!outside, "%s: %d points outside the domain", label, outside);
+        if (iso)
+        {
+            EXPECT((int)per_line.size() == (int)c.outer[0], "%s: %zu lines, want %g", label, per_line.size(), c.outer[0]);
+            for (auto &l : per_line)
+                EXPECT(l.second == (int)c.outer[1] + 1, "%s: a line has %d points, want %g", label, l.second, c.outer[1] + 1);
+        }
+        else if (c.points)
+        {
+            EXPECT(!wrong, "%s: %d pixels not covered exactly once", label, wrong);
+            for (int e = 0; e < (quad ? 4 : 3); e++)
+                if (c.edges[e])
+                    EXPECT(edge_points[e] == c.edges[e], "%s: edge %d has %d points, want %d", label, e, edge_points[e], c.edges[e]);
+            int topo = !strcmp(c.topology, "triangle_ccw");
+            int state = culled_drawn == 0 ? 0 : culled_drawn == inside ? 1 : 2;
+            EXPECT(state != 2, "%s: back face culling keeps %d of %d pixels (mixed winding)", label, culled_drawn, inside);
+            if (cull_state[topo] < 0)
+                cull_state[topo] = state;
+            EXPECT(cull_state[topo] == state, "%s: winding differs from other %s cases", label, c.topology);
+        }
+        else
+            EXPECT(!n && !wrong, "%s: a culled patch evaluated %u points", label, n);
+        orb->Release();
+        pso[0]->Release(); pso[1]->Release();
+    }
+    EXPECT(cull_state[0] != cull_state[1], "triangle_cw and triangle_ccw wind the same way");
+    rb->Release(); rts[0]->Release(); rts[1]->Release(); rtv_heap->Release(); zero->Release(); out->Release(); rs->Release();
+    return true;
+}
+
+static bool test_tess_domains() { return tess_domains(false); }
+static bool test_tess_domains_dxbc() { return tess_domains(true); }
 
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
@@ -9504,6 +9788,8 @@ static const Test tests[] = {
     { "mesh_resources", test_mesh_resources },
     { "mesh_cull", test_mesh_cull },
     { "tessellation", test_tessellation },
+    { "tess_domains", test_tess_domains },
+    { "tess_domains_dxbc", test_tess_domains_dxbc },
     { "executeindirect", test_executeindirect },
     { "executeindirect_dispatch_count", test_executeindirect_dispatch_count },
     { "dynamicresources", test_dynamicresources },
