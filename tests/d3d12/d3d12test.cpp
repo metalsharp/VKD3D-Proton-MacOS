@@ -7106,12 +7106,7 @@ RWStructuredBuffer<float> o : register(u0);
                 fabs(c.want) * ldexp(1.0, -22) + 1e-12;
         printf("  %s: %.9f, want %.9f (bias read %.3g, want %.3g)\n", c.name, r[i], c.want, r[i] - (double)c.zl,
                c.want - (double)c.zl);
-        // Metal's depth clamp (depth clip off) holds depth in front of the near plane at 0, not at MinDepth.
-        if (!c.clip && c.zl < 0.0f && c.vmin > 0.0f && r[i] == 0.0f)
-        {
-            printf("  %s: known: Metal clamps depth in front of the near plane to 0, not MinDepth\n", c.name);
-            continue;
-        }
+        // Depth clip off clamps depth in front of the near plane to MinDepth (MoltenVK's former OpenGL mode clamped to 0).
         EXPECT(fabs(r[i] - c.want) <= tol, "%s: depth %.9f, want %.9f", c.name, r[i], c.want);
     }
     rb->Release(); out->Release(); cpso->Release(); crs->Release(); grs->Release(); dsv_heap->Release(); srv_heap->Release();

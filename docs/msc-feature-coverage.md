@@ -155,7 +155,9 @@ and off), except as noted.
   - D24 is 32-bit float depth on Apple GPUs, so its bias came out in float units: an eighth of it at depth 0.1, which
     shows as shadow acne. VKD3D-Proton now applies the constant part as a viewport depth offset in D24 steps.
     MoltenVK advertises `VK_EXT_depth_range_unrestricted`, so a viewport may move past 1; depth stays clamped to 1.
-  - Known: with depth clip off, Metal clamps depth in front of the near plane to 0, not to MinDepth.
+  - Depth clip on and off were wrong in front of the near plane while MoltenVK kept every render pass in Metal's
+    private OpenGL mode (z clipped against -w, clamped to 0 instead of MinDepth); MoltenVK now uses that mode only for
+    draws that need it. `raster_clip` and `ia_restart` cover it.
 - `heap_placement`: aliased placed buffers, overlapping buffers, GPU addresses that differ by the heap offsets, a
   placed texture, and placed upload buffers.
 
