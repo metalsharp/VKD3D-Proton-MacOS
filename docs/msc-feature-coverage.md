@@ -130,6 +130,32 @@ The others, checked on an Apple M6 against D3D's rules on both paths (DXIL and D
   float10 (70000 stores the largest finite value) and to nearest into UNORM (`rt_float_conversion`,
   `uav_float_conversion`). Not set.
 
+## Second accuracy round: tessellation, geometry, mesh, rasterizer depth, heaps
+
+Each test checks D3D's rules directly rather than comparing paths. All pass on every lane (Metal 4 and 3, bridge on
+and off), except as noted.
+
+- `tess_domains` (DXIL, DXBC). For each domain, partitioning and factor set, the domain shader records its points and
+  the pixel shader counts coverage. Checked: distinct points, points per edge (which also checks the order of the edge
+  factors), exactly-once coverage, the rounding of integer, pow2 and fractional factors, the clamp at 64, culled
+  patches, and windings. pow2 tessellated as integer, because SPIR-V has no pow2 spacing. The hull shader now rounds
+  its factors up to a power of 2 as it stores them (dxil-spirv 0009, with the DXBC declaration found in its tokens).
+  Isolines make no pipeline: Metal's tessellator has triangle and quad domains only. MoltenVK skips draws with
+  tessellation followed by a geometry shader.
+- `gs_features` (DXIL, DXBC): adjacency input order, `SV_PrimitiveID`, `[instance(3)]` with `SV_GSInstanceID`,
+  point-to-quad strips with `RestartStrip`, and `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` from a GS.
+- `mesh_features` (on the bridge): amplification payloads launching 0 to 2 mesh groups, per-primitive attributes,
+  `SV_CullPrimitive`, `SetMeshOutputCounts(0, 0)`, and a group at the 256-primitive limit.
+- `raster_depth`:
+  - Checked: depth bias on D32 (`2^(e - 23)` units), D24 (`1 / (2^24 - 1)`) and D16 (`1 / 65535`), slope-scaled and
+    clamped bias, the viewport depth range, and depth clip on and off.
+  - D24 is 32-bit float depth on Apple GPUs, so its bias came out in float units: an eighth of it at depth 0.1, which
+    shows as shadow acne. VKD3D-Proton now applies the constant part as a viewport depth offset in D24 steps.
+    MoltenVK advertises `VK_EXT_depth_range_unrestricted`, so a viewport may move past 1; depth stays clamped to 1.
+  - Known: with depth clip off, Metal clamps depth in front of the near plane to 0, not to MinDepth.
+- `heap_placement`: aliased placed buffers, overlapping buffers, GPU addresses that differ by the heap offsets, a
+  placed texture, and placed upload buffers.
+
 ## SPIR-V path limits found on the way
 
 - One pixel shader reading both perspective and noperspective `SV_Barycentrics` needs MSL 4.0. Before it, Metal takes
