@@ -132,3 +132,12 @@ conversion (DXIL).
   - RG16 SNORM
 
   SNORM maps -128 (and -32768) to -1, as D3D requires.
+- `d3d12test texdiff` (opt-in: `D3D12TEST_TEXDIFF=<Windows path>`; compare with `tests/run/texdiff.py`): 29 texture
+  formats read texel by texel with `Load` through an SRV:
+  - sRGB RGBA8, BGRA8 and BC1/BC7
+  - BGRX8, RGB9E5, B5G6R5, B5G5R5A1, B4G4R4A4, A8
+  - R10G10B10A2, R11G11B10, RG8 SNORM, BC1 to BC7
+  - D32, D16, and the depth and stencil planes of D24S8 and D32S8
+
+  Both paths read the same values. Against a CPU reference, the sRGB, 16-bit packed, depth and stencil reads are
+  exact, including D24S8, which Apple GPUs keep as D32S8. Stencil arrives in `.g`.

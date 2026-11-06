@@ -5618,6 +5618,174 @@ RWStructuredBuffer<uint4> loaded : register(u1);
     return true;
 }
 
+// Texture format differential dump (opt-in: D3D12TEST_TEXDIFF=<Windows path>): 16x16 textures of random data in
+// color formats (sRGB, packed 16-bit, shared exponent, BC1 to BC7) and depth/stencil formats, every texel read with
+// Load through an SRV (depth and stencil planes through their plane formats). tests/run/texdiff.py compares two dumps.
+static bool test_texdiff()
+{
+    const char *path = getenv("D3D12TEST_TEXDIFF");
+    if (!path)
+    {
+        printf("  skipped: D3D12TEST_TEXDIFF not set\n");
+        return true;
+    }
+    // resource format, SRV format, plane, bytes per block, block size, uint read, name
+    static const struct { DXGI_FORMAT res, srv; UINT plane, bpb, block; bool uint_read, depth; const char *name; } fmts[] = {
+        { DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0, 4, 1, false, false, "R8G8B8A8_UNORM_SRGB" },
+        { DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 0, 4, 1, false, false, "B8G8R8A8_UNORM_SRGB" },
+        { DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, 0, 4, 1, false, false, "B8G8R8X8_UNORM" },
+        { DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 0, 4, 1, false, false, "R9G9B9E5_SHAREDEXP" },
+        { DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, 0, 2, 1, false, false, "B5G6R5_UNORM" },
+        { DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, 0, 2, 1, false, false, "B5G5R5A1_UNORM" },
+        { DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, 0, 2, 1, false, false, "B4G4R4A4_UNORM" },
+        { DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_A8_UNORM, 0, 1, 1, false, false, "A8_UNORM" },
+        { DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, 0, 4, 1, false, false, "R10G10B10A2_UNORM" },
+        { DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, 0, 4, 1, false, false, "R11G11B10_FLOAT" },
+        { DXGI_FORMAT_R8G8_SNORM, DXGI_FORMAT_R8G8_SNORM, 0, 2, 1, false, false, "R8G8_SNORM" },
+        { DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM, 0, 8, 4, false, false, "BC1_UNORM" },
+        { DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC1_UNORM_SRGB, 0, 8, 4, false, false, "BC1_UNORM_SRGB" },
+        { DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC2_UNORM, 0, 16, 4, false, false, "BC2_UNORM" },
+        { DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM, 0, 16, 4, false, false, "BC3_UNORM" },
+        { DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_UNORM, 0, 8, 4, false, false, "BC4_UNORM" },
+        { DXGI_FORMAT_BC4_SNORM, DXGI_FORMAT_BC4_SNORM, 0, 8, 4, false, false, "BC4_SNORM" },
+        { DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, 0, 16, 4, false, false, "BC5_UNORM" },
+        { DXGI_FORMAT_BC5_SNORM, DXGI_FORMAT_BC5_SNORM, 0, 16, 4, false, false, "BC5_SNORM" },
+        { DXGI_FORMAT_BC6H_UF16, DXGI_FORMAT_BC6H_UF16, 0, 16, 4, false, false, "BC6H_UF16" },
+        { DXGI_FORMAT_BC6H_SF16, DXGI_FORMAT_BC6H_SF16, 0, 16, 4, false, false, "BC6H_SF16" },
+        { DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM, 0, 16, 4, false, false, "BC7_UNORM" },
+        { DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_BC7_UNORM_SRGB, 0, 16, 4, false, false, "BC7_UNORM_SRGB" },
+        { DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, 0, 4, 1, false, true, "D32_FLOAT depth" },
+        { DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, 0, 2, 1, false, true, "D16_UNORM depth" },
+        { DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0, 4, 1, false, true, "D24S8 depth" },
+        { DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1, 1, 1, true, true, "D24S8 stencil" },
+        { DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, 0, 4, 1, false, true, "D32S8 depth" },
+        { DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, 1, 1, 1, true, true, "D32S8 stencil" },
+    };
+    static const char *src = R"(
+Texture2D<float4> tf : register(t0);
+Texture2D<uint4> tu : register(t1);
+RWStructuredBuffer<uint4> o : register(u0);
+cbuffer C : register(b0) { uint use_uint; };
+[numthreads(16, 16, 1)] void main(uint2 p : SV_DispatchThreadID)
+{
+    o[p.y * 16 + p.x] = use_uint ? tu.Load(int3(p, 0)) : asuint(tf.Load(int3(p, 0)));
+}
+)";
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2 } };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable = { 2, ranges };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!ps) return false;
+    const UINT N = 16;
+    ID3D12Resource *upload = create_buffer(256 * N, D3D12_HEAP_TYPE_UPLOAD);
+    ID3D12Resource *out = create_buffer(N * N * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  can't write %s\n", path); return false; }
+    UINT count = sizeof(fmts) / sizeof(fmts[0]);
+    fwrite(&count, 4, 1, f);
+    uint32_t seed = 4242;
+    int failed = 0;
+    for (UINT k = 0; k < count; k++)
+    {
+        // Random bytes, except depth: floats in [0, 1] (D32), any value for UNORM depth, stencil any byte.
+        uint8_t *up = nullptr;
+        upload->Map(0, nullptr, (void **)&up);
+        for (UINT i = 0; i < 256 * N; i++) { seed = seed * 1664525 + 1013904223; up[i] = seed >> 24; }
+        if (fmts[k].depth && fmts[k].plane == 0 && fmts[k].bpb == 4 && fmts[k].srv != DXGI_FORMAT_R24_UNORM_X8_TYPELESS)
+            for (UINT i = 0; i < 64 * N; i++) { seed = seed * 1664525 + 1013904223; ((float *)up)[i] = (seed >> 8) / 16777216.0f; }
+        upload->Unmap(0, nullptr);
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = N; td.Height = N; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = fmts[k].res;
+        td.SampleDesc.Count = 1;
+        td.Flags = fmts[k].depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE;
+        ID3D12Resource *tex = nullptr;
+        char name[32] = {};
+        snprintf(name, sizeof(name), "%s", fmts[k].name);
+        fwrite(name, 1, 32, f);
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex))))
+        {
+            uint32_t zero = 0;
+            fwrite(&zero, 4, 1, f);
+            printf("  %s: no texture\n", fmts[k].name);
+            continue;
+        }
+        UINT planes = (fmts[k].res == DXGI_FORMAT_R24G8_TYPELESS || fmts[k].res == DXGI_FORMAT_R32G8X24_TYPELESS) ? 2 : 1;
+        for (UINT pl = 0; pl < planes; pl++)
+        {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+            UINT rows = 0; UINT64 rowsize = 0, total = 0;
+            dev->GetCopyableFootprints(&td, pl, 1, 0, &fp, &rows, &rowsize, &total);
+            fp.Offset = 0;
+            fp.Footprint.RowPitch = 256;
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+            dst.pResource = tex;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = pl;
+            srcl.pResource = upload;
+            srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcl.PlacedFootprint = fp;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        }
+        transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_CPU_DESCRIPTOR_HANDLE c = heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = fmts[k].srv;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        sd.Texture2D.PlaneSlice = fmts[k].plane;
+        dev->CreateShaderResourceView(tex, &sd, c);                       // t0: float view (or the stencil view, unused)
+        c.ptr += inc;
+        dev->CreateShaderResourceView(tex, &sd, c);                       // t1: the same, read as uint for stencil
+        c.ptr += inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = N * N;
+        ud.Buffer.StructureByteStride = 16;
+        dev->CreateUnorderedAccessView(out, nullptr, &ud, c);
+        g.list->SetDescriptorHeaps(1, &heap);
+        g.list->SetComputeRootSignature(rs);
+        g.list->SetPipelineState(ps);
+        g.list->SetComputeRoot32BitConstant(0, fmts[k].uint_read ? 1 : 0, 0);
+        g.list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->Dispatch(1, 1, 1);
+        ID3D12Resource *rb = nullptr;
+        const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, N * N * 16, &rb);
+        if (!r) { failed++; continue; }
+        uint32_t one = 1;
+        fwrite(&one, 4, 1, f);
+        uint32_t ui = fmts[k].uint_read;
+        fwrite(&ui, 4, 1, f);
+        fwrite(r, 16, N * N, f);
+        // The uploaded bytes, for checking against a reference.
+        uint8_t *upr = nullptr;
+        upload->Map(0, nullptr, (void **)&upr);
+        fwrite(upr, 1, 256 * N, f);
+        upload->Unmap(0, nullptr);
+        rb->Release();
+        tex->Release();
+    }
+    fclose(f);
+    printf("  wrote %u texture formats\n", count);
+    out->Release(); heap->Release(); upload->Release(); ps->Release(); rs->Release();
+    EXPECT(!failed, "%d formats failed", failed);
+    return true;
+}
+
 // Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
 // a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
 // sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
@@ -7714,6 +7882,7 @@ static const Test tests[] = {
     { "opdiff", test_opdiff },
     { "samplediff", test_samplediff },
     { "formatdiff", test_formatdiff },
+    { "texdiff", test_texdiff },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
