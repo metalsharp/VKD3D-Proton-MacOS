@@ -2577,6 +2577,110 @@ float4 ps(bool front : SV_IsFrontFace) : SV_Target { return front ? 1.0 : 0.5; }
 static bool test_culling_dxil() { return culling(false); }
 static bool test_culling_dxbc() { return culling(true); }
 
+// SV_CullDistance and SV_ClipDistance: three triangles side by side. The left one has a negative cull distance at
+// every vertex and must not be drawn; the middle one is positive everywhere and is drawn; the right one has a clip
+// distance that goes from -1 at its left edge to +1 at its right, so only its right part is drawn. (A triangle with
+// cull distances of both signs is drawn whole by D3D12; Metal has no cull distance, and clip distances in its place
+// would cut it, so that case isn't checked.)
+static bool cull_clip_distance(bool dxbc)
+{
+    static const char *src = R"(
+struct V { float4 pos : SV_Position; float cull : SV_CullDistance; float clip : SV_ClipDistance; };
+V vs(uint id : SV_VertexID)
+{
+    // Right angle at the top left of each: (x0, 0.9), (x1, 0.9), (x0, -0.9).
+    float2 p[9] = { float2(-0.9, 0.9), float2(-0.5, 0.9), float2(-0.9, -0.9),
+                    float2(-0.3, 0.9), float2(0.3, 0.9), float2(-0.3, -0.9),
+                    float2(0.4, 0.9), float2(1.0, 0.9), float2(0.4, -0.9) };
+    float cull[9] = { -1, -1, -1, 1, 1, 1, 1, 1, 1 };
+    float clip[9] = { 1, 1, 1, 1, 1, 1, -1, 1, -1 };
+    V v;
+    v.pos = float4(p[id], 0, 1);
+    v.cull = cull[id];
+    v.clip = clip[id];
+    return v;
+}
+float4 ps(V v) : SV_Target { return 1.0; }
+)";
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0"),
+                      ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    const UINT W = 32, H = 16;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    float clear[4] = { 0, 0, 0, 0 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(9, 1, 0, 0);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    // Row 2 (y = 0.69): x = -0.84 (culled), -0.22 (drawn), 0.47 (clip -0.77) and 0.84 (clip +0.48).
+    struct { UINT x; uint8_t want; const char *what; } probes[4] = {
+        { 2, 0, "all-negative cull distance" }, { 12, 255, "positive cull distance" },
+        { 23, 0, "negative clip distance" }, { 29, 255, "positive clip distance" },
+    };
+    int bad = 0;
+    for (auto &pr : probes)
+        if (abs(px[2 * 256 + pr.x] - pr.want) > 1 && bad++ < 4)
+            printf("  %s: pixel %u is %u, want %u\n", pr.what, pr.x, px[2 * 256 + pr.x], pr.want);
+    rb->Unmap(0, nullptr);
+    EXPECT(!bad, "%d of 4 cull/clip distance probes wrong", bad);
+    pso->Release(); rb->Release(); rtv_heap->Release(); rt->Release(); rs->Release();
+    return true;
+}
+
+static bool test_cull_clip_distance_dxil() { return cull_clip_distance(false); }
+static bool test_cull_clip_distance_dxbc() { return cull_clip_distance(true); }
+
 // WriteBufferImmediate inside a render pass: 1200 draws, each between a MARKER_IN and a MARKER_OUT write, and a
 // DEFAULT write after each, land every value in its slot. Without buffer markers MARKER_IN is batched with the rest
 // and written when the pass ends or the batch (1024 writes) fills, so the writes span more than one batch.
@@ -6779,6 +6883,8 @@ static const Test tests[] = {
     { "draw_params_sm68", test_draw_params_sm68 },
     { "culling_dxil", test_culling_dxil },
     { "culling_dxbc", test_culling_dxbc },
+    { "cull_clip_distance_dxil", test_cull_clip_distance_dxil },
+    { "cull_clip_distance_dxbc", test_cull_clip_distance_dxbc },
     { "streamoutput", test_streamoutput },
     { "gs_streamoutput_dxil", test_gs_streamoutput_dxil },
     { "gs_streamoutput_dxbc", test_gs_streamoutput_dxbc },

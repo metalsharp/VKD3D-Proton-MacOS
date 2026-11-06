@@ -35,6 +35,7 @@ glslangValidator -V -o "$OUT/il_vs.spv" "$SRC/glsl/il.vert"
 glslangValidator -V -o "$OUT/il_fs.spv" "$SRC/glsl/il.frag"
 MSC_HEADERS="$WS/sources/MoltenVK/MoltenVK/MoltenVK/MetalShaderConverter/metal_irconverter"
 clang -O1 -I "$MSC_HEADERS" -o "$OUT/mscprobe" "$SRC/mscprobe.c" -L "$WS/artifacts/mvk-new" -lmetalirconverter
+clang -O1 -I "$MSC_HEADERS" -o "$OUT/mscconv" "$SRC/mscconv.c" -L "$WS/artifacts/mvk-new" -lmetalirconverter
 for n in cs vs ps; do (cd "$OUT" && xxd -i -n ${n}_dxil ei_$n.dxil > $n.h); done
 "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang" -O1 -I "$OUT" -o "$OUT/eitest.exe" "$SRC/eitest.c" -ld3d12
 echo "msc-bridge tests: $OUT"

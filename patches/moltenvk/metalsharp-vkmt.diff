@@ -24030,7 +24030,7 @@ index c5b74991..d4672547 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..d6dc538d 100644
+index 3aa44a44..5944819d 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,13 @@
@@ -24315,7 +24315,7 @@ index 3aa44a44..d6dc538d 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +704,498 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +704,509 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -24791,6 +24791,17 @@ index 3aa44a44..d6dc538d 100644
 +		uint8_t* libBytes = (uint8_t*)malloc(libSize);
 +		if ( !libBytes ) { return "Out of memory for the metallib."; }
 +		msc.IRMetalLibGetBytecode(metalLib, libBytes);
++		// With a shader dump directory, keep the DXIL and the converted metallib (metal-objdump -d prints its AIR).
++		if (const char* dumpDir = getMVKConfig().shaderDumpDir; dumpDir && *dumpDir) {
++			char path[PATH_MAX];
++			mkdir(dumpDir, 0755);
++			auto dump = [&](const char* ext, const void* data, size_t size) {
++				snprintf(path, sizeof(path), "%s/shader-msc-%016zx.%s", dumpDir, _key.codeHash, ext);
++				if (FILE* file = fopen(path, "wb")) { fwrite(data, 1, size, file); fclose(file); }
++			};
++			dump("dxil", dxilData, dxilSize);
++			dump("metallib", libBytes, libSize);
++		}
 +		@autoreleasepool {
 +			dispatch_data_t libData = dispatch_data_create(libBytes, libSize, nullptr, DISPATCH_DATA_DESTRUCTOR_FREE);
 +			NSError* nsErr = nil;
@@ -24814,7 +24825,7 @@ index 3aa44a44..d6dc538d 100644
  }
  
  
-@@ -741,4 +1389,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1400,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }
