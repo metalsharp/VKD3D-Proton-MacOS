@@ -1878,6 +1878,80 @@ static bool test_descriptor_lifetime()
     return test_typedbuffer_uav_offset();
 }
 
+// Wave and quad intrinsics in compute, checked against what they mean for the wave size the shader reports: ballot
+// bit counts, prefix sums and counts, lane reads (first and fixed), active any/all/min/max/sum/product, and quad
+// reads across X, Y and the diagonal (lanes in groups of 4 by index). 256 threads.
+static bool test_wave_ops_compute()
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint t : SV_DispatchThreadID, uint g : SV_GroupIndex)
+{
+    uint lane = WaveGetLaneIndex(), size = WaveGetLaneCount();
+    uint v = t * 7 + 3;
+    uint4 ballot = WaveActiveBallot((t & 3) == 1);
+    uint base = t * 64;
+    o.Store4(base + 0, uint4(lane, size, countbits(ballot.x) + countbits(ballot.y) + countbits(ballot.z) + countbits(ballot.w),
+                             WavePrefixCountBits((t & 1) == 0)));
+    o.Store4(base + 16, uint4(WavePrefixSum(v), WaveActiveSum(v), WaveActiveMin(v), WaveActiveMax(v)));
+    o.Store4(base + 32, uint4(WaveReadLaneFirst(v), WaveReadLaneAt(v, 5), WaveActiveAnyTrue(t == 3) ? 1 : 0,
+                             WaveActiveAllTrue(t < 100000) ? 1 : 0));
+    o.Store4(base + 48, uint4(QuadReadAcrossX(v), QuadReadAcrossY(v), QuadReadAcrossDiagonal(v), QuadReadLaneAt(v, 2)));
+}
+)";
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *ps = create_compute_pipeline(rs, compile_dxc(src, "main", "cs_6_0"));
+    if (!ps)
+        return false;
+    const UINT n = 256;
+    ID3D12Resource *buf = create_buffer(n * 64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(ps);
+    g.list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    g.list->Dispatch(n / 64, 1, 1);
+    ID3D12Resource *rb;
+    const uint32_t *o = read_buffer(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, n * 64, &rb);
+    if (!o)
+        return false;
+    int bad = 0;
+    uint32_t size = o[1];
+    printf("  wave size %u\n", size);
+    for (uint32_t t = 0; t < n && size; t++)
+    {
+        const uint32_t *r = o + t * 16;
+        uint32_t lane = t % size, first = t - lane, last = std::min(first + size, (n / 64) * 64);
+        first = std::max(first, t / 64 * 64);   // waves don't cross groups
+        last = std::min(last, t / 64 * 64 + 64);
+        uint32_t ballot = 0, prefix_even = 0, psum = 0, sum = 0, mn = ~0u, mx = 0;
+        bool any3 = false;
+        for (uint32_t u = first; u < last; u++)
+        {
+            uint32_t v = u * 7 + 3;
+            ballot += (u & 3) == 1;
+            if (u < t) { prefix_even += (u & 1) == 0; psum += v; }
+            sum += v; mn = std::min(mn, v); mx = std::max(mx, v); any3 |= u == 3;
+        }
+        uint32_t want[16] = { lane, size, ballot, prefix_even, psum, sum, mn, mx,
+                              first * 7 + 3, (first + 5) * 7 + 3, any3, 1,
+                              (t ^ 1) * 7 + 3, (t ^ 2) * 7 + 3, (t ^ 3) * 7 + 3, ((t & ~3u) + 2) * 7 + 3 };
+        static const char *names[16] = { "lane", "size", "ballot bits", "prefix count", "prefix sum", "sum", "min", "max",
+                                         "read first", "read lane 5", "any", "all", "quad x", "quad y", "quad diagonal",
+                                         "quad lane 2" };
+        for (int k = 0; k < 16; k++)
+            if (r[k] != want[k] && bad++ < 12)
+                printf("  thread %u %s: %u, want %u\n", t, names[k], r[k], want[k]);
+    }
+    EXPECT(size == 32 || size == 64 || size == 16 || size == 8 || size == 4, "wave size %u", size);
+    EXPECT(!bad, "%d wrong wave/quad results", bad);
+    rb->Release(); buf->Release(); ps->Release(); rs->Release();
+    return true;
+}
+
 static bool test_typedbuffer()
 {
     static const char *src = R"(
@@ -6680,6 +6754,7 @@ static const Test tests[] = {
     { "static_sampler_lod", test_static_sampler_lod },
     { "queues", test_queues },
     { "fences", test_fences },
+    { "wave_ops_compute", test_wave_ops_compute },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "viewinstancing", test_viewinstancing },
