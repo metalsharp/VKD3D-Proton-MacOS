@@ -3745,6 +3745,129 @@ RWStructuredBuffer<float4> o : register(u0);
     return true;
 }
 
+// ResourceMinLODClamp with comparison samples: a 32x32 R32_FLOAT texture whose mip m holds 0.1 * (m + 1), read
+// through an SRV clamped to LOD 2 with a LESS_EQUAL point comparison sampler. SampleCmpLevelZero and an implicit-LOD
+// SampleCmp at 1:1 (LOD 0) compare against mip 2 (0.3), so a reference of 0.25 passes; mip 0 would fail it.
+// SampleCmpLevel 3 reads mip 3 (0.4), and a reference of 0.35 fails at mip 2 (not clamped further).
+static bool srv_min_lod_clamp_cmp(bool dxbc)
+{
+    static const char *src_dxil = R"(
+Texture2D<float> t : register(t0);
+SamplerComparisonState s : register(s0);
+RWStructuredBuffer<float> o : register(u0);
+[numthreads(8, 8, 1)] void cs(uint2 id : SV_DispatchThreadID)
+{
+    float2 uv = (id + 0.5) / 32.0;
+    float a = t.SampleCmpLevelZero(s, uv, 0.25), b = t.SampleCmp(s, uv, 0.25), c = t.SampleCmp(s, uv, 0.35);
+    float d = t.SampleCmpLevel(s, uv, 0.35, 3), e = t.SampleCmpLevel(s, uv, 0.25, 0);
+    if (all(id == 0)) { o[0] = a; o[1] = b; o[2] = c; o[3] = d; o[4] = e; }
+}
+)";
+    static const char *src_dxbc = R"(
+Texture2D<float> t : register(t0);
+SamplerComparisonState s : register(s0);
+RWStructuredBuffer<float> o : register(u0);
+[numthreads(1, 1, 1)] void cs()
+{
+    o[0] = t.SampleCmpLevelZero(s, float2(0.5, 0.5) / 32.0, 0.25);
+    o[1] = t.SampleCmpLevelZero(s, float2(0.5, 0.5) / 32.0, 0.35);
+}
+)";
+    std::vector<char> cs = dxbc ? compile_fxc(src_dxbc, "cs", "cs_5_0") : compile_dxc(src_dxil, "cs", "cs_6_7");
+    if (cs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso = create_compute_pipeline(rs, cs);
+    if (!pso)
+        return false;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 32; td.Height = 32; td.DepthOrArraySize = 1; td.MipLevels = 6;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    ID3D12Resource *upload = create_buffer(6 * 32 * 256, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT m = 0; m < 6; m++)
+    {
+        UINT w = 32 >> m;
+        for (UINT y = 0; y < w; y++)
+            for (UINT x = 0; x < w; x++)
+                ((float *)(u + m * 32 * 256 + y * 256))[x] = 0.1f * (m + 1);
+    }
+    upload->Unmap(0, nullptr);
+    for (UINT m = 0; m < 6; m++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m;
+        srcl.pResource = upload;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcl.PlacedFootprint.Offset = m * 32 * 256;
+        srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, 32u >> m, 32u >> m, 1, 256 };
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 6;
+    sd.Texture2D.ResourceMinLODClamp = 2.0f;
+    dev->CreateShaderResourceView(tex, &sd, heap->GetCPUDescriptorHandleForHeapStart());
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->Dispatch(dxbc ? 1 : 4, dxbc ? 1 : 4, 1);
+    ID3D12Resource *rb = nullptr;
+    const float *r = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    if (dxbc)
+    {
+        printf("  SampleCmpLevelZero ref 0.25 %g, ref 0.35 %g\n", r[0], r[1]);
+        EXPECT(r[0] == 1.0f, "SampleCmpLevelZero at ref 0.25 gives %g, want 1 (mip 2, the clamp)", r[0]);
+        EXPECT(r[1] == 0.0f, "SampleCmpLevelZero at ref 0.35 gives %g, want 0 (mip 2)", r[1]);
+    }
+    else
+    {
+        printf("  LevelZero %g, SampleCmp %g / %g, Level 3 %g, Level 0 %g\n", r[0], r[1], r[2], r[3], r[4]);
+        EXPECT(r[0] == 1.0f, "SampleCmpLevelZero at ref 0.25 gives %g, want 1 (mip 2, the clamp)", r[0]);
+        EXPECT(r[1] == 1.0f, "SampleCmp at LOD 0, ref 0.25 gives %g, want 1 (mip 2, the clamp)", r[1]);
+        EXPECT(r[2] == 0.0f, "SampleCmp at LOD 0, ref 0.35 gives %g, want 0 (mip 2)", r[2]);
+        EXPECT(r[3] == 1.0f, "SampleCmpLevel 3 at ref 0.35 gives %g, want 1 (mip 3)", r[3]);
+        EXPECT(r[4] == 1.0f, "SampleCmpLevel 0 at ref 0.25 gives %g, want 1 (mip 2, the clamp)", r[4]);
+    }
+    rb->Release(); out->Release(); heap->Release(); upload->Release(); tex->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_srv_min_lod_clamp_cmp() { return srv_min_lod_clamp_cmp(false); }
+static bool test_srv_min_lod_clamp_cmp_dxbc() { return srv_min_lod_clamp_cmp(true); }
+
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
 
@@ -10872,6 +10995,8 @@ static const Test tests[] = {
     { "depth_equal_cross_path_dxbc", test_depth_equal_cross_path_dxbc },
     { "srv_min_lod_clamp", test_srv_min_lod_clamp },
     { "srv_min_lod_clamp_dxbc", test_srv_min_lod_clamp_dxbc },
+    { "srv_min_lod_clamp_cmp", test_srv_min_lod_clamp_cmp },
+    { "srv_min_lod_clamp_cmp_dxbc", test_srv_min_lod_clamp_cmp_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },

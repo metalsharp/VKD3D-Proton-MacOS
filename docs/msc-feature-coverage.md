@@ -96,11 +96,14 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
   - SPIR-V shaders read it from a word MoltenVK keeps next to each texture (SPIRV-Cross `emulate_image_view_min_lod`),
     as `level(max())` and `min_lod_clamp()`. Always on: it measured within noise.
   - Converted shaders take it from the texture entry's metadata (`IRCompatibilityFlagTextureMinLODClamp`), counted from
-    the view's first mip. The converter clamps `Sample` and `SampleGrad`, but not `SampleLevel`, which Vulkan's
-    extension (made to match D3D12) clamps. Shaders with explicit LOD samples (dxil-spirv 0008) use SPIR-V once the
-    application has made a clamped view.
-  - Test `srv_min_lod_clamp` (and `_dxbc`): MostDetailedMip 1, clamp 2.5, linear mip filtering, passing on every lane.
-  - Not covered: comparisons, gathers and `Load` aren't clamped on either path.
+    the view's first mip. The converter clamps `Sample`, `SampleGrad` and `SampleCmp`, but not `SampleLevel`,
+    `SampleCmpLevelZero` or `SampleCmpLevel`, which Vulkan's extension (made to match D3D12) clamps. Shaders with such
+    explicit LOD samples (dxil-spirv 0008) use SPIR-V once the application has made a clamped view.
+  - Comparisons: SPIR-V shaders clamp them too (`sample_compare` takes `min_lod_clamp()` and `level()`).
+  - Tests `srv_min_lod_clamp` (and `_dxbc`): MostDetailedMip 1, clamp 2.5, linear mip filtering;
+    `srv_min_lod_clamp_cmp` (and `_dxbc`): `SampleCmp`, `SampleCmpLevelZero` and `SampleCmpLevel` at clamp 2. Every lane.
+  - D3D12 defines the clamp for sample LODs, so `Load` reads any mip. Gathers aren't clamped on either path; what
+    hardware does there is unverified.
 - Typed SRVs of three 32-bit components have no Metal texel format. Shaders declaring one use SPIR-V (DXIL:
   dxil-spirv's meta flag; DXBC: the reflection check). A shader declaring `Buffer<float4>` (or any 32-bit typed SRV)
   may still be given such a view. Once the application makes one, PSOs reading typed buffer SRVs use SPIR-V the same
