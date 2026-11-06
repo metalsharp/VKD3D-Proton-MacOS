@@ -12244,7 +12244,7 @@ index 9b6a7351..83e32eb0 100644
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
-index a00c09bd..9ea56253 100644
+index a00c09bd..cfb245e4 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
 @@ -17,6 +17,7 @@
@@ -12468,6 +12468,25 @@ index a00c09bd..9ea56253 100644
  
  #pragma mark -
  #pragma mark MVKBufferView
+@@ -280,7 +420,9 @@
+ 			id<MTLTexture> tex = [mtlBuff newTextureWithDescriptor: mtlTexDesc
+ 			                                                offset: mtlBuffOffset
+ 			                                           bytesPerRow: _mtlBytesPerRow];
+-			_device->makeResident(tex);
++			// No residency of its own: a texture made from a buffer is a view of the buffer's allocation
++			// (it reports the buffer's allocatedSize), which is resident with the buffer. Adding and removing
++			// it cost more than making the texture where views are made per frame (ring-buffer typed views).
+ 			_device->getLiveResources().add(tex);
+ 			_mtlTexture = tex;
+ 			propagateDebugName();
+@@ -340,7 +482,6 @@
+ void MVKBufferView::detachMemory() {
+ 	if (id<MTLTexture> tex = _mtlTexture) {
+ 		_device->getLiveResources().remove(tex);
+-		_device->removeResidency(tex);
+ 		[tex release];
+ 		_mtlTexture = nil;
+ 	}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h
 index d6c738aa..ec4c65ed 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.h
