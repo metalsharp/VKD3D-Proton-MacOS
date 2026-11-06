@@ -3153,8 +3153,8 @@ uint2 ps(float4 pos : SV_Position) : SV_Target
 
 // Minimum and maximum filters (D3D12_FILTER_MINIMUM_* / MAXIMUM_*): a 2x1 texture of 0 and 1 sampled at its middle,
 // every filter linear, reads 0 through a minimum sampler and 1 through a maximum one, where an ordinary linear
-// sampler reads 0.5. On an Apple M4 (Apple9) Metal's sampler reduction mode has no effect, and the reducing samplers
-// average too.
+// sampler reads 0.5. Before Apple10 GPUs with macOS 26, Metal's sampler reduction mode has no effect (MoltenVK
+// emulates it in SPIR-V shaders), and reducing samplers average too.
 static bool minmax(bool sampler_heap, bool late = false)
 {
     static const char *src = R"(
@@ -3897,7 +3897,7 @@ static bool test_gs_narrow_dxbc()
 // GetAttributeAtVertex (SM 6.1, with SV_Barycentrics): a triangle whose vertices output 1, 3 and 5 covers a pixel
 // whose shader returns the input at each vertex, which arrives as a PerVertexKHR input. MoltenVK builds it on MSL 4's
 // vertex_value<T> where a drawn triangle shows it works, and returns 1, 3 and 5; where the driver's vertex_value reads
-// other values (macOS 27.2 on an Apple M4) it takes the interpolated value at every vertex instead, so the pipeline
+// other values (macOS 27.2 on an Apple M6) it takes the interpolated value at every vertex instead, so the pipeline
 // still compiles: three equal values between 1 and 5.
 static bool test_pervertex()
 {
@@ -4679,6 +4679,148 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
 // a quad covering one half of the render target.
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE T, typename V>
 struct alignas(void *) StreamSubobject { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = T; V value; };
+
+// The depth bounds test (OMSetDepthBounds, DEPTH_STENCIL1.DepthBoundsTestEnable): a D32 target whose left half holds
+// 0.3 and right half 0.7, and a full-screen quad drawn with depth testing off and bounds [0.5, 1]: only the right
+// half is drawn; then bounds [0, 0.5] by a second PSO: only the left half. Metal has the test on Apple10 GPUs with
+// macOS 26 (the Metal Shader Converter bridge can take such PSOs there); MoltenVK emulates it elsewhere.
+static bool test_depth_bounds()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2 = {};
+    if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2))) || !o2.DepthBoundsTestSupported)
+    {
+        printf("  skipped: no depth bounds test\n");
+        return true;
+    }
+    static const char *src = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0.9, 1); }
+float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
+)";
+    std::vector<char> vsb = compile_dxc(src, "vs", "vs_6_0"), psb = compile_dxc(src, "ps", "ps_6_0");
+    if (vsb.empty() || psb.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12Device2 *dev2 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev2)));
+    ID3D12PipelineState *pso[2] = {};
+    for (int k = 0; k < 2; k++)
+    {
+        D3D12_RASTERIZER_DESC rast = {};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_NONE;
+        rast.DepthClipEnable = TRUE;
+        D3D12_BLEND_DESC blend = {};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        D3D12_RT_FORMAT_ARRAY rts = {};
+        rts.NumRenderTargets = 1;
+        rts.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        D3D12_DEPTH_STENCIL_DESC1 ds = {};
+        ds.DepthEnable = FALSE;
+        ds.DepthBoundsTestEnable = TRUE;
+        struct
+        {
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topo;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1> ds;
+            StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+        } stream;
+        stream.rs.value = rs;
+        stream.vs.value = { vsb.data(), vsb.size() };
+        stream.ps.value = { psb.data(), psb.size() };
+        stream.rast.value = rast;
+        stream.blend.value = blend;
+        stream.mask.value = ~0u;
+        stream.topo.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        stream.rtvs.value = rts;
+        stream.dsv.value = DXGI_FORMAT_D32_FLOAT;
+        stream.ds.value = ds;
+        stream.sample.value = { 1, 0 };
+        D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(stream), &stream };
+        CHECK_HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso[k])));
+    }
+    dev2->Release();
+    const UINT W = 8, H = 4;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr, *depth = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&depth)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 }, dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    CHECK_HR(g.device->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dsv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart(), dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    g.device->CreateDepthStencilView(depth, nullptr, dsv);
+    ID3D12GraphicsCommandList1 *l1 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&l1)));
+    ID3D12Resource *rb = create_buffer(256 * H * 2, D3D12_HEAP_TYPE_READBACK);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    const float bounds[2][2] = { { 0.5f, 1.0f }, { 0.0f, 0.5f } };
+    for (int k = 0; k < 2; k++)
+    {
+        float clear[4] = { 0, 0, 0, 0 };
+        D3D12_RECT left = { 0, 0, (LONG)W / 2, (LONG)H }, right = { (LONG)W / 2, 0, (LONG)W, (LONG)H };
+        g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.3f, 0, 1, &left);
+        g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.7f, 0, 1, &right);
+        g.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        g.list->RSSetViewports(1, &vp);
+        g.list->RSSetScissorRects(1, &sc);
+        g.list->SetGraphicsRootSignature(rs);
+        g.list->SetPipelineState(pso[k]);
+        l1->OMSetDepthBounds(bounds[k][0], bounds[k][1]);
+        g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.list->DrawInstanced(3, 1, 0, 0);
+        transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = k * 256 * H;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+        srcl.pResource = rt;
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H * 2 };
+    rb->Map(0, &r, (void **)&px);
+    int bad = 0;
+    for (int k = 0; k < 2; k++)
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++)
+            {
+                bool drawn = px[(k * 256 * H + y * 256) / 4 + x] == 0xff0000ffu;
+                bool want = k == 0 ? x >= W / 2 : x < W / 2;
+                if (drawn != want && bad++ < 4)
+                    printf("  bounds [%g, %g], pixel (%u, %u): %s, want %s\n", bounds[k][0], bounds[k][1], x, y,
+                           drawn ? "drawn" : "not drawn", want ? "drawn" : "not drawn");
+            }
+    rb->Unmap(0, nullptr);
+    EXPECT(!bad, "%d pixels wrong", bad);
+    l1->Release(); rb->Release(); rtv_heap->Release(); dsv_heap->Release(); rt->Release(); depth->Release();
+    pso[0]->Release(); pso[1]->Release(); rs->Release();
+    return true;
+}
 
 // A mesh shader without an amplification shader that reads root constants and a descriptor table (SRV), drawing a
 // triangle into the top-left of the target only: the top-left pixel gets the color, the bottom-left and the
@@ -8356,6 +8498,7 @@ static const Test tests[] = {
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
+    { "depth_bounds", test_depth_bounds },
     { "viewinstancing", test_viewinstancing },
     { "d3d11on12", test_d3d11on12 },
     { "samplerfeedback", test_samplerfeedback },

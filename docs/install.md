@@ -67,7 +67,7 @@ MetalSharp Wine's `bin/wine` is a wrapper that clears Vulkan's variables. Pass t
 
 ## Tested
 
-On an Apple M4 (macOS 27.2), with the D3D12 performance probe (`tests/perf`):
+On an Apple M6 (macOS 27.2), with the D3D12 performance probe (`tests/perf`):
 
 - the x86_64 package, in a prefix of MetalSharp's x86_64 Wine 11.17 (under Rosetta 2): offscreen scenes and a
   swap chain (`present`);

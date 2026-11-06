@@ -30,7 +30,7 @@ ___
 
 ## Capabilities
 
-Measured on an Apple M4 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
+Measured on an Apple M6 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
 
 - Shader Model **6.8**
 - D3D12 feature levels **12_1, 12_0, 11_1, 11_0** by default, and **12_2** with

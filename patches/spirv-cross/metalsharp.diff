@@ -206,7 +206,7 @@ index 90178875..9765a986 100644
  	bool unroll_array_to_complex_store(uint32_t target_id, uint32_t source_id);
  	void convert_non_uniform_expression(std::string &expr, uint32_t ptr_id);
 diff --git a/spirv_msl.cpp b/spirv_msl.cpp
-index ff081182..43e41b9b 100644
+index ff081182..a3373205 100644
 --- a/spirv_msl.cpp
 +++ b/spirv_msl.cpp
 @@ -36,6 +36,21 @@ static const uint32_t k_unknown_location = ~0u;
@@ -282,7 +282,7 @@ index ff081182..43e41b9b 100644
  		needs_workgroup_zero_init || needs_local_invocation_index;
  	bool need_workgroup_size = msl_options.emulate_subgroups && active_input_builtins.get(BuiltInNumSubgroups);
 +	// A fragment function whose only stage input is a perspective barycentric_coord reads wrong barycentrics on Apple
-+	// GPUs (macOS 27.2, Apple M4: (l0, l1 / 2, l2 + l1 / 2) for a triangle with w = 1, 2, 4). With [[position]] among
++	// GPUs (macOS 27.2, Apple M6: (l0, l1 / 2, l2 + l1 / 2) for a triangle with w = 1, 2, 4). With [[position]] among
 +	// its inputs, even unused, they're right.
 +	bool need_bary_frag_coord = get_execution_model() == ExecutionModelFragment && active_input_builtins.get(BuiltInBaryCoordKHR);
  	bool force_frag_depth_passthrough =

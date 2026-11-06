@@ -86,7 +86,7 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
   (`structured_inbounds`, `particles`). `StructuredBuffer<float4>` accesses also become four 4-byte loads or stores,
   even with `rawBufferLoad` alignment 16, but that measured no slower.
 - Metal `sin` and `cos` return 0 for infinite or NaN arguments, on either path.
-- `SV_Barycentrics` (perspective) reads wrong values when it's the fragment function's only stage input (Apple M4,
+- `SV_Barycentrics` (perspective) reads wrong values when it's the fragment function's only stage input (Apple M6,
   macOS 27.2: `(l0, l1 / 2, l2 + l1 / 2)` for a triangle with w = 1, 2 and 4), and the converter passes Metal's
   `barycentric_coord` straight through. Barycentric shaders stay on SPIR-V (meta flag). There, SPIRV-Cross gives such a
   fragment function a `[[position]]` input, which makes them right. Test `barycentrics`.
@@ -101,7 +101,7 @@ These convert cleanly, but tests found them wrong or slow, so the bridge treats 
 
 `d3d12test opdiff` (opt-in: `D3D12TEST_OPDIFF=1`; writes `opdiff-dxil.bin` and `opdiff-dxbc.bin` in the run directory) runs 67 single-operation compute shaders as DXIL
 and 64 as DXBC on every pair of about 40 special inputs (zeros, infinities, NaNs, denormals, integer limits) and on
-random bits. `tests/run/opdiff.py` compares a run with the bridge against one without. Results on an Apple M4, macOS
+random bits. `tests/run/opdiff.py` compares a run with the bridge against one without. Results on an Apple M6, macOS
 27.2, with the D3D11.3 functional spec's rules:
 
 | Operation | Bridge (converter) | SPIR-V | Spec |

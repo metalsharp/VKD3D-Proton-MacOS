@@ -36,7 +36,7 @@ less, because VKMT does not provide what the levels need:
 (The `flprobe.c` "official"/"mingw" labels are swapped: Microsoft's values are
 `SHADER_MODEL = 7`, `OPTIONS5 = 27`, `OPTIONS6 = 30`, `OPTIONS7 = 32`, which both builds answer.)
 
-## Measured on Apple M4 (macOS 27.2)
+## Measured on Apple M6 (macOS 27.2)
 
 Out-of-bounds buffer access (`tests/metal/robust.m`):
 
