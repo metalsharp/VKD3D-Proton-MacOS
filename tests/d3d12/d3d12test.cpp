@@ -3745,6 +3745,325 @@ RWStructuredBuffer<float4> o : register(u0);
 static bool test_srv_min_lod_clamp() { return srv_min_lod_clamp(false); }
 static bool test_srv_min_lod_clamp_dxbc() { return srv_min_lod_clamp(true); }
 
+// Sampling at NaN coordinates: D3D converts NaN to 0 when it turns texture coordinates into fixed point (D3D11.3
+// 3.2.3), so a point sample at (NaN, NaN) reads texel (0, 0), and at (NaN, 0.9) texel (0, 3) of a 4x4 texture whose
+// texel (x, y) holds 1 + x + 4y. Infinite coordinates are clamped like any other, with CLAMP addressing.
+static bool sample_nan_coords(bool dxbc)
+{
+    static const char *src = R"(
+Texture2D<float> t : register(t0);
+SamplerState s : register(s0);
+RWStructuredBuffer<float4> o : register(u0);
+cbuffer C : register(b0) { float zero; };
+[numthreads(1, 1, 1)] void cs()
+{
+    float nan = asfloat(0x7fc00000u + (uint)zero), inf = 1.0 / zero;
+    o[0] = float4(t.SampleLevel(s, float2(nan, nan), 0), t.SampleLevel(s, float2(nan, 0.9), 0),
+                  t.SampleLevel(s, float2(inf, 0.1), 0), t.SampleLevel(s, float2(-inf, nan), 0));
+}
+)";
+    std::vector<char> cs = dxbc ? compile_fxc(src, "cs", "cs_5_0") : compile_dxc(src, "cs", "cs_6_0");
+    if (cs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[2].Constants.Num32BitValues = 1;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso = create_compute_pipeline(rs, cs);
+    if (!pso)
+        return false;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    ID3D12Resource *upload = create_buffer(256 * 4, D3D12_HEAP_TYPE_UPLOAD);
+    float *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    for (UINT y = 0; y < 4; y++)
+        for (UINT x = 0; x < 4; x++)
+            u[y * 64 + x] = 1.0f + x + 4 * y;
+    upload->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = tex;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcl.pResource = upload;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, 4, 4, 1, 256 };
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    dev->CreateShaderResourceView(tex, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    float zero = 0.0f;
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    g.list->SetComputeRoot32BitConstants(2, 1, &zero, 0);
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = nullptr;
+    const float *r = (const float *)read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    printf("  (NaN, NaN) %g, (NaN, 0.9) %g, (inf, 0.1) %g, (-inf, NaN) %g\n", r[0], r[1], r[2], r[3]);
+    EXPECT(r[0] == 1.0f, "(NaN, NaN) reads %g, want 1 (texel 0, 0)", r[0]);
+    EXPECT(r[1] == 13.0f, "(NaN, 0.9) reads %g, want 13 (texel 0, 3)", r[1]);
+    EXPECT(r[2] == 4.0f, "(inf, 0.1) reads %g, want 4 (texel 3, 0)", r[2]);
+    EXPECT(r[3] == 1.0f, "(-inf, NaN) reads %g, want 1 (texel 0, 0)", r[3]);
+    rb->Release(); out->Release(); heap->Release(); upload->Release(); tex->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+static bool test_sample_nan_coords() { return sample_nan_coords(false); }
+static bool test_sample_nan_coords_dxbc() { return sample_nan_coords(true); }
+
+// Render target conversions (D3D data type conversion rules): a float converted to a lower range float format rounds
+// toward zero, so 70000 stores the largest finite float16 (not infinity) and 1 + 0.75 ulp stores 1; infinity stays
+// infinity. Conversions to UNORM round to nearest. Targets: R16G16B16A16_FLOAT, R11G11B10_FLOAT, R8G8B8A8_UNORM.
+static bool rt_float_conversion(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { float one; };
+struct Out { float4 a : SV_Target0; float4 b : SV_Target1; float4 c : SV_Target2; };
+Out ps(float4 p : SV_Position)
+{
+    Out o;
+    float inf = 1.0 / (one - 1.0);
+    // float16: 70000 (overflow), 1 + 0.75 ulp (2^-10), -70000, infinity.
+    o.a = float4(70000.0 * one, one + 0.000732421875, -70000.0 * one, inf);
+    // float11 (red, green: ulp 2^-6 at 1) and float10 (blue: ulp 2^-5): 1 + 0.75 ulp, 70000 (max 65024).
+    o.b = float4(one + 0.01171875, 70000.0 * one, one + 0.0234375, 1);
+    // UNORM: (k + 0.75) / 255 rounds to k + 1.
+    o.c = float4(100.75 / 255.0, 3.75 / 255.0, 254.75 / 255.0, 0.25 / 255.0);
+    return o;
+}
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0, 1); }
+)";
+    std::vector<char> vsb = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_0");
+    std::vector<char> psb = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_0");
+    if (vsb.empty() || psb.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    const DXGI_FORMAT fmts[3] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM };
+    const UINT bpp[3] = { 8, 4, 4 };
+    ID3D12Resource *rts[3] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    UINT rinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3];
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    for (UINT i = 0; i < 3; i++)
+    {
+        D3D12_RESOURCE_DESC rtd = {};
+        rtd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rtd.Width = 4; rtd.Height = 4; rtd.DepthOrArraySize = 1; rtd.MipLevels = 1;
+        rtd.Format = fmts[i];
+        rtd.SampleDesc.Count = 1;
+        rtd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rtd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rts[i])));
+        rtvs[i] = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtvs[i].ptr += i * rinc;
+        dev->CreateRenderTargetView(rts[i], nullptr, rtvs[i]);
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.PS = { psb.data(), psb.size() };
+    for (UINT i = 0; i < 3; i++)
+    {
+        pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.RTVFormats[i] = fmts[i];
+    }
+    pd.NumRenderTargets = 3;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    D3D12_VIEWPORT vpt = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    float one = 1.0f;
+    g.list->RSSetViewports(1, &vpt);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->OMSetRenderTargets(3, rtvs, FALSE, nullptr);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRoot32BitConstants(0, 1, &one, 0);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = create_buffer(3 * 1024, D3D12_HEAP_TYPE_READBACK);
+    for (UINT i = 0; i < 3; i++)
+    {
+        transition(rts[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = i * 1024;
+        dst.PlacedFootprint.Footprint = { fmts[i], 4, 4, 1, 256 };
+        srcl.pResource = rts[i];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *m = nullptr;
+    D3D12_RANGE r = { 0, 3 * 1024 };
+    rb->Map(0, &r, (void **)&m);
+    uint16_t h[4];
+    memcpy(h, m, 8);
+    uint32_t f11;
+    memcpy(&f11, m + 1024, 4);
+    const uint8_t *un = m + 2048;
+    printf("  float16 %04x %04x %04x %04x; float11/10 %03x %03x %03x; unorm %u %u %u %u\n", h[0], h[1], h[2], h[3],
+           f11 & 0x7ff, (f11 >> 11) & 0x7ff, f11 >> 22, un[0], un[1], un[2], un[3]);
+    EXPECT(h[0] == 0x7bff, "70000 stores float16 %04x, want 7bff (round toward zero)", h[0]);
+    EXPECT(h[1] == 0x3c00, "1 + 0.75 ulp stores float16 %04x, want 3c00 (round toward zero)", h[1]);
+    EXPECT(h[2] == 0xfbff, "-70000 stores float16 %04x, want fbff (round toward zero)", h[2]);
+    EXPECT(h[3] == 0x7c00, "infinity stores float16 %04x, want 7c00", h[3]);
+    EXPECT((f11 & 0x7ff) == 0x3c0, "1 + 0.75 ulp stores float11 %03x, want 3c0", f11 & 0x7ff);
+    EXPECT(((f11 >> 11) & 0x7ff) == 0x7bf, "70000 stores float11 %03x, want 7bf (largest finite)", (f11 >> 11) & 0x7ff);
+    EXPECT((f11 >> 22) == 0x1e0, "1 + 0.75 ulp stores float10 %03x, want 1e0", f11 >> 22);
+    EXPECT(un[0] == 101 && un[1] == 4 && un[2] == 255 && un[3] == 0, "UNORM stores %u %u %u %u, want 101 4 255 0",
+           un[0], un[1], un[2], un[3]);
+    rb->Unmap(0, nullptr);
+    rb->Release(); pso->Release(); rtv_heap->Release(); rs->Release();
+    for (UINT i = 0; i < 3; i++)
+        rts[i]->Release();
+    return true;
+}
+
+static bool test_rt_float_conversion() { return rt_float_conversion(false); }
+static bool test_rt_float_conversion_dxbc() { return rt_float_conversion(true); }
+
+// The same conversions through typed UAV stores (RWTexture2D<float4>): float formats round toward zero, UNORM to
+// nearest.
+static bool uav_float_conversion(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { float one; };
+RWTexture2D<float4> a : register(u0);
+RWTexture2D<float4> b : register(u1);
+RWTexture2D<float4> c : register(u2);
+[numthreads(1, 1, 1)] void cs()
+{
+    float inf = 1.0 / (one - 1.0);
+    a[uint2(0, 0)] = float4(70000.0 * one, one + 0.000732421875, -70000.0 * one, inf);
+    b[uint2(0, 0)] = float4(one + 0.01171875, 70000.0 * one, one + 0.0234375, 1);
+    c[uint2(0, 0)] = float4(100.75 / 255.0, 3.75 / 255.0, 254.75 / 255.0, 0.25 / 255.0);
+}
+)";
+    std::vector<char> cs = dxbc ? compile_fxc(src, "cs", "cs_5_0") : compile_dxc(src, "cs", "cs_6_0");
+    if (cs.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso = create_compute_pipeline(rs, cs);
+    if (!pso)
+        return false;
+    const DXGI_FORMAT fmts[3] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM };
+    ID3D12Resource *texs[3] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    for (UINT i = 0; i < 3; i++)
+    {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = fmts[i];
+        td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&texs[i])));
+        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * inc;
+        dev->CreateUnorderedAccessView(texs[i], nullptr, nullptr, h);
+    }
+    float one = 1.0f;
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRoot32BitConstants(1, 1, &one, 0);
+    g.list->Dispatch(1, 1, 1);
+    ID3D12Resource *rb = create_buffer(3 * 1024, D3D12_HEAP_TYPE_READBACK);
+    for (UINT i = 0; i < 3; i++)
+    {
+        transition(texs[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = i * 1024;
+        dst.PlacedFootprint.Footprint = { fmts[i], 4, 4, 1, 256 };
+        srcl.pResource = texs[i];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *m = nullptr;
+    D3D12_RANGE r = { 0, 3 * 1024 };
+    rb->Map(0, &r, (void **)&m);
+    uint16_t h[4];
+    memcpy(h, m, 8);
+    uint32_t f11;
+    memcpy(&f11, m + 1024, 4);
+    const uint8_t *un = m + 2048;
+    printf("  float16 %04x %04x %04x %04x; float11/10 %03x %03x %03x; unorm %u %u %u %u\n", h[0], h[1], h[2], h[3],
+           f11 & 0x7ff, (f11 >> 11) & 0x7ff, f11 >> 22, un[0], un[1], un[2], un[3]);
+    EXPECT(h[0] == 0x7bff, "70000 stores float16 %04x, want 7bff (round toward zero)", h[0]);
+    EXPECT(h[1] == 0x3c00, "1 + 0.75 ulp stores float16 %04x, want 3c00 (round toward zero)", h[1]);
+    EXPECT(h[2] == 0xfbff, "-70000 stores float16 %04x, want fbff (round toward zero)", h[2]);
+    EXPECT(h[3] == 0x7c00, "infinity stores float16 %04x, want 7c00", h[3]);
+    EXPECT((f11 & 0x7ff) == 0x3c0, "1 + 0.75 ulp stores float11 %03x, want 3c0", f11 & 0x7ff);
+    EXPECT(((f11 >> 11) & 0x7ff) == 0x7bf, "70000 stores float11 %03x, want 7bf (largest finite)", (f11 >> 11) & 0x7ff);
+    EXPECT((f11 >> 22) == 0x1e0, "1 + 0.75 ulp stores float10 %03x, want 1e0", f11 >> 22);
+    EXPECT(un[0] == 101 && un[1] == 4 && un[2] == 255 && un[3] == 0, "UNORM stores %u %u %u %u, want 101 4 255 0",
+           un[0], un[1], un[2], un[3]);
+    rb->Unmap(0, nullptr);
+    rb->Release(); pso->Release(); heap->Release(); rs->Release();
+    for (UINT i = 0; i < 3; i++)
+        texs[i]->Release();
+    return true;
+}
+
+static bool test_uav_float_conversion() { return uav_float_conversion(false); }
+static bool test_uav_float_conversion_dxbc() { return uav_float_conversion(true); }
+
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
 // zero constant (the select on the address, robust_guarded_load), which this is the check of.
@@ -9202,6 +9521,12 @@ static const Test tests[] = {
     { "depth_equal_cross_path_dxbc", test_depth_equal_cross_path_dxbc },
     { "srv_min_lod_clamp", test_srv_min_lod_clamp },
     { "srv_min_lod_clamp_dxbc", test_srv_min_lod_clamp_dxbc },
+    { "sample_nan_coords", test_sample_nan_coords },
+    { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
+    { "rt_float_conversion", test_rt_float_conversion },
+    { "rt_float_conversion_dxbc", test_rt_float_conversion_dxbc },
+    { "uav_float_conversion", test_uav_float_conversion },
+    { "uav_float_conversion_dxbc", test_uav_float_conversion_dxbc },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
