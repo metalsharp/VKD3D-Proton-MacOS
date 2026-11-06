@@ -6600,6 +6600,206 @@ float4 ps_pos(float4 p : SV_Position) : SV_Target
 static bool test_interp_samples() { return interp_samples(false); }
 static bool test_interp_samples_dxbc() { return interp_samples(true); }
 
+// Viewport and layer from the vertex shader (no GS), and line rasterization. A 2-layer 8x8 target with four 4x4
+// viewports in quadrants; instance i draws a viewport-filling triangle into viewport i, layer i & 1. Viewport 3's
+// scissor keeps (5, 5)-(7, 7). Then, on layer 0 with one full viewport, lines under D3D's diamond-exit rule (a line
+// covers a pixel when it leaves the pixel's diamond; the diamond holds its bottom corner, and for y-major lines its
+// right corner too): a horizontal line from x = 0 to 8 on y = 2.5 leaves all 8 diamonds (the last through its right
+// corner), a vertical one from y = 0 to 8 on x = 5.5 ends on the last diamond's bottom corner, inside it (7 pixels),
+// and a wireframe triangle with vertices on pixel centers (0, 0), (6, 0), (0, 6) draws each edge from its first center
+// up to, not including, its last: 6 + 6 + 6 fragments.
+static bool raster_vp_lines(bool dxbc)
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint mode; };
+RWByteAddressBuffer o : register(u1);
+struct V { float4 p : SV_Position; uint vp : SV_ViewportArrayIndex; uint layer : SV_RenderTargetArrayIndex; };
+V vs(uint id : SV_VertexID, uint iid : SV_InstanceID)
+{
+    V v;
+    v.vp = 0;
+    v.layer = 0;
+    if (mode == 0)
+    {
+        v.p = float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1);
+        v.vp = iid;
+        v.layer = iid & 1;
+    }
+    else
+    {
+        // Pixel coordinates in an 8x8 viewport.
+        float2 q = mode == 1 ? float2(id * 8.0, 2.5) : mode == 2 ? float2(5.5, id * 8.0) :
+                   float2(id == 1 ? 6.5 : 0.5, id == 2 ? 6.5 : 0.5);
+        v.p = float4(q.x / 4 - 1, 1 - q.y / 4, 0.5, 1);
+    }
+    return v;
+}
+float4 ps(V v) : SV_Target
+{
+    uint2 q = uint2(v.p.xy);
+    if (mode == 0)
+    {
+        uint slot = (v.vp * 2 + v.layer) * 16;
+        o.InterlockedAdd(slot, 1);
+        o.InterlockedMin(slot + 4, q.x * 16 + q.y);
+        o.InterlockedMax(slot + 8, q.x * 16 + q.y);
+    }
+    else
+    {
+        o.InterlockedAdd(128 + mode * 4, 1);
+        o.InterlockedOr(256 + (mode - 1) * 32 + q.y * 4, 1u << q.x);
+    }
+    return 1;
+}
+)";
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts));
+    if (!opts.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation)
+    {
+        printf("  VPAndRTArrayIndexFromAnyShaderFeedingRasterizer is off: skipped\n");
+        return true;
+    }
+    std::vector<char> vs = dxbc ? compile_fxc(src, "vs", "vs_5_0") : compile_dxc(src, "vs", "vs_6_1");
+    std::vector<char> ps = dxbc ? compile_fxc(src, "ps", "ps_5_0") : compile_dxc(src, "ps", "ps_6_1");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    auto make = [&](D3D12_PRIMITIVE_TOPOLOGY_TYPE type, D3D12_FILL_MODE fill) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.SampleMask = ~0u;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        pd.RasterizerState.FillMode = fill;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = type;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        ID3D12PipelineState *pso = nullptr;
+        dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        return pso;
+    };
+    ID3D12PipelineState *tri = make(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_FILL_MODE_SOLID),
+                        *line = make(D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_FILL_MODE_SOLID),
+                        *wire = make(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_FILL_MODE_WIREFRAME);
+    if (!tri || !line || !wire)
+    {
+        printf("  pipeline creation failed\n");
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 8; td.Height = 8; td.DepthOrArraySize = 2; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rheap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rheap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rheap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    ID3D12Resource *out = create_buffer(512, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *init = create_buffer(512, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *m = nullptr;
+    init->Map(0, nullptr, (void **)&m);
+    memset(m, 0, 512);
+    for (UINT s = 0; s < 8; s++)
+        m[s * 4 + 1] = ~0u;  // minimum slots
+    init->Unmap(0, nullptr);
+    transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(out, 0, init, 0, 512);
+    transition(out, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vps[4];
+    D3D12_RECT scs[4];
+    for (UINT i = 0; i < 4; i++)
+    {
+        vps[i] = { 4.0f * (i & 1), 4.0f * (i >> 1), 4, 4, 0, 1 };
+        scs[i] = { (LONG)(4 * (i & 1)), (LONG)(4 * (i >> 1)), (LONG)(4 * (i & 1) + 4), (LONG)(4 * (i >> 1) + 4) };
+    }
+    scs[3] = { 5, 5, 7, 7 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(4, vps);
+    g.list->RSSetScissorRects(4, scs);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    UINT mode = 0;
+    g.list->SetGraphicsRoot32BitConstants(0, 1, &mode, 0);
+    g.list->SetPipelineState(tri);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 4, 0, 0);
+    D3D12_VIEWPORT full = { 0, 0, 8, 8, 0, 1 };
+    D3D12_RECT fsc = { 0, 0, 8, 8 };
+    g.list->RSSetViewports(1, &full);
+    g.list->RSSetScissorRects(1, &fsc);
+    g.list->SetPipelineState(line);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+    for (mode = 1; mode <= 2; mode++)
+    {
+        g.list->SetGraphicsRoot32BitConstants(0, 1, &mode, 0);
+        g.list->DrawInstanced(2, 1, 0, 0);
+    }
+    g.list->SetPipelineState(wire);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->SetGraphicsRoot32BitConstants(0, 1, &mode, 0);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 512, &rb);
+    if (!r)
+        return false;
+    // Slot (viewport * 2 + layer): count, min and max of x * 16 + y.
+    static const struct { uint32_t vp, layer, count, x0, y0, x1, y1; } want[4] = {
+        { 0, 0, 16, 0, 0, 3, 3 }, { 1, 1, 16, 4, 0, 7, 3 }, { 2, 0, 16, 0, 4, 3, 7 }, { 3, 1, 4, 5, 5, 6, 6 },
+    };
+    uint32_t total = 0;
+    for (UINT s = 0; s < 8; s++)
+        total += r[s * 4];
+    EXPECT(total == 52, "viewport/layer draws: %u fragments, want 52", total);
+    for (UINT i = 0; i < 4; i++)
+    {
+        const uint32_t *e = r + (want[i].vp * 2 + want[i].layer) * 4;
+        printf("  viewport %u layer %u: %u fragments, (%u, %u)-(%u, %u)\n", want[i].vp, want[i].layer, e[0], e[1] >> 4, e[1] & 15,
+               e[2] >> 4, e[2] & 15);
+        EXPECT(e[0] == want[i].count && e[1] == want[i].x0 * 16 + want[i].y0 && e[2] == want[i].x1 * 16 + want[i].y1,
+               "viewport %u layer %u: %u fragments in (%u, %u)-(%u, %u), want %u in (%u, %u)-(%u, %u)", want[i].vp, want[i].layer,
+               e[0], e[1] >> 4, e[1] & 15, e[2] >> 4, e[2] & 15, want[i].count, want[i].x0, want[i].y0, want[i].x1, want[i].y1);
+    }
+    static const char *names[3] = { "horizontal line", "vertical line", "wireframe triangle" };
+    static const uint32_t counts[3] = { 8, 7, 18 };
+    for (UINT k = 0; k < 3; k++)
+    {
+        printf("  %s: %u fragments:", names[k], r[32 + (k + 1)]);
+        for (UINT y = 0; y < 8; y++)
+            printf(" %02x", r[64 + k * 8 + y]);
+        printf("\n");
+        EXPECT(r[32 + (k + 1)] == counts[k], "%s: %u fragments, want %u", names[k], r[32 + (k + 1)], counts[k]);
+    }
+    EXPECT(r[64 + 2] == 0xff, "horizontal line row 2: %#x, want 0xff", r[64 + 2]);
+    for (UINT y = 0; y < 8; y++)
+        EXPECT(r[64 + 8 + y] == (y < 7 ? 0x20u : 0u), "vertical line row %u: %#x, want %#x", y, r[64 + 8 + y], y < 7 ? 0x20u : 0u);
+    static const uint32_t wire_rows[8] = { 0x7f, 0x21, 0x11, 0x09, 0x05, 0x03, 0x01, 0 };
+    for (UINT y = 0; y < 8; y++)
+        EXPECT(r[64 + 16 + y] == wire_rows[y], "wireframe row %u: %#x, want %#x", y, r[64 + 16 + y], wire_rows[y]);
+    rb->Release(); init->Release(); out->Release(); rheap->Release(); rt->Release(); tri->Release(); line->Release(); wire->Release();
+    rs->Release();
+    return true;
+}
+
+static bool test_raster_vp_lines() { return raster_vp_lines(false); }
+static bool test_raster_vp_lines_dxbc() { return raster_vp_lines(true); }
+
 // DXBC with its reflection stripped (D3DCOMPILER_STRIP_REFLECTION_DATA, as shipped games often are): the bridge then
 // scans the instruction stream itself (for typed buffer declarations), and must step over imad (opcode 35) and
 // customdata (53, whose length is in the next token). Draws with an imad in each stage; run with VKD3D_DEBUG=info to
@@ -13860,6 +14060,8 @@ static const Test tests[] = {
     { "interp_samples", test_interp_samples },
     { "interp_samples_dxbc", test_interp_samples_dxbc },
     { "dxbc_stripped", test_dxbc_stripped },
+    { "raster_vp_lines", test_raster_vp_lines },
+    { "raster_vp_lines_dxbc", test_raster_vp_lines_dxbc },
     { "sample_nan_coords", test_sample_nan_coords },
     { "sample_nan_coords_dxbc", test_sample_nan_coords_dxbc },
     { "rt_float_conversion", test_rt_float_conversion },
