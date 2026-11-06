@@ -4362,6 +4362,57 @@ float4 ps(float4 p : SV_Position) : SV_Target { if (p.x < 1 && p.y < 1) o.Store(
     return true;
 }
 
+// A vertex shader writing a UAV, in a PSO with no pixel shader, render target or depth target (a pipeline made with
+// rasterizer discard): 64 points, each writing its vertex ID times 3 plus 1. On Metal, a converted vertex function
+// returns its outputs, which needs rasterization: MoltenVK rasterizes such bridge pipelines, which draw nothing.
+static bool test_vs_uav_no_attachments()
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u0);
+float4 vs(uint id : SV_VertexID) : SV_Position { o.Store(id * 4, id * 3 + 1); return float4(0, 0, 0, 1); }
+)";
+    std::vector<char> vsb = compile_dxc(src, "vs", "vs_6_0");
+    if (vsb.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vsb.data(), vsb.size() };
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    g.list->DrawInstanced(64, 1, 0, 0);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!v)
+        return false;
+    int bad = 0;
+    for (uint32_t i = 0; i < 64; i++)
+        if (v[i] != i * 3 + 1 && bad++ < 4)
+            printf("  vertex %u wrote %u, want %u\n", i, v[i], i * 3 + 1);
+    EXPECT(!bad, "%d of 64 vertices wrote the wrong value", bad);
+    rb->Release(); out->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // Native 16-bit shader operations (SM 6.2, -enable-16bit-types): half and 16-bit integer arithmetic, 16-bit loads
 // and stores of raw and structured buffers, and FP16 denormals (which D3D12 requires to be preserved).
 static const char *cs_16bit_src = R"(
@@ -8304,6 +8355,7 @@ static const Test tests[] = {
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_template_first", test_executeindirect_template_first },
+    { "vs_uav_no_attachments", test_vs_uav_no_attachments },
     { "viewinstancing", test_viewinstancing },
     { "d3d11on12", test_d3d11on12 },
     { "samplerfeedback", test_samplerfeedback },

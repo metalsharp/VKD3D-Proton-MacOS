@@ -150,5 +150,8 @@ conversion (DXIL).
   Metal vertex format read the same on both paths, and the decodes checked against a CPU reference are exact, with
   missing components reading 0, 0, 1. The formats checked are R32, R32G32, RGBA8 SNORM, R8, BGRA8, R10G10B10A2_UNORM
   and R11G11B10. `R10G10B10A2_UINT` makes no pipeline on either path: Metal only has a normalized 10:10:10:2 vertex
-  format. A pipeline with no pixel shader, render target or depth target stays on SPIR-V: VKD3D-Proton makes it with
-  rasterizer discard, and a converted vertex function returns its outputs, which Metal rejects without rasterization.
+  format. A pipeline with no pixel shader, render target or depth target is made with rasterizer discard, and a converted
+  vertex function returns its outputs, which Metal rejects without rasterization: MoltenVK rasterizes such bridge
+  pipelines, which draw nothing (test `vs_uav_no_attachments`). An unnormalized 10:10:10:2 vertex format would need
+  the vertex shader to fetch its attributes itself, which MoltenVK does only for geometry shaders and conservative
+  rasterization; it remains unsupported.
