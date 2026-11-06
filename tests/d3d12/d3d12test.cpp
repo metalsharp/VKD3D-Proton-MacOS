@@ -4850,6 +4850,211 @@ RWByteAddressBuffer o : register(u0);
     return true;
 }
 
+// 64-bit buffer atomics against CPU results, contended (16 addresses per operation), each shader using one kind of
+// operation with its result unused (the forms MoltenVK may run without its lock table: two 32-bit atomics for add,
+// sub, and, or, xor; native unsigned min and max) and one shader that uses the returned values (the lock table).
+// Adds carry from the low word into the high one; ORs, ANDs and XORs touch both words.
+static bool test_atomics64()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9));
+    if (!o9.AtomicInt64OnTypedResourceSupported)
+        printf("  note: no 64-bit atomics on typed resources\n");
+    static const char *src = R"(
+RWStructuredBuffer<uint64_t> o : register(u0);
+RWStructuredBuffer<uint64_t> r : register(u1);
+uint64_t v(uint t) { return ((uint64_t)(t * 2654435761u) << 20) ^ (uint64_t)t; }
+[numthreads(64, 1, 1)] void add(uint t : SV_DispatchThreadID) { InterlockedAdd(o[t & 15], v(t) | 0xffffffffull); }
+[numthreads(64, 1, 1)] void max_(uint t : SV_DispatchThreadID) { InterlockedMax(o[16 + (t & 15)], v(t)); }
+[numthreads(64, 1, 1)] void min_(uint t : SV_DispatchThreadID) { InterlockedMin(o[32 + (t & 15)], v(t) + 1); }
+[numthreads(64, 1, 1)] void or_(uint t : SV_DispatchThreadID) { InterlockedOr(o[48 + (t & 15)], 1ull << (t % 64)); }
+[numthreads(64, 1, 1)] void xor_(uint t : SV_DispatchThreadID) { InterlockedXor(o[64 + (t & 15)], v(t)); }
+[numthreads(64, 1, 1)] void and_(uint t : SV_DispatchThreadID) { InterlockedAnd(o[80 + (t & 15)], ~(1ull << (t % 61))); }
+[numthreads(64, 1, 1)] void ret(uint t : SV_DispatchThreadID) { uint64_t old; InterlockedAdd(o[96 + (t & 15)], 1ull << 32, old); r[t] = old; }
+)";
+    const char *entries[] = { "add", "max_", "min_", "or_", "xor_", "and_", "ret" };
+    ID3D12Device *dev = g.device;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *psos[7] = {};
+    for (UINT i = 0; i < 7; i++)
+    {
+        std::vector<char> cs = compile_dxc(src, entries[i], "cs_6_6");
+        if (cs.empty() || !(psos[i] = create_compute_pipeline(rs, cs)))
+            return false;
+    }
+    const UINT N = 16384; // threads per dispatch: 1024 per address
+    ID3D12Resource *up = create_buffer(112 * 8, D3D12_HEAP_TYPE_UPLOAD);
+    uint64_t init[112];
+    for (UINT k = 0; k < 112; k++)
+        init[k] = k < 16 ? 0x00000000fffffff0ull * k : k < 32 ? 0 : k < 48 ? ~0ull : k < 64 ? 0 : k < 80 ? 0x0123456789abcdefull : k < 96 ? ~0ull : 0;
+    void *m = nullptr;
+    up->Map(0, nullptr, &m);
+    memcpy(m, init, sizeof(init));
+    up->Unmap(0, nullptr);
+    ID3D12Resource *o = create_buffer(112 * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *r = create_buffer(N * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->CopyBufferRegion(o, 0, up, 0, sizeof(init));
+    transition(o, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(0, o->GetGPUVirtualAddress());
+    g.list->SetComputeRootUnorderedAccessView(1, r->GetGPUVirtualAddress());
+    for (UINT i = 0; i < 7; i++)
+    {
+        g.list->SetPipelineState(psos[i]);
+        g.list->Dispatch(N / 64, 1, 1);
+    }
+    ID3D12Resource *rb = nullptr, *rrb = nullptr;
+    const uint64_t *got = (const uint64_t *)read_buffer(o, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 112 * 8, &rb);
+    if (!got)
+        return false;
+    // CPU results.
+    uint64_t want[112];
+    memcpy(want, init, sizeof(want));
+    auto v = [](uint32_t t) { return ((uint64_t)(uint32_t)(t * 2654435761u) << 20) ^ (uint64_t)t; };
+    for (uint32_t t = 0; t < N; t++)
+    {
+        uint32_t a = t & 15;
+        want[a] += v(t) | 0xffffffffull;
+        want[16 + a] = std::max(want[16 + a], v(t));
+        want[32 + a] = std::min(want[32 + a], v(t) + 1);
+        want[48 + a] |= 1ull << (t % 64);
+        want[64 + a] ^= v(t);
+        want[80 + a] &= ~(1ull << (t % 61));
+        want[96 + a] += 1ull << 32;
+    }
+    static const char *names[7] = { "add", "max", "min", "or", "xor", "and", "add with result" };
+    for (UINT i = 0; i < 7; i++)
+    {
+        int bad = 0;
+        for (UINT a = 0; a < 16; a++)
+            if (got[i * 16 + a] != want[i * 16 + a] && bad++ < 2)
+                printf("  %s [%u]: %016llx, want %016llx\n", names[i], a, (unsigned long long)got[i * 16 + a],
+                       (unsigned long long)want[i * 16 + a]);
+        EXPECT(!bad, "64-bit atomic %s: %d of 16 addresses wrong", names[i], bad);
+    }
+    // The returned values: each address returns 0, 1, ..., 1023 (times 2^32), once each.
+    const uint64_t *ret = (const uint64_t *)read_buffer(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, N * 8, &rrb);
+    if (!ret)
+        return false;
+    std::vector<int> seen(16 * 1024, 0);
+    int bad_ret = 0;
+    for (uint32_t t = 0; t < N; t++)
+    {
+        uint64_t k = ret[t] >> 32;
+        if ((ret[t] & 0xffffffffull) || k >= 1024 || seen[(t & 15) * 1024 + k]++)
+            bad_ret++;
+    }
+    EXPECT(!bad_ret, "64-bit InterlockedAdd returned %d wrong or repeated values", bad_ret);
+    rb->Release(); rrb->Release(); r->Release(); o->Release(); up->Release(); rs->Release();
+    for (UINT i = 0; i < 7; i++)
+        psos[i]->Release();
+    return true;
+}
+
+// 64-bit image atomics (SM 6.6, RWTexture2D<uint64_t> on R32G32_UINT), as Nanite's visibility buffer uses them:
+// 64K threads InterlockedMax onto a 16x16 texture (256 per texel, results unused), then a shader that uses the
+// returned values of InterlockedAdd. Checked against CPU results.
+static bool test_image_atomics64()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9));
+    if (!o9.AtomicInt64OnTypedResourceSupported)
+    {
+        printf("  skipped: no 64-bit atomics on typed resources\n");
+        return true;
+    }
+    static const char *src = R"(
+RWTexture2D<uint64_t> t : register(u0);
+RWStructuredBuffer<uint64_t> r : register(u1);
+uint64_t v(uint i) { return ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i; }
+[numthreads(64, 1, 1)] void max_(uint i : SV_DispatchThreadID) { InterlockedMax(t[uint2(i & 15, (i >> 4) & 15)], v(i)); }
+[numthreads(64, 1, 1)] void ret(uint i : SV_DispatchThreadID) { uint64_t old; InterlockedAdd(t[uint2(i & 15, 16 + ((i >> 4) & 15))], 1ull << 32, old); r[i] = old; }
+)";
+    std::vector<char> cs_max = compile_dxc(src, "max_", "cs_6_6"), cs_ret = compile_dxc(src, "ret", "cs_6_6");
+    if (cs_max.empty() || cs_ret.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pmax = create_compute_pipeline(rs, cs_max), *pret = create_compute_pipeline(rs, cs_ret);
+    if (!pmax || !pret)
+        return false;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 16; td.Height = 32; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32_UINT;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *tex = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&tex)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    dev->CreateUnorderedAccessView(tex, nullptr, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+    const UINT N = 65536, R = 4096;
+    ID3D12Resource *r = create_buffer(R * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetDescriptorHeaps(1, &heap);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, r->GetGPUVirtualAddress());
+    g.list->SetPipelineState(pmax);
+    g.list->Dispatch(N / 64, 1, 1);
+    g.list->SetPipelineState(pret);
+    g.list->Dispatch(R / 64, 1, 1);
+    transition(tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource *rb = create_buffer(32 * 256, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32_UINT, 16, 32, 1, 256 };
+    srcl.pResource = tex;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    ID3D12Resource *rrb = nullptr;
+    const uint64_t *ret = (const uint64_t *)read_buffer(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, R * 8, &rrb);
+    if (!ret)
+        return false;
+    const uint64_t *m = nullptr;
+    D3D12_RANGE rr = { 0, 32 * 256 };
+    rb->Map(0, &rr, (void **)&m);
+    auto v = [](uint32_t i) { return ((uint64_t)(uint32_t)(i * 2654435761u) << 24) ^ (uint64_t)i; };
+    uint64_t want[256] = {};
+    for (uint32_t i = 0; i < N; i++)
+        want[(i & 15) + ((i >> 4) & 15) * 16] = std::max(want[(i & 15) + ((i >> 4) & 15) * 16], v(i));
+    int bad_max = 0, bad_add = 0, bad_ret = 0;
+    for (UINT y = 0; y < 16; y++)
+        for (UINT x = 0; x < 16; x++)
+        {
+            bad_max += m[y * 32 + x] != want[y * 16 + x];
+            bad_add += m[(16 + y) * 32 + x] != (uint64_t)(R / 256) << 32;
+        }
+    std::vector<int> seen(256 * 16, 0);
+    for (uint32_t i = 0; i < R; i++)
+    {
+        uint64_t k = ret[i] >> 32;
+        uint32_t texel = (i & 15) + ((i >> 4) & 15) * 16;
+        if ((ret[i] & 0xffffffffull) || k >= 16 || seen[texel * 16 + k]++)
+            bad_ret++;
+    }
+    rb->Unmap(0, nullptr);
+    printf("  max: %d of 256 texels wrong; add with result: %d texels, %d returned values wrong\n", bad_max, bad_add, bad_ret);
+    EXPECT(!bad_max && !bad_add && !bad_ret, "64-bit image atomics wrong");
+    rb->Release(); rrb->Release(); r->Release(); heap->Release(); tex->Release(); pmax->Release(); pret->Release(); rs->Release();
+    return true;
+}
+
 // Constant buffer rows through a descriptor table past the view's end, and of a null view, read 0 (D3D11.3 7.5). A
 // 256-byte view (16 rows) is read as 32 rows, and a null view as 32 more: MoltenVK reads a row out of range from a
 // zero constant (the select on the address, robust_guarded_load), which this is the check of.
@@ -10550,6 +10755,8 @@ static const Test tests[] = {
     { "predication_rewrite", test_predication_rewrite },
     { "native16bit", test_native16bit },
     { "groupshared64", test_groupshared64 },
+    { "atomics64", test_atomics64 },
+    { "image_atomics64", test_image_atomics64 },
 };
 
 int main(int argc, char **argv)

@@ -2086,13 +2086,13 @@ static double first_use(ID3D12PipelineState *pso)
 
 static std::vector<Scene> sm6_scenes()
 {
-    static ID3D12PipelineState *fill6, *sample6, *mesh_pso, *rq_pso, *fb_pso, *fbbase_pso, *bindless6, *wave_pso, *atom_pso[3],
+    static ID3D12PipelineState *fill6, *sample6, *mesh_pso, *rq_pso, *fb_pso, *fbbase_pso, *bindless6, *wave_pso, *atom_pso[4],
         *math16, *math32;
     static ID3D12RootSignature *mesh_rs, *rt_rs, *fb_rs, *bindless6_rs;
     static std::vector<D3D12_SHADER_BYTECODE> cold_vs, cold_ps;
     static std::vector<std::vector<char>> cold_code;
     static RtGeometry rt;
-    static ID3D12Resource *rt_out, *table, *fb_tex, *fb_map, *wave_buf, *atom_buf;
+    static ID3D12Resource *rt_out, *table, *fb_tex, *fb_map, *wave_buf, *atom_buf, *atom_tex;
     static ID3D12StateObject *rt_so;
     static ID3D12DescriptorHeap *fb_heap;
     static std::string math_src16, math_src32;
@@ -2573,6 +2573,32 @@ float4 ps_math(V i) : SV_Target
         { "atomics64_spread", "spread", "1M 64-bit InterlockedAdds per frame over 64K addresses" },
         { "atomics32_contended", "contended32", "1M 32-bit InterlockedAdds onto 16 addresses (baseline for atomics64_contended)" },
     };
+    // Nanite's visibility buffer: 64-bit InterlockedMax onto a RWTexture2D<uint64_t> (R32G32_UINT), results unused.
+    v.push_back({ "atomics64_image_max", "1M 64-bit InterlockedMax per frame onto a 64x64 RWTexture2D<uint64_t> (Nanite visibility buffer)", [] {
+        static const char *src = R"(
+RWTexture2D<uint64_t> t : register(u0);
+[numthreads(64, 1, 1)] void cs(uint i : SV_DispatchThreadID)
+{
+    uint64_t v = ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i;
+    InterlockedMax(t[uint2(i & 63, (i >> 6) & 63)], v);
+}
+)";
+        D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER rp = {};
+        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp.DescriptorTable = { 1, &range };
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        rt_rs = serialize_root_signature(rsd);
+        atom_pso[3] = compute_pso_from(rt_rs, shader_code(src, "cs", "cs_6_6"));
+        atom_tex = create_texture(64, 64, DXGI_FORMAT_R32G32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        p.device->CreateUnorderedAccessView(atom_tex, nullptr, nullptr, srv_cpu(3990));
+    }, [](UINT) {
+        p.list->SetComputeRootSignature(rt_rs);
+        p.list->SetPipelineState(atom_pso[3]);
+        p.list->SetComputeRootDescriptorTable(0, srv_gpu(3990));
+        p.list->Dispatch((1 << 20) / 64, 1, 1);
+    }, false, 0, true });
     for (int k = 0; k < 3; k++)
     {
         const char *entry = atom_names[k][1];
