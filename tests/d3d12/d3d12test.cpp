@@ -5166,6 +5166,150 @@ void cs(uint t : SV_DispatchThreadID) { o.InterlockedAdd(64 + id * 4, 1); }
     return true;
 }
 
+// Dynamic resources (SM 6.6) in a graphics pipeline: the vertex shader reads its positions from a structured buffer at
+// a heap index from a root constant; the pixel shader samples a texture at a literal heap index with a sampler from the
+// sampler heap, so it reads nothing from the root arguments, only the heaps (the bridge must bind them to it anyway).
+static bool test_dynamicresources_graphics()
+{
+    static const char *src = R"(
+cbuffer C : register(b0) { uint pos_index; };
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    StructuredBuffer<float2> pos = ResourceDescriptorHeap[pos_index];
+    return float4(pos[id], 0, 1);
+}
+float4 ps(float4 p : SV_Position) : SV_Target
+{
+    Texture2D<float4> tex = ResourceDescriptorHeap[5];
+    SamplerState smp = SamplerDescriptorHeap[11];
+    return tex.Sample(smp, float2(p.x / 2, 0.5));
+}
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_6"), ps = compile_dxc(src, "ps", "ps_6_6");
+    if (vs.empty() || ps.empty())
+        return false;
+    ID3D12Device *dev = g.device;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrsd = {};
+    vrsd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    D3D12_ROOT_PARAMETER1 rp1 = {};
+    rp1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp1.Constants.Num32BitValues = 1;
+    rp1.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    vrsd.Desc_1_1 = { 1, &rp1, 0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED };
+    ID3DBlob *blob = nullptr, *error = nullptr;
+    CHECK_HR(D3D12SerializeVersionedRootSignature(&vrsd, &blob, &error));
+    ID3D12RootSignature *rs = nullptr;
+    CHECK_HR(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    blob->Release();
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    // A full-screen triangle's positions, and a 2x1 texture (r = 10, 20).
+    ID3D12Resource *upload = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    upload->Map(0, nullptr, (void **)&u);
+    const float tri[6] = { -1, -1, -1, 3, 3, -1 };
+    memcpy(u, tri, sizeof(tri));
+    const uint32_t texels[2] = { 10, 20 };
+    memcpy(u + 2048, texels, sizeof(texels));
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *pos_buf = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 2; td.Height = 1; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ID3D12Resource *tex = nullptr, *rt = nullptr;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    CHECK_HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    g.list->CopyBufferRegion(pos_buf, 0, upload, 0, sizeof(tri));
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = tex;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcl.pResource = upload;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcl.PlacedFootprint.Offset = 2048;
+    srcl.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 2, 1, 1, 256 };
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    transition(pos_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    ID3D12DescriptorHeap *heap = nullptr, *sheap = nullptr, *rtv_heap = nullptr;
+    CHECK_HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+    D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 16, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    CHECK_HR(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&sheap)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    CHECK_HR(dev->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    UINT sinc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    auto cpu = [&](ID3D12DescriptorHeap *h, UINT i, UINT step) { D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart(); c.ptr += i * step; return c; };
+    const UINT pos_index = 41;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = 3;
+    srv.Buffer.StructureByteStride = 8;
+    dev->CreateShaderResourceView(pos_buf, &srv, cpu(heap, pos_index, inc));
+    dev->CreateShaderResourceView(tex, nullptr, cpu(heap, 5, inc));
+    D3D12_SAMPLER_DESC sd = {};
+    sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sd.MaxLOD = D3D12_FLOAT32_MAX;
+    dev->CreateSampler(&sd, cpu(sheap, 11, sinc));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+
+    float clear[4] = { 0, 0, 0, 0 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, 2, 1, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 2, 1 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    ID3D12DescriptorHeap *heaps[2] = { heap, sheap };
+    g.list->SetDescriptorHeaps(2, heaps);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->SetGraphicsRoot32BitConstant(0, pos_index, 0);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->DrawInstanced(3, 1, 0, 0);
+    ID3D12Resource *rb = create_buffer(256, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION rdst = {}, rsrc = {};
+    rdst.pResource = rb;
+    rdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    rdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 2, 1, 1, 256 };
+    rsrc.pResource = rt;
+    rsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&rdst, 0, 0, 0, &rsrc, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 8 };
+    rb->Map(0, &r, (void **)&px);
+    EXPECT(px[0] == 10 && px[1] == 20, "pixels 0x%08x 0x%08x, want 0x0000000a 0x00000014", px[0], px[1]);
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); heap->Release(); sheap->Release(); rt->Release(); tex->Release(); pos_buf->Release();
+    upload->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // Dynamic resources (SM 6.6): ResourceDescriptorHeap and SamplerDescriptorHeap indexed by values from a root
 // constant: a structured buffer SRV, a texture sampled with a heap sampler, and a UAV written through the heap.
 static bool test_dynamicresources()
@@ -7114,6 +7258,7 @@ static const Test tests[] = {
     { "executeindirect", test_executeindirect },
     { "executeindirect_dispatch_count", test_executeindirect_dispatch_count },
     { "dynamicresources", test_dynamicresources },
+    { "dynamicresources_graphics", test_dynamicresources_graphics },
     { "msaa_depth_stencil", test_msaa_depth_stencil },
     { "textures", test_textures },
     { "static_sampler_lod", test_static_sampler_lod },
