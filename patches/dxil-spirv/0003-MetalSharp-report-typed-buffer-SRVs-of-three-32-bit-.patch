@@ -1,0 +1,186 @@
+From aff163d8ddfcc348a1df7047df290f6c04f07588 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 02:33:15 -0700
+Subject: [PATCH 3/4] MetalSharp: report typed buffer SRVs of three 32-bit
+ components
+
+dxil_spv_converter_declares_three_component_typed_srv says whether the shader declares a typed buffer SRV of three
+32-bit components (Buffer<float3>, Buffer<uint3>, Buffer<int3>), from the resource variable's element type (SM 6.5 and
+before) or the annotateHandle properties' component count (SM 6.6, heap-indexed and bound). Metal has no texel format
+for such views, so VKD3D-Proton keeps those shaders off Metal Shader Converter.
+---
+ dxil_converter.cpp                | 38 +++++++++++++++++++++++++++++++
+ dxil_converter.hpp                |  1 +
+ dxil_spirv_c.cpp                  |  9 ++++++++
+ dxil_spirv_c.h                    |  5 ++++
+ opcodes/converter_impl.hpp        |  4 ++++
+ opcodes/opcodes_dxil_builtins.cpp | 19 +++++++++++++++-
+ 6 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index f94b77ec..aea4f750 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -137,6 +137,27 @@ bool Converter::is_multiview_compatible() const
+ 	       impl->options.multiview.view_index_to_view_instance_spec_id != UINT32_MAX;
+ }
+ 
++bool Converter::declares_three_component_typed_srv() const
++{
++	return impl->declares_three_component_typed_srv;
++}
++
++void Converter::Impl::note_typed_srv_components(DXIL::ComponentType type, unsigned count)
++{
++	if (count != 3)
++		return;
++	switch (type)
++	{
++	case DXIL::ComponentType::I32:
++	case DXIL::ComponentType::U32:
++	case DXIL::ComponentType::F32:
++		declares_three_component_typed_srv = true;
++		break;
++	default:
++		break;
++	}
++}
++
+ bool Converter::shader_requires_feature(ShaderFeature feature) const
+ {
+ 	switch (feature)
+@@ -1304,6 +1325,23 @@ bool Converter::Impl::emit_srvs(const llvm::MDNode *srvs, const llvm::MDNode *re
+ 				stride = get_constant_metadata(tags, 1);
+ 		}
+ 
++		// MetalSharp: Buffer<float3> and the like declare their element vector in the variable's type.
++		if (resource_kind == DXIL::ResourceKind::TypedBuffer && srv->getOperand(1))
++		{
++			if (auto *variable = llvm::dyn_cast<llvm::ConstantAsMetadata>(srv->getOperand(1)))
++			{
++				const llvm::Type *type = variable->getValue()->getType();
++				if (type->getTypeID() == llvm::Type::TypeID::PointerTyID)
++					type = type->getPointerElementType();
++				while (type->getTypeID() == llvm::Type::TypeID::ArrayTyID)
++					type = type->getArrayElementType();
++				if (type->getTypeID() == llvm::Type::TypeID::StructTyID && type->getStructNumElements() >= 1)
++					type = type->getStructElementType(0);
++				if (type->getTypeID() == llvm::Type::TypeID::VectorTyID)
++					note_typed_srv_components(actual_component_type, type->getVectorNumElements());
++			}
++		}
++
+ 		unsigned alignment = resource_kind == DXIL::ResourceKind::RawBuffer ? 16 : (stride & -int(stride));
+ 
+ 		DescriptorTableEntry local_table_entry = {};
+diff --git a/dxil_converter.hpp b/dxil_converter.hpp
+index 9f7b242c..a368f1a8 100644
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -1111,6 +1111,7 @@ public:
+ 
+ 	// Returns true if view instancing is enabled and the result can be lowered directly to Vulkan.
+ 	bool is_multiview_compatible() const;
++	bool declares_three_component_typed_srv() const;
+ 
+ 	bool shader_requires_feature(ShaderFeature feature) const;
+ 
+diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
+index 33931836..dfba3ec9 100644
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -411,6 +411,7 @@ struct dxil_spv_converter_s
+ 	bool active_table = false;
+ 	bool uses_subgroup_size = false;
+ 	bool is_multiview_compatible = false;
++	bool declares_three_component_typed_srv = false;
+ 	uint32_t workgroup_size[3] = {};
+ 	uint32_t patch_vertex_count = 0;
+     uint32_t patch_location_offset = UINT32_MAX;
+@@ -838,6 +839,7 @@ dxil_spv_result dxil_spv_converter_run(dxil_spv_converter converter)
+ 	converter->compiled_entry_point = dxil_converter.get_compiled_entry_point();
+ 	converter->uses_subgroup_size = module.has_builtin_shader_input(spv::BuiltInSubgroupSize);
+ 	converter->is_multiview_compatible = dxil_converter.is_multiview_compatible();
++	converter->declares_three_component_typed_srv = dxil_converter.declares_three_component_typed_srv();
+ 	dxil_converter.get_workgroup_dimensions(converter->workgroup_size[0],
+ 	                                        converter->workgroup_size[1],
+ 	                                        converter->workgroup_size[2]);
+@@ -1738,6 +1740,13 @@ dxil_spv_result dxil_spv_converter_is_multiview_compatible(
+ 	return DXIL_SPV_SUCCESS;
+ }
+ 
++dxil_spv_result dxil_spv_converter_declares_three_component_typed_srv(
++		dxil_spv_converter converter, dxil_spv_bool *result)
++{
++	*result = converter->declares_three_component_typed_srv ? DXIL_SPV_TRUE : DXIL_SPV_FALSE;
++	return DXIL_SPV_SUCCESS;
++}
++
+ dxil_spv_result dxil_spv_converter_set_meta_descriptor(
+ 		dxil_spv_converter converter, dxil_spv_meta_descriptor meta,
+ 		dxil_spv_meta_descriptor_kind kind, unsigned desc_set, unsigned binding_or_push_index)
+diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
+index 6477e773..ed597568 100644
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -1141,6 +1141,11 @@ DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_is_multiview_compatible(
+ 	dxil_spv_converter converter, dxil_spv_bool *result);
+ #endif
+ 
++/* MetalSharp: whether the converted shader declares a typed buffer SRV of three 32-bit components (Buffer<float3>
++ * and the like). Valid after dxil_spv_converter_run. */
++DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_declares_three_component_typed_srv(
++	dxil_spv_converter converter, dxil_spv_bool *result);
++
+ /* Intended to be added to the GLSL output in repro suite.
+  * Attempts to analyze the DXIL for potential out of spec behavior that needs another pair of eyes.
+  * Lifetime of string is only as long as converter is alive.
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 668cb7ca..722e59c0 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -482,6 +482,10 @@ struct Converter::Impl
+ 		spv::Id offset_buffer_id;
+ 	};
+ 	UnorderedMap<const llvm::Value *, AnnotateHandleReference> llvm_annotate_handle_uses;
++	// MetalSharp: a typed buffer SRV declared with three 32-bit components (Buffer<float3> and the like), which
++	// Metal has no texel format for: VKD3D-Proton keeps such shaders off Metal Shader Converter.
++	bool declares_three_component_typed_srv = false;
++	void note_typed_srv_components(DXIL::ComponentType type, unsigned count);
+ 	UnorderedSet<const llvm::Value *> llvm_annotate_handle_lib_uses;
+ 	Vector<const llvm::Value *> llvm_vkmm_coherent_ptrs;
+ 
+diff --git a/opcodes/opcodes_dxil_builtins.cpp b/opcodes/opcodes_dxil_builtins.cpp
+index e98df353..a6f32c54 100644
+--- a/opcodes/opcodes_dxil_builtins.cpp
++++ b/opcodes/opcodes_dxil_builtins.cpp
+@@ -1260,8 +1260,25 @@ bool analyze_dxil_instruction_primary_pass(Converter::Impl &impl, const llvm::Ca
+ 			else if (use.resource_kind != DXIL::ResourceKind::RawBuffer &&
+ 			         use.resource_kind != DXIL::ResourceKind::CBuffer)
+ 				use.component_type = DXIL::ComponentType(params & 0xff);
++
++			// MetalSharp: typed resource properties carry the component count in bits 8-15.
++			if (use.resource_kind == DXIL::ResourceKind::TypedBuffer && use.resource_type == DXIL::ResourceType::SRV)
++				impl.note_typed_srv_components(use.component_type, (params >> 8) & 0xff);
+ 		}
+-		else if (meta.resource_op == DXIL::Op::CreateHandleFromBinding ||
++		else if (meta.resource_op == DXIL::Op::CreateHandleFromBinding && meta.resource_type == DXIL::ResourceType::SRV)
++		{
++			// MetalSharp: the same properties on bound SM 6.6 resources.
++			auto *constant = llvm::dyn_cast<llvm::ConstantAggregate>(instruction->getOperand(2));
++			if (constant && constant->getNumOperands() == 2 &&
++			    DXIL::ResourceKind(constant->getOperand(0)->getUniqueInteger().getZExtValue() & 0xff) ==
++			    DXIL::ResourceKind::TypedBuffer)
++			{
++				uint32_t params = constant->getOperand(1)->getUniqueInteger().getZExtValue();
++				impl.note_typed_srv_components(DXIL::ComponentType(params & 0xff), (params >> 8) & 0xff);
++			}
++		}
++
++		if (meta.resource_op == DXIL::Op::CreateHandleFromBinding ||
+ 		         meta.resource_op == DXIL::Op::CreateHandleForLib)
+ 		{
+ 			if (meta.resource_type == DXIL::ResourceType::UAV)
+-- 
+2.54.0 (Apple Git-157)
+

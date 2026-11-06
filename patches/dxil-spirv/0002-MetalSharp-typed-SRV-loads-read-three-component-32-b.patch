@@ -1,0 +1,173 @@
+From a0ef8c4276223f3d94dae133dab3118c15100b80 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 2 Nov 2026 23:58:43 -0700
+Subject: [PATCH 2/4] MetalSharp: typed SRV loads read three-component 32-bit
+ views as three single-component texels where the offset buffer says so (bit
+ 31 of the size)
+
+---
+ opcodes/dxil/dxil_buffer.cpp | 104 ++++++++++++++++++++++++++++++++---
+ opcodes/dxil/dxil_buffer.hpp |   4 ++
+ 2 files changed, 100 insertions(+), 8 deletions(-)
+
+diff --git a/opcodes/dxil/dxil_buffer.cpp b/opcodes/dxil/dxil_buffer.cpp
+index db9d8ac6..dd4f4cbe 100644
+--- a/opcodes/dxil/dxil_buffer.cpp
++++ b/opcodes/dxil/dxil_buffer.cpp
+@@ -515,6 +515,7 @@ static BufferAccessInfo build_buffer_access(Converter::Impl &impl, const llvm::C
+ 	const auto &meta = impl.handle_to_resource_meta[image_id];
+ 
+ 	spv::Id index_id = 0;
++	spv::Id rgb32_flag_id = 0;
+ 	unsigned raw_vecsize = 1;
+ 	unsigned addr_shift_log2 = raw_buffer_data_type_to_addr_shift_log2(impl, data_type);
+ 
+@@ -587,12 +588,45 @@ static BufferAccessInfo build_buffer_access(Converter::Impl &impl, const llvm::C
+ 		extract_len->add_literal(1);
+ 		impl.add(extract_len);
+ 
++		spv::Id len_id = extract_len->id;
++		spv::Id last_index_id = index_id;
++		if (meta.kind == DXIL::ResourceKind::TypedBuffer && meta.storage == spv::StorageClassUniformConstant)
++		{
++			// MetalSharp: a three-component 32-bit view emulated with the single-component format (BufferAccessInfo).
++			spv::Id uint_type = builder.makeUintType(32);
++			Operation *flag_bits = impl.allocate(spv::OpBitwiseAnd, uint_type);
++			flag_bits->add_ids({ len_id, builder.makeUintConstant(0x80000000u) });
++			impl.add(flag_bits);
++			Operation *flag = impl.allocate(spv::OpINotEqual, builder.makeBoolType());
++			flag->add_ids({ flag_bits->id, builder.makeUintConstant(0) });
++			impl.add(flag);
++			Operation *masked_len = impl.allocate(spv::OpBitwiseAnd, uint_type);
++			masked_len->add_ids({ len_id, builder.makeUintConstant(0x7fffffffu) });
++			impl.add(masked_len);
++			Operation *tripled = impl.allocate(spv::OpIMul, uint_type);
++			tripled->add_ids({ index_id, builder.makeUintConstant(3) });
++			impl.add(tripled);
++			Operation *last = impl.allocate(spv::OpIAdd, uint_type);
++			last->add_ids({ tripled->id, builder.makeUintConstant(2) });
++			impl.add(last);
++			Operation *scaled = impl.allocate(spv::OpSelect, uint_type);
++			scaled->add_ids({ flag->id, tripled->id, index_id });
++			impl.add(scaled);
++			Operation *last_sel = impl.allocate(spv::OpSelect, uint_type);
++			last_sel->add_ids({ flag->id, last->id, index_id });
++			impl.add(last_sel);
++			index_id = scaled->id;
++			last_index_id = last_sel->id;
++			len_id = masked_len->id;
++			rgb32_flag_id = flag->id;
++		}
++
+ 		Operation *add_op = impl.allocate(spv::OpIAdd, builder.makeUintType(32));
+ 		add_op->add_ids({ index_id, extract_offset->id });
+ 		impl.add(add_op);
+ 
+ 		Operation *compare_op = impl.allocate(spv::OpULessThan, builder.makeBoolType());
+-		compare_op->add_ids({ index_id, extract_len->id });
++		compare_op->add_ids({ last_index_id, len_id });
+ 		impl.add(compare_op);
+ 
+ 		// If we have an offset ID, it also means we cannot rely on accurate robustness.
+@@ -628,7 +662,7 @@ static BufferAccessInfo build_buffer_access(Converter::Impl &impl, const llvm::C
+ 		index_id = select_op->id;
+ 	}
+ 
+-	return { index_id, raw_vecsize };
++	return { index_id, raw_vecsize, rgb32_flag_id };
+ }
+ 
+ static spv::Id build_physical_pointer_address_for_raw_load_store(Converter::Impl &impl, const llvm::CallInst *instruction)
+@@ -1289,14 +1323,68 @@ bool emit_buffer_load_instruction(Converter::Impl &impl, const llvm::CallInst *i
+ 		else
+ 			opcode = sparse ? spv::OpImageSparseFetch : spv::OpImageFetch;
+ 
+-		Operation *op = impl.allocate(opcode, instruction, sample_type);
++		Operation *op;
++		if (access.rgb32_flag_id && !is_uav && !sparse)
++		{
++			// MetalSharp: a three-component view read as the single-component format, a texel per component (the
++			// second and third only where the load uses them), with the fourth component 1, as D3D reads one. The
++			// later texels' indices advance only for such a view in bounds (an out-of-bounds index is all ones).
++			spv::Id scalar_type = impl.get_type_id(effective_component_type, 1, 1);
++			unsigned texel_count = (access_mask & 0x6) ? 3 : 1;
++			Operation *in_bounds = impl.allocate(spv::OpINotEqual, builder.makeBoolType());
++			in_bounds->add_ids({ access.index_id, builder.makeUintConstant(0xffffffffu) });
++			impl.add(in_bounds);
++			Operation *advance = impl.allocate(spv::OpLogicalAnd, builder.makeBoolType());
++			advance->add_ids({ access.rgb32_flag_id, in_bounds->id });
++			impl.add(advance);
++			spv::Id fetched[3] = {}, components[4] = {};
++			for (unsigned t = 0; t < texel_count; t++)
++			{
++				spv::Id index_id = access.index_id;
++				if (t)
++				{
++					Operation *sel = impl.allocate(spv::OpSelect, builder.makeUintType(32));
++					sel->add_ids({ advance->id, impl.build_offset(access.index_id, t), access.index_id });
++					impl.add(sel);
++					index_id = sel->id;
++				}
++				Operation *fetch = impl.allocate(spv::OpImageFetch, texel_type);
++				fetch->add_ids({ image_id, index_id });
++				impl.add(fetch);
++				fetched[t] = fetch->id;
++				Operation *extract = impl.allocate(spv::OpCompositeExtract, scalar_type);
++				extract->add_id(fetch->id);
++				extract->add_literal(0);
++				impl.add(extract);
++				components[t] = extract->id;
++			}
++			for (unsigned t = texel_count; t < 3; t++)
++				components[t] = components[0];
++			components[3] = effective_component_type == DXIL::ComponentType::F32 ? builder.makeFloatConstant(1.0f) :
++			                effective_component_type == DXIL::ComponentType::I32 ? builder.makeIntConstant(1) :
++			                builder.makeUintConstant(1);
++			Operation *rgb = impl.allocate(spv::OpCompositeConstruct, texel_type);
++			rgb->add_ids({ components[0], components[1], components[2], components[3] });
++			impl.add(rgb);
++			spv::Id bvec4 = builder.makeVectorType(builder.makeBoolType(), 4);
++			Operation *flags = impl.allocate(spv::OpCompositeConstruct, bvec4);
++			flags->add_ids({ access.rgb32_flag_id, access.rgb32_flag_id, access.rgb32_flag_id, access.rgb32_flag_id });
++			impl.add(flags);
++			op = impl.allocate(spv::OpSelect, instruction, texel_type);
++			op->add_ids({ flags->id, rgb->id, fetched[0] });
++			impl.add(op);
++		}
++		else
++		{
++			op = impl.allocate(opcode, instruction, sample_type);
+ 
+-		if (!sparse)
+-			impl.decorate_relaxed_precision(get_composite_element_type(instruction->getType()), op->id, true);
++			if (!sparse)
++				impl.decorate_relaxed_precision(get_composite_element_type(instruction->getType()), op->id, true);
+ 
+-		op->add_ids({ image_id, access.index_id });
+-		add_vkmm_access_qualifiers(impl, op, meta.vkmm);
+-		impl.add(op, meta.rov);
++			op->add_ids({ image_id, access.index_id });
++			add_vkmm_access_qualifiers(impl, op, meta.vkmm);
++			impl.add(op, meta.rov);
++		}
+ 
+ 		if (sparse)
+ 			impl.repack_sparse_feedback(meta.component_type, 4, instruction, element_type);
+diff --git a/opcodes/dxil/dxil_buffer.hpp b/opcodes/dxil/dxil_buffer.hpp
+index 36cd3800..2ea7547d 100644
+--- a/opcodes/dxil/dxil_buffer.hpp
++++ b/opcodes/dxil/dxil_buffer.hpp
+@@ -32,6 +32,10 @@ struct BufferAccessInfo
+ {
+ 	spv::Id index_id;
+ 	unsigned raw_vec_size;
++	// MetalSharp: a typed SRV whose view is a three-component 32-bit format the device has no texel buffer format
++	// for: the offset buffer's size has bit 31 set, the view is the single-component format over three times the
++	// elements, and index_id is the first component's. Null where the load can't be one.
++	spv::Id rgb32_flag_id = 0;
+ };
+ 
+ bool emit_buffer_load_instruction(Converter::Impl &impl, const llvm::CallInst *instruction, bool is_vector);
+-- 
+2.54.0 (Apple Git-157)
+
