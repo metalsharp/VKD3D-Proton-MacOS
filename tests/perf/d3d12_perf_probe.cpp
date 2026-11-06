@@ -938,6 +938,18 @@ static std::vector<Scene> base_scenes()
                 small_quad(p.list, i, f * 0.01f);
             }
         } },
+        { "uav_barriers", "300 global UAV barriers (no resource named) between draws that use no UAVs", [] {
+            flat = create_pso({});
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 300; i++)
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                p.list->ResourceBarrier(1, &b);
+                small_quad(p.list, i, f * 0.01f);
+            }
+        } },
         // the same between dispatches, as Starfield's compute passes have them
         { "alias_dispatches", "300 aliasing barriers (no resources named) between small dispatches, with a reserved buffer alive", [] {
             compute = create_compute_pso();

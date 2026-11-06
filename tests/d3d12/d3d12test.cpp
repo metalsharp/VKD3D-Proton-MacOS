@@ -4413,6 +4413,91 @@ float4 vs(uint id : SV_VertexID) : SV_Position { o.Store(id * 4, id * 3 + 1); re
     return true;
 }
 
+// A global UAV barrier (no resource named) in a render pass while the bound pipeline uses no UAVs (VKD3D-Proton defers
+// it on MoltenVK, keeping the pass open): draw 1's pixel shader writes 7 to a UAV, draw 2 uses a pipeline without
+// UAVs, then the barrier, then draw 3's pixel shader reads the value and writes it times 3. The barrier must still
+// order draw 1's write before draw 3's read.
+static bool test_uav_global_barrier_deferred()
+{
+    static const char *src = R"(
+RWByteAddressBuffer o : register(u0);
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
+float4 ps_write(float4 p : SV_Position) : SV_Target { if (p.x < 1 && p.y < 1) o.Store(0, 7); return 0; }
+float4 ps_plain(float4 p : SV_Position) : SV_Target { return 1; }
+float4 ps_read(float4 p : SV_Position) : SV_Target { if (p.x < 1 && p.y < 1) o.Store(4, o.Load(0) * 3); return 0; }
+)";
+    std::vector<char> vsb = compile_dxc(src, "vs", "vs_6_0"), pw = compile_dxc(src, "ps_write", "ps_6_0"),
+                      pp = compile_dxc(src, "ps_plain", "ps_6_0"), pr = compile_dxc(src, "ps_read", "ps_6_0");
+    if (vsb.empty() || pw.empty() || pp.empty() || pr.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *pso[3] = {};
+    const std::vector<char> *pss[3] = { &pw, &pp, &pr };
+    for (int k = 0; k < 3; k++)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { vsb.data(), vsb.size() };
+        pd.PS = { pss[k]->data(), pss[k]->size() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso[k])));
+    }
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    D3D12_VIEWPORT vp = { 0, 0, 4, 4, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 4, 4 };
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetGraphicsRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (int k = 0; k < 3; k++)
+    {
+        if (k == 2)
+        {
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            g.list->ResourceBarrier(1, &b);
+        }
+        g.list->SetPipelineState(pso[k]);
+        g.list->DrawInstanced(3, 1, 0, 0);
+    }
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 8, &rb);
+    if (!v)
+        return false;
+    EXPECT(v[0] == 7 && v[1] == 21, "draw 1 wrote %u (want 7), draw 3 read and wrote %u (want 21)", v[0], v[1]);
+    rb->Release(); rtv_heap->Release(); rt->Release(); out->Release();
+    for (auto *p : pso) p->Release();
+    rs->Release();
+    return true;
+}
+
 // Native 16-bit shader operations (SM 6.2, -enable-16bit-types): half and 16-bit integer arithmetic, 16-bit loads
 // and stores of raw and structured buffers, and FP16 denormals (which D3D12 requires to be preserved).
 static const char *cs_16bit_src = R"(
@@ -8498,6 +8583,7 @@ static const Test tests[] = {
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
+    { "uav_global_barrier_deferred", test_uav_global_barrier_deferred },
     { "depth_bounds", test_depth_bounds },
     { "viewinstancing", test_viewinstancing },
     { "d3d11on12", test_d3d11on12 },
