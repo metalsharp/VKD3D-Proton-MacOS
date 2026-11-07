@@ -2,7 +2,7 @@
 
 ## D3D12 ladder
 
-`scripts/flprobe.c` against VKD3D-Proton and this MoltenVK on an Apple M4 (macOS 27.2):
+`scripts/flprobe.c` against VKD3D-Proton and this MoltenVK on an Apple M6 (macOS 27.2):
 
 | Minimum level | Result |
 |---|---|

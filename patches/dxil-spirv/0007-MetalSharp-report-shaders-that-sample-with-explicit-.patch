@@ -1,0 +1,127 @@
+From 624188ccf6a253fec1ef14387c5928a74166868a Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 09:21:58 -0700
+Subject: [PATCH 07/10] MetalSharp: report shaders that sample with explicit
+ gradients
+
+dxil_spv_converter_samples_with_gradients: the shader uses SampleGrad or
+SampleCmpGrad. Metal Shader Converter adds a sampler's LOD bias (where Metal
+samplers have none) to every other sample, so VKD3D-Proton keeps such shaders
+on SPIR-V where a biased sampler can reach them.
+---
+ dxil_converter.cpp             | 5 +++++
+ dxil_converter.hpp             | 1 +
+ dxil_spirv_c.cpp               | 9 +++++++++
+ dxil_spirv_c.h                 | 6 ++++++
+ opcodes/converter_impl.hpp     | 3 +++
+ opcodes/dxil/dxil_sampling.cpp | 1 +
+ 6 files changed, 25 insertions(+)
+
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 0ed57544..dbb42209 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -147,6 +147,11 @@ bool Converter::declares_32bit_typed_srv() const
+ 	return impl->declares_32bit_typed_srv;
+ }
+ 
++bool Converter::samples_with_gradients() const
++{
++	return impl->samples_with_gradients;
++}
++
+ void Converter::Impl::note_typed_srv_components(DXIL::ComponentType type, unsigned count)
+ {
+ 	switch (type)
+diff --git a/dxil_converter.hpp b/dxil_converter.hpp
+index 8d17985c..d48978dc 100644
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -1115,6 +1115,7 @@ public:
+ 	bool is_multiview_compatible() const;
+ 	bool declares_three_component_typed_srv() const;
+ 	bool declares_32bit_typed_srv() const;
++	bool samples_with_gradients() const;
+ 
+ 	bool shader_requires_feature(ShaderFeature feature) const;
+ 
+diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
+index ab5347ad..16371bce 100644
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -415,6 +415,7 @@ struct dxil_spv_converter_s
+ 	bool is_multiview_compatible = false;
+ 	bool declares_three_component_typed_srv = false;
+ 	bool declares_32bit_typed_srv = false;
++	bool samples_with_gradients = false;
+ 	uint32_t workgroup_size[3] = {};
+ 	uint32_t patch_vertex_count = 0;
+     uint32_t patch_location_offset = UINT32_MAX;
+@@ -844,6 +845,7 @@ dxil_spv_result dxil_spv_converter_run(dxil_spv_converter converter)
+ 	converter->is_multiview_compatible = dxil_converter.is_multiview_compatible();
+ 	converter->declares_three_component_typed_srv = dxil_converter.declares_three_component_typed_srv();
+ 	converter->declares_32bit_typed_srv = dxil_converter.declares_32bit_typed_srv();
++	converter->samples_with_gradients = dxil_converter.samples_with_gradients();
+ 	dxil_converter.get_workgroup_dimensions(converter->workgroup_size[0],
+ 	                                        converter->workgroup_size[1],
+ 	                                        converter->workgroup_size[2]);
+@@ -1758,6 +1760,13 @@ dxil_spv_result dxil_spv_converter_declares_32bit_typed_srv(
+ 	return DXIL_SPV_SUCCESS;
+ }
+ 
++dxil_spv_result dxil_spv_converter_samples_with_gradients(
++		dxil_spv_converter converter, dxil_spv_bool *result)
++{
++	*result = converter->samples_with_gradients ? DXIL_SPV_TRUE : DXIL_SPV_FALSE;
++	return DXIL_SPV_SUCCESS;
++}
++
+ dxil_spv_result dxil_spv_converter_set_meta_descriptor(
+ 		dxil_spv_converter converter, dxil_spv_meta_descriptor meta,
+ 		dxil_spv_meta_descriptor_kind kind, unsigned desc_set, unsigned binding_or_push_index)
+diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
+index 9b33ca9e..15174011 100644
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -1163,6 +1163,12 @@ DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_declares_three_component_
+ DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_declares_32bit_typed_srv(
+ 	dxil_spv_converter converter, dxil_spv_bool *result);
+ 
++/* MetalSharp: whether the converted shader samples with explicit gradients (SampleGrad, SampleCmpGrad), to which
++ * Metal Shader Converter doesn't add a sampler's LOD bias where Metal samplers have none. Valid after
++ * dxil_spv_converter_run. */
++DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_samples_with_gradients(
++	dxil_spv_converter converter, dxil_spv_bool *result);
++
+ /* Intended to be added to the GLSL output in repro suite.
+  * Attempts to analyze the DXIL for potential out of spec behavior that needs another pair of eyes.
+  * Lifetime of string is only as long as converter is alive.
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index da395c47..61926c4e 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -487,6 +487,9 @@ struct Converter::Impl
+ 	// MetalSharp: a typed buffer SRV declared with three 32-bit components (Buffer<float3> and the like), which
+ 	// Metal has no texel format for: VKD3D-Proton keeps such shaders off Metal Shader Converter.
+ 	bool declares_three_component_typed_srv = false;
++	// MetalSharp: the shader samples with explicit gradients (SampleGrad, SampleCmpGrad), which Metal Shader
++	// Converter doesn't add a sampler's emulated LOD bias to.
++	bool samples_with_gradients = false;
+ 	bool declares_32bit_typed_srv = false;
+ 	void note_typed_srv_components(DXIL::ComponentType type, unsigned count);
+ 	UnorderedSet<const llvm::Value *> llvm_annotate_handle_lib_uses;
+diff --git a/opcodes/dxil/dxil_sampling.cpp b/opcodes/dxil/dxil_sampling.cpp
+index 98505cba..bf8fd237 100644
+--- a/opcodes/dxil/dxil_sampling.cpp
++++ b/opcodes/dxil/dxil_sampling.cpp
+@@ -694,6 +694,7 @@ static spv::Id sample_grad_is_lod_bias(Converter::Impl &impl, const llvm::CallIn
+ bool emit_sample_grad_instruction(DXIL::Op opcode, Converter::Impl &impl, const llvm::CallInst *instruction)
+ {
+ 	bool comparison_sampling = opcode == DXIL::Op::SampleCmpGrad;
++	impl.samples_with_gradients = true;
+ 
+ 	// Elide dead loads.
+ 	if (!comparison_sampling && !impl.composite_is_accessed(instruction))
+-- 
+2.54.0 (Apple Git-157)
+

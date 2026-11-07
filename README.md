@@ -30,7 +30,7 @@ ___
 
 ## Capabilities
 
-Measured on an Apple M4 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
+Measured on an Apple M6 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
 
 - Shader Model **6.8**
 - D3D12 feature levels **12_1, 12_0, 11_1, 11_0** by default, and **12_2** with
@@ -80,6 +80,15 @@ MoltenVK compiles each Metal pipeline on the thread that creates it. `MVK_CONFIG
 pipelines on background threads instead, and `MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment
 shader alongside its vertex shader. Both are off by default: their compiles wait on Metal from GCD worker threads,
 and a game creating pipelines from many threads can take every worker, which leaves Metal none to finish them on.
+
+Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
+(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
+tessellation shaders, stream output, logic operations, conservative rasterization, the depth bounds test, view
+instancing, ray queries, 64-bit atomics, barycentrics, residency feedback, min/max sampler filtering or a
+three-component 32-bit typed buffer stay on SPIR-V. `METALSHARP_MSC=0` keeps every pipeline on SPIR-V,
+`METALSHARP_MSC=compute` keeps graphics ones there, and `METALSHARP_MSC_DXBC=0` keeps DXBC (SM 4.x and 5.x)
+shaders there. `METALSHARP_METAL_VERSION=3` has MoltenVK run as it does on macOS 14 and 15 (no MSL 4.0, Metal 4
+family features, sampler reduction or sparse resources), to test the Metal 3 paths on a newer system.
 
 ## Build from source
 
@@ -143,7 +152,8 @@ This repository's own code, scripts and documentation are licensed under the
 [GNU Affero General Public License v3.0](LICENSE).
 
 The projects it builds keep their own licenses, and so do this repository's changes to them in `patches/`:
-VKD3D-Proton is LGPL-2.1, DXVK is zlib, and MoltenVK and SPIRV-Cross are Apache-2.0. Each release package carries
+VKD3D-Proton is LGPL-2.1, DXVK is zlib, MoltenVK and SPIRV-Cross are Apache-2.0, and DirectXShaderCompiler (whose
+DXBC to DXIL converter the MoltenVK package carries) is the University of Illinois/NCSA license. Each release package carries
 the licenses of what it contains. [Third-party licenses](#third-party-licenses) lists them, with the terms Apple's
 Metal Shader Converter library ships under.
 
@@ -156,6 +166,7 @@ Metal Shader Converter library ships under.
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |
 | Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license, see below | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |
+| [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)'s dxilconv | `libdxbcconverter.dylib` (DXBC to DXIL, for Metal Shader Converter) | University of Illinois/NCSA | `LICENSE.dxc.txt` |
 | Metal Shader Converter headers | built into `libMoltenVK.dylib` | Apache-2.0 | `sources/MoltenVK/MoltenVK/MoltenVK/MetalShaderConverter/metal_irconverter/LICENSE.txt` in MoltenVK's source |
 
 ### Apple Metal Shader Converter

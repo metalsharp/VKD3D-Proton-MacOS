@@ -1,0 +1,232 @@
+From b9b2c6689d2e073f674d8436d900c561689f8505 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 09:01:15 -0700
+Subject: [PATCH 06/10] MetalSharp: vertex inputs fetched as one packed
+ R10G10B10A2_UINT word
+
+Metal has no unnormalized 10:10:10:2 vertex format. The vertex input remapper can
+now report that an attribute is bound as a single 32-bit uint holding
+R10G10B10A2_UINT (dxil_spv_vulkan_vertex_input::packed_format); the input is then
+declared as a scalar uint and LoadInput unpacks the component:
+(word >> 10 * col) & (col == 3 ? 0x3 : 0x3ff), cast to the declared type.
+---
+ dxil_converter.cpp              | 32 +++++++++++----
+ dxil_converter.hpp              |  2 +
+ dxil_spirv_c.cpp                |  2 +
+ dxil_spirv_c.h                  | 12 ++++++
+ opcodes/converter_impl.hpp      |  2 +
+ opcodes/dxil/dxil_resources.cpp | 71 +++++++++++++++++++++++++++++++++
+ 6 files changed, 114 insertions(+), 7 deletions(-)
+
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 89a4f995..0ed57544 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -5801,6 +5801,30 @@ bool Converter::Impl::emit_stage_input_variables()
+ 			variable_name += dxil_spv::to_string(semantic_index);
+ 		}
+ 
++		// Vertex inputs are remapped up front, since the remap may change the declared type
++		// (formats fetched as one packed word and unpacked in the shader).
++		VulkanStageIO vk_vertex_input = { start_row, start_col };
++		bool vertex_input_remapped = false;
++		if (system_value == DXIL::Semantic::User && execution_model == spv::ExecutionModelVertex &&
++		    resource_mapping_iface)
++		{
++			D3DStageIO d3d_input = { semantic_name.c_str(), semantic_index, start_row, rows };
++			if (!resource_mapping_iface->remap_vertex_input(d3d_input, vk_vertex_input))
++				return false;
++			vertex_input_remapped = true;
++
++			if (vk_vertex_input.flags & STAGE_IO_PACKED_RGB10A2_UINT)
++			{
++				if (rows != 1)
++				{
++					LOGE("Packed R10G10B10A2_UINT vertex input must be a single row.\n");
++					return false;
++				}
++				type_id = builder.makeUintType(32);
++				input_packed_rgb10a2_uint.insert(element_id);
++			}
++		}
++
+ 		spv::Id variable_id = create_variable(masked_input ? spv::StorageClassPrivate : spv::StorageClassInput, type_id,
+ 		                                      variable_name.c_str());
+ 		input_elements_meta[element_id] = { variable_id, actual_element_type, system_value != DXIL::Semantic::User ? start_row : 0, system_value };
+@@ -5834,18 +5858,12 @@ bool Converter::Impl::emit_stage_input_variables()
+ 			if (execution_model == spv::ExecutionModelFragment)
+ 				emit_interpolation_decorations(variable_id, interpolation);
+ 
+-			VulkanStageIO vk_input = { start_row, start_col };
++			VulkanStageIO vk_input = vertex_input_remapped ? vk_vertex_input : VulkanStageIO{ start_row, start_col };
+ 
+ 			if (resource_mapping_iface)
+ 			{
+ 				D3DStageIO d3d_input = { semantic_name.c_str(), semantic_index, start_row, rows };
+ 
+-				if (execution_model == spv::ExecutionModelVertex)
+-				{
+-					if (!resource_mapping_iface->remap_vertex_input(d3d_input, vk_input))
+-						return false;
+-				}
+-
+ 				if (!resource_mapping_iface->remap_stage_input(d3d_input, vk_input))
+ 					return false;
+ 			}
+diff --git a/dxil_converter.hpp b/dxil_converter.hpp
+index 1f8a8b1d..8d17985c 100644
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -178,6 +178,8 @@ enum VulkanStageIoFlagBits
+ {
+ 	STAGE_IO_NONE = 0u,
+ 	STAGE_IO_PER_PRIMITIVE = 0x1u,
++	// Vertex input only: the attribute is one 32-bit uint holding R10G10B10A2_UINT.
++	STAGE_IO_PACKED_RGB10A2_UINT = 0x2u,
+ };
+ 
+ using VulkanStageIoFlags = unsigned;
+diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
+index bc7a178e..ab5347ad 100644
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -225,6 +225,8 @@ struct Remapper : ResourceRemappingInterface
+ 			{
+ 				vk_input.location = c_vk_input.location;
+ 				vk_input.component = 0;
++				if (c_vk_input.packed_format == DXIL_SPV_VERTEX_INPUT_PACKED_RGB10A2_UINT)
++					vk_input.flags |= STAGE_IO_PACKED_RGB10A2_UINT;
+ 				return true;
+ 			}
+ 			else
+diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
+index 27a64c78..9b33ca9e 100644
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -103,9 +103,21 @@ typedef struct dxil_spv_d3d_vertex_input
+ 	unsigned rows;
+ } dxil_spv_d3d_vertex_input;
+ 
++/* Vertex attribute formats that Vulkan cannot fetch natively. The attribute is then bound as
++ * a single 32-bit integer and the shader unpacks it. */
++typedef enum dxil_spv_vertex_input_packed_format
++{
++	DXIL_SPV_VERTEX_INPUT_PACKED_NONE = 0,
++	/* D3D R10G10B10A2_UINT, bound as R32_UINT. */
++	DXIL_SPV_VERTEX_INPUT_PACKED_RGB10A2_UINT = 1,
++	DXIL_SPV_VERTEX_INPUT_PACKED_INT_MAX = 0x7fffffff
++} dxil_spv_vertex_input_packed_format;
++
+ typedef struct dxil_spv_vulkan_vertex_input
+ {
+ 	unsigned location;
++	/* dxil_spv_vertex_input_packed_format. Zero-initialized by the converter. */
++	unsigned packed_format;
+ } dxil_spv_vulkan_vertex_input;
+ typedef dxil_spv_bool (*dxil_spv_vertex_input_remapper_cb)(void *userdata, const dxil_spv_d3d_vertex_input *d3d_input,
+                                                            dxil_spv_vulkan_vertex_input *vulkan_input);
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 6be1e584..da395c47 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -326,6 +326,8 @@ struct Converter::Impl
+ 	UnorderedSet<const llvm::Value *> llvm_values_using_update_counter;
+ 	UnorderedMap<const llvm::Value *, spv::Id> llvm_value_actual_type;
+ 	UnorderedSet<uint32_t> llvm_attribute_at_vertex_indices;
++	// Vertex input elements declared as one packed R10G10B10A2_UINT word.
++	UnorderedSet<uint32_t> input_packed_rgb10a2_uint;
+ 
+ 	AGSState ags;
+ 	NVAPIState nvapi;
+diff --git a/opcodes/dxil/dxil_resources.cpp b/opcodes/dxil/dxil_resources.cpp
+index 018f4d0d..47b67977 100644
+--- a/opcodes/dxil/dxil_resources.cpp
++++ b/opcodes/dxil/dxil_resources.cpp
+@@ -163,6 +163,74 @@ static bool emit_amd_bary_coord_load(Converter::Impl &impl, const llvm::CallInst
+ 	return true;
+ }
+ 
++// The vertex attribute is one 32-bit word holding R10G10B10A2_UINT (Vulkan drivers on Metal cannot
++// fetch that format). Unpack the requested component: (word >> 10 * col) & (col == 3 ? 0x3 : 0x3ff).
++static bool emit_load_packed_rgb10a2_uint_input(Converter::Impl &impl, const llvm::CallInst *instruction,
++                                                const Converter::Impl::ElementMeta &meta)
++{
++	auto &builder = impl.builder();
++	spv::Id uint_type = builder.makeUintType(32);
++
++	auto *word = impl.allocate(spv::OpLoad, uint_type);
++	word->add_id(meta.id);
++	impl.add(word);
++
++	spv::Id shift_id, mask_id;
++	uint32_t col = 0;
++	if (get_constant_operand(instruction, 3, &col))
++	{
++		if (col > 3)
++		{
++			LOGE("Packed R10G10B10A2_UINT vertex input has only four components.\n");
++			return false;
++		}
++		shift_id = builder.makeUintConstant(10 * col);
++		mask_id = builder.makeUintConstant(col == 3 ? 0x3u : 0x3ffu);
++	}
++	else
++	{
++		spv::Id col_id = impl.get_id_for_value(instruction->getOperand(3), 32);
++
++		auto *shift = impl.allocate(spv::OpIMul, uint_type);
++		shift->add_id(col_id);
++		shift->add_id(builder.makeUintConstant(10));
++		impl.add(shift);
++		shift_id = shift->id;
++
++		auto *is_alpha = impl.allocate(spv::OpIEqual, builder.makeBoolType());
++		is_alpha->add_id(col_id);
++		is_alpha->add_id(builder.makeUintConstant(3));
++		impl.add(is_alpha);
++
++		auto *mask = impl.allocate(spv::OpSelect, uint_type);
++		mask->add_id(is_alpha->id);
++		mask->add_id(builder.makeUintConstant(0x3u));
++		mask->add_id(builder.makeUintConstant(0x3ffu));
++		impl.add(mask);
++		mask_id = mask->id;
++	}
++
++	auto *shifted = impl.allocate(spv::OpShiftRightLogical, uint_type);
++	shifted->add_id(word->id);
++	shifted->add_id(shift_id);
++	impl.add(shifted);
++
++	auto *masked = impl.allocate(spv::OpBitwiseAnd, uint_type);
++	masked->add_id(shifted->id);
++	masked->add_id(mask_id);
++	impl.add(masked);
++
++	// Produce the type a regular input load would, then let the usual fixup cast it.
++	DXIL::ComponentType load_type = impl.get_effective_input_output_type(meta.component_type);
++	spv::Id value_id = masked->id;
++	if (load_type != DXIL::ComponentType::U32)
++		value_id = impl.build_value_cast(value_id, DXIL::ComponentType::U32, load_type, 1);
++	impl.rewrite_value(instruction, value_id);
++
++	impl.fixup_load_type_io(meta.component_type, 1, instruction);
++	return true;
++}
++
+ bool emit_load_input_instruction(Converter::Impl &impl, const llvm::CallInst *instruction, bool spirv_semantics)
+ {
+ 	auto &builder = impl.builder();
+@@ -179,6 +247,9 @@ bool emit_load_input_instruction(Converter::Impl &impl, const llvm::CallInst *in
+ 	uint32_t var_id = meta.id;
+ 	uint32_t ptr_id;
+ 
++	if (impl.input_packed_rgb10a2_uint.count(input_element_index))
++		return emit_load_packed_rgb10a2_uint_input(impl, instruction, meta);
++
+ 	if (impl.options.quirks.ignore_primitive_shading_rate && meta.semantic == DXIL::Semantic::ShadingRate)
+ 	{
+ 		impl.rewrite_value(instruction, builder.makeUintConstant(0));
+-- 
+2.54.0 (Apple Git-157)
+

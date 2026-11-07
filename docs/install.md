@@ -42,8 +42,9 @@ The installer:
 - copies the DLLs into the prefix's `system32`, keeping the ones they replace in `<prefix>/vkd3d-proton-macos/backup`;
 - sets `native` DLL overrides for them;
 - installs MoltenVK into `<prefix>/vkd3d-proton-macos/moltenvk`, with Apple's Metal Shader Converter library beside
-  it. VKD3D-Proton hands eligible DXIL compute, vertex and pixel shaders to the converter instead of compiling
-  them through SPIR-V and Metal source, which cuts their compile time. `METALSHARP_MSC=0` turns this off.
+  it. VKD3D-Proton hands eligible DXIL shaders (compute; vertex, mesh, amplification and pixel) to the converter
+  instead of compiling them through SPIR-V and Metal source, which cuts their compile time. `METALSHARP_MSC=0` turns
+  this off.
 
 ## Run
 
@@ -66,7 +67,7 @@ MetalSharp Wine's `bin/wine` is a wrapper that clears Vulkan's variables. Pass t
 
 ## Tested
 
-On an Apple M4 (macOS 27.2), with the D3D12 performance probe (`tests/perf`):
+On an Apple M6 (macOS 27.2), with the D3D12 performance probe (`tests/perf`):
 
 - the x86_64 package, in a prefix of MetalSharp's x86_64 Wine 11.17 (under Rosetta 2): offscreen scenes and a
   swap chain (`present`);

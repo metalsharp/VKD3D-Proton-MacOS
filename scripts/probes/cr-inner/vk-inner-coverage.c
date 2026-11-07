@@ -9,6 +9,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Creates (or truncates) a file for writing, owner-only (0600) and not through a symlink. */
+static FILE* create_owner_file(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "w");
+}
+
 
 static const int W = 64, H = 64;
 
@@ -53,8 +62,8 @@ int main(int argc, char** argv) {
     // Shaders: the VS passes the position; the FS reads the FullyCoveredEXT
     static const char* vsSrc = "#version 450\nlayout(location=0) in vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
     static const char* fsSrc = "#version 450\n#extension GL_EXT_fragment_fully_covered : enable\nlayout(location=0) out vec4 color;\nvoid main(){ color = vec4(gl_FragCoord.xy / 64.0, gl_FragFullyCoveredEXT ? 1.0 : 0.0, 1.0); }\n";
-    FILE* f = fopen("/tmp/vk-ic-vs.vert","w"); fputs(vsSrc,f); fclose(f);
-    f = fopen("/tmp/vk-ic-fs.frag","w"); fputs(fsSrc,f); fclose(f);
+    FILE* f = create_owner_file("/tmp/vk-ic-vs.vert"); fputs(vsSrc,f); fclose(f);
+    f = create_owner_file("/tmp/vk-ic-fs.frag"); fputs(fsSrc,f); fclose(f);
     system("glslangValidator -V /tmp/vk-ic-vs.vert -o /tmp/vk-ic-vert.spv >/dev/null 2>&1");
     system("glslangValidator -V /tmp/vk-ic-fs.frag -o /tmp/vk-ic-frag.spv >/dev/null 2>&1");
     FILE* vf = fopen("/tmp/vk-ic-vert.spv","rb"); FILE* ff = fopen("/tmp/vk-ic-frag.spv","rb");

@@ -15,6 +15,7 @@
 // ("extra name=value"), then D3D12_PERF_PROBE_OK SCENE.
 // Shaders are DXBC (d3dcompiler_47), like PEAK's; the salt makes compiles cold.
 #include <windows.h>
+#include <psapi.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -33,7 +34,7 @@
 
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("error: %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); exit(3); } } while (0)
 
-static const UINT W = 1920, H = 1080, FRAMES_IN_FLIGHT = 3, HEAP_SIZE = 16384;
+static const UINT W = 1920, H = 1080, FRAMES_IN_FLIGHT = 3, HEAP_SIZE = 32768;
 static const DXGI_FORMAT BACKBUFFER_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 static const DXGI_FORMAT HDR_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -937,6 +938,18 @@ static std::vector<Scene> base_scenes()
                 small_quad(p.list, i, f * 0.01f);
             }
         } },
+        { "uav_barriers", "300 global UAV barriers (no resource named) between draws that use no UAVs", [] {
+            flat = create_pso({});
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 300; i++)
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                p.list->ResourceBarrier(1, &b);
+                small_quad(p.list, i, f * 0.01f);
+            }
+        } },
         // the same between dispatches, as Starfield's compute passes have them
         { "alias_dispatches", "300 aliasing barriers (no resources named) between small dispatches, with a reserved buffer alive", [] {
             compute = create_compute_pso();
@@ -1046,6 +1059,41 @@ static std::vector<Scene> base_scenes()
             extras.add("us_per_view", (t1 - t) * 1000.0 / 5000);
             extras.add("us_per_copy", (qpc_ms() - t1) * 1000.0 / 5000);
         } },
+        { "typed_view_churn", "5000 typed buffer SRVs per frame into the shader-visible heap, each at a first element not used before (ring-buffer views)", base, [](UINT f) {
+            UINT64 elements = p.upload_ring->GetDesc().Width / 4;
+            double t = qpc_ms();
+            for (UINT i = 0; i < 5000; i++)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = DXGI_FORMAT_R32_FLOAT;
+                sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Buffer.FirstElement = ((UINT64)f * 5000 + i) % (elements - 64);
+                sd.Buffer.NumElements = 64;
+                p.device->CreateShaderResourceView(p.upload_ring, &sd, srv_cpu(4000 + (i % 1000)));
+            }
+            extras.add("us_per_view", (qpc_ms() - t) * 1000.0 / 5000);
+            PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                extras.add("working_set_mb", pmc.WorkingSetSize / 1048576.0);
+        } },
+        { "typed_view_ring", "5000 typed buffer SRVs per frame from a ring of 2000 ranges that wraps every 0.4 frames (dynamic typed buffers)", base, [](UINT f) {
+            double t = qpc_ms();
+            for (UINT i = 0; i < 5000; i++)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = DXGI_FORMAT_R32_FLOAT;
+                sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Buffer.FirstElement = (((UINT64)f * 5000 + i) % 2000) * 64;
+                sd.Buffer.NumElements = 64;
+                p.device->CreateShaderResourceView(p.upload_ring, &sd, srv_cpu(4000 + (i % 1000)));
+            }
+            extras.add("us_per_view", (qpc_ms() - t) * 1000.0 / 5000);
+            PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                extras.add("working_set_mb", pmc.WorkingSetSize / 1048576.0);
+        } },
         { "fence_sync", "8 mid-frame submissions, each waited on by the CPU (readback-style stalls)", [] {
             flat = create_pso({});
             for (int i = 0; i < 2; i++)
@@ -1070,6 +1118,39 @@ static std::vector<Scene> base_scenes()
                 barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 double t = qpc_ms();
                 submit_and_wait(l);
+                wait += qpc_ms() - t;
+            }
+            extras.add("submit_wait_ms_each", wait / 8);
+        } },
+        { "fence_spin", "fence_sync's submissions, each waited on by polling GetCompletedValue (wait latency floor)", [] {
+            flat = create_pso({});
+            for (int i = 0; i < 2; i++)
+            {
+                CHECK(p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&extra_allocs[i])));
+                CHECK(p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, extra_allocs[i], nullptr, IID_PPV_ARGS(&extra_lists[i])));
+                CHECK(extra_lists[i]->Close());
+            }
+        }, [](UINT f) {
+            double wait = 0;
+            for (UINT k = 0; k < 8; k++)
+            {
+                ID3D12GraphicsCommandList *l = extra_lists[0];
+                CHECK(extra_allocs[0]->Reset());
+                CHECK(l->Reset(extra_allocs[0], nullptr));
+                auto h = rtv(FRAMES_IN_FLIGHT);
+                barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+                viewport(l);
+                set_quad_state(l, flat);
+                for (UINT i = 0; i < 200; i++) small_quad(l, i, f * 0.01f);
+                barrier(l, p.hdr_targets[0], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                double t = qpc_ms();
+                CHECK(l->Close());
+                ID3D12CommandList *lists[] = { l };
+                p.queue->ExecuteCommandLists(1, lists);
+                UINT64 v = signal_queue();
+                while (p.fence->GetCompletedValue() < v)
+                    YieldProcessor();
                 wait += qpc_ms() - t;
             }
             extras.add("submit_wait_ms_each", wait / 8);
@@ -2038,13 +2119,13 @@ static double first_use(ID3D12PipelineState *pso)
 
 static std::vector<Scene> sm6_scenes()
 {
-    static ID3D12PipelineState *fill6, *sample6, *mesh_pso, *rq_pso, *fb_pso, *fbbase_pso, *bindless6, *wave_pso, *atom_pso[3],
+    static ID3D12PipelineState *fill6, *sample6, *mesh_pso, *rq_pso, *fb_pso, *fbbase_pso, *bindless6, *wave_pso, *atom_pso[4],
         *math16, *math32;
     static ID3D12RootSignature *mesh_rs, *rt_rs, *fb_rs, *bindless6_rs;
     static std::vector<D3D12_SHADER_BYTECODE> cold_vs, cold_ps;
     static std::vector<std::vector<char>> cold_code;
     static RtGeometry rt;
-    static ID3D12Resource *rt_out, *table, *fb_tex, *fb_map, *wave_buf, *atom_buf;
+    static ID3D12Resource *rt_out, *table, *fb_tex, *fb_map, *wave_buf, *atom_buf, *atom_tex;
     static ID3D12StateObject *rt_so;
     static ID3D12DescriptorHeap *fb_heap;
     static std::string math_src16, math_src32;
@@ -2525,6 +2606,32 @@ float4 ps_math(V i) : SV_Target
         { "atomics64_spread", "spread", "1M 64-bit InterlockedAdds per frame over 64K addresses" },
         { "atomics32_contended", "contended32", "1M 32-bit InterlockedAdds onto 16 addresses (baseline for atomics64_contended)" },
     };
+    // Nanite's visibility buffer: 64-bit InterlockedMax onto a RWTexture2D<uint64_t> (R32G32_UINT), results unused.
+    v.push_back({ "atomics64_image_max", "1M 64-bit InterlockedMax per frame onto a 64x64 RWTexture2D<uint64_t> (Nanite visibility buffer)", [] {
+        static const char *src = R"(
+RWTexture2D<uint64_t> t : register(u0);
+[numthreads(64, 1, 1)] void cs(uint i : SV_DispatchThreadID)
+{
+    uint64_t v = ((uint64_t)(i * 2654435761u) << 24) ^ (uint64_t)i;
+    InterlockedMax(t[uint2(i & 63, (i >> 6) & 63)], v);
+}
+)";
+        D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER rp = {};
+        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp.DescriptorTable = { 1, &range };
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        rt_rs = serialize_root_signature(rsd);
+        atom_pso[3] = compute_pso_from(rt_rs, shader_code(src, "cs", "cs_6_6"));
+        atom_tex = create_texture(64, 64, DXGI_FORMAT_R32G32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        p.device->CreateUnorderedAccessView(atom_tex, nullptr, nullptr, srv_cpu(3990));
+    }, [](UINT) {
+        p.list->SetComputeRootSignature(rt_rs);
+        p.list->SetPipelineState(atom_pso[3]);
+        p.list->SetComputeRootDescriptorTable(0, srv_gpu(3990));
+        p.list->Dispatch((1 << 20) / 64, 1, 1);
+    }, false, 0, true });
     for (int k = 0; k < 3; k++)
     {
         const char *entry = atom_names[k][1];
@@ -2564,6 +2671,26 @@ V vs_point(uint id : SV_VertexID)
     for (uint k = 0; k < 4; k++) { V o = i[0]; o.pos.xy += float2(k & 1, k >> 1) * 0.008; o.uv = float2(k & 1, k >> 1); s.Append(o); }
 }
 [maxvertexcount(3)] void gs_pass(triangle V i[3], inout TriangleStream<V> s) { for (uint k = 0; k < 3; k++) s.Append(i[k]); }
+// A cube shadow map's caster pass: 20000 small triangles, each to the 6 faces of a depth cube (array slices).
+float4 vs_caster(uint id : SV_VertexID) : SV_Position
+{
+    uint t = id / 3, c = id % 3;
+    float2 p = float2(t % 200, t / 200 % 100) / float2(100, 50) - 1 + float2(c == 1, c == 2) * 0.012;
+    return float4(p, 0.25 + 0.5 * frac(t * 0.618), 1);
+}
+struct VL { float4 pos : SV_Position; uint layer : SV_RenderTargetArrayIndex; };
+[maxvertexcount(18)] void gs_cube(triangle float4 i[3] : SV_Position, inout TriangleStream<VL> s)
+{
+    for (uint f = 0; f < 6; f++)
+    {
+        for (uint k = 0; k < 3; k++) { VL o; o.pos = i[k]; o.pos.x = -o.pos.x * (f & 1 ? 1 : -1); o.layer = f; s.Append(o); }
+        s.RestartStrip();
+    }
+}
+[instance(6)] [maxvertexcount(3)] void gs_cube_inst(triangle float4 i[3] : SV_Position, uint f : SV_GSInstanceID, inout TriangleStream<VL> s)
+{
+    for (uint k = 0; k < 3; k++) { VL o; o.pos = i[k]; o.pos.x = -o.pos.x * (f & 1 ? 1 : -1); o.layer = f; s.Append(o); }
+}
 struct TV { float2 pos : POS; };
 TV vs_patch(uint id : SV_VertexID)
 {
@@ -2609,6 +2736,24 @@ RWStructuredBuffer<float4> sb_dst : register(u1);
 [numthreads(64, 1, 1)] void cs_typed(uint t : SV_DispatchThreadID) { typed_dst[t] = typed_src[t] * 2 + rc.x; }
 [numthreads(64, 1, 1)] void cs_struct(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t] * 2 + rc.x; }
 [numthreads(64, 1, 1)] void cs_robust(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t * rc.y] * 2 + typed_src[t * rc.y]; }
+// cs_struct within the SRV's bounds (it has half the elements): the cost of the loads without the robustness path.
+[numthreads(64, 1, 1)] void cs_struct_in(uint t : SV_DispatchThreadID) { sb_dst[t] = sb_src[t & ((1u << 19) - 1)] * 2 + rc.x; }
+// A particle update: position and velocity (two float4s) read, integrated with drag, gravity and a bounce, written back.
+[numthreads(64, 1, 1)] void cs_particles(uint t : SV_DispatchThreadID)
+{
+    uint i = t * 2;
+    if (i + 1 >= (1u << 20) / 2) return;
+    float4 pos = sb_src[i], vel = sb_src[i + 1];
+    float dt = 0.016 + rc.x * 1e-6;
+    float3 acc = float3(0, -9.8, 0) - vel.xyz * (0.1 + 0.01 * dot(vel.xyz, vel.xyz));
+    vel.xyz += acc * dt;
+    pos.xyz += vel.xyz * dt;
+    if (pos.y < 0) { pos.y = -pos.y; vel.y = -vel.y * 0.8; }
+    vel.w = sqrt(dot(vel.xyz, vel.xyz));
+    pos.w = saturate(pos.w - dt * 0.25) + sin(pos.x * 3.1) * cos(pos.z * 1.7) * 1e-3;
+    sb_dst[i] = pos;
+    sb_dst[i + 1] = vel;
+}
 )";
 
 // Graphics root signature like p.root_signature, with a given static sampler filter and flags.
@@ -2848,6 +2993,64 @@ static std::vector<Scene> feature_scenes()
             pso_a = create_pso(d);
         });
     };
+    // Cube shadow maps: a 512x512 D32 array of 6 slices, a DSV of all of them and one per slice.
+    static ID3D12Resource *cube_depth;
+    static ID3D12DescriptorHeap *cube_dsv_heap;
+    auto cube_init = [](const char *gs) {
+        return std::function<void()>([gs] {
+            PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_caster"; d.ps = nullptr; d.num_rt = 0; d.depth = true;
+            d.dsv = DXGI_FORMAT_D32_FLOAT; d.gs = gs;
+            pso_a = create_pso(d);
+            D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+            D3D12_RESOURCE_DESC td = {};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = 512; td.Height = 512; td.DepthOrArraySize = 6; td.MipLevels = 1;
+            td.Format = DXGI_FORMAT_D32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_D32_FLOAT };
+            cv.DepthStencil.Depth = 1.0f;
+            CHECK(p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&cube_depth)));
+            D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 7 };
+            CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cube_dsv_heap)));
+            UINT inc = p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            for (UINT k = 0; k < 7; k++)
+            {
+                D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
+                dd.Format = DXGI_FORMAT_D32_FLOAT;
+                dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                dd.Texture2DArray.FirstArraySlice = k == 6 ? 0 : k;
+                dd.Texture2DArray.ArraySize = k == 6 ? 6 : 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+                h.ptr += k * inc;
+                p.device->CreateDepthStencilView(cube_depth, &dd, h);
+            }
+        });
+    };
+    auto cube_frame = [](bool six_passes) {
+        UINT inc = p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE all = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        all.ptr += 6 * inc;
+        p.list->ClearDepthStencilView(all, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        D3D12_VIEWPORT vp = { 0, 0, 512, 512, 0, 1 };
+        D3D12_RECT sc = { 0, 0, 512, 512 };
+        p.list->RSSetViewports(1, &vp);
+        p.list->RSSetScissorRects(1, &sc);
+        set_quad_state(p.list, pso_a);
+        if (!six_passes)
+        {
+            p.list->OMSetRenderTargets(0, nullptr, FALSE, &all);
+            p.list->DrawInstanced(60000, 1, 0, 0);
+            return;
+        }
+        for (UINT f = 0; f < 6; f++)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = cube_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += f * inc;
+            p.list->OMSetRenderTargets(0, nullptr, FALSE, &h);
+            p.list->DrawInstanced(60000, 1, 0, 0);
+        }
+    };
     // Tessellation (hull and domain shaders run in compute and mesh stages on Metal).
     auto tess_init = [](const char *vs_target) {
         return std::function<void()>([vs_target] {
@@ -2893,9 +3096,9 @@ static std::vector<Scene> feature_scenes()
             p.device->CreateUnorderedAccessView(res_d, nullptr, &ud, srv_cpu(CS_TABLE + 3));
         });
     };
-    auto buffers_frame = [](const char *entry, UINT stride) {
-        return std::function<void(UINT)>([entry, stride](UINT f) {
-            if (!pso_a) pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, entry, "cs_5_0"));
+    auto buffers_frame = [](const char *entry, UINT stride, const char *target = "cs_5_0") {
+        return std::function<void(UINT)>([entry, stride, target](UINT f) {
+            if (!pso_a) pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, entry, target));
             p.list->SetComputeRootSignature(cs_rs);
             p.list->SetPipelineState(pso_a);
             uint32_t rc[4] = { f, stride, 0, 0 };
@@ -3021,6 +3224,11 @@ static std::vector<Scene> feature_scenes()
           [](UINT f) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST); p.list->DrawInstanced(20000, 1, 0, 0); }, false, 0, true },
         { "gs_passthrough", "a pass-through geometry shader on 5000 small triangles (compare draws)", gs_init("gs_pass", "vs_quad", "vs_5_0", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE),
           [quads](UINT f) { set_quad_state(p.list, pso_a); quads(5000, 0.01f, f); } },
+        { "gs_cube_shadow", "a cube shadow map: 20000 triangles to 6 depth slices by a geometry shader (SV_RenderTargetArrayIndex)", cube_init("gs_cube"),
+          [cube_frame](UINT) { cube_frame(false); } },
+        { "gs_cube_instanced", "the same with [instance(6)], one face per invocation", cube_init("gs_cube_inst"), [cube_frame](UINT) { cube_frame(false); } },
+        { "cube_shadow_6pass", "the same without a geometry shader: 6 draws, one per slice (baseline for gs_cube_*)", cube_init(nullptr),
+          [cube_frame](UINT) { cube_frame(true); } },
         { "tess_dxbc", "1000 triangle patches at tessellation factor 16 (256000 triangles), DXBC", tess_init("vs_5_0"),
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); } },
         { "tess_dxil", "the same compiled as DXIL", tess_init("vs_6_0"),
@@ -3131,9 +3339,21 @@ static std::vector<Scene> feature_scenes()
             PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_cull"; d.ps = "ps_cull"; pso_a = create_pso(d);
         }, [bind, quads](UINT f) { bind(nullptr, pso_a); quads(5000, 0.01f, f); } },
         { "typed_buffer", "1M typed loads (RGBA8 SRV) and stores (RGBA32F UAV) at unaligned element offsets in compute", buffers_init(false), buffers_frame("cs_typed", 1) },
-        { "structured_buffer", "1M structured loads and stores in compute (baseline for typed_buffer and robustness)", buffers_init(false), buffers_frame("cs_struct", 1) },
+        { "structured_buffer", "1M structured loads and stores in compute, half the loads out of the view's bounds", buffers_init(false), buffers_frame("cs_struct", 1) },
         { "robust_oob", "1M loads, half of them out of bounds, from structured and typed views (robust access)", buffers_init(false), buffers_frame("cs_robust", 2) },
+        // The DXIL is compiled at init, where the runner's prepare pass fills the DXIL cache.
+        { "structured_buffer_dxil", "structured_buffer compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_struct", "cs_6_0"));
+        }, buffers_frame("cs_struct", 1, "cs_6_0"), false, 0, true },
+        { "robust_oob_dxil", "robust_oob compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_robust", "cs_6_0"));
+        }, buffers_frame("cs_robust", 2, "cs_6_0"), false, 0, true },
         { "null_descriptors", "the same reading through a null typed descriptor", buffers_init(true), buffers_frame("cs_robust", 2) },
+        { "structured_inbounds", "structured_buffer with every load in bounds (structured_buffer reads half out of bounds)", buffers_init(false), buffers_frame("cs_struct_in", 1) },
+        { "particles", "1M structured float4 particle updates: two loads, about 30 ALU ops, two stores (a typical compute pass)", buffers_init(false), buffers_frame("cs_particles", 1) },
+        { "particles_dxil", "particles compiled as DXIL", [buffers_init] {
+            buffers_init(false)(); pso_a = compute_pso_from(cs_rs, shader_code(buffer_cs_hlsl, "cs_particles", "cs_6_0"));
+        }, buffers_frame("cs_particles", 1, "cs_6_0"), false, 0, true },
         { "tiled_update", "UpdateTileMappings of 256 tiles per frame on a 4096x4096 reserved texture (streaming)", tiled_init(false), [](UINT f) {
             if (!reserved) return;
             std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords(256);
@@ -3236,7 +3456,7 @@ static std::vector<Scene> engine_scenes()
     static ID3D12QueryHeap *occlusion;
     static std::vector<char> library_blob;
     static std::string eng_src;
-    enum { RTV_MRT = FRAMES_IN_FLIGHT + 10, SRV_MRT = 12000, SRV_CUBE3D = 12010, UAV_ENGINE = 12020, CBV_RING = 12100, CPU_UAV = 15200 };
+    enum { RTV_MRT = FRAMES_IN_FLIGHT + 10, SRV_MRT = 12000, SRV_CUBE3D = 12010, UAV_ENGINE = 12020, CBV_RING = 16384, CPU_UAV = 15200 };   // the ring: 3 frames x 3000
     eng_src = std::string(common_hlsl) + engine_hlsl_tail;
 
     auto quads = [](ID3D12GraphicsCommandList *l, UINT n, float scale, UINT frame) {
@@ -3502,6 +3722,44 @@ static std::vector<Scene> engine_scenes()
                 quads(p.list, 20, 0.01f, f);
             }
             p.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        } },
+        { "predication_one", "predication with one predicate for all 2000 draws (per-draw cost of predicated draws)", [] {
+            pso_a = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 100 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&occlusion)));
+            res_a = create_buffer(100 * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PREDICATION);
+        }, [quads](UINT f) {
+            set_quad_state(p.list, pso_a);
+            for (UINT i = 0; i < 100; i++)
+            {
+                p.list->BeginQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+                small_quad(p.list, i * 37, 0.5f);
+                p.list->EndQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+            }
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            p.list->ResolveQueryData(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 100, res_a, 0);
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+            p.list->SetPredication(res_a, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            quads(p.list, 2000, 0.01f, f);
+            p.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        } },
+        { "predication_off", "predication's queries and resolve, then its 2000 draws unpredicated (baseline for predication)", [] {
+            pso_a = create_pso({});
+            D3D12_QUERY_HEAP_DESC qh = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, 100 };
+            CHECK(p.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&occlusion)));
+            res_a = create_buffer(100 * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PREDICATION);
+        }, [quads](UINT f) {
+            set_quad_state(p.list, pso_a);
+            for (UINT i = 0; i < 100; i++)
+            {
+                p.list->BeginQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+                small_quad(p.list, i * 37, 0.5f);
+                p.list->EndQuery(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, i);
+            }
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            p.list->ResolveQueryData(occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 100, res_a, 0);
+            barrier(p.list, res_a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+            quads(p.list, 2000, 0.01f, f);
         } },
         { "cube_3d_array", "20 full-screen quads sampling a cube map, a 3D texture and a texture array (6 samples each)", [] {
             D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
@@ -4364,6 +4622,11 @@ int main(int argc, char **argv)
     printf("first %.3f ms\n", first);
     // Extras are per frame over the timed frames (accumulation during the serialized frames is dropped).
     for (auto &e : extras.values) printf("extra %s=%.4f\n", e.first.c_str(), e.second);
+    // The process's memory at the end of the run (what the scene, the runtime and the driver hold).
+    PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        printf("extra end_working_set_mb=%.1f\nextra peak_working_set_mb=%.1f\n", pmc.WorkingSetSize / 1048576.0,
+               pmc.PeakWorkingSetSize / 1048576.0);
     printf("D3D12_PERF_PROBE_OK %s\n", scene->name);
     return 0;
 }

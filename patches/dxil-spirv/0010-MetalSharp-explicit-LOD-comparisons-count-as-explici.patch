@@ -1,0 +1,29 @@
+From d70530972aecebb44f5cc404433a62edd96ea0a9 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 12:16:40 -0700
+Subject: [PATCH 10/10] MetalSharp: explicit LOD comparisons count as explicit
+ LOD samples
+
+SampleCmpLevelZero and SampleCmpLevel set samples_with_explicit_lod:
+Metal Shader Converter doesn't apply a view's minimum LOD to them.
+---
+ opcodes/dxil/dxil_sampling.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/opcodes/dxil/dxil_sampling.cpp b/opcodes/dxil/dxil_sampling.cpp
+index 5bc7cf26..8539b2ac 100644
+--- a/opcodes/dxil/dxil_sampling.cpp
++++ b/opcodes/dxil/dxil_sampling.cpp
+@@ -309,7 +309,8 @@ bool emit_sample_instruction(DXIL::Op opcode, Converter::Impl &impl, const llvm:
+ 	                           opcode == DXIL::Op::SampleCmpBias;
+ 
+ 	bool force_explicit_lod = impl.execution_mode_meta.synthesize_dummy_derivatives;
+-	if (opcode == DXIL::Op::SampleLevel)
++	// The converter doesn't apply a view's minimum LOD to an explicit LOD, comparisons included.
++	if (opcode == DXIL::Op::SampleLevel || opcode == DXIL::Op::SampleCmpLevelZero || opcode == DXIL::Op::SampleCmpLevel)
+ 		impl.samples_with_explicit_lod = true;
+ 
+ 	// Elide dead loads.
+-- 
+2.54.0 (Apple Git-157)
+

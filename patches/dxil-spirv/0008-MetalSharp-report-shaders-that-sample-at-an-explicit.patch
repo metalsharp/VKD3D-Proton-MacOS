@@ -1,0 +1,127 @@
+From 62f96e5de0d62650a51f1cf143f7bfa47adbce70 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 09:40:13 -0700
+Subject: [PATCH 08/10] MetalSharp: report shaders that sample at an explicit
+ LOD
+
+dxil_spv_converter_samples_with_explicit_lod: the shader uses SampleLevel. Metal
+Shader Converter clamps other samples to the image view's minimum LOD
+(ResourceMinLODClamp), but not those.
+---
+ dxil_converter.cpp             | 5 +++++
+ dxil_converter.hpp             | 1 +
+ dxil_spirv_c.cpp               | 9 +++++++++
+ dxil_spirv_c.h                 | 6 ++++++
+ opcodes/converter_impl.hpp     | 3 +++
+ opcodes/dxil/dxil_sampling.cpp | 2 ++
+ 6 files changed, 26 insertions(+)
+
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index dbb42209..938ee5b4 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -152,6 +152,11 @@ bool Converter::samples_with_gradients() const
+ 	return impl->samples_with_gradients;
+ }
+ 
++bool Converter::samples_with_explicit_lod() const
++{
++	return impl->samples_with_explicit_lod;
++}
++
+ void Converter::Impl::note_typed_srv_components(DXIL::ComponentType type, unsigned count)
+ {
+ 	switch (type)
+diff --git a/dxil_converter.hpp b/dxil_converter.hpp
+index d48978dc..dfceaebb 100644
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -1116,6 +1116,7 @@ public:
+ 	bool declares_three_component_typed_srv() const;
+ 	bool declares_32bit_typed_srv() const;
+ 	bool samples_with_gradients() const;
++	bool samples_with_explicit_lod() const;
+ 
+ 	bool shader_requires_feature(ShaderFeature feature) const;
+ 
+diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
+index 16371bce..3b0fd57a 100644
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -416,6 +416,7 @@ struct dxil_spv_converter_s
+ 	bool declares_three_component_typed_srv = false;
+ 	bool declares_32bit_typed_srv = false;
+ 	bool samples_with_gradients = false;
++	bool samples_with_explicit_lod = false;
+ 	uint32_t workgroup_size[3] = {};
+ 	uint32_t patch_vertex_count = 0;
+     uint32_t patch_location_offset = UINT32_MAX;
+@@ -846,6 +847,7 @@ dxil_spv_result dxil_spv_converter_run(dxil_spv_converter converter)
+ 	converter->declares_three_component_typed_srv = dxil_converter.declares_three_component_typed_srv();
+ 	converter->declares_32bit_typed_srv = dxil_converter.declares_32bit_typed_srv();
+ 	converter->samples_with_gradients = dxil_converter.samples_with_gradients();
++	converter->samples_with_explicit_lod = dxil_converter.samples_with_explicit_lod();
+ 	dxil_converter.get_workgroup_dimensions(converter->workgroup_size[0],
+ 	                                        converter->workgroup_size[1],
+ 	                                        converter->workgroup_size[2]);
+@@ -1767,6 +1769,13 @@ dxil_spv_result dxil_spv_converter_samples_with_gradients(
+ 	return DXIL_SPV_SUCCESS;
+ }
+ 
++dxil_spv_result dxil_spv_converter_samples_with_explicit_lod(
++		dxil_spv_converter converter, dxil_spv_bool *result)
++{
++	*result = converter->samples_with_explicit_lod ? DXIL_SPV_TRUE : DXIL_SPV_FALSE;
++	return DXIL_SPV_SUCCESS;
++}
++
+ dxil_spv_result dxil_spv_converter_set_meta_descriptor(
+ 		dxil_spv_converter converter, dxil_spv_meta_descriptor meta,
+ 		dxil_spv_meta_descriptor_kind kind, unsigned desc_set, unsigned binding_or_push_index)
+diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
+index 15174011..fa06c2c3 100644
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -1169,6 +1169,12 @@ DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_declares_32bit_typed_srv(
+ DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_samples_with_gradients(
+ 	dxil_spv_converter converter, dxil_spv_bool *result);
+ 
++/* MetalSharp: whether the converted shader samples at an explicit LOD (SampleLevel; not comparisons), which Metal
++ * Shader Converter doesn't clamp to the image view's minimum LOD (ResourceMinLODClamp). Valid after
++ * dxil_spv_converter_run. */
++DXIL_SPV_PUBLIC_API dxil_spv_result dxil_spv_converter_samples_with_explicit_lod(
++	dxil_spv_converter converter, dxil_spv_bool *result);
++
+ /* Intended to be added to the GLSL output in repro suite.
+  * Attempts to analyze the DXIL for potential out of spec behavior that needs another pair of eyes.
+  * Lifetime of string is only as long as converter is alive.
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 61926c4e..7044978c 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -490,6 +490,9 @@ struct Converter::Impl
+ 	// MetalSharp: the shader samples with explicit gradients (SampleGrad, SampleCmpGrad), which Metal Shader
+ 	// Converter doesn't add a sampler's emulated LOD bias to.
+ 	bool samples_with_gradients = false;
++	// MetalSharp: the shader samples at an explicit LOD (SampleLevel), which Metal Shader Converter doesn't clamp to the
++	// image view's minimum LOD (D3D12's ResourceMinLODClamp).
++	bool samples_with_explicit_lod = false;
+ 	bool declares_32bit_typed_srv = false;
+ 	void note_typed_srv_components(DXIL::ComponentType type, unsigned count);
+ 	UnorderedSet<const llvm::Value *> llvm_annotate_handle_lib_uses;
+diff --git a/opcodes/dxil/dxil_sampling.cpp b/opcodes/dxil/dxil_sampling.cpp
+index bf8fd237..5bc7cf26 100644
+--- a/opcodes/dxil/dxil_sampling.cpp
++++ b/opcodes/dxil/dxil_sampling.cpp
+@@ -309,6 +309,8 @@ bool emit_sample_instruction(DXIL::Op opcode, Converter::Impl &impl, const llvm:
+ 	                           opcode == DXIL::Op::SampleCmpBias;
+ 
+ 	bool force_explicit_lod = impl.execution_mode_meta.synthesize_dummy_derivatives;
++	if (opcode == DXIL::Op::SampleLevel)
++		impl.samples_with_explicit_lod = true;
+ 
+ 	// Elide dead loads.
+ 	if (!comparison_sampling && !impl.composite_is_accessed(instruction))
+-- 
+2.54.0 (Apple Git-157)
+

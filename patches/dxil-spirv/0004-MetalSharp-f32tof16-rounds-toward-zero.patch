@@ -1,0 +1,187 @@
+From 8b57d9c409323cf158a223e393079f125134a59d Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Fri, 6 Nov 2026 07:54:49 -0700
+Subject: [PATCH 04/10] MetalSharp: f32tof16 rounds toward zero
+
+The D3D11 functional spec's conversions to a smaller float format round
+toward zero, and finite values past its range become the largest finite
+one (3.2.2). PackHalf2x16 rounds to nearest even and turns values from
+65520 up into infinity. LegacyF32ToF16 (DXIL) and ExtendedLegacyF32ToF16
+(DXBC) now step each half that rounded away from zero one value toward
+zero: exact for every input of the op-level differential test, where the
+Metal Shader Converter only rounds float16 denormals to nearest.
+---
+ opcodes/converter_impl.hpp        |   2 +
+ opcodes/dxil/dxil_arithmetic.cpp  | 109 ++++++++++++++++++++++++++++++
+ opcodes/dxil/dxil_arithmetic.hpp  |   1 +
+ opcodes/opcodes_dxil_builtins.cpp |   2 +-
+ 4 files changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 722e59c0..3b799a30 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -773,6 +773,8 @@ struct Converter::Impl
+ 		bool arithmetic_relaxed_precision = false;
+ 		bool force_wave_size_enable = false;
+ 		bool supports_float16_denorm_preserve = false;
++		// LegacyF32ToF16 (f32tof16) rounds toward zero, as the D3D11 functional spec requires, instead of to nearest even.
++		bool legacy_f32_to_f16_rtz = true;
+ 		bool supports_float64_denorm_preserve = false;
+ 		bool strict_helper_lane_waveops = true;
+ 		bool nv_subgroup_partition_enabled = false;
+diff --git a/opcodes/dxil/dxil_arithmetic.cpp b/opcodes/dxil/dxil_arithmetic.cpp
+index 6148d75a..012574f6 100644
+--- a/opcodes/dxil/dxil_arithmetic.cpp
++++ b/opcodes/dxil/dxil_arithmetic.cpp
+@@ -1090,6 +1090,68 @@ bool emit_legacy_f16_to_f32_instruction(Converter::Impl &impl, const llvm::CallI
+ 	return true;
+ }
+ 
++// DXBC f32tof16 of two components (the DXBC front end clamps finite inputs to the float16 range): PackHalf2x16, then
++// each half that rounded away from zero stepped one value toward zero, as for LegacyF32ToF16 below.
++bool emit_extended_legacy_f32_to_f16_instruction(Converter::Impl &impl, const llvm::CallInst *instruction)
++{
++	if (!emit_dxil_std450_unary_instruction(GLSLstd450PackHalf2x16, impl, instruction))
++		return false;
++	if (!impl.options.legacy_f32_to_f16_rtz)
++		return true;
++
++	auto &builder = impl.builder();
++	spv::Id uint_type = builder.makeUintType(32);
++	spv::Id float_type = builder.makeFloatType(32);
++	spv::Id packed = impl.get_id_for_value(instruction);
++	spv::Id input = impl.get_id_for_value(instruction->getOperand(1));
++
++	auto *unpack = impl.allocate(spv::OpExtInst, builder.makeVectorType(float_type, 2));
++	unpack->add_id(impl.glsl_std450_ext);
++	unpack->add_literal(GLSLstd450UnpackHalf2x16);
++	unpack->add_id(packed);
++	impl.add(unpack);
++
++	spv::Id dec[2];
++	for (uint32_t i = 0; i < 2; i++)
++	{
++		spv::Id abs_ids[2];
++		spv::Id sources[2] = { unpack->id, input };
++		for (uint32_t j = 0; j < 2; j++)
++		{
++			auto *extract = impl.allocate(spv::OpCompositeExtract, float_type);
++			extract->add_id(sources[j]);
++			extract->add_literal(i);
++			impl.add(extract);
++			auto *abs_op = impl.allocate(spv::OpExtInst, float_type);
++			abs_op->add_id(impl.glsl_std450_ext);
++			abs_op->add_literal(GLSLstd450FAbs);
++			abs_op->add_id(extract->id);
++			impl.add(abs_op);
++			abs_ids[j] = abs_op->id;
++		}
++		auto *away = impl.allocate(spv::OpFOrdGreaterThan, builder.makeBoolType());
++		away->add_id(abs_ids[0]);
++		away->add_id(abs_ids[1]);
++		impl.add(away);
++		auto *sel = impl.allocate(spv::OpSelect, uint_type);
++		sel->add_id(away->id);
++		sel->add_id(builder.makeUintConstant(i ? 0x10000u : 1u));
++		sel->add_id(builder.makeUintConstant(0));
++		impl.add(sel);
++		dec[i] = sel->id;
++	}
++	auto *sum = impl.allocate(spv::OpIAdd, uint_type);
++	sum->add_id(dec[0]);
++	sum->add_id(dec[1]);
++	impl.add(sum);
++	auto *result = impl.allocate(spv::OpISub, uint_type);
++	result->add_id(packed);
++	result->add_id(sum->id);
++	impl.add(result);
++	impl.rewrite_value(instruction, result->id);
++	return true;
++}
++
+ bool emit_legacy_f32_to_f16_instruction(Converter::Impl &impl, const llvm::CallInst *instruction)
+ {
+ 	if (impl.support_native_fp16_operations() && emit_bypass_fp16_trunc(impl, instruction))
+@@ -1147,6 +1209,53 @@ bool emit_legacy_f32_to_f16_instruction(Converter::Impl &impl, const llvm::CallI
+ 	impl.add(op);
+ 	impl.decorate_relaxed_precision(instruction->getType(), op->id, false);
+ 
++	if (impl.options.legacy_f32_to_f16_rtz)
++	{
++		// The D3D11 functional spec's conversions to a smaller float format round toward zero, and finite values
++		// past its range become the largest finite one, not infinity. PackHalf2x16 rounds to nearest even: where
++		// that rounded away from zero (by magnitude; never for infinity or NaN, whose compare is false), step the
++		// half one value toward zero, which in sign-magnitude is one less.
++		spv::Id uint_type = builder.makeUintType(32);
++		spv::Id float_type = builder.makeFloatType(32);
++		spv::Id packed = op->id;
++
++		auto *unpack = impl.allocate(spv::OpExtInst, builder.makeVectorType(float_type, 2));
++		unpack->add_id(impl.glsl_std450_ext);
++		unpack->add_literal(GLSLstd450UnpackHalf2x16);
++		unpack->add_id(packed);
++		impl.add(unpack);
++		auto *back = impl.allocate(spv::OpCompositeExtract, float_type);
++		back->add_id(unpack->id);
++		back->add_literal(0);
++		impl.add(back);
++
++		auto *abs_back = impl.allocate(spv::OpExtInst, float_type);
++		abs_back->add_id(impl.glsl_std450_ext);
++		abs_back->add_literal(GLSLstd450FAbs);
++		abs_back->add_id(back->id);
++		impl.add(abs_back);
++		auto *abs_in = impl.allocate(spv::OpExtInst, float_type);
++		abs_in->add_id(impl.glsl_std450_ext);
++		abs_in->add_literal(GLSLstd450FAbs);
++		abs_in->add_id(input_id);
++		impl.add(abs_in);
++
++		auto *away = impl.allocate(spv::OpFOrdGreaterThan, builder.makeBoolType());
++		away->add_id(abs_back->id);
++		away->add_id(abs_in->id);
++		impl.add(away);
++		auto *step = impl.allocate(spv::OpISub, uint_type);
++		step->add_id(packed);
++		step->add_id(builder.makeUintConstant(1));
++		impl.add(step);
++		auto *sel = impl.allocate(spv::OpSelect, uint_type);
++		sel->add_id(away->id);
++		sel->add_id(step->id);
++		sel->add_id(packed);
++		impl.add(sel);
++		impl.rewrite_value(instruction, sel->id);
++	}
++
+ 	return true;
+ }
+ 
+diff --git a/opcodes/dxil/dxil_arithmetic.hpp b/opcodes/dxil/dxil_arithmetic.hpp
+index a383e807..df589ca3 100644
+--- a/opcodes/dxil/dxil_arithmetic.hpp
++++ b/opcodes/dxil/dxil_arithmetic.hpp
+@@ -60,6 +60,7 @@ bool emit_split_double_instruction(Converter::Impl &impl, const llvm::CallInst *
+ 
+ bool emit_legacy_f16_to_f32_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
+ bool emit_legacy_f32_to_f16_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
++bool emit_extended_legacy_f32_to_f16_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
+ 
+ bool emit_bitcast_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
+ 
+diff --git a/opcodes/opcodes_dxil_builtins.cpp b/opcodes/opcodes_dxil_builtins.cpp
+index a6f32c54..2916ab6f 100644
+--- a/opcodes/opcodes_dxil_builtins.cpp
++++ b/opcodes/opcodes_dxil_builtins.cpp
+@@ -197,7 +197,7 @@ struct DXILDispatcher
+ 		OP(LegacyF16ToF32) = emit_legacy_f16_to_f32_instruction;
+ 		OP(LegacyF32ToF16) = emit_legacy_f32_to_f16_instruction;
+ 		OP(ExtendedLegacyF16ToF32) = std450_unary_dispatch<GLSLstd450UnpackHalf2x16>;
+-		OP(ExtendedLegacyF32ToF16) = std450_unary_dispatch<GLSLstd450PackHalf2x16>;
++		OP(ExtendedLegacyF32ToF16) = emit_extended_legacy_f32_to_f16_instruction;
+ 		OP(LegacyDoubleToFloat) = emit_legacy_double_conv_dispatch<spv::OpFConvert>;
+ 		OP(LegacyDoubleToSInt32) = emit_legacy_double_conv_dispatch<spv::OpConvertFToS>;
+ 		OP(LegacyDoubleToUInt32) = emit_legacy_double_conv_dispatch<spv::OpConvertFToU>;
+-- 
+2.54.0 (Apple Git-157)
+

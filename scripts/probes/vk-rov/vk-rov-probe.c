@@ -9,6 +9,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Creates (or truncates) a file for writing, owner-only (0600) and not through a symlink. */
+static FILE* create_owner_file(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "w");
+}
+
 
 int main(int argc, char** argv) {
     if (argc < 2) { printf("usage: %s <libMoltenVK.dylib>\n", argv[0]); return 1; }
@@ -62,8 +71,8 @@ int main(int argc, char** argv) {
         "    endInvocationInterlockARB();\n"
         "    color = vec4(1,0,0,1);\n"
         "}\n";
-    FILE* f = fopen("/tmp/vk-rov-vs.vert","w"); fputs(vsSrc,f); fclose(f);
-    f = fopen("/tmp/vk-rov-fs.frag","w"); fputs(fsSrc,f); fclose(f);
+    FILE* f = create_owner_file("/tmp/vk-rov-vs.vert"); fputs(vsSrc,f); fclose(f);
+    f = create_owner_file("/tmp/vk-rov-fs.frag"); fputs(fsSrc,f); fclose(f);
     system("glslangValidator -V /tmp/vk-rov-vs.vert -o /tmp/vk-rov-vert.spv >/dev/null 2>&1");
     system("glslangValidator -V /tmp/vk-rov-fs.frag -o /tmp/vk-rov-frag.spv >/dev/null 2>&1");
     FILE* vf = fopen("/tmp/vk-rov-vert.spv","rb"); FILE* ff = fopen("/tmp/vk-rov-frag-1.spv","rb");

@@ -8,6 +8,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Creates (or truncates) a file for writing, owner-only (0600) and not through a symlink. */
+static FILE* create_owner_file(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "w");
+}
 
 static const int W = 64, H = 64;
 static const float HALF_DIAG = 0.70710678f;  // half pixel diagonal (safe expansion)
@@ -257,7 +265,7 @@ fragment FSOut fs(VSOut in [[stage_in]]) {
         }
         printf("gpu covered=%d ref covered=%d mismatches=%d\n", totalCovered, refTotal, mismatches);
         if (getenv("DUMP_PPM")) {
-            FILE* f = fopen("/tmp/cr-gpu.ppm","w"); fprintf(f,"P3\n%d %d\n255\n",W,H);
+            FILE* f = create_owner_file("/tmp/cr-gpu.ppm"); fprintf(f,"P3\n%d %d\n255\n",W,H);
             for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
                 if (getenv("DUMP_INPUTS")) {
                     uint32_t v=px[y*W+x];
@@ -267,7 +275,7 @@ fragment FSOut fs(VSOut in [[stage_in]]) {
                 }
             }
             fclose(f);
-            FILE* f2 = fopen("/tmp/cr-ref.ppm","w"); fprintf(f2,"P3\n%d %d\n255\n",W,H);
+            FILE* f2 = create_owner_file("/tmp/cr-ref.ppm"); fprintf(f2,"P3\n%d %d\n255\n",W,H);
             for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
                 int r=0; for (int i=0;i<triCount;i++) if (refCovered(tris[i],x,H-2-y)) r=1;
                 fprintf(f2,"%d %d %d\n", r*255,0,0);
