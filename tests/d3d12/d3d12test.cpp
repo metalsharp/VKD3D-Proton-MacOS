@@ -1187,6 +1187,467 @@ void read()
     return true;
 }
 
+// Tiled resources the way texture streamers use them (CONTROL Resonant streams its materials through ~5000 reserved
+// BC textures): reserved 2D textures with full mip chains, their tiles mapped from one tile pool in scrambled order, the
+// packed mips as one range, mapped and filled on a copy queue. Each tiled texture is compared with a committed one
+// holding the same data, through copies (raw blocks) and through shader Loads and point SampleLevels. Then tiles are
+// recycled as streamers do (A's mip 0 takes over B's mip 0 tiles) and B's mip 0, now unmapped, must read 0.
+static uint8_t tiled_bc_byte(uint32_t seed, uint32_t mip, uint64_t offset)
+{
+    uint32_t x = seed * 0x9E3779B1u ^ (mip + 1) * 0x85EBCA77u ^ (uint32_t)offset * 0xC2B2AE3Du ^ (uint32_t)(offset >> 32);
+    x ^= x >> 15; x *= 0x2C1B3C6Du; x ^= x >> 12; x *= 0x297A2D39u; x ^= x >> 15;
+    return (uint8_t)x;
+}
+
+struct TiledBcLayout
+{
+    UINT total = 0;
+    D3D12_PACKED_MIP_INFO packed = {};
+    D3D12_TILE_SHAPE shape = {};
+    std::vector<D3D12_SUBRESOURCE_TILING> mips;
+};
+
+// Maps every tile of a reserved texture: the packed mips to heap tiles [base, base + packed), the standard mips' tiles
+// one by one, in reverse order, to the heap tiles after them.
+static void tiled_bc_map_all(ID3D12CommandQueue *queue, ID3D12Resource *res, ID3D12Heap *heap, const TiledBcLayout &l, UINT base)
+{
+    std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords;
+    std::vector<D3D12_TILE_REGION_SIZE> sizes;
+    std::vector<UINT> starts, counts;
+    std::vector<D3D12_TILE_RANGE_FLAGS> flags;
+    for (UINT mip = 0; mip < l.packed.NumStandardMips; mip++)
+        for (UINT y = 0; y < l.mips[mip].HeightInTiles; y++)
+            for (UINT x = 0; x < l.mips[mip].WidthInTiles; x++)
+                coords.push_back({ x, y, 0, mip });
+    UINT standard = (UINT)coords.size();
+    for (UINT i = 0; i < standard; i++)
+    {
+        sizes.push_back({ 1, FALSE, 1, 1, 1 });
+        starts.push_back(base + l.packed.NumTilesForPackedMips + (standard - 1 - i));
+        counts.push_back(1);
+        flags.push_back(D3D12_TILE_RANGE_FLAG_NONE);
+    }
+    if (l.packed.NumPackedMips)
+    {
+        coords.push_back({ 0, 0, 0, l.packed.NumStandardMips });
+        sizes.push_back({ l.packed.NumTilesForPackedMips, FALSE, 0, 0, 0 });
+        starts.push_back(base);
+        counts.push_back(l.packed.NumTilesForPackedMips);
+        flags.push_back(D3D12_TILE_RANGE_FLAG_NONE);
+    }
+    queue->UpdateTileMappings(res, (UINT)coords.size(), coords.data(), sizes.data(), heap, (UINT)starts.size(), flags.data(),
+                              starts.data(), counts.data(), D3D12_TILE_MAPPING_FLAG_NONE);
+}
+
+// Records copies of seeded block data into each texture's mips [first, last] from a new upload buffer.
+static ID3D12Resource *tiled_bc_upload(ID3D12GraphicsCommandList *list, ID3D12Resource *const *dsts, int dst_count,
+                                       const D3D12_RESOURCE_DESC &desc, UINT first, UINT last, uint32_t seed)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16];
+    UINT rows[16];
+    UINT64 row_bytes[16], total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, desc.MipLevels, 0, fp, rows, row_bytes, &total);
+    ID3D12Resource *up = create_buffer(total, D3D12_HEAP_TYPE_UPLOAD);
+    if (!up)
+        return nullptr;
+    uint8_t *p = nullptr;
+    up->Map(0, nullptr, (void **)&p);
+    for (UINT mip = first; mip <= last; mip++)
+        for (UINT r = 0; r < rows[mip]; r++)
+            for (UINT64 b = 0; b < row_bytes[mip]; b++)
+                p[fp[mip].Offset + (UINT64)r * fp[mip].Footprint.RowPitch + b] = tiled_bc_byte(seed, mip, r * row_bytes[mip] + b);
+    up->Unmap(0, nullptr);
+    for (int i = 0; i < dst_count; i++)
+        for (UINT mip = first; mip <= last; mip++)
+        {
+            D3D12_TEXTURE_COPY_LOCATION dst = { dsts[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            dst.SubresourceIndex = mip;
+            D3D12_TEXTURE_COPY_LOCATION src = { up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            src.PlacedFootprint = fp[mip];
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    return up;
+}
+
+// Copies every mip of a texture (in PIXEL_SHADER_RESOURCE) out and counts the 4x4 blocks (texels for uncompressed
+// formats) that differ from the seeds given per mip.
+static bool tiled_bc_check_copy(const char *name, ID3D12Resource *tex, const D3D12_RESOURCE_DESC &desc, const uint32_t *seeds)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16];
+    UINT rows[16];
+    UINT64 row_bytes[16], total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, desc.MipLevels, 0, fp, rows, row_bytes, &total);
+    ID3D12Resource *rb = create_buffer(total, D3D12_HEAP_TYPE_READBACK);
+    if (!rb)
+        return false;
+    transition(tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT mip = 0; mip < desc.MipLevels; mip++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = { rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        dst.PlacedFootprint = fp[mip];
+        D3D12_TEXTURE_COPY_LOCATION src = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        src.SubresourceIndex = mip;
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *p = nullptr;
+    D3D12_RANGE range = { 0, (SIZE_T)total };
+    rb->Map(0, &range, (void **)&p);
+    UINT block_bytes = (UINT)(row_bytes[0] / ((fp[0].Footprint.Width + 3) / 4));
+    bool bc = desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!bc)
+        block_bytes = 4;
+    for (UINT mip = 0; mip < desc.MipLevels; mip++)
+    {
+        UINT bad = 0, blocks = 0, first_bad = ~0u;
+        UINT per_row = (UINT)(row_bytes[mip] / block_bytes);
+        for (UINT r = 0; r < rows[mip]; r++)
+            for (UINT k = 0; k < per_row; k++, blocks++)
+            {
+                const uint8_t *got = p + fp[mip].Offset + (UINT64)r * fp[mip].Footprint.RowPitch + (UINT64)k * block_bytes;
+                for (UINT b = 0; b < block_bytes; b++)
+                    if (got[b] != tiled_bc_byte(seeds[mip], mip, r * row_bytes[mip] + (UINT64)k * block_bytes + b))
+                    {
+                        if (first_bad == ~0u)
+                            first_bad = r << 16 | k;
+                        bad++;
+                        break;
+                    }
+            }
+        if (bad && mip == 0 && getenv("D3D12TEST_TILED_MAP"))
+        {
+            // One character per 16x16 blocks: '.' all right, '#' all wrong, '+' mixed.
+            for (UINT cy = 0; cy < rows[mip]; cy += 16)
+            {
+                printf("    ");
+                for (UINT cx = 0; cx < per_row; cx += 16)
+                {
+                    UINT nbad = 0, n = 0;
+                    for (UINT r = cy; r < std::min(cy + 16, rows[mip]); r++)
+                        for (UINT k = cx; k < std::min(cx + 16, per_row); k++, n++)
+                        {
+                            const uint8_t *got = p + fp[mip].Offset + (UINT64)r * fp[mip].Footprint.RowPitch + (UINT64)k * block_bytes;
+                            for (UINT b = 0; b < block_bytes; b++)
+                                if (got[b] != tiled_bc_byte(seeds[mip], mip, r * row_bytes[mip] + (UINT64)k * block_bytes + b))
+                                {
+                                    nbad++;
+                                    break;
+                                }
+                        }
+                    putchar(!nbad ? '.' : nbad == n ? '#' : '+');
+                }
+                putchar('\n');
+            }
+        }
+        EXPECT(!bad, "%s copy: mip %u: %u of %u blocks differ (first at block %u,%u)", name, mip, bad, blocks,
+               first_bad & 0xffff, first_bad >> 16);
+    }
+    rb->Unmap(0, nullptr);
+    rb->Release();
+    return true;
+}
+
+static bool test_tiled_bc()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+    if (o.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+    {
+        printf("  skipped: tiled resources tier %d\n", o.TiledResourcesTier);
+        return true;
+    }
+
+    static const char *src = R"(
+Texture2D<float4> tiled : register(t0);
+Texture2D<float4> ref : register(t1);
+RWByteAddressBuffer o : register(u0);
+SamplerState s : register(s0);
+cbuffer c : register(b0) { uint mip; uint w; uint h; };
+[numthreads(8, 8, 1)]
+void cmp(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= w || id.y >= h)
+        return;
+    float4 a = tiled.Load(int3(id.xy, mip)), b = ref.Load(int3(id.xy, mip));
+    uint n;
+    if (any(asuint(a) != asuint(b)))
+    {
+        o.InterlockedAdd(mip * 32, 1, n);
+        if (n == 0)
+            o.Store3(mip * 32 + 4, uint3(id.x | id.y << 16, asuint(a.x), asuint(b.x)));
+    }
+    float2 uv = (float2(id.xy) + 0.5) / float2(w, h);
+    if (any(asuint(tiled.SampleLevel(s, uv, mip)) != asuint(ref.SampleLevel(s, uv, mip))))
+        o.InterlockedAdd(mip * 32 + 16, 1, n);
+}
+[numthreads(1, 1, 1)]
+void unmapped()
+{
+    o.Store4(0, asuint(tiled.Load(int3(0, 0, 0))));
+    o.Store4(16, asuint(tiled.Load(int3(200, 100, 0))));
+}
+)";
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER rp[3] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable = { 1, &range };
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants = { 0, 0, 3 };
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[2].Descriptor.ShaderRegister = 0;
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 1, &ss };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    ID3D12PipelineState *cmp = create_compute_pipeline(rs, compile_dxc(src, "cmp", "cs_6_0"));
+    ID3D12PipelineState *unm = create_compute_pipeline(rs, compile_dxc(src, "unmapped", "cs_6_0"));
+    if (!rs || !cmp || !unm)
+        return false;
+
+    ID3D12CommandQueue *cq = nullptr;
+    ID3D12CommandAllocator *ca = nullptr;
+    ID3D12GraphicsCommandList *cl = nullptr;
+    D3D12_COMMAND_QUEUE_DESC cqd = {};
+    cqd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    CHECK_HR(g.device->CreateCommandQueue(&cqd, IID_PPV_ARGS(&cq)));
+    CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&ca)));
+    CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca, nullptr, IID_PPV_ARGS(&cl)));
+
+    static const struct { DXGI_FORMAT f; const char *n; UINT w, h; } fmts[] = {
+        { DXGI_FORMAT_R8G8B8A8_UNORM, "RGBA8 1024x1024", 1024, 1024 },
+        { DXGI_FORMAT_BC1_UNORM_SRGB, "BC1_SRGB 2048x2048", 2048, 2048 },
+        { DXGI_FORMAT_BC1_UNORM, "BC1 1024x512", 1024, 512 },
+        { DXGI_FORMAT_BC3_UNORM_SRGB, "BC3_SRGB 1024x1024", 1024, 1024 },
+        { DXGI_FORMAT_BC4_UNORM, "BC4 512x512", 512, 512 },
+        { DXGI_FORMAT_BC5_UNORM, "BC5 1024x1024", 1024, 1024 },
+        { DXGI_FORMAT_BC7_UNORM, "BC7 2048x1024", 2048, 1024 },
+    };
+    for (auto &f : fmts)
+    {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = f.w; td.Height = f.h; td.DepthOrArraySize = 1; td.MipLevels = 0;
+        td.Format = f.f;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        ID3D12Resource *a = nullptr, *b = nullptr, *ra = nullptr, *rb = nullptr;
+        CHECK_HR(g.device->CreateReservedResource(&td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&a)));
+        CHECK_HR(g.device->CreateReservedResource(&td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&b)));
+        td = a->GetDesc();
+        D3D12_RESOURCE_DESC cd = td;
+        cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ra)));
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)));
+
+        TiledBcLayout l;
+        UINT count = td.MipLevels;
+        l.mips.resize(count);
+        g.device->GetResourceTiling(a, &l.total, &l.packed, &l.shape, &count, 0, l.mips.data());
+        printf("  %s: %u mips, %u tiles, tile %ux%u, %u standard mips, %u packed in %u tiles\n", f.n, td.MipLevels, l.total,
+               l.shape.WidthInTexels, l.shape.HeightInTexels, l.packed.NumStandardMips, l.packed.NumPackedMips,
+               l.packed.NumTilesForPackedMips);
+
+        D3D12_HEAP_DESC hd = { (UINT64)l.total * 2 * 65536, { D3D12_HEAP_TYPE_DEFAULT }, 0,
+                               D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES };
+        ID3D12Heap *heap = nullptr;
+        CHECK_HR(g.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)));
+
+        // A: mapped and filled on the copy queue, as streamers do; the direct queue waits for it.
+        tiled_bc_map_all(cq, a, heap, l, 0);
+        ID3D12Resource *ad[2] = { a, ra };
+        ID3D12Resource *up_a = tiled_bc_upload(cl, ad, 2, td, 0, td.MipLevels - 1, 1);
+        CHECK_HR(cl->Close());
+        ID3D12CommandList *cls[] = { cl };
+        cq->ExecuteCommandLists(1, cls);
+        CHECK_HR(cq->Signal(g.fence, ++g.fence_value));
+        CHECK_HR(g.queue->Wait(g.fence, g.fence_value));
+        // B: on the direct queue, from the second half of the pool.
+        tiled_bc_map_all(g.queue, b, heap, l, l.total);
+        ID3D12Resource *bd[2] = { b, rb };
+        ID3D12Resource *up_b = tiled_bc_upload(g.list, bd, 2, td, 0, td.MipLevels - 1, 2);
+        transition(a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        transition(ra, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        transition(b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        transition(rb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (!up_a || !up_b || !execute_and_wait())
+            return false;
+        CHECK_HR(ca->Reset());
+        CHECK_HR(cl->Reset(ca, nullptr));
+
+        std::vector<uint32_t> seeds_a(td.MipLevels, 1), seeds_b(td.MipLevels, 2);
+        char name[96];
+
+        auto shader_compare = [&](const char *what, ID3D12Resource *t, ID3D12Resource *r) -> bool {
+            D3D12_DESCRIPTOR_HEAP_DESC dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+            ID3D12DescriptorHeap *dh = nullptr;
+            CHECK_HR(g.device->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dh)));
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = dh->GetCPUDescriptorHandleForHeapStart();
+            g.device->CreateShaderResourceView(t, nullptr, cpu);
+            cpu.ptr += g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.device->CreateShaderResourceView(r, nullptr, cpu);
+            ID3D12Resource *out = create_buffer(32 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.list->SetDescriptorHeaps(1, &dh);
+            g.list->SetComputeRootSignature(rs);
+            g.list->SetComputeRootDescriptorTable(0, dh->GetGPUDescriptorHandleForHeapStart());
+            g.list->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+            g.list->SetPipelineState(cmp);
+            for (UINT mip = 0; mip < td.MipLevels; mip++)
+            {
+                UINT k[3] = { mip, (UINT)std::max<UINT64>(1, td.Width >> mip), std::max<UINT>(1, td.Height >> mip) };
+                g.list->SetComputeRoot32BitConstants(1, 3, k, 0);
+                g.list->Dispatch((k[1] + 7) / 8, (k[2] + 7) / 8, 1);
+            }
+            ID3D12Resource *rbk;
+            const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 32 * 16, &rbk);
+            if (!v)
+                return false;
+            for (UINT mip = 0; mip < td.MipLevels; mip++)
+            {
+                const uint32_t *m = v + mip * 8;
+                EXPECT(!m[0] && !m[4], "%s %s: mip %u: %u texels Load differently, %u SampleLevel differently (first at %u,%u: %08x, not %08x)",
+                       f.n, what, mip, m[0], m[4], m[1] & 0xffff, m[1] >> 16, m[2], m[3]);
+            }
+            rbk->Release(); out->Release(); dh->Release();
+            return true;
+        };
+
+        snprintf(name, sizeof(name), "%s A", f.n);
+        if (!tiled_bc_check_copy(name, a, td, seeds_a.data()) || !shader_compare("A", a, ra))
+            return false;
+        snprintf(name, sizeof(name), "%s B", f.n);
+        if (!tiled_bc_check_copy(name, b, td, seeds_b.data()) || !shader_compare("B", b, rb))
+            return false;
+
+        // Recycle: B's mip 0 is evicted (unmapped) and its tiles go to A's mip 0, which streams in new data.
+        if (l.packed.NumStandardMips)
+        {
+            D3D12_TILED_RESOURCE_COORDINATE c0 = { 0, 0, 0, 0 };
+            D3D12_TILE_REGION_SIZE whole = { l.mips[0].WidthInTiles * l.mips[0].HeightInTiles, TRUE,
+                                             l.mips[0].WidthInTiles, l.mips[0].HeightInTiles, 1 };
+            D3D12_TILE_RANGE_FLAGS null_flag = D3D12_TILE_RANGE_FLAG_NULL;
+            g.queue->UpdateTileMappings(b, 1, &c0, &whole, nullptr, 1, &null_flag, nullptr, nullptr, D3D12_TILE_MAPPING_FLAG_NONE);
+            // B's mip 0 tiles were the last ones of its range (reverse order): heap tiles [2 * total - mip0, 2 * total).
+            UINT mip0 = whole.NumTiles;
+            UINT start = 2 * l.total - mip0;
+            D3D12_TILE_RANGE_FLAGS none = D3D12_TILE_RANGE_FLAG_NONE;
+            g.queue->UpdateTileMappings(a, 1, &c0, &whole, heap, 1, &none, &start, &mip0, D3D12_TILE_MAPPING_FLAG_NONE);
+            transition(a, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            transition(ra, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12Resource *up_c = tiled_bc_upload(g.list, ad, 2, td, 0, 0, 3);
+            transition(a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            transition(ra, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (!up_c || !execute_and_wait())
+                return false;
+            up_c->Release();
+            seeds_a[0] = 3;
+            snprintf(name, sizeof(name), "%s A recycled", f.n);
+            if (!tiled_bc_check_copy(name, a, td, seeds_a.data()) || !shader_compare("A recycled", a, ra))
+                return false;
+
+            // B's mip 0 is unmapped: D3D12 tier 2 reads 0 there, not the tiles' new contents.
+            D3D12_DESCRIPTOR_HEAP_DESC dhd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+            ID3D12DescriptorHeap *dh = nullptr;
+            CHECK_HR(g.device->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&dh)));
+            g.device->CreateShaderResourceView(b, nullptr, dh->GetCPUDescriptorHandleForHeapStart());
+            ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.list->SetDescriptorHeaps(1, &dh);
+            g.list->SetComputeRootSignature(rs);
+            g.list->SetComputeRootDescriptorTable(0, dh->GetGPUDescriptorHandleForHeapStart());
+            g.list->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+            g.list->SetPipelineState(unm);
+            g.list->Dispatch(1, 1, 1);
+            ID3D12Resource *rbk;
+            const uint32_t *v = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rbk);
+            if (!v)
+                return false;
+            // Metal reads unmapped tiles as zero bytes, which BC1 decodes to opaque black (alpha 1), not D3D12's 0 in
+            // every component: only the color is checked, the alpha is reported.
+            EXPECT(!(v[0] | v[1] | v[2] | v[4] | v[5] | v[6]),
+                   "%s unmapped B mip 0 reads %08x %08x %08x %08x / %08x %08x %08x %08x, not 0", f.n,
+                   v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            if (v[3] | v[7])
+                printf("  %s unmapped B mip 0 reads alpha %08x / %08x, not 0\n", f.n, v[3], v[7]);
+            rbk->Release(); out->Release(); dh->Release();
+        }
+        up_a->Release(); up_b->Release(); heap->Release(); rb->Release(); ra->Release(); b->Release(); a->Release();
+    }
+    cl->Release(); ca->Release(); cq->Release();
+    unm->Release(); cmp->Release(); rs->Release();
+    return true;
+}
+
+// One tile mapping batch the way CONTROL Resonant streams (MoltenVK trace): two 512x512 BC1_SRGB textures (Metal sparse
+// tier 2) and a 128x128 B8G8R8A8_SRGB one (tier 1) from one tile pool, in the game's order: packed mips first, then the
+// standard mips. Metal stalled such a batch for 4 s (tier 1 mip tail, tier 2 tile, tier 1 tile), and the game's GPU timed
+// out behind it.
+static bool test_tiled_mixed_tiers()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+    if (o.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+    {
+        printf("  skipped: tiled resources tier %d\n", o.TiledResourcesTier);
+        return true;
+    }
+    D3D12_HEAP_DESC hd = { 64 * 65536, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES };
+    ID3D12Heap *heap = nullptr;
+    CHECK_HR(g.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)));
+    struct { DXGI_FORMAT f; UINT size; } descs[3] = {
+        { DXGI_FORMAT_BC1_UNORM_SRGB, 512 }, { DXGI_FORMAT_BC1_UNORM_SRGB, 512 }, { DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 128 } };
+    ID3D12Resource *res[3] = {};
+    TiledBcLayout l[3];
+    for (int i = 0; i < 3; i++)
+    {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = td.Height = descs[i].size; td.DepthOrArraySize = 1; td.MipLevels = 0;
+        td.Format = descs[i].f;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        CHECK_HR(g.device->CreateReservedResource(&td, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res[i])));
+        UINT count = res[i]->GetDesc().MipLevels;
+        l[i].mips.resize(count);
+        g.device->GetResourceTiling(res[i], &l[i].total, &l[i].packed, &l[i].shape, &count, 0, l[i].mips.data());
+    }
+    UINT next = 0;
+    auto map = [&](int i, UINT subresource, UINT tiles) {
+        D3D12_TILED_RESOURCE_COORDINATE c = { 0, 0, 0, subresource };
+        D3D12_TILE_REGION_SIZE r = { tiles, FALSE, 0, 0, 0 };
+        D3D12_TILE_RANGE_FLAGS f = D3D12_TILE_RANGE_FLAG_NONE;
+        UINT start = next;
+        next += tiles;
+        g.queue->UpdateTileMappings(res[i], 1, &c, &r, heap, 1, &f, &start, &tiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    };
+    // Packed mips of each, then the standard mips of each, as the game's streamer did.
+    for (int i = 0; i < 3; i++)
+        if (l[i].packed.NumPackedMips)
+            map(i, l[i].packed.NumStandardMips, l[i].packed.NumTilesForPackedMips);
+    for (int i = 0; i < 3; i++)
+        for (UINT mip = 0; mip < l[i].packed.NumStandardMips; mip++)
+            map(i, mip, l[i].mips[mip].WidthInTiles * l[i].mips[mip].HeightInTiles);
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    if (!execute_and_wait())
+        return false;
+    QueryPerformanceCounter(&t1);
+    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    printf("  %u tiles mapped, first submission after them done in %.1f ms\n", next, ms);
+    EXPECT(ms < 1000.0, "mapping batch took %.1f ms", ms);
+    for (auto *r : res)
+        r->Release();
+    heap->Release();
+    return true;
+}
+
 // Typed buffer views at element offsets that are not 16-byte aligned (D3D12 only requires element
 // alignment): an SRV from element 3 and a UAV from element 5 of R32_UINT buffers.
 // A buffer view of 32-bit elements reads the same memory whichever kind of buffer the shader declares (as games rely on
@@ -10237,7 +10698,9 @@ static bool test_groupshared64()
 
 // Ray tracing pipelines (DXR 1.0): a state object with ray generation, miss and closest hit shaders, its shader
 // tables, and DispatchRays against the one-triangle scene (hits report RayTCurrent and the barycentrics).
-static bool test_dispatchrays()
+// stride: the miss and hit group tables' StrideInBytes; 0 reads their first record for every index (CONTROL
+// Resonant's ray tracing).
+static bool dispatchrays_case(UINT64 stride)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
@@ -10329,8 +10792,8 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
     D3D12_GPU_VIRTUAL_ADDRESS base = table->GetGPUVirtualAddress();
     D3D12_DISPATCH_RAYS_DESC rays = {};
     rays.RayGenerationShaderRecord = { base, 32 };
-    rays.MissShaderTable = { base + 64, 32, 32 };
-    rays.HitGroupTable = { base + 128, 32, 32 };
+    rays.MissShaderTable = { base + 64, 32, stride };
+    rays.HitGroupTable = { base + 128, 32, stride };
     rays.Width = 4;
     rays.Height = rays.Depth = 1;
     list4->SetComputeRootSignature(rs);
@@ -10360,6 +10823,9 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
     release_rt_scene(scene); list4->Release(); dev5->Release();
     return true;
 }
+
+static bool test_dispatchrays() { return dispatchrays_case(32); }
+static bool test_dispatchrays_stride0() { return dispatchrays_case(0); }
 
 // Mesh shaders (tier 1): an amplification shader launches two mesh groups with a payload of colors; each emits
 // a quad covering one half of the render target.
@@ -10505,6 +10971,351 @@ float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
     EXPECT(!bad, "%d pixels wrong", bad);
     l1->Release(); rb->Release(); rtv_heap->Release(); dsv_heap->Release(); rt->Release(); depth->Release();
     pso[0]->Release(); pso[1]->Release(); rs->Release();
+    return true;
+}
+
+// ExecuteIndirect with DispatchMesh arguments, as CONTROL Resonant draws its shadow casters (one bridge mesh PSO,
+// drawMeshThreadgroupsWithIndirectBuffer at growing offsets). The mesh shader outputs one degenerate triangle: each threadgroup adds 1
+// to its command's slot of a UAV and its group ID + 1 to a second slot, which shows which commands ran with which
+// arguments. Plain DispatchMesh signature (bridge PSO): a count buffer of 2 of 4 commands, then no count buffer.
+// Signature with a root constant per command (state template, so the PSO's SPIR-V pipeline): 3 of 4 commands from
+// a nonzero argument offset.
+static bool test_ei_mesh()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+    if (o7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1)
+    {
+        printf("  skipped: mesh shader tier %d\n", o7.MeshShaderTier);
+        return true;
+    }
+    static const char *src = R"(
+cbuffer c : register(b0) { uint slot; };
+RWByteAddressBuffer counts : register(u0);
+struct V { float4 pos : SV_Position; };
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void ms_main(uint3 g : SV_GroupID, out vertices V v[3], out indices uint3 tri[1])
+{
+    SetMeshOutputCounts(3, 1);
+    v[0].pos = v[1].pos = v[2].pos = float4(0, 0, 0, 1);   // degenerate: rasterizes nothing
+    tri[0] = uint3(0, 1, 2);
+    uint o;
+    counts.InterlockedAdd(slot * 4, 1, o);
+    counts.InterlockedAdd(64 + slot * 4, g.x + 1, o);
+}
+float4 ps_main(V i) : SV_Target { return 1.0; }
+)";
+    std::vector<char> ms = compile_dxc(src, "ms_main", "ms_6_5"), ps = compile_dxc(src, "ps_main", "ps_6_5");
+    if (ms.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.Num32BitValues = 1;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    if (!rs)
+        return false;
+
+    // The state template signature must exist before the PSO (engines make command signatures at startup; patch 55
+    // compiles the PSO's SPIR-V pipeline with it then).
+    D3D12_INDIRECT_ARGUMENT_DESC plain_arg = {};
+    plain_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    D3D12_COMMAND_SIGNATURE_DESC plain_desc = { 12, 1, &plain_arg, 0 };
+    ID3D12CommandSignature *plain = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&plain_desc, nullptr, IID_PPV_ARGS(&plain)));
+    D3D12_INDIRECT_ARGUMENT_DESC tmpl_args[2] = {};
+    tmpl_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    tmpl_args[0].Constant.RootParameterIndex = 0;
+    tmpl_args[0].Constant.DestOffsetIn32BitValues = 0;
+    tmpl_args[0].Constant.Num32BitValuesToSet = 1;
+    tmpl_args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    D3D12_COMMAND_SIGNATURE_DESC tmpl_desc = { 16, 2, tmpl_args, 0 };
+    ID3D12CommandSignature *tmpl = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&tmpl_desc, rs, IID_PPV_ARGS(&tmpl)));
+
+    D3D12_RASTERIZER_DESC rast = {};
+    rast.FillMode = D3D12_FILL_MODE_SOLID;
+    rast.CullMode = D3D12_CULL_MODE_NONE;
+    rast.DepthClipEnable = TRUE;
+    D3D12_BLEND_DESC blend = {};
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    D3D12_RT_FORMAT_ARRAY rtv_formats = {};
+    rtv_formats.NumRenderTargets = 1;
+    rtv_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    struct
+    {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+    } stream;
+    stream.rs.value = rs;
+    stream.ms.value = { ms.data(), ms.size() };
+    stream.ps.value = { ps.data(), ps.size() };
+    stream.rast.value = rast;
+    stream.blend.value = blend;
+    stream.mask.value = ~0u;
+    stream.rtvs.value = rtv_formats;
+    stream.sample.value = { 1, 0 };
+    D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(stream), &stream };
+    ID3D12Device2 *dev2 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev2)));
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)));
+
+    // Arguments: plain commands at 0 (stride 12), the count (2) at 48, template commands at 64 + 16 (stride 16),
+    // their count (3) at 160.
+    uint32_t args[64] = {};
+    const uint32_t groups[4] = { 2, 3, 5, 7 };
+    for (int i = 0; i < 4; i++)
+    {
+        args[i * 3 + 0] = groups[i]; args[i * 3 + 1] = 1; args[i * 3 + 2] = 1;
+        uint32_t *t = &args[(64 + 16 + i * 16) / 4];
+        t[0] = i + 1; t[1] = groups[i]; t[2] = 1; t[3] = 1;
+    }
+    args[48 / 4] = 2;
+    args[160 / 4] = 3;
+    ID3D12Resource *upload = create_buffer(sizeof(args), D3D12_HEAP_TYPE_UPLOAD);
+    void *p = nullptr;
+    upload->Map(0, nullptr, &p);
+    memcpy(p, args, sizeof(args));
+    upload->Unmap(0, nullptr);
+    ID3D12Resource *argbuf = create_buffer(sizeof(args), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(argbuf, 0, upload, 0, sizeof(args));
+    transition(argbuf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    // Three counter sets (one per case), 128 bytes each, zeroed.
+    ID3D12Resource *counts = create_buffer(3 * 128, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *zero = create_buffer(3 * 128, D3D12_HEAP_TYPE_UPLOAD);
+    zero->Map(0, nullptr, &p);
+    memset(p, 0, 3 * 128);
+    zero->Unmap(0, nullptr);
+    g.list->CopyBufferRegion(counts, 0, zero, 0, 3 * 128);
+    transition(counts, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const UINT W = 8, H = 8;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    g.list->RSSetViewports(1, &vp);
+    g.list->RSSetScissorRects(1, &sc);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    D3D12_RESOURCE_BARRIER uavb = {};
+    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    for (int c = 0; c < 3; c++)
+    {
+        g.list->SetGraphicsRoot32BitConstant(0, 0, 0);
+        g.list->SetGraphicsRootUnorderedAccessView(1, counts->GetGPUVirtualAddress() + c * 128);
+        if (c == 0)
+            g.list->ExecuteIndirect(plain, 4, argbuf, 0, argbuf, 48);
+        else if (c == 1)
+            g.list->ExecuteIndirect(plain, 4, argbuf, 0, nullptr, 0);
+        else
+            g.list->ExecuteIndirect(tmpl, 4, argbuf, 64 + 16, argbuf, 160);
+        g.list->ResourceBarrier(1, &uavb);
+    }
+    ID3D12Resource *rb;
+    const uint32_t *v = read_buffer(counts, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 3 * 128, &rb);
+    if (!v)
+        return false;
+    // Expected groups and group-ID sums per slot: case 0 slot 0 = commands 0-1, case 1 slot 0 = commands 0-3,
+    // case 2 slots 1-3 = commands 0-2 (slot 4 = command 3 must not run).
+    auto id_sum = [](uint32_t n) { return n * (n + 1) / 2; };
+    const char *names[3] = { "plain, count 2 of 4", "plain, no count buffer", "root constant per command, count 3 of 4" };
+    for (int c = 0; c < 3; c++)
+    {
+        const uint32_t *cnt = v + c * 32, *ids = v + c * 32 + 16;
+        for (uint32_t slot = 0; slot < 5; slot++)
+        {
+            uint32_t want_groups = 0, want_ids = 0;
+            if (c < 2 && slot == 0)
+                for (int i = 0; i < (c == 0 ? 2 : 4); i++)
+                    want_groups += groups[i], want_ids += id_sum(groups[i]);
+            if (c == 2 && slot >= 1 && slot <= 3)
+                want_groups = groups[slot - 1], want_ids = id_sum(groups[slot - 1]);
+            EXPECT(cnt[slot] == want_groups && ids[slot] == want_ids, "%s: slot %u ran %u groups (ID sum %u), not %u (%u)",
+                   names[c], slot, cnt[slot], ids[slot], want_groups, want_ids);
+        }
+    }
+    rb->Release(); rtv_heap->Release(); rt->Release(); zero->Release(); counts->Release(); argbuf->Release();
+    upload->Release(); pso->Release(); dev2->Release(); tmpl->Release(); plain->Release(); rs->Release();
+    return true;
+}
+
+// Mesh shader outputs that are arrays per vertex and per primitive (float2 tc[2] : TEXCOORD, float2 pd[2] : PRIMDATA),
+// as CONTROL Resonant's mesh shaders write texture coordinates: through SPIR-V (METALSHARP_MSC=0), SPIRV-Cross split
+// each into one member per element but copied the whole array into each, and the Metal compile failed. A triangle
+// covering the target; the pixel shader writes the four values it reads.
+static bool test_mesh_array_outputs()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+    if (o7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1)
+    {
+        printf("  skipped: mesh shader tier %d\n", o7.MeshShaderTier);
+        return true;
+    }
+    static const char *src = R"(
+struct V { float4 pos : SV_Position; float2 tc[2] : TEXCOORD; };
+struct P { float2 pd[2] : PRIMDATA; };
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void ms_main(uint t : SV_GroupThreadID, out vertices V v[3], out indices uint3 tri[1], out primitives P prim[1])
+{
+    SetMeshOutputCounts(3, 1);
+    float2 p = t == 0 ? float2(-1, -1) : t == 1 ? float2(3, -1) : float2(-1, 3);
+    v[t].pos = float4(p, 0, 1);
+    v[t].tc[0] = float2(0.25, 0.5);
+    v[t].tc[1] = float2(0.75, 1.0);
+    if (t == 0)
+    {
+        tri[0] = uint3(0, 1, 2);
+        prim[0].pd[0] = float2(0.125, 0.375);
+        prim[0].pd[1] = float2(0.625, 0.875);
+    }
+}
+struct O { float4 a : SV_Target0; float4 b : SV_Target1; };
+O ps_main(V i, P p)
+{
+    O o;
+    o.a = float4(i.tc[0], i.tc[1]);
+    o.b = float4(p.pd[0], p.pd[1]);
+    return o;
+}
+)";
+    std::vector<char> ms = compile_dxc(src, "ms_main", "ms_6_5"), ps = compile_dxc(src, "ps_main", "ps_6_5");
+    if (ms.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_RASTERIZER_DESC rast = {};
+    rast.FillMode = D3D12_FILL_MODE_SOLID;
+    rast.CullMode = D3D12_CULL_MODE_NONE;
+    rast.DepthClipEnable = TRUE;
+    D3D12_BLEND_DESC blend = {};
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    D3D12_RT_FORMAT_ARRAY rtv_formats = {};
+    rtv_formats.NumRenderTargets = 2;
+    rtv_formats.RTFormats[0] = rtv_formats.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    struct
+    {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rast;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+    } stream;
+    stream.rs.value = rs;
+    stream.ms.value = { ms.data(), ms.size() };
+    stream.ps.value = { ps.data(), ps.size() };
+    stream.rast.value = rast;
+    stream.blend.value = blend;
+    stream.mask.value = ~0u;
+    stream.rtvs.value = rtv_formats;
+    stream.sample.value = { 1, 0 };
+    D3D12_PIPELINE_STATE_STREAM_DESC sd = { sizeof(stream), &stream };
+    ID3D12Device2 *dev2 = nullptr;
+    CHECK_HR(g.device->QueryInterface(IID_PPV_ARGS(&dev2)));
+    ID3D12PipelineState *pso = nullptr;
+    HRESULT hr = dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso));
+    EXPECT(SUCCEEDED(hr), "CreatePipelineState = 0x%08lx", (unsigned long)hr);
+    if (FAILED(hr))
+    {
+        dev2->Release(); rs->Release();
+        return true;
+    }
+    ID3D12GraphicsCommandList6 *list6 = nullptr;
+    CHECK_HR(g.list->QueryInterface(IID_PPV_ARGS(&list6)));
+    const UINT W = 8, H = 8;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt[2] = {};
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[2];
+    float clear[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 2; i++)
+    {
+        CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt[i])));
+        rtv[i] = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv[i].ptr += i * g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g.device->CreateRenderTargetView(rt[i], nullptr, rtv[i]);
+        list6->ClearRenderTargetView(rtv[i], clear, 0, nullptr);
+    }
+    list6->OMSetRenderTargets(2, rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    D3D12_RECT sc = { 0, 0, (LONG)W, (LONG)H };
+    list6->RSSetViewports(1, &vp);
+    list6->RSSetScissorRects(1, &sc);
+    list6->SetGraphicsRootSignature(rs);
+    list6->SetPipelineState(pso);
+    list6->DispatchMesh(1, 1, 1);
+    ID3D12Resource *rb = create_buffer(2 * 256 * H, D3D12_HEAP_TYPE_READBACK);
+    for (int i = 0; i < 2; i++)
+    {
+        transition(rt[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+        dst.pResource = rb;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = i * 256 * H;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+        srcl.pResource = rt[i];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list6->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    }
+    if (!execute_and_wait())
+        return false;
+    const uint8_t *px = nullptr;
+    D3D12_RANGE rr = { 0, 2 * 256 * H };
+    rb->Map(0, &rr, (void **)&px);
+    static const float want[2][4] = { { 0.25f, 0.5f, 0.75f, 1.0f }, { 0.125f, 0.375f, 0.625f, 0.875f } };
+    static const char *what[2] = { "per-vertex tc[2]", "per-primitive pd[2]" };
+    for (int i = 0; i < 2; i++)
+    {
+        const uint8_t *c = px + i * 256 * H + (H / 2) * 256 + (W / 2) * 4;
+        bool ok = true;
+        for (int k = 0; k < 4; k++)
+            ok &= abs((int)c[k] - (int)(want[i][k] * 255.0f + 0.5f)) <= 1;
+        EXPECT(ok, "%s reads %u %u %u %u, not %g %g %g %g (x255)", what[i], c[0], c[1], c[2], c[3],
+               want[i][0], want[i][1], want[i][2], want[i][3]);
+    }
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); rt[0]->Release(); rt[1]->Release(); list6->Release();
+    pso->Release(); dev2->Release(); rs->Release();
     return true;
 }
 
@@ -14488,8 +15299,11 @@ static const Test tests[] = {
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
     { "dispatchrays", test_dispatchrays },
+    { "dispatchrays_stride0", test_dispatchrays_stride0 },
     { "mesh", test_mesh },
     { "mesh_resources", test_mesh_resources },
+    { "ei_mesh", test_ei_mesh },
+    { "mesh_array_outputs", test_mesh_array_outputs },
     { "mesh_cull", test_mesh_cull },
     { "mesh_features", test_mesh_features },
     { "tessellation", test_tessellation },
@@ -14577,6 +15391,8 @@ static const Test tests[] = {
     { "samplerfeedback", test_samplerfeedback },
     { "vrs", test_vrs },
     { "tiled3d", test_tiled3d },
+    { "tiled_bc", test_tiled_bc },
+    { "tiled_mixed_tiers", test_tiled_mixed_tiers },
     { "typedbuffer", test_typedbuffer },
     { "typedbuffer_matrix", test_typedbuffer_matrix },
     { "typedbuffer_uav_offset", test_typedbuffer_uav_offset },
