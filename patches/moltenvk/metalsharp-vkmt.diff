@@ -23539,7 +23539,7 @@ index b18549c7..acf4bf71 100644
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-index dec4b452..81d6430f 100644
+index dec4b452..8530393d 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 @@ -18,6 +18,8 @@
@@ -23715,7 +23715,7 @@ index dec4b452..81d6430f 100644
  		[mtlCmdBuff commit];
  		[mtlCmdBuff waitUntilCompleted];
  	}
-@@ -169,16 +304,22 @@
+@@ -169,16 +304,25 @@
  
  	MTLCommandBufferDescriptor* mtlCmdBuffDesc = [MTLCommandBufferDescriptor new];	// temp retain
  	mtlCmdBuffDesc.retainedReferences = retainRefs;
@@ -23728,8 +23728,11 @@ index dec4b452..81d6430f 100644
  	[mtlCmdBuffDesc release];														// temp release
  
  	addPerformanceInterval(getPerformanceStats().queue.retrieveMTLCommandBuffer, startTime);
-+	// Sparse mappings made on this queue precede its later work.
-+	if (uint64_t sparseMappingsDone = _sparseMappingsDoneValue.load()) {
++	// Sparse mappings made on this queue precede its later work: wait for them unless they are done already.
++	// (Under a GPU capture scope they always are: MVKQueueSparseBindSubmission waits for them on the CPU, so
++	// captured command buffers don't wait on the MTL4 queue's signals, which a capture doesn't replay.)
++	uint64_t sparseMappingsDone = _sparseMappingsDoneValue.load();
++	if (sparseMappingsDone && _sparseMappingEvent.signaledValue < sparseMappingsDone) {
 +		[mtlCmdBuff encodeWaitForEvent: _sparseMappingEvent value: sparseMappingsDone];
 +	}
  	NSString* mtlCmdBuffLabel = getMTLCommandBufferLabel(cmdUse);
@@ -23739,7 +23742,7 @@ index dec4b452..81d6430f 100644
  
  	if ( !mtlCmdBuff ) { reportError(VK_ERROR_OUT_OF_POOL_MEMORY, "%s could not be acquired.", mtlCmdBuffLabel.UTF8String); }
  	return mtlCmdBuff;
-@@ -258,13 +399,15 @@
+@@ -258,13 +402,15 @@
  				 mtlCmdBuff.error.code, mtlCmdBuff.error.localizedDescription.UTF8String);
  
  	if (NSArray<id<MTLCommandBufferEncoderInfo>>* mtlEncInfo = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {
@@ -23761,7 +23764,7 @@ index dec4b452..81d6430f 100644
  				}
  			}
  		}
-@@ -300,9 +443,8 @@
+@@ -300,9 +446,8 @@
  	_name = name;
  }
  
@@ -23773,7 +23776,7 @@ index dec4b452..81d6430f 100644
  		// Determine the dispatch queue priority
  		dispatch_qos_class_t dqQOS;
  		switch (_globalPriority) {
-@@ -341,6 +483,8 @@
+@@ -341,6 +486,8 @@
  
  MVKQueue::~MVKQueue() {
  	destroyExecQueue();
@@ -23782,7 +23785,7 @@ index dec4b452..81d6430f 100644
  	_submissionCaptureScope->destroy();
  	_device->removeResidencySet(_mtlQueue);
  
-@@ -366,11 +510,160 @@
+@@ -366,11 +513,160 @@
  #pragma mark MVKQueueSubmission
  
  void MVKSemaphoreSubmitInfo::encodeWait(id<MTLCommandBuffer> mtlCmdBuff) {
@@ -23945,7 +23948,7 @@ index dec4b452..81d6430f 100644
  }
  
  MVKSemaphoreSubmitInfo::MVKSemaphoreSubmitInfo(const VkSemaphoreSubmitInfo& semaphoreSubmitInfo) :
-@@ -394,7 +687,8 @@
+@@ -394,7 +690,8 @@
  	_semaphore(other._semaphore),
  	value(other.value),
  	stageMask(other.stageMask),
@@ -23955,7 +23958,7 @@ index dec4b452..81d6430f 100644
  		if (_semaphore) { _semaphore->retain(); }
  }
  
-@@ -407,6 +701,7 @@
+@@ -407,6 +704,7 @@
  	value = other.value;
  	stageMask = other.stageMask;
  	deviceIndex = other.deviceIndex;
@@ -23963,7 +23966,7 @@ index dec4b452..81d6430f 100644
  	return *this;
  }
  
-@@ -435,6 +730,9 @@
+@@ -435,6 +733,9 @@
  	for (uint32_t i = 0; i < waitSemaphoreInfoCount; i++) {
  		_waitSemaphores.emplace_back(pWaitSemaphoreSubmitInfos[i]);
  	}
@@ -23973,7 +23976,7 @@ index dec4b452..81d6430f 100644
  }
  
  MVKQueueSubmission::MVKQueueSubmission(MVKQueue* queue,
-@@ -451,12 +749,20 @@
+@@ -451,12 +752,20 @@
  	for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
  		_waitSemaphores.emplace_back(pWaitSemaphores[i], pWaitDstStageMask ? pWaitDstStageMask[i] : 0);
  	}
@@ -23994,7 +23997,7 @@ index dec4b452..81d6430f 100644
  
  #pragma mark -
  #pragma mark MVKQueueCommandBufferSubmission
-@@ -467,26 +773,124 @@
+@@ -467,26 +776,124 @@
  
  	// If using encoded semaphore waiting, do so now.
  	for (auto& ws : _waitSemaphores) { ws.encodeWait(getActiveMTLCommandBuffer()); }
@@ -24122,7 +24125,7 @@ index dec4b452..81d6430f 100644
  			// Partially bound descriptors will get bound by us even if they're not used at runtime by the shader.
  			// The application is free to destroy them even if they're not used at runtime even if we bound them.
  			// Metal will be very unhappy if we destroy something we bound, even if it isn't used at runtime.
-@@ -553,6 +957,7 @@
+@@ -553,6 +960,7 @@
  
  	// Retrieve the result before committing MTLCommandBuffer, because finish() will destroy this instance.
  	VkResult rslt = mtlCmdBuff ? getConfigurationResult() : VK_ERROR_OUT_OF_POOL_MEMORY;
@@ -24130,7 +24133,7 @@ index dec4b452..81d6430f 100644
  	[mtlCmdBuff commit];
  	[mtlCmdBuff release];		// retained
  
-@@ -563,6 +968,18 @@
+@@ -563,6 +971,18 @@
  	return rslt;
  }
  
@@ -24149,7 +24152,7 @@ index dec4b452..81d6430f 100644
  // Be sure to retain() any API objects referenced in this function, and release() them in the
  // destructor (or superclass destructor). It is possible for rare race conditions to result
  // in the app destroying API objects before this function completes execution. For example,
-@@ -574,8 +991,19 @@
+@@ -574,8 +994,19 @@
  	// immediately after a waitIdle() is cleared by fence below, taking the capture scope with it.
  	_queue->_submissionCaptureScope->endScope();
  
@@ -24170,7 +24173,7 @@ index dec4b452..81d6430f 100644
  
  	// If a fence exists, signal it.
  	if (_fence) { _fence->signal(); }
-@@ -605,6 +1033,9 @@
+@@ -605,6 +1036,9 @@
  		for (uint32_t i = 0; i < ssCnt; i++) {
  			_signalSemaphores.emplace_back(pSubmit->pSignalSemaphoreInfos[i]);
  		}
@@ -24180,7 +24183,7 @@ index dec4b452..81d6430f 100644
  	}
  }
  
-@@ -654,6 +1085,9 @@
+@@ -654,6 +1088,9 @@
  				_signalSemaphores[i].value = pTimelineSubmit->pSignalSemaphoreValues[i];
  			}
          }
@@ -24190,7 +24193,7 @@ index dec4b452..81d6430f 100644
      }
  }
  
-@@ -666,11 +1100,39 @@
+@@ -666,11 +1103,39 @@
  void MVKQueueFullCommandBufferSubmission<N>::submitCommandBuffers() {
  	uint64_t startTime = getPerformanceTimestamp();
  
@@ -24231,7 +24234,18 @@ index dec4b452..81d6430f 100644
  template <size_t N>
  MVKQueueFullCommandBufferSubmission<N>::MVKQueueFullCommandBufferSubmission(MVKQueue* queue,
  																			const VkSubmitInfo2* pSubmit,
-@@ -744,6 +1206,7 @@
+@@ -733,7 +1198,9 @@
+ 	if (_queue->_queueFamily->getIndex() == getMVKConfig().defaultGPUCaptureScopeQueueFamilyIndex &&
+ 		_queue->_index == getMVKConfig().defaultGPUCaptureScopeQueueIndex) {
+ 		getDevice()->stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_ON_DEMAND);
+-		getDevice()->startAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_ON_DEMAND, _queue->getMTLCommandQueue());
++		// The whole MTLDevice, not this queue: a frame's command buffers wait on semaphores other queues
++		// (copy, compute) signal, and a replay of one queue's work hangs at the first such wait.
++		getDevice()->startAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_ON_DEMAND, getMTLDevice());
+ 	}
+ 
+ 	if ( !mtlCmdBuff ) { setConfigurationResult(VK_ERROR_OUT_OF_POOL_MEMORY); }	// Check after images may set error.
+@@ -744,6 +1211,7 @@
  	VkResult rslt = getConfigurationResult();
  	if (mtlCmdBuff) {
  		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) { this->finish(); }];
@@ -24239,7 +24253,7 @@ index dec4b452..81d6430f 100644
  		[mtlCmdBuff commit];
  	} else {
  		finish();
-@@ -851,3 +1314,206 @@
+@@ -851,3 +1319,213 @@
  	}
  }
  
@@ -24389,6 +24403,13 @@ index dec4b452..81d6430f 100644
 +	uint64_t mappingsDone = ++_queue->_sparseMappingEventValue;
 +	[mtl4Queue signalEvent: event value: mappingsDone];
 +	_queue->_sparseMappingsDoneValue.store(mappingsDone);
++
++	// Under a GPU capture scope, finish the mappings before going on, so that no captured command buffer waits
++	// on the MTL4 queue (a replay never signals it, and hangs).
++	if (getMVKConfig().autoGPUCaptureScope != MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_NONE) {
++		uint64_t start = mvkGetTimestamp();
++		while (event.signaledValue < mappingsDone && mvkGetElapsedMilliseconds(start) < 10000.0) { usleep(50); }
++	}
 +
 +	// METALSHARP_TRACE=gpu: sparse binds whose mappings take 50 ms or more, or haven't finished after 2 s; gpu+heavy
 +	// also every bind and its operations.
