@@ -17606,7 +17606,7 @@ index 45ddd3a4..aee21d46 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..67f21eac 100644
+index 2b394922..73316806 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -17635,7 +17635,7 @@ index 2b394922..67f21eac 100644
          if (tex.storageMode != MTLStorageModeMemoryless) {
              _image->_device->makeResident(tex);
              _image->_device->getLiveResources().add(tex);
-@@ -180,6 +192,15 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -180,6 +192,23 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
      // For 2D views of 3D and block texel views, we alias the underlying memory.
      // Ensure that it remains consistent by disabling GPU layout optimization.
      mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible;
@@ -17644,14 +17644,22 @@ index 2b394922..67f21eac 100644
 +		mtlTexDesc.placementSparsePageSize = MTLSparsePageSize64;
 +		mtlTexDesc.storageMode = MTLStorageModePrivate;
 +		// Shader write usage selects Metal's sparse texture tier 1, which writes reliably
-+		// (writes to tier 2 placement sparse textures fault on Apple9 GPUs).
-+		mtlTexDesc.usage |= MTLTextureUsageShaderWrite;
++		// (writes to tier 2 placement sparse textures fault on Apple9 GPUs). Not for block-compressed
++		// formats, which shaders never write: their tier 1 tiles aren't the rectangles that
++		// sparseTileSizeWithTextureType reports (a BC1 tile of a 2048x1024 texture holds scattered blocks
++		// from x 0-511, y 0-639), so tiles mapped by that shape take other tiles' texels or none
++		// (CONTROL Resonant's streamed BC1/BC4 materials rendered as noise). Tier 2 tiles match it.
++		if (_image->getPixelFormats()->getFormatType(_mtlPixFmt) == kMVKFormatCompressed) {
++			mtlTexDesc.usage &= ~MTLTextureUsageShaderWrite;
++		} else {
++			mtlTexDesc.usage |= MTLTextureUsageShaderWrite;
++		}
 +	}
 +#endif
  
      return mtlTexDesc;
  }
-@@ -816,6 +837,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -816,6 +845,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  			}
  
  			[mtlBlitEnc endEncoding];
@@ -17659,7 +17667,7 @@ index 2b394922..67f21eac 100644
  			[mtlCmdBuff commit];
  			[mtlCmdBuff waitUntilCompleted];
  		}
-@@ -940,6 +962,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -940,6 +970,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  	MVKPhysicalDevice* mvkPD = getPhysicalDevice();
  	VkImageUsageFlags combinedUsage = getCombinedUsage();
  
@@ -17674,7 +17682,7 @@ index 2b394922..67f21eac 100644
      pMemoryRequirements->memoryTypeBits = (_isDepthStencilAttachment)
                                            ? mvkPD->getPrivateMemoryTypes()
                                            : mvkPD->getAllMemoryTypes();
-@@ -987,9 +1017,157 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -987,9 +1025,157 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  }
  
  VkResult MVKImage::bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset, uint8_t planeIndex) {
@@ -17832,7 +17840,7 @@ index 2b394922..67f21eac 100644
  VkResult MVKImage::bindDeviceMemory2(const VkBindImageMemoryInfo* pBindInfo) {
      uint8_t planeIndex = 0;
      for (const auto* next = (const VkBaseInStructure*)pBindInfo->pNext; next; next = next->pNext) {
-@@ -1185,6 +1363,9 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1185,6 +1371,9 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  	MTLTextureUsage mtlUsage = pixFmts->getMTLTextureUsage(getCombinedUsage(), mtlPixFmt, _samples,
  														   _isLinear || _isLinearForAtomics, needsReinterpretation, _hasExtendedUsage,
  														   _shouldSupportAtomics && getMetalFeatures().nativeTextureAtomics);
@@ -17842,7 +17850,7 @@ index 2b394922..67f21eac 100644
  
  	return mtlUsage;
  }
-@@ -1258,6 +1439,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1258,6 +1447,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  
  	_isLinearForAtomics = _shouldSupportAtomics && !getMetalFeatures().nativeTextureAtomics && _arrayLayers == 1 && getImageType() == VK_IMAGE_TYPE_2D;
  
@@ -17857,7 +17865,7 @@ index 2b394922..67f21eac 100644
  	_isDepthStencilAttachment = (mvkAreAllFlagsEnabled(pCreateInfo->usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
  								 mvkAreAllFlagsEnabled(pixFmts->getVkFormatProperties3(pCreateInfo->format).optimalTilingFeatures, VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT));
  	_rowByteAlignment = _isLinear || _isLinearForAtomics ? _device->getVkFormatTexelBufferAlignment(pCreateInfo->format, this) : mvkEnsurePowerOfTwo(pixFmts->getBytesPerBlock(pCreateInfo->format));
-@@ -1312,6 +1501,8 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1312,6 +1509,8 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
      }
      _hasExpectedTexelSize = _hasChromaSubsampling || (pixFmts->getBytesPerBlock(_planes[0]->_mtlPixFmt) == pixFmts->getBytesPerBlock(_vkFormat));
  
@@ -17866,7 +17874,7 @@ index 2b394922..67f21eac 100644
  	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
  
  	// Setting Metal objects directly will override Vulkan settings.
-@@ -1599,6 +1790,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1599,6 +1798,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			}
  			signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
  			signal(signaler.fence);
@@ -17874,7 +17882,7 @@ index 2b394922..67f21eac 100644
  			[mtlCmdBuff commit];
  		}
  
-@@ -1624,8 +1816,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1624,8 +1824,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
  			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
  				uint64_t startTime = getPerformanceTimestamp();
@@ -17886,7 +17894,7 @@ index 2b394922..67f21eac 100644
  				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
  				if (hasInvalidFormat) { releaseMetalDrawable(); }
  			}
-@@ -1641,6 +1836,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1641,6 +1844,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
  id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
@@ -17894,7 +17902,7 @@ index 2b394922..67f21eac 100644
  	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
  }
  
-@@ -1649,6 +1845,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1649,6 +1853,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
  															  MVKImagePresentInfo presentInfo) {
  	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
@@ -17903,7 +17911,7 @@ index 2b394922..67f21eac 100644
  
  	// According to Apple, it is more performant to call MTLDrawable present from within a
  	// MTLCommandBuffer scheduled-handler than it is to call MTLCommandBuffer presentDrawable:.
-@@ -1656,7 +1854,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1656,7 +1862,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// Attach present handler before presenting to avoid race condition.
  	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
  	MVKSwapchainSignaler signaler = getPresentationSignaler();
@@ -17915,7 +17923,7 @@ index 2b394922..67f21eac 100644
  
  		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
  
-@@ -1751,6 +1953,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1751,6 +1961,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// time will not be available if the presentation did not actually happen, such as when
  	// running headless, or on a test harness that is not attached to the windowing system.
  	if (actualPresentTime == 0) { actualPresentTime = mvkGetRuntimeNanoseconds(); }
@@ -17931,7 +17939,7 @@ index 2b394922..67f21eac 100644
  
  	{	// Scope to avoid deadlock if release() is run within detachment lock
  		// If I have become detached from the swapchain, it means the swapchain, and possibly the
-@@ -1811,6 +2022,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1811,6 +2030,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  			_mtlTextureHeadless = [[getMTLDevice() newTextureWithDescriptor: mtlTexDesc] retain];	// retained
  		}
@@ -17952,7 +17960,7 @@ index 2b394922..67f21eac 100644
  	}
  }
  
-@@ -1819,6 +2044,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1819,6 +2052,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	releaseMetalDrawable();
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
@@ -17961,7 +17969,7 @@ index 2b394922..67f21eac 100644
  	MVKSwapchainImage::destroy();
  }
  
-@@ -1903,6 +2130,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1903,6 +2138,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
              MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
              initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
@@ -17969,7 +17977,7 @@ index 2b394922..67f21eac 100644
          }
          return _mtlTexture;
      } else {
-@@ -1911,6 +2139,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1911,6 +2147,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  }
  
  bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
@@ -17979,7 +17987,7 @@ index 2b394922..67f21eac 100644
      id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
      if (cachedBaseMTLTexture == mtlTexture) { return true; }
  
-@@ -2202,6 +2433,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2202,6 +2441,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		[tex release];
  		_mtlTexture = nil;
  	}
@@ -17988,7 +17996,7 @@ index 2b394922..67f21eac 100644
  }
  
  MVKImageViewPlane::~MVKImageViewPlane() {
-@@ -2292,6 +2525,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2292,6 +2533,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  				if (mvkAreAllFlagsEnabled(_usage, newUsage)) { _usage = newUsage; }
  				break;
  			}
@@ -18001,7 +18009,7 @@ index 2b394922..67f21eac 100644
              /* case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR: {
                  const VkSamplerYcbcrConversionInfoKHR* sampConvInfo = (const VkSamplerYcbcrConversionInfoKHR*)next;
                  break;
-@@ -2570,6 +2809,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -2570,6 +2817,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
@@ -23531,7 +23539,7 @@ index b18549c7..acf4bf71 100644
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-index dec4b452..fcd8b5bb 100644
+index dec4b452..81d6430f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 @@ -18,6 +18,8 @@
@@ -24231,7 +24239,7 @@ index dec4b452..fcd8b5bb 100644
  		[mtlCmdBuff commit];
  	} else {
  		finish();
-@@ -851,3 +1314,146 @@
+@@ -851,3 +1314,206 @@
  	}
  }
  
@@ -24340,8 +24348,24 @@ index dec4b452..fcd8b5bb 100644
 +		[mtl4Queue updateBufferMappings: _bufferMappings[i].buffer heap: _bufferMappings[i].heap operations: ops.data() count: ops.size()];
 +		i += n;
 +	}
++
++	// Tier 1 textures' mappings first, then tier 2 textures' (sparse BC textures are tier 2, the rest tier 1:
++	// MVKImagePlane::newMTLTextureDescriptor()), each texture's together and in their order, with an event signal
++	// between the tiers. Metal stalls the queue for 4 s on batches that interleave the tiers (one that maps a tier 1
++	// texture's mip tail, then a tier 2 texture, then that tier 1 texture's other mips, for one), which CONTROL
++	// Resonant's texture streaming does all the time. Mappings of different textures don't depend on each other.
++	auto tierOf = [](id<MTLTexture> texture) { return texture.sparseTextureTier == MTLTextureSparseTier2 ? 2 : 1; };
++	std::unordered_map<id<MTLTexture>, size_t> firstUse;
++	for (size_t k = 0; k < _textureMappings.size(); k++) { firstUse.emplace(_textureMappings[k].texture, k); }
++	std::stable_sort(_textureMappings.begin(), _textureMappings.end(), [&](const TextureMapping& a, const TextureMapping& b) {
++		int ta = tierOf(a.texture), tb = tierOf(b.texture);
++		return ta != tb ? ta < tb : firstUse[a.texture] < firstUse[b.texture];
++	});
 +	count = _textureMappings.size();
 +	for (size_t i = 0; i < count; ) {
++		if (i && tierOf(_textureMappings[i].texture) != tierOf(_textureMappings[i - 1].texture)) {
++			[mtl4Queue signalEvent: event value: ++_queue->_sparseMappingEventValue];
++		}
 +		size_t n = 1;
 +		while (i + n < count && _textureMappings[i + n].texture == _textureMappings[i].texture &&
 +			   _textureMappings[i + n].mapping.heap == _textureMappings[i].mapping.heap) { n++; }
@@ -24365,6 +24389,50 @@ index dec4b452..fcd8b5bb 100644
 +	uint64_t mappingsDone = ++_queue->_sparseMappingEventValue;
 +	[mtl4Queue signalEvent: event value: mappingsDone];
 +	_queue->_sparseMappingsDoneValue.store(mappingsDone);
++
++	// METALSHARP_TRACE=gpu: sparse binds whose mappings take 50 ms or more, or haven't finished after 2 s; gpu+heavy
++	// also every bind and its operations.
++	if (MVK_MS_TRACE_ON(GPU)) {
++		uint32_t tierOps[3] = {};
++		for (auto& m : _textureMappings) { tierOps[std::min((NSUInteger)m.texture.sparseTextureTier, (NSUInteger)2)]++; }
++		char summary[160];
++		snprintf(summary, sizeof(summary), "%zu buffer and %zu texture operations (%u tier 1, %u tier 2)",
++				 _bufferMappings.size(), _textureMappings.size(), tierOps[1], tierOps[2]);
++		bool heavy = mvkMSTraceHeavyMask() & kMVKMSTraceGPU;
++		if (heavy) {
++			MVK_MS_TRACE(GPU, "Sparse bind on queue %p: waits %llu, mappings %llu: %s", _queue, waitsDone, mappingsDone, summary);
++			for (auto& m : _textureMappings) {
++				id<MTLTexture> t = m.texture;
++				const auto& r = m.mapping.region;
++				MVK_MS_TRACE(GPU, "  %s texture %p format %lu tier %lu %lux%lu mips %lu tail %lu: level %lu slice %lu region %lu,%lu,%lu %lux%lux%lu heap %p offset %lu",
++							 m.mapping.heap ? "map" : "unmap", t, (unsigned long)t.pixelFormat, (unsigned long)t.sparseTextureTier,
++							 (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.mipmapLevelCount,
++							 (unsigned long)t.firstMipmapInTail, (unsigned long)m.mapping.level, (unsigned long)m.mapping.slice,
++							 (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)r.origin.z,
++							 (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.size.depth,
++							 m.mapping.heap, (unsigned long)m.mapping.heapOffset);
++			}
++		}
++		static MTLSharedEventListener* listener = [[MTLSharedEventListener alloc] init];
++		uint64_t start = mvkGetTimestamp();
++		void* queue = _queue;
++		std::string what = summary;
++		[event notifyListener: listener atValue: mappingsDone block: ^(id<MTLSharedEvent>, uint64_t) {
++			double ms = mvkGetElapsedMilliseconds(start);
++			if (heavy || ms >= 50.0) {
++				MVK_MS_TRACE(GPU, "Sparse bind on queue %p: mappings %llu done after %.3f ms (%s)", queue, mappingsDone, ms, what.c_str());
++			}
++		}];
++		id<MTLSharedEvent> ev = [event retain];
++		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++			uint64_t now = ev.signaledValue;
++			if (now < mappingsDone) {
++				MVK_MS_TRACE(GPU, "SPARSE BIND STUCK? queue %p: mappings %llu not done after 2 s (event at %llu, waits %llu): %s",
++							 queue, mappingsDone, now, waitsDone, what.c_str());
++			}
++			[ev release];
++		});
++	}
 +#endif
 +}
 +
