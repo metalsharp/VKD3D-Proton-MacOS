@@ -10698,7 +10698,9 @@ static bool test_groupshared64()
 
 // Ray tracing pipelines (DXR 1.0): a state object with ray generation, miss and closest hit shaders, its shader
 // tables, and DispatchRays against the one-triangle scene (hits report RayTCurrent and the barycentrics).
-static bool test_dispatchrays()
+// stride: the miss and hit group tables' StrideInBytes; 0 reads their first record for every index (CONTROL
+// Resonant's ray tracing).
+static bool dispatchrays_case(UINT64 stride)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
@@ -10790,8 +10792,8 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
     D3D12_GPU_VIRTUAL_ADDRESS base = table->GetGPUVirtualAddress();
     D3D12_DISPATCH_RAYS_DESC rays = {};
     rays.RayGenerationShaderRecord = { base, 32 };
-    rays.MissShaderTable = { base + 64, 32, 32 };
-    rays.HitGroupTable = { base + 128, 32, 32 };
+    rays.MissShaderTable = { base + 64, 32, stride };
+    rays.HitGroupTable = { base + 128, 32, stride };
     rays.Width = 4;
     rays.Height = rays.Depth = 1;
     list4->SetComputeRootSignature(rs);
@@ -10821,6 +10823,9 @@ void ch(inout Payload p, BuiltInTriangleIntersectionAttributes a) { p.hit = 1; p
     release_rt_scene(scene); list4->Release(); dev5->Release();
     return true;
 }
+
+static bool test_dispatchrays() { return dispatchrays_case(32); }
+static bool test_dispatchrays_stride0() { return dispatchrays_case(0); }
 
 // Mesh shaders (tier 1): an amplification shader launches two mesh groups with a payload of colors; each emits
 // a quad covering one half of the render target.
@@ -15294,6 +15299,7 @@ static const Test tests[] = {
     { "conservative", test_conservative },
     { "rayquery", test_rayquery },
     { "dispatchrays", test_dispatchrays },
+    { "dispatchrays_stride0", test_dispatchrays_stride0 },
     { "mesh", test_mesh },
     { "mesh_resources", test_mesh_resources },
     { "ei_mesh", test_ei_mesh },

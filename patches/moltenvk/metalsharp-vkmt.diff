@@ -2796,10 +2796,10 @@ index bc1474c5..8e815e18 100644
 +	VkDeviceSize _mtlIndirectBufferOffset = 0;
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
-index 2a7eff45..1a3b50b5 100644
+index 2a7eff45..9ebbf2ca 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
-@@ -75,3 +75,270 @@
+@@ -75,3 +75,277 @@
  																			   threadsPerThreadgroup: cmdEncoder->getComputePipeline()->getThreadgroupSize()];
  }
  
@@ -2857,15 +2857,22 @@ index 2a7eff45..1a3b50b5 100644
 +		return cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT,
 +									"vkCmdTraceRaysKHR(): The ray-generation shader binding table is invalid for the Metal backend.");
 +	}
++	// A stride of 0 reads the first record for every index (D3D12's StrideInBytes of 0, which VKD3D-Proton passes
++	// through): the shaders read the record at address + index * stride.
 +	auto invalidOptionalRegion = [](const VkStridedDeviceAddressRegionKHR* region) {
-+		return region->size && (!region->deviceAddress || region->stride < 32 ||
++		return region->size && (!region->deviceAddress || (region->stride && region->stride < 32) ||
 +			(region->deviceAddress & 15) || (region->stride & 15));
 +	};
++	static const char* regionNames[] = { "miss", "hit", "callable" };
++	uint32_t regionIndex = 0;
 +	for (auto* region : {pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable}) {
 +		if (invalidOptionalRegion(region)) {
 +			return cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT,
-+										"vkCmdTraceRaysKHR(): An optional shader binding table is invalid for the Metal backend.");
++										"vkCmdTraceRaysKHR(): The %s shader binding table (address 0x%llx, stride %llu, size %llu) is invalid for the Metal backend.",
++										regionNames[regionIndex], (unsigned long long)region->deviceAddress,
++										(unsigned long long)region->stride, (unsigned long long)region->size);
 +		}
++		regionIndex++;
 +	}
 +	_raygenShaderBindingTable = *pRaygenShaderBindingTable;
 +	_missShaderBindingTable = *pMissShaderBindingTable;
@@ -5326,7 +5333,7 @@ index 5119f856..a1ee183c 100644
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-index 3e9fc79f..bbcee3f6 100644
+index 3e9fc79f..96925414 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 @@ -22,9 +22,12 @@
@@ -5404,7 +5411,7 @@ index 3e9fc79f..bbcee3f6 100644
  			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
  		}
  	}
-@@ -237,6 +278,319 @@
+@@ -237,6 +278,318 @@
  template class MVKCmdPipelineBarrier<32>;
  
  
@@ -5535,7 +5542,6 @@ index 3e9fc79f..bbcee3f6 100644
 +			interpolator.depthReversed = mvkIsAnyFlagEnabled(_info.flags, VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK);
 +			interpolator.uiTextureComposited = ui && _interpolation.uiComposited;
 +			[interpolator encodeToCommandBuffer: mtlCmdBuff];
-+			cmdEncoder->getDevice()->markFrameInterpolation(CACurrentMediaTime());
 +			[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) { [scaler release]; }];
 +
 +			[cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) waitForFence: fence];
@@ -5724,7 +5730,7 @@ index 3e9fc79f..bbcee3f6 100644
  #pragma mark -
  #pragma mark MVKCmdBindPipeline
  
-@@ -260,6 +614,14 @@
+@@ -260,6 +613,14 @@
  	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
  }
  
@@ -5739,7 +5745,7 @@ index 3e9fc79f..bbcee3f6 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindComputePipeline
-@@ -268,6 +630,18 @@
+@@ -268,6 +629,18 @@
  	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
  }
  
@@ -5758,7 +5764,7 @@ index 3e9fc79f..bbcee3f6 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindDescriptorSetsStatic
-@@ -279,14 +653,16 @@
+@@ -279,14 +652,16 @@
  													   uint32_t firstSet,
  													   uint32_t setCount,
  													   const VkDescriptorSet* pDescriptorSets) {
@@ -5778,7 +5784,7 @@ index 3e9fc79f..bbcee3f6 100644
  	// Add the descriptor sets
  	_descriptorSets.clear();	// Clear for reuse
  	_descriptorSets.reserve(setCount);
-@@ -373,7 +749,7 @@
+@@ -373,7 +748,7 @@
  
  template <size_t N>
  void MVKCmdPushConstants<N>::encode(MVKCommandEncoder* cmdEncoder) {
@@ -5787,7 +5793,7 @@ index 3e9fc79f..bbcee3f6 100644
  }
  
  template class MVKCmdPushConstants<64>;
-@@ -384,57 +760,188 @@
+@@ -384,57 +759,188 @@
  #pragma mark -
  #pragma mark MVKCmdPushDescriptorSet
  
@@ -5997,7 +6003,7 @@ index 3e9fc79f..bbcee3f6 100644
  		}
  	}
  
-@@ -442,7 +949,11 @@
+@@ -442,7 +948,11 @@
  }
  
  void MVKCmdPushDescriptorSet::encode(MVKCommandEncoder* cmdEncoder) {
@@ -6010,7 +6016,7 @@ index 3e9fc79f..bbcee3f6 100644
  }
  
  MVKCmdPushDescriptorSet::~MVKCmdPushDescriptorSet() {
-@@ -452,24 +963,24 @@
+@@ -452,24 +962,24 @@
  
  void MVKCmdPushDescriptorSet::clearDescriptorWrites() {
  	for (VkWriteDescriptorSet &descWrite : _descriptorWrites) {
@@ -6049,7 +6055,7 @@ index 3e9fc79f..bbcee3f6 100644
  }
  
  
-@@ -481,11 +992,21 @@
+@@ -481,11 +991,21 @@
  														 VkPipelineLayout layout,
  														 uint32_t set,
  														 const void* pData) {
@@ -6075,7 +6081,7 @@ index 3e9fc79f..bbcee3f6 100644
  
  	size_t oldSize = _dataSize;
  	_dataSize = _descUpdateTemplate->getSize();
-@@ -495,6 +1016,15 @@
+@@ -495,6 +1015,15 @@
  	}
  	if (_pData && pData) {
  		mvkCopy(_pData, pData, _dataSize);
@@ -6091,7 +6097,7 @@ index 3e9fc79f..bbcee3f6 100644
  	}
  
  	return VK_SUCCESS;
-@@ -505,6 +1035,8 @@
+@@ -505,6 +1034,8 @@
  }
  
  MVKCmdPushDescriptorSetWithTemplate::~MVKCmdPushDescriptorSetWithTemplate() {
@@ -14568,7 +14574,7 @@ index 3cdc6234..4c15129c 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..fd0babda 100644
+index 534a414f..5166d471 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,13 @@
@@ -14949,7 +14955,7 @@ index 534a414f..fd0babda 100644
  	bool hasResidencySet() {
  #if MVK_XCODE_16
  		return _residencySet != nil;
-@@ -1050,12 +1269,42 @@ public:
+@@ -1050,12 +1269,33 @@ public:
  		return _barrierFences[stage][index];
  	}
  
@@ -14964,15 +14970,6 @@ index 534a414f..fd0babda 100644
 +
 +	/** MetalSharp: releases the MetalFX scalers kept under these ids. */
 +	void releaseMetalFXScalers(const uint64_t* scalerIds, uint32_t count);
-+
-+	/** MetalSharp: notes that a frame interpolation was encoded now (host seconds, CACurrentMediaTime). */
-+	void markFrameInterpolation(double now) { _lastFrameInterpolationTime = now; }
-+
-+	/** MetalSharp: whether a frame interpolation was encoded in the last half second, which paces presents. */
-+	bool isFrameInterpolating(double now) {
-+		double last = _lastFrameInterpolationTime;
-+		return last > 0.0 && now - last < 0.5;
-+	}
 +
 +	/** returns the Metal render stages that run Vulkan pre-rasterization shaders */
 +	MTLRenderStages getMTLVertexStages() {
@@ -14992,7 +14989,7 @@ index 534a414f..fd0babda 100644
  	MVKImage* addImage(MVKImage* mvkImg);
  	MVKImage* removeImage(MVKImage* mvkImg);
      void initPerformanceTracking();
-@@ -1076,6 +1325,8 @@ protected:
+@@ -1076,6 +1316,8 @@ protected:
  	void getDescriptorVariableDescriptorCountLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
@@ -15001,7 +14998,7 @@ index 534a414f..fd0babda 100644
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
-@@ -1093,11 +1344,30 @@ protected:
+@@ -1093,11 +1335,29 @@ protected:
  
  	id<MTLFence> _barrierFences[kMVKBarrierStageCount][kMVKBarrierFenceCount];
  
@@ -15013,7 +15010,6 @@ index 534a414f..fd0babda 100644
 +	};
 +	std::unordered_map<uint64_t, MVKMetalFXScaler> _metalFXScalers;
 +	std::mutex _metalFXScalersLock;
-+	std::atomic<double> _lastFrameInterpolationTime{0.0};
 +
  	MVKPerformanceStatistics _performanceStats;
      MVKCommandResourceFactory* _commandResourceFactory = nullptr;
@@ -15032,7 +15028,7 @@ index 534a414f..fd0babda 100644
  	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
  	MVKSmallVector<bool> _privateDataSlotsAvailability;
  	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
-@@ -1105,16 +1375,68 @@ protected:
+@@ -1105,16 +1365,68 @@ protected:
  	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
  	MVKLiveResourceSet _liveResources;
  	std::mutex _rezLock;
@@ -15101,7 +15097,7 @@ index 534a414f..fd0babda 100644
  	int _capturePipeFileDesc = -1;
  	bool _isPerformanceTracking = false;
  	bool _isCurrentlyAutoGPUCapturing = false;
-@@ -1165,12 +1487,15 @@ public:
+@@ -1165,12 +1477,15 @@ public:
  
  	/** Device features available and enabled. */
  	const VkPhysicalDeviceFeatures& getEnabledFeatures() const { return _device->_enabledFeatures; }
@@ -15119,7 +15115,7 @@ index 534a414f..fd0babda 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1600,50 @@ protected:
+@@ -1275,6 +1590,50 @@ protected:
  };
  
  
@@ -17820,7 +17816,7 @@ index 45ddd3a4..aee21d46 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..0bc224d8 100644
+index 2b394922..73316806 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -18137,16 +18133,7 @@ index 2b394922..0bc224d8 100644
  
  		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
  
-@@ -1667,6 +1877,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
- 		}
- 		if (presentInfo.desiredPresentTime) {
- 			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
-+		} else if (_swapchain && _swapchain->presentPacedForFrameInterpolation(mtlDrwbl)) {
-+			// MetalSharp: paced for frame generation
- 		} else {
- 			[mtlDrwbl present];
- 		}
-@@ -1751,6 +1963,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1751,6 +1961,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	// time will not be available if the presentation did not actually happen, such as when
  	// running headless, or on a test harness that is not attached to the windowing system.
  	if (actualPresentTime == 0) { actualPresentTime = mvkGetRuntimeNanoseconds(); }
@@ -18162,7 +18149,7 @@ index 2b394922..0bc224d8 100644
  
  	{	// Scope to avoid deadlock if release() is run within detachment lock
  		// If I have become detached from the swapchain, it means the swapchain, and possibly the
-@@ -1811,6 +2032,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1811,6 +2030,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  			_mtlTextureHeadless = [[getMTLDevice() newTextureWithDescriptor: mtlTexDesc] retain];	// retained
  		}
@@ -18183,7 +18170,7 @@ index 2b394922..0bc224d8 100644
  	}
  }
  
-@@ -1819,6 +2054,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1819,6 +2052,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	releaseMetalDrawable();
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
@@ -18192,7 +18179,7 @@ index 2b394922..0bc224d8 100644
  	MVKSwapchainImage::destroy();
  }
  
-@@ -1903,6 +2140,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1903,6 +2138,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
              MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
              initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
@@ -18200,7 +18187,7 @@ index 2b394922..0bc224d8 100644
          }
          return _mtlTexture;
      } else {
-@@ -1911,6 +2149,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1911,6 +2147,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  }
  
  bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
@@ -18210,7 +18197,7 @@ index 2b394922..0bc224d8 100644
      id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
      if (cachedBaseMTLTexture == mtlTexture) { return true; }
  
-@@ -2202,6 +2443,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2202,6 +2441,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		[tex release];
  		_mtlTexture = nil;
  	}
@@ -18219,7 +18206,7 @@ index 2b394922..0bc224d8 100644
  }
  
  MVKImageViewPlane::~MVKImageViewPlane() {
-@@ -2292,6 +2535,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2292,6 +2533,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  				if (mvkAreAllFlagsEnabled(_usage, newUsage)) { _usage = newUsage; }
  				break;
  			}
@@ -18232,7 +18219,7 @@ index 2b394922..0bc224d8 100644
              /* case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR: {
                  const VkSamplerYcbcrConversionInfoKHR* sampConvInfo = (const VkSamplerYcbcrConversionInfoKHR*)next;
                  break;
-@@ -2570,6 +2819,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -2570,6 +2817,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
@@ -25798,10 +25785,10 @@ index 3aa44a44..e3d5ed00 100644
  }
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
-index 1665b514..e9f7a784 100644
+index 1665b514..31dc526f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
-@@ -125,7 +125,15 @@ protected:
+@@ -125,6 +125,9 @@ protected:
  	void endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime = 0);
  	void notifyPresentComplete(const MVKImagePresentInfo& presentInfo);
  	void forceUnpresentedImageCompletion();
@@ -25809,25 +25796,12 @@ index 1665b514..e9f7a784 100644
 +	void encodeMetalFXSpatialScale(id<MTLTexture> mtlTexture, id<CAMetalDrawable> mtlDrawable, id<MTLCommandBuffer> mtlCmdBuff);
 +	void sampleMetalFXOnScreenExtent();
  
-+public:
-+	/** MetalSharp: presents the drawable paced for frame generation; false where it is not to be paced. */
-+	bool presentPacedForFrameInterpolation(id<CAMetalDrawable> mtlDrawable);
-+
-+protected:
  	MVKSurface* _surface = nullptr;
      MVKWatermark* _licenseWatermark = nullptr;
- 	MVKSmallVector<MVKPresentableSwapchainImage*, kMVKMaxSwapchainImageCount> _presentableImages;
-@@ -145,4 +153,26 @@ protected:
+@@ -145,4 +148,19 @@ protected:
  	uint32_t _presentHistoryIndex = 0;
  	uint32_t _presentHistoryHeadIndex = 0;
  	bool _isDeliberatelyScaled = false;
-+
-+	// MetalSharp: frame generation presents an interpolated frame and the real one back to back, so while the device
-+	// interpolates frames each present stays on screen for most of the average time between presents.
-+	std::mutex _framePacingLock;
-+	double _lastPacedPresentTime = 0.0;
-+	double _pacedPresentInterval = 0.0;
-+	uint32_t _pacedPresentCount = 0;
 +
 +	// MetalSharp: MetalFX spatial upscaling at present (VkSwapchainMetalFXSpatialCreateInfoMVK). The images are
 +	// textures of their own, which the scaler upscales into _metalFXOutput, the drawable's size, copied to the drawable.
@@ -25845,7 +25819,7 @@ index 1665b514..e9f7a784 100644
 +	bool _metalFXRequested = false;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
-index 4c908669..cc781e0b 100644
+index 4c908669..7db8e029 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
 @@ -26,10 +26,12 @@
@@ -25907,7 +25881,7 @@ index 4c908669..cc781e0b 100644
  
  	if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
  		mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-@@ -658,5 +674,140 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+@@ -658,5 +674,103 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
  
  MVKSwapchain::~MVKSwapchain() {
      if (_licenseWatermark) { _licenseWatermark->destroy(); }
@@ -25976,43 +25950,6 @@ index 4c908669..cc781e0b 100644
 +
 +// MetalSharp: the layer's size on screen, measured on the main thread without waiting for it, every
 +// kMVKMetalFXSampleInterval presents of a swapchain that asked for MetalFX.
-+// MetalSharp: Streamline presents frame generation's interpolated frame and then the real one right after it, and
-+// then waits for the next real frame, so on screen the frames alternate between a vsync or so and the rest of the
-+// real frame's time. While the device interpolates frames, each drawable stays on screen for at least 85% of the
-+// average time between presents (an exponential average, leaving out gaps of 100 ms or more), which gives the
-+// interpolated and the real frame about the same time on screen. METALSHARP_FRAME_PACING=0 turns it off.
-+bool MVKSwapchain::presentPacedForFrameInterpolation(id<CAMetalDrawable> mtlDrawable) {
-+	static const bool enabled = [] {
-+		const char* v = getenv("METALSHARP_FRAME_PACING");
-+		return !(v && v[0] == '0');
-+	}();
-+	if ( !enabled ) { return false; }
-+
-+	double now = CACurrentMediaTime();
-+	double minDuration = 0.0;
-+	{
-+		lock_guard<mutex> lock(_framePacingLock);
-+		double interval = _lastPacedPresentTime > 0.0 ? now - _lastPacedPresentTime : 0.0;
-+		_lastPacedPresentTime = now;
-+		if ( !getDevice()->isFrameInterpolating(now) ) {
-+			_pacedPresentInterval = 0.0;
-+			_pacedPresentCount = 0;
-+			return false;
-+		}
-+		if (interval > 0.0 && interval < 0.1) {
-+			_pacedPresentInterval = _pacedPresentCount ? _pacedPresentInterval + 0.1 * (interval - _pacedPresentInterval) : interval;
-+			_pacedPresentCount++;
-+		}
-+		// a pair of presents at least, so the average is of the whole real frame
-+		if (_pacedPresentCount >= 4) { minDuration = _pacedPresentInterval * 0.85; }
-+	}
-+	if (minDuration < 0.004) { return false; }
-+
-+	MVK_MS_TRACE(Present, "frame generation pacing: on screen for at least %.2f ms", minDuration * 1000.0);
-+	[mtlDrawable presentAfterMinimumDuration: minDuration];
-+	return true;
-+}
-+
 +void MVKSwapchain::sampleMetalFXOnScreenExtent() {
 +	if ( !_metalFXRequested || --_metalFXSampleCountdown ) { return; }
 +	_metalFXSampleCountdown = kMVKMetalFXSampleInterval;
