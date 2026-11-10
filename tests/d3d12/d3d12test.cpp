@@ -1426,6 +1426,10 @@ void unmapped()
         { DXGI_FORMAT_BC4_UNORM, "BC4 512x512", 512, 512 },
         { DXGI_FORMAT_BC5_UNORM, "BC5 1024x1024", 1024, 1024 },
         { DXGI_FORMAT_BC7_UNORM, "BC7 2048x1024", 2048, 1024 },
+        // CONTROL Resonant's window interiors: a height that is not a power of two, whose packed mips Metal's sparse
+        // tail lost two of (mips 6 and 7 read as zeros, whatever was copied in)
+        { DXGI_FORMAT_BC6H_UF16, "BC6H 2048x1080", 2048, 1080 },
+        { DXGI_FORMAT_BC7_UNORM, "BC7 1920x1080", 1920, 1080 },
     };
     for (auto &f : fmts)
     {
