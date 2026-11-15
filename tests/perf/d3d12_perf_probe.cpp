@@ -1909,6 +1909,28 @@ static std::vector<Scene> more_scenes()
             set_quad_state(p.list, flat);
             p.list->ExecuteIndirect(draw_sig, 4000, args, 0, count_buffer, 0);
         } },
+        { "execute_indirect_count_draws", "ExecuteIndirect of draws alone with a count buffer: up to 4000, 200 executed (GPU-driven multi-draw)", [] {
+            flat = create_pso({});
+            D3D12_INDIRECT_ARGUMENT_DESC a[1] = {};
+            a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 16, 1, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&draw_sig)));
+            args = create_buffer(4000 * 16, D3D12_HEAP_TYPE_UPLOAD);
+            uint32_t *v; CHECK(args->Map(0, nullptr, (void **)&v));
+            for (UINT i = 0; i < 4000; i++)
+            {
+                uint32_t draw[4] = { 3, 1, 0, 0 };
+                memcpy(v + i * 4, draw, 16);
+            }
+            args->Unmap(0, nullptr);
+            count_buffer = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+            uint32_t *c; CHECK(count_buffer->Map(0, nullptr, (void **)&c));
+            *c = 200;
+            count_buffer->Unmap(0, nullptr);
+        }, [](UINT) {
+            set_quad_state(p.list, flat);
+            p.list->ExecuteIndirect(draw_sig, 4000, args, 0, count_buffer, 0);
+        } },
         { "instancing", "one draw of 160000 small instances (vertex/instance throughput)", [] {
             PsoDesc d; d.vs = "vs_instanced"; inst = create_pso(d);
         }, [](UINT) {

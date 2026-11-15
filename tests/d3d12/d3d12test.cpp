@@ -14493,6 +14493,135 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+// ExecuteIndirect of draws alone with a count buffer, as GPU-driven renderers make it: up to 32 draws, fewer counted,
+// each drawing one column of a 32x2 target from the vertices at its start vertex (row 0) or start index (row 1).
+static bool test_executeindirect_count_draws()
+{
+    static const char *src = R"(
+float4 vs(float2 pos : POSITION) : SV_Position { return float4(pos, 0, 1); }
+float4 ps() : SV_Target { return float4(1, 1, 1, 1); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_INPUT_ELEMENT_DESC ie = { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.InputLayout = { &ie, 1 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    D3D12_INDIRECT_ARGUMENT_DESC draw = {}, draw_indexed = {};
+    draw.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    draw_indexed.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(D3D12_DRAW_ARGUMENTS), 1, &draw, 0 };
+    D3D12_COMMAND_SIGNATURE_DESC csdi = { sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), 1, &draw_indexed, 0 };
+    ID3D12CommandSignature *sig = nullptr, *sigi = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+    CHECK_HR(g.device->CreateCommandSignature(&csdi, nullptr, IID_PPV_ARGS(&sigi)));
+
+    const UINT W = 32, H = 2, MAX = 32, COUNT0 = 20, COUNT1 = 13;
+    ID3D12Resource *buf = create_buffer(8192, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    buf->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 8192);
+    uint32_t indices[6 * 32];
+    for (UINT i = 0; i < MAX; i++)
+    {
+        // Six vertex IDs from 6 * i: the start vertex, or the indices from the start index.
+        D3D12_DRAW_ARGUMENTS d = { 6, 1, 6 * i, 0 };
+        memcpy(u + i * sizeof(d), &d, sizeof(d));
+        D3D12_DRAW_INDEXED_ARGUMENTS di = { 6, 1, 6 * i, 0, 0 };
+        memcpy(u + 1024 + i * sizeof(di), &di, sizeof(di));
+        // Column i's quad: corners 0, 1, 2 and 0, 2, 3.
+        float x0 = -1.0f + i / 16.0f, x1 = x0 + 1.0f / 16.0f;
+        const float corner[4][2] = { { x0, -1 }, { x1, -1 }, { x1, 1 }, { x0, 1 } };
+        const UINT order[6] = { 0, 1, 2, 0, 2, 3 };
+        for (UINT c = 0; c < 6; c++)
+        {
+            indices[6 * i + c] = 6 * i + c;
+            memcpy(u + 4096 + (6 * i + c) * 8, corner[order[c]], 8);
+        }
+    }
+    memcpy(u + 2048, indices, sizeof(indices));
+    const uint32_t counts[2] = { COUNT0, COUNT1 };
+    memcpy(u + 3072, &counts[0], 4);
+    memcpy(u + 3328, &counts[1], 4);
+    static_assert(2048 + sizeof(indices) <= 3072, "indices before the counts");
+    buf->Unmap(0, nullptr);
+    D3D12_GPU_VIRTUAL_ADDRESS va = buf->GetGPUVirtualAddress();
+
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_INDEX_BUFFER_VIEW ibv = { va + 2048, sizeof(indices), DXGI_FORMAT_R32_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { va + 4096, 6 * 32 * 8, 8 };
+    g.list->IASetVertexBuffers(0, 1, &vbv);
+    D3D12_RECT row0 = { 0, 0, (LONG)W, 1 }, row1 = { 0, 1, (LONG)W, 2 };
+    g.list->RSSetScissorRects(1, &row0);
+    g.list->ExecuteIndirect(sig, MAX, buf, 0, buf, 3072);
+    g.list->RSSetScissorRects(1, &row1);
+    g.list->ExecuteIndirect(sigi, MAX, buf, 1024, buf, 3328);
+
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    for (UINT y = 0; y < H; y++)
+        for (UINT x = 0; x < W; x++)
+        {
+            uint32_t want = x < (y ? COUNT1 : COUNT0) ? 0xffffffff : 0xff000000;
+            EXPECT(px[y * 64 + x] == want, "%s draw %u: pixel (%u, %u) 0x%08x, want 0x%08x",
+                   y ? "indexed" : "non-indexed", x, x, y, px[y * 64 + x], want);
+        }
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); rt->Release(); buf->Release(); sigi->Release(); sig->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // View instancing (tier 2): two views, mapped to slices 1 and 0 of a render target array, through a vertex shader,
 // a geometry shader, tessellation and a mesh shader. Each pre-rasterization stage adds a multiple of SV_ViewID to
 // red (1x, then 2x and 4x by the next stages), the pixel shader writes its own view to green.
@@ -15386,6 +15515,7 @@ static const Test tests[] = {
     { "wave_ops_compute", test_wave_ops_compute },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
+    { "executeindirect_count_draws", test_executeindirect_count_draws },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
     { "uav_global_barrier_deferred", test_uav_global_barrier_deferred },
