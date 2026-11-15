@@ -3339,7 +3339,7 @@ index 9afc3ed8..4a26505b 100644
 +	uint32_t _maxSequenceCount = 0;
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
-index d0452973..2f54afdb 100644
+index d0452973..72cc779f 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 @@ -19,10 +19,7 @@
@@ -4366,7 +4366,7 @@ index d0452973..2f54afdb 100644
                          [cmdEncoder->_mtlRenderEncoder drawIndexedPrimitives: cmdEncoder->getMtlGraphics().getPrimitiveType()
                                                                     indexType: (MTLIndexType)ibb.mtlIndexType
                                                                   indexBuffer: ibb.mtlBuffer
-@@ -1535,3 +2113,918 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1535,3 +2113,910 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          }
      }
  }
@@ -4952,28 +4952,6 @@ index d0452973..2f54afdb 100644
 +void MVKCmdExecuteGeneratedCommands::encode(MVKCommandEncoder* cmdEncoder) {
 +	if ( !_maxSequenceCount || !_layout || _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT ) { return; }
 +	if (_layout->_actionType != VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT && mvkSkipsUnsupportedDraw(cmdEncoder)) { return; }
-+	// Generated push constants are in the app's own layout, not a Metal Shader Converter top-level argument buffer
-+	// (VKD3D-Proton uses SPIR-V pipelines for these): skip the draws.
-+	if (_layout->_actionType != VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT &&
-+		cmdEncoder->getGraphicsPipeline() && cmdEncoder->getGraphicsPipeline()->isMSC()) {
-+		static bool reportedDraw = false;
-+		if ( !reportedDraw ) {
-+			reportedDraw = true;
-+			cmdEncoder->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdExecuteGeneratedCommandsEXT(): Draws with a Metal Shader Converter pipeline are not supported, and are skipped.");
-+		}
-+		return;
-+	}
-+	// Generated push constants are in the app's own layout, not a Metal Shader Converter top-level argument buffer
-+	// (VKD3D-Proton uses a SPIR-V pipeline for these): skip the dispatches.
-+	if (_layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT &&
-+		cmdEncoder->getComputePipeline() && cmdEncoder->getComputePipeline()->isMSC()) {
-+		static bool reported = false;
-+		if ( !reported ) {
-+			reported = true;
-+			cmdEncoder->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdExecuteGeneratedCommandsEXT(): Dispatches with a Metal Shader Converter pipeline are not supported, and are skipped.");
-+		}
-+		return;
-+	}
 +	mvkLogGeneratedCommandsStats(_layout->_actionType, _maxSequenceCount, _mtlCount != nil);
 +
 +	uint32_t argsSize;
@@ -5247,6 +5225,20 @@ index d0452973..2f54afdb 100644
 +	fill(bindings->fragmentBuffers, capture->_fragment, capture->_fragmentMask);
 +	bindings->vertexMask = capture->_vertexMask;
 +	bindings->fragmentMask = capture->_fragmentMask;
++	// A converted vertex shader that reads draw parameters reads each draw's arguments, which are the sequence's own
++	// (its indirect argument layouts match Metal's), and the index type.
++	MVKGraphicsPipeline* pipeline = cmdEncoder->getGraphicsPipeline();
++	if (pipeline && pipeline->isMSC() && pipeline->mscNeedsDrawParams()) {
++		const auto& ib = cmdEncoder->getVkGraphics()._indexBuffer;
++		bool indexed = _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT;
++		uint16_t irIndexType = indexed ? uint16_t((ib.mtlBuffer ? ib.mtlIndexType : MTLIndexTypeUInt32) + 1) : 0;
++		const MVKMTLBufferAllocation* typeAlloc = cmdEncoder->copyToTempMTLBufferAllocation(&irIndexType, sizeof(irIndexType));
++		bindings->vertexBuffers[kMVKMSCDrawArgumentsIndex] = { 0, 0, 4u };
++		bindings->vertexBuffers[kMVKMSCDrawUniformsIndex] = { typeAlloc->_mtlBuffer.gpuAddress + typeAlloc->_offset, 0, 0 };
++		bindings->vertexMask |= (1u << kMVKMSCDrawArgumentsIndex) | (1u << kMVKMSCDrawUniformsIndex);
++		[mtlRender useResource: _mtlStream usage: MTLResourceUsageRead stages: MTLRenderStageVertex];
++		[mtlRender useResource: typeAlloc->_mtlBuffer usage: MTLResourceUsageRead stages: MTLRenderStageVertex];
++	}
 +	bindings->pushConstantsStride = pcStride;
 +	bindings->primitiveType = (uint32_t)cmdEncoder->getMtlGraphics().getPrimitiveType();
 +	const auto& indexBuffer = cmdEncoder->getVkGraphics()._indexBuffer;
@@ -8557,7 +8549,7 @@ index 0a4d180e..58f1d23c 100644
 -
 -
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
-index 199172a0..2b8a032d 100644
+index 199172a0..65ad35db 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
 @@ -19,11 +19,14 @@
@@ -9258,7 +9250,7 @@ index 199172a0..2b8a032d 100644
  void MVKMetalGraphicsCommandEncoderState::changePipeline(MVKGraphicsPipeline* from, MVKGraphicsPipeline* to) {
  	_flags.remove(MVKMetalRenderEncoderStateFlag::PipelineReady);
  	// Everything that was static is now dirty
-@@ -1105,6 +1379,66 @@ static uint32_t getSampleCount(VkSampleCountFlags vk) {
+@@ -1105,6 +1379,69 @@ static uint32_t getSampleCount(VkSampleCountFlags vk) {
  	}
  	if (to)
  		markDirty(to->getStaticStateFlags());
@@ -9295,8 +9287,11 @@ index 199172a0..2b8a032d 100644
 +		if (fragment) { bindFragmentBuffer(encoder, buffer, offset, index); }
 +	};
 +	uint32_t size = std::min<uint32_t>(pipeline->getLayout()->getPushConstantsLength(), (uint32_t)vkShared._pushConstants.size());
++	// Generated commands give each sequence its own push constants, the top-level argument buffer, in a buffer.
 +	// Bytes, not the argument ring that dispatches use: the ring measured no faster for draws.
-+	if (size && size < 4096) {
++	if (vkShared._pushConstantsBuffer) {
++		bindBufferAll(vkShared._pushConstantsBuffer, vkShared._pushConstantsBufferOffset, kMVKMSCArgumentBufferIndex);
++	} else if (size && size < 4096) {
 +		bindBytesAll(vkShared._pushConstants.data(), size, kMVKMSCArgumentBufferIndex);
 +	} else if (size) {
 +		const MVKMTLBufferAllocation* alloc = mvkEncoder.copyToTempMTLBufferAllocation(vkShared._pushConstants.data(), size);
@@ -9325,7 +9320,7 @@ index 199172a0..2b8a032d 100644
  }
  
  static constexpr MVKRenderStateFlags FlagsScissor {
-@@ -1161,17 +1495,17 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1161,17 +1498,17 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  				[encoder setStencilFrontReferenceValue:_stencilReference.frontFaceValue backReferenceValue:_stencilReference.backFaceValue];
  		}
  #if MVK_USE_METAL_PRIVATE_API
@@ -9346,7 +9341,7 @@ index 199172a0..2b8a032d 100644
  					[mvkRendEnc setProvokingVertexMode:_provokingVertexMode];
  				}
  			}
-@@ -1214,6 +1548,9 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1214,6 +1551,9 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  		depthClipState.emulateViewportZ = !clamp && !clip;
  		uint32_t emulatedReversedDepthViewportMask = 0;
  		bool shouldEmulateReversedDepthViewports = shouldEmulateReversedDepthViewport(mvkEncoder.getDevice()->getPhysicalDevice());
@@ -9356,7 +9351,7 @@ index 199172a0..2b8a032d 100644
  		const VkViewport* viewports = dynamicStateFlags.has(MVKRenderStateFlag::Viewports) ? vk._viewports : pipeline->getViewports();
  		uint32_t numViewports = PICK_STATE(Viewports)->numViewports;
  		VkViewport adjustedViewports[kMVKMaxViewportScissorCount];
-@@ -1235,6 +1572,10 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1235,6 +1575,10 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  				emulatedReversedDepthViewportMask |= 1u << i;
  				std::swap(adjustedViewports[i].minDepth, adjustedViewports[i].maxDepth);
  			}
@@ -9367,7 +9362,7 @@ index 199172a0..2b8a032d 100644
  		}
  		mvkEncoder.getState().setGraphicsEmulatedReversedDepthViewportMask(emulatedReversedDepthViewportMask);
  		mvkEncoder.getState().setGraphicsDepthClipState(depthClipState);
-@@ -1318,7 +1659,8 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1318,7 +1662,8 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  		_stateReady.addAll(FlagsDepthStencil);
  		MVKRenderSubpass* subpass = mvkEncoder.getSubpass();
  		MVKMTLDepthStencilDescriptorData desc;
@@ -9377,7 +9372,7 @@ index 199172a0..2b8a032d 100644
  			const MVKMTLDepthStencilDescriptorData& op = PICK_STATE(StencilOp)->depthStencil;
  			desc.backFaceStencilData.op = op.backFaceStencilData.op;
  			desc.frontFaceStencilData.op = op.frontFaceStencilData.op;
-@@ -1329,7 +1671,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1329,7 +1674,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  			desc.backFaceStencilData.writeMask = write.backFaceStencilData.writeMask;
  			desc.frontFaceStencilData.writeMask = write.frontFaceStencilData.writeMask;
  		}
@@ -9386,7 +9381,7 @@ index 199172a0..2b8a032d 100644
  			desc.depthWriteEnabled = PICK_STATE(DepthWriteEnable)->depthStencil.depthWriteEnabled;
  			desc.depthCompareFunction = PICK_STATE(DepthCompareOp)->depthStencil.depthCompareFunction;
  		}
-@@ -1390,8 +1732,8 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1390,8 +1735,8 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  #endif
  #if MVK_USE_METAL_PRIVATE_API
  		if (anyStateNeeded.has(MVKRenderStateFlag::PrimitiveRestartEnable) &&
@@ -9397,7 +9392,7 @@ index 199172a0..2b8a032d 100644
  		{
  			auto mvkRendEnc = static_cast<id<MVKMTLRenderCommandEncoder>>(mvkEncoder._mtlRenderEncoder);
  			bool wasEnabled = _flags.has(MVKMetalRenderEncoderStateFlag::PrimitiveRestartEnable);
-@@ -1440,6 +1782,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1440,6 +1785,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	}
  }
  
@@ -9405,7 +9400,7 @@ index 199172a0..2b8a032d 100644
  void MVKMetalGraphicsCommandEncoderState::prepareDraw(
    id<MTLRenderCommandEncoder> encoder,
    MVKCommandEncoder& mvkEncoder,
-@@ -1457,7 +1800,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1457,7 +1803,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  		if (subpass->isMultiview() && !pipeline->isTessellationPipeline()) {
  			mtlPipeline = pipeline->getMultiviewPipelineState(subpass->getViewCountInMetalPass(mvkEncoder.getMultiviewPassIndex()));
  		} else {
@@ -9414,7 +9409,7 @@ index 199172a0..2b8a032d 100644
  		}
  		if (mtlPipeline != _pipeline) {
  			_pipeline = mtlPipeline;
-@@ -1468,16 +1811,52 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1468,16 +1814,52 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	// State
  	bindState(encoder, mvkEncoder, vk);
  
@@ -9469,7 +9464,7 @@ index 199172a0..2b8a032d 100644
  
  void MVKMetalGraphicsCommandEncoderState::prepareHelperDraw(
    id<MTLRenderCommandEncoder> encoder,
-@@ -1556,18 +1935,18 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1556,18 +1938,18 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  		[encoder setViewport:mvkMTLViewportFromVkViewport(viewport)];
  	}
  #if MVK_USE_METAL_PRIVATE_API
@@ -9491,7 +9486,7 @@ index 199172a0..2b8a032d 100644
  				[mvkRendEnc setProvokingVertexMode:_provokingVertexMode];
  			}
  		}
-@@ -1609,7 +1988,11 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1609,7 +1991,11 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	if (!mtlPipeline) // Abort if pipeline could not be created.
  		return;
  
@@ -9504,7 +9499,7 @@ index 199172a0..2b8a032d 100644
  
  	if (_pipeline != mtlPipeline) {
  		_pipeline = mtlPipeline;
-@@ -1619,13 +2002,42 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1619,13 +2005,45 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	if (_vkStage != kMVKShaderStageCompute) {
  		if (_vkStage != kMVKShaderStageCount) {
  			// Switching between graphics and compute, need to invalidate implicit buffers too
@@ -9525,7 +9520,10 @@ index 199172a0..2b8a032d 100644
 +		// pushes as push constants, and binds nothing else: the device's residency set makes the resources resident.
 +		// The arguments are copied into the command buffer's argument ring and bound by offset (copyMSCArguments()).
 +		uint32_t size = std::min<uint32_t>(pipeline->getLayout()->getPushConstantsLength(), (uint32_t)vkShared._pushConstants.size());
-+		if (size) {
++		if (vkShared._pushConstantsBuffer) {
++			// Generated commands give each sequence its own top-level argument buffer.
++			bindBuffer(encoder, vkShared._pushConstantsBuffer, vkShared._pushConstantsBufferOffset, kMVKMSCArgumentBufferIndex);
++		} else if (size) {
 +			NSUInteger offset = 0;
 +			id<MTLBuffer> args = mvkEncoder.copyMSCArguments(vkShared._pushConstants.data(), size, offset);
 +			bindBuffer(encoder, args, offset, kMVKMSCArgumentBufferIndex);
@@ -9548,7 +9546,7 @@ index 199172a0..2b8a032d 100644
  	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
  }
  
-@@ -1637,24 +2049,20 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1637,24 +2055,20 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	MVKShaderStage stage)
  {
  	MVKGraphicsPipeline* pipeline = vk._pipeline;
@@ -9580,7 +9578,7 @@ index 199172a0..2b8a032d 100644
  
  	if (_vkPipeline != pipeline) {
  		_vkPipeline = pipeline;
-@@ -1671,6 +2079,12 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1671,6 +2085,12 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  			invalidateDescriptorSetImplicitBuffers(*this);
  			_exists.descriptorSetData.reset();
  		}
@@ -9593,7 +9591,7 @@ index 199172a0..2b8a032d 100644
  		_vkStage = stage;
  	}
  
-@@ -1687,6 +2101,15 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1687,6 +2107,15 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  
  #pragma mark - MVKCommandEncoderState
  
@@ -9609,7 +9607,7 @@ index 199172a0..2b8a032d 100644
  static constexpr MVKRenderStateFlags SampleLocationFlags {
  	MVKRenderStateFlag::SampleLocations,
  	MVKRenderStateFlag::SampleLocationsEnable,
-@@ -1787,10 +2210,132 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1787,10 +2216,132 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  	}
  }
  
@@ -9744,7 +9742,7 @@ index 199172a0..2b8a032d 100644
  }
  
  void MVKCommandEncoderState::bindDescriptorSets(
-@@ -1801,17 +2346,45 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1801,17 +2352,45 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
    MVKDescriptorSet*const* sets,
    uint32_t dynamicOffsetCount,
    const uint32_t* dynamicOffsets) {
@@ -9799,7 +9797,7 @@ index 199172a0..2b8a032d 100644
  	}
  }
  
-@@ -1819,25 +2392,40 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1819,25 +2398,40 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  	switch (bindPoint) {
  		case VK_PIPELINE_BIND_POINT_GRAPHICS: return &_vkGraphics;
  		case VK_PIPELINE_BIND_POINT_COMPUTE:  return &_vkCompute;
@@ -9847,7 +9845,7 @@ index 199172a0..2b8a032d 100644
  	}
  }
  
-@@ -1854,22 +2442,48 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1854,22 +2448,48 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  }
  
  void MVKCommandEncoderState::offsetZeroDivisorVertexBuffers(MVKCommandEncoder& mvkEncoder, MVKGraphicsStage stage, MVKGraphicsPipeline* pipeline, uint32_t firstInstance) {
@@ -9902,7 +9900,7 @@ index 199172a0..2b8a032d 100644
  	}
  }
  
-@@ -1887,6 +2501,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1887,6 +2507,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  
  template <typename Fn>
  void MVKCommandEncoderState::applyToActiveMTLState(VkPipelineBindPoint bindPoint, Fn&& fn) {
@@ -10136,7 +10134,7 @@ index d7fa57c3..40cc4d4a 100644
 +	_mtlTraceRaysIndirectConvertComputePipelineState = nil;
  }
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
-index 9a72cc2a..a8f82796 100644
+index 9a72cc2a..811e7863 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h
 @@ -359,6 +359,30 @@ kernel void cmdDrawIndexedIndirectCountConvertBuffers(const device char* srcBuff
@@ -10237,7 +10235,7 @@ index 9a72cc2a..a8f82796 100644
  	destBuff[i] = srcBuff[params.indexStart + i];
  }
  
-@@ -503,21 +533,452 @@ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [
+@@ -503,21 +533,454 @@ kernel void cmdCopyQueryPoolResultsToBuffer(const device VisibilityBuffer* src [
                                              constant uint& numQueries [[buffer(3)]],
                                              constant uint& flags [[buffer(4)]],
                                              constant QueryStatus* availability [[buffer(5)]],
@@ -10457,7 +10455,8 @@ index 9a72cc2a..a8f82796 100644
 +typedef struct {
 +	ulong address;
 +	uint32_t stride;
-+	uint32_t flags;					// 1: per-sequence push constants (address + sequence * pushConstantsStride); 2: with a stride.
++	uint32_t flags;					// 1: per-sequence push constants (address + sequence * pushConstantsStride); 2: with a stride;
++									// 4: the sequence's own draw arguments in the stream (a converted shader's draw parameters).
 +} MVKDGCBufferEntry;
 +
 +typedef struct {
@@ -10527,6 +10526,7 @@ index 9a72cc2a..a8f82796 100644
 +		if ( !(b.vertexMask & (1u << i)) ) { continue; }
 +		MVKDGCBufferEntry e = b.vertexBuffers[i];
 +		ulong a = e.address + ((e.flags & 1) ? ulong(idx) * b.pushConstantsStride : 0);
++		if (e.flags & 4) { a = reinterpret_cast<ulong>(seq + params.actionOffset); }
 +		if (e.flags & 2) {
 +			cmd.set_vertex_buffer(reinterpret_cast<device void*>(a), e.stride, i);
 +		} else {
@@ -10696,7 +10696,7 @@ index 9a72cc2a..a8f82796 100644
  }
  
  kernel void accumulateOcclusionQueryResults(uint pos [[thread_position_in_grid]],
-@@ -547,4 +1008,270 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
+@@ -547,4 +1010,270 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
  	uint8_t idx = src[pos];
  	dst[pos] = idx;
  }

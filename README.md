@@ -88,7 +88,9 @@ file each), so a relaunch converts none of them again (`MVK_CONFIG_MSC_DISK_CACH
 targets the GPU's Apple family and the running macOS (`MVK_CONFIG_MSC_TARGET_DEVICE=0` keeps its oldest targets).
 
 ExecuteIndirect of 25 or more draws whose signature has only root constants runs from one Metal indirect command buffer
-(`MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES` sets the threshold; `0` turns it off). MetalFX's temporal scaler is made
+(`MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES` sets the threshold; `0` turns it off). ExecuteIndirect that sets root
+constants or root descriptors writes them into a converted pipeline's top-level argument buffer, so the pipeline stays
+the converter's instead of switching to a SPIR-V one compiled for it. MetalFX's temporal scaler is made
 without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
 lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
 
