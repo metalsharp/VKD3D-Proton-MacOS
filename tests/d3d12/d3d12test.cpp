@@ -14493,6 +14493,42 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+// 100 command lists recorded and closed before any is executed, as engines record a frame's (or a loading screen's)
+// lists on many threads and submit them together: each copies its own value, all of which must arrive.
+static bool test_many_recorded_lists()
+{
+    const UINT N = 100;
+    ID3D12Resource *src = create_buffer(N * 4, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    src->Map(0, nullptr, (void **)&u);
+    for (UINT i = 0; i < N; i++)
+        u[i] = 0x1000 + i;
+    src->Unmap(0, nullptr);
+    ID3D12Resource *dst = create_buffer(N * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12CommandAllocator *alloc[N] = {};
+    ID3D12GraphicsCommandList *lists[N] = {};
+    for (UINT i = 0; i < N; i++)
+    {
+        CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[i])));
+        CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[i], nullptr, IID_PPV_ARGS(&lists[i])));
+        lists[i]->CopyBufferRegion(dst, i * 4, src, i * 4, 4);
+        CHECK_HR(lists[i]->Close());
+    }
+    g.queue->ExecuteCommandLists(N, (ID3D12CommandList *const *)lists);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(dst, D3D12_RESOURCE_STATE_COPY_DEST, N * 4, &rb);
+    if (!r)
+        return false;
+    UINT wrong = 0;
+    for (UINT i = 0; i < N; i++)
+        wrong += r[i] != 0x1000 + i;
+    EXPECT(!wrong, "%u of %u lists' copies missing", wrong, N);
+    rb->Release();
+    for (UINT i = 0; i < N; i++) { lists[i]->Release(); alloc[i]->Release(); }
+    dst->Release(); src->Release();
+    return true;
+}
+
 // ExecuteIndirect of dispatches alone with a count buffer: up to 64, 23 counted, dispatch i of i + 1 groups, each of
 // which counts itself: 276 groups, where all 64 would be 2080.
 static bool test_executeindirect_count_dispatches()
@@ -15569,6 +15605,7 @@ static const Test tests[] = {
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_count_draws", test_executeindirect_count_draws },
+    { "many_recorded_lists", test_many_recorded_lists },
     { "executeindirect_count_dispatches", test_executeindirect_count_dispatches },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
