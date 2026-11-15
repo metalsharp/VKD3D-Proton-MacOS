@@ -58,3 +58,40 @@ unity_frame: cpu 1.039->1.014 (-2%); work 1.031->1.008 (-2%); gpu 1.650->1.616 (
 ```
 
 perf-1 was measured before the ExecuteIndirect commit, perf-2 after it. In pso_cold and pso_cold_threads the gpu column rises because the first draw now waits for a compile that overlapped the frame; wall_ms_per_frame is the end-to-end time.
+
+## Later changes (same branch)
+
+Functional harness after each: 141 pass (139 plus `executeindirect_count_draws` and `executeindirect_count_dispatches`),
+17 fail (the same 17), 0 failed checks. Perf probe, best or typical of three, x86_64 under a plain Wine on an M6:
+
+| Change | Scene | Before | After |
+|---|---|---|---|
+| SyncInterval as a relative present target | `present_interval2`, 144 Hz | 6.96 ms/frame | 13.89 ms/frame (2 refreshes) |
+| Count-buffer draws from an ICB | `execute_indirect_count_draws` (4000 max, 200 counted) | CPU 0.37, GPU 0.78 ms | CPU 0.19, GPU 0.50 ms |
+| (same, with root constants) | `execute_indirect_count` (4000 max, 2000 counted) | CPU 0.90, GPU 1.74 ms | CPU 0.25, GPU 0.61 ms |
+| Dispatch-only count buffers via generated commands | `execute_indirect_dispatch_only` | CPU 2.70, GPU 5.8 ms | CPU 0.58, GPU 1.0 ms |
+| Generated draws' kernels before the render pass | `gbuffer_execute_indirect` | CPU 1.08, GPU 1.90 ms | CPU 0.49, GPU 1.11 ms |
+| Tessellation in the converter's emulation | `tess_dxil_many` (100 draws of 10 patches) | CPU 4.35, GPU 6.3 ms (SPIR-V) | CPU 0.42, GPU 0.73 ms |
+| Command lists encode on their recording threads | `mt_submit` (8 threads x 500 draws) | CPU 0.81, GPU 1.31 ms | CPU 0.48, GPU 0.71 ms |
+| (same) | `many_lists` (40 lists) | GPU 2.41 ms | GPU 0.75 ms |
+| Direct fence waits | `empty`, median submit-to-completion | 0.299 ms | 0.276 ms |
+
+"GPU" is the probe's serialized submit-to-completion figure. "Before" is the MetalSharp Wine 7.0 lane except where
+it says SPIR-V (the same build with `VKD3D_MSC_TESSELLATION=0`).
+
+## Coverage of the D3D12 translation's mechanisms
+
+| Area | Here |
+|---|---|
+| Command lists, queues, fences | encoding on recording threads; direct fence waits; one queue family (MoltenVK's single-queue semaphores) |
+| Barriers | encoder-preserving barriers; enhanced barriers take ResourceBarrier's shortcuts |
+| Resources, heaps, residency | residency set; GPU-side zero init; host-only CPU descriptor heaps |
+| Descriptors | converter top-level argument buffers with shadow heaps; per-resource view cache (VKD3D-Proton's); RGB32 typed buffers stay on SPIR-V (no converter support) |
+| PSOs and shaders | converter conversions on disk and in memory; deferred, archived compiles; DXBC converted once |
+| Draw, dispatch, ExecuteIndirect | root arguments into the top-level argument buffer; ICBs for count buffers; kernels before the pass |
+| Tessellation, geometry, mesh | tessellation in the converter's emulation (not isolines, DXBC or with a geometry shader); mesh shaders converted |
+| Queries, predication | predication by patched indirect arguments, as the reference does outside its private layer |
+| Ray tracing | residency instead of per-structure useResource |
+| Clear, copy, resolve | clears folded into load actions (VKD3D-Proton's) |
+| Swap chain, MetalFX | relative present targets for SyncInterval; asynchronous scaler creation |
+| Caps | options to report no ray tracing before Apple family 9 and no conservative rasterization |
