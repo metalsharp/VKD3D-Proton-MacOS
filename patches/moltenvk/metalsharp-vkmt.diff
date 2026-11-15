@@ -27571,7 +27571,7 @@ index e357299e..36823729 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSync.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSync.mm
-index b15e6b8a..aa03a63b 100644
+index b15e6b8a..873ca91c 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSync.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKSync.mm
 @@ -81,6 +81,68 @@
@@ -27779,15 +27779,46 @@ index b15e6b8a..aa03a63b 100644
  	return rslt;
  }
  
-@@ -411,6 +513,7 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+@@ -410,6 +512,38 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+ 	VkResult rslt = VK_SUCCESS;
  	bool waitAny = mvkIsAnyFlagEnabled(pWaitInfo->flags, VK_SEMAPHORE_WAIT_ANY_BIT);
  	bool alreadySignaled = false;
- 	MVKFenceSitter fenceSitter(!waitAny);
 +	uint64_t msTraceStart = MVK_MS_TRACE_ON(Sync) ? mvkGetTimestamp() : 0;
++
++	// One semaphore on a Metal shared event, for a millisecond or more: the thread waits on the event itself, which
++	// wakes it when the GPU signals, where a listener's handler on another thread would wake it (VKD3D-Proton's fence
++	// waits). In slices, so that a lost device ends the wait. MVK_CONFIG_DIRECT_SEMAPHORE_WAIT=0 keeps the listener.
++	static const bool directWait = mvkGetEnvVarNumber("MVK_CONFIG_DIRECT_SEMAPHORE_WAIT", 1) != 0;
++	id<MTLSharedEvent> directEvent = directWait && pWaitInfo->semaphoreCount == 1 && timeout >= 1000000 ?
++		((MVKTimelineSemaphore*)pWaitInfo->pSemaphores[0])->getMTLSharedEvent() : nil;
++	if (directEvent) {
++		uint64_t value = pWaitInfo->pValues[0];
++		uint64_t start = mvkGetTimestamp();
++		double timeoutMS = (double)timeout / 1.0e6;
++		rslt = VK_TIMEOUT;
++		for (;;) {
++			if (device->getConfigurationResult() != VK_SUCCESS) { rslt = device->getConfigurationResult(); break; }
++			if (directEvent.signaledValue >= value) { rslt = VK_SUCCESS; break; }
++			double remainingMS = timeoutMS - mvkGetElapsedMilliseconds(start);
++			if (remainingMS <= 0) { break; }
++			uint64_t sliceMS = (uint64_t)std::max(1.0, std::min(50.0, remainingMS));
++			if ([directEvent waitUntilSignaledValue: value timeoutMS: sliceMS]) { rslt = VK_SUCCESS; break; }
++		}
++		if (msTraceStart) {
++			double ms = mvkGetElapsedMilliseconds(msTraceStart);
++			if (mvkMSTraceSyncWait(ms, rslt)) {
++				mvkMSTracePrintf(kMVKMSTraceSync, "vkWaitSemaphores 1 semaphore (%p >= %llu), direct, timeout %llu ns: %.3f ms, %s",
++								 (void*)pWaitInfo->pSemaphores[0], (unsigned long long)value,
++								 (unsigned long long)timeout, ms, mvkVkResultName(rslt));
++			}
++		}
++		return rslt;
++	}
++
+ 	MVKFenceSitter fenceSitter(!waitAny);
  
  	for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
- 		if (((MVKTimelineSemaphore*)pWaitInfo->pSemaphores[i])->registerWait(&fenceSitter, pWaitInfo, i) && waitAny) {
-@@ -431,6 +534,15 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+@@ -431,6 +565,15 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
  		((MVKTimelineSemaphore*)pWaitInfo->pSemaphores[i])->unregisterWait(&fenceSitter);
  	}
  
@@ -27803,7 +27834,7 @@ index b15e6b8a..aa03a63b 100644
  	return rslt;
  }
  
-@@ -447,6 +559,8 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+@@ -447,6 +590,8 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
  	MVKAssert( _startTime == 0, "%s compile occurred already in this instance. Instances of %s should only be used for a single compile activity.", _compilerType.c_str(), getClassName().c_str());
  
  	_startTime = getPerformanceTimestamp();
@@ -27812,7 +27843,7 @@ index b15e6b8a..aa03a63b 100644
  
  	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ @autoreleasepool { block(); } });
  
-@@ -462,6 +576,13 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+@@ -462,6 +607,13 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
  	}
  
  	if (_compileError) { handleError(); }
@@ -27826,7 +27857,7 @@ index b15e6b8a..aa03a63b 100644
  
  	addPerformanceInterval(*_pPerformanceTracker, _startTime);
  }
-@@ -553,4 +674,3 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
+@@ -553,4 +705,3 @@ VkResult mvkWaitSemaphores(MVKDevice* device,
  	_operationResult = opResult;
  	_maxConcurrency = maxConCurr;
  }
