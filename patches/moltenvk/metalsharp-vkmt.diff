@@ -15872,7 +15872,7 @@ index 534a414f..d531f38e 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..fafd208e 100644
+index 359f8a2b..e6e4492f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -17140,7 +17140,9 @@ index 359f8a2b..fafd208e 100644
 +											bool write,
 +											MVKSmallVector<id<MTLBuffer>, 16>* retainedBuffers) {
 +	if (hasResidencySet()) { return; }
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	for (auto* buffer : _gpuAddressableBuffers) {
 +		id<MTLBuffer> mtlBuffer = buffer->getMTLBuffer();
 +		if (!mtlBuffer) { continue; }
@@ -17441,9 +17443,7 @@ index 359f8a2b..fafd208e 100644
 +}
 +
 +void MVKDevice::removeGPUAddressableAccelerationStructure(MVKAccelerationStructure* accelerationStructure) {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	mvkRemoveFirstOccurance(_gpuAddressableAccelerationStructures, accelerationStructure);
 +}
 +
@@ -17932,7 +17932,7 @@ index 359f8a2b..fafd208e 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,24 +6429,70 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,24 +6429,63 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -17971,18 +17971,11 @@ index 359f8a2b..fafd208e 100644
 +		   _enabledInlineUniformBlockFeatures.descriptorBindingInlineUniformBlockUpdateAfterBind;
 +}
 +
-+// The prefill style: the configuration's, or, where it isn't set in the environment, deferred encoding on a device whose
-+// descriptors may be updated after binding and are still seen in prefilled command buffers (VKD3D-Proton's: bindless
-+// heaps). Each command buffer then encodes into a Metal command buffer of its own when its recording ends, on the thread
-+// that recorded it, rather than all of a submission's on the submitting thread.
++// The prefill style: the configuration's (off by default). Not a default for update-after-bind devices: command buffers
++// encoded concurrently share the device's barrier fences, so a Metal command buffer committed earlier can wait for a
++// fence update in one committed after it, and the GPU deadlocks (Subnautica 2 while loading).
 +MVKPrefillMetalCommandBuffersStyle MVKDevice::getPrefillStyle() {
-+	static const bool configured = getenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS") != nullptr;
-+	auto style = getMVKConfig().prefillMetalCommandBuffers;
-+	if ( !configured && style == MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS_STYLE_NO_PREFILL &&
-+		usesUpdateAfterBind() && updateAfterBindAllowsPrefill() ) {
-+		return MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS_STYLE_DEFERRED_ENCODING;
-+	}
-+	return style;
++	return getMVKConfig().prefillMetalCommandBuffers;
 +}
 +
 +// At most half the queue's Metal command buffers wait in prefilled command buffers; the rest are for submissions.
@@ -18014,7 +18007,7 @@ index 359f8a2b..fafd208e 100644
  }
  
  void MVKDevice::startAutoGPUCapture(MVKConfigAutoGPUCaptureScope autoGPUCaptureScope, id mtlCaptureObject) {
-@@ -5252,10 +6721,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6714,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -18292,7 +18285,7 @@ index 359f8a2b..fafd208e 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +7003,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6996,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -18305,7 +18298,7 @@ index 359f8a2b..fafd208e 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5575,7 +7315,60 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +7308,60 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -18366,7 +18359,7 @@ index 359f8a2b..fafd208e 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +7384,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +7377,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
