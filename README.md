@@ -76,10 +76,21 @@ from `env.sh`. MetalSharp writes its own; other Wines use these:
 
 A path in either variable may be a Unix path or a Windows one (`Z:/...`).
 
-MoltenVK compiles each Metal pipeline on the thread that creates it. `MVK_CONFIG_DEFERRED_PIPELINES=1` compiles
-pipelines on background threads instead, and `MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment
-shader alongside its vertex shader. Both are off by default: their compiles wait on Metal from GCD worker threads,
-and a game creating pipelines from many threads can take every worker, which leaves Metal none to finish them on.
+Creating a pipeline returns once its shaders are converted: Metal compiles it meanwhile, started from the creating
+thread and finished by its completion handler, so no thread waits for it, and the first draw or dispatch that uses
+the pipeline waits if it isn't done. `MVK_CONFIG_DEFERRED_PIPELINES=0` compiles in the creating call instead.
+`MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment shader alongside its vertex shader; it is off by
+default, as its compiles wait on Metal from GCD worker threads. Metal compiles with as many threads as the machine has
+(`MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=0` turns that off).
+
+Shaders the Metal Shader Converter converts are kept on disk beside MoltenVK's pipeline cache (`<cache>.msc/`, one
+file each), so a relaunch converts none of them again (`MVK_CONFIG_MSC_DISK_CACHE=0` turns that off). The converter
+targets the GPU's Apple family and the running macOS (`MVK_CONFIG_MSC_TARGET_DEVICE=0` keeps its oldest targets).
+
+ExecuteIndirect of 25 or more draws whose signature has only root constants runs from one Metal indirect command buffer
+(`MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES` sets the threshold; `0` turns it off). MetalFX's temporal scaler is made
+without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
+lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
 
 Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
 (compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
