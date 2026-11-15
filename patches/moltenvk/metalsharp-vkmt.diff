@@ -205,10 +205,10 @@ index 69df0349..985607ba 100644
  
 diff --git a/MoltenVK/MoltenVK/API/mvk_metalfx.h b/MoltenVK/MoltenVK/API/mvk_metalfx.h
 new file mode 100644
-index 00000000..cc9a9eaa
+index 00000000..ddca7980
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/API/mvk_metalfx.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,144 @@
 +/*
 + * mvk_metalfx.h
 + *
@@ -241,6 +241,7 @@ index 00000000..cc9a9eaa
 +#define VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK ((VkStructureType)1000999100)
 +#define VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK ((VkStructureType)1000999101)
 +#define VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK ((VkStructureType)1000999102)
++#define VK_STRUCTURE_TYPE_METALFX_CONTENT_OFFSETS_MVK ((VkStructureType)1000999103)
 +
 +#define VK_MVK_METALFX_DRIVER_INFO "metalfx"
 +#define VK_MVK_METALFX_DENOISED_DRIVER_INFO "metalfx-denoised"
@@ -271,6 +272,9 @@ index 00000000..cc9a9eaa
 +	/* Frame interpolation: color, depth, motion, output and, optionally, the UI (color and alpha) in the denoised
 +	 * diffuse albedo's place. Depth and motion are at the render size, the others at the swapchain's. */
 +	VK_METALFX_IMAGE_UI_MVK = VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK,
++	/* Temporal: the reactive mask (optional, one channel, 1 favoring the current frame: DLSS's
++	 * Bias.Current.Color.Mask), in the denoised diffuse albedo's place. A MoltenVK before it ignores it. */
++	VK_METALFX_IMAGE_REACTIVE_MVK = VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK,
 +} VkMetalFXImageMVK;
 +
 +typedef enum VkMetalFXScaleFlagBitsMVK {
@@ -279,6 +283,9 @@ index 00000000..cc9a9eaa
 +	VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK = 0x4,
 +	/* The motion vectors are at the output resolution (DLSS without MV_LOWRES): they are brought to the input's. */
 +	VK_METALFX_SCALE_MOTION_DISPLAY_RES_BIT_MVK = 0x8,
++	/* Temporal: the motion vectors include the camera jitter (DLSS's MVJittered), which MetalFX takes out with the
++	 * jitter offset where it can (macOS 27). */
++	VK_METALFX_SCALE_JITTERED_MOTION_BIT_MVK = 0x10,
 +} VkMetalFXScaleFlagBitsMVK;
 +
 +/*
@@ -324,6 +331,15 @@ index 00000000..cc9a9eaa
 +	float aspectRatio;
 +	uint32_t uiComposited;					/* the UI image's contents are in the color image too */
 +} VkMetalFXFrameInterpolationInfoMVK;
++
++/* Temporal: where each image's region starts, in pixels (DLSS's subrect bases), in the pNext chain of its
++ * VkMetalFXScaleInfoMVK; MetalFX reads the regions in place where it can (macOS 27). */
++typedef struct VkMetalFXContentOffsetsMVK {
++	VkStructureType sType;
++	const void* pNext;
++	uint32_t offsetX[VK_METALFX_IMAGE_COUNT_MVK];	/* by VkMetalFXImageMVK: color, depth, motion, output, reactive */
++	uint32_t offsetY[VK_METALFX_IMAGE_COUNT_MVK];
++} VkMetalFXContentOffsetsMVK;
 +
 +/* MetalFX spatial upscaling at present, to the surface's native size, where that is larger than the images' */
 +typedef struct VkSwapchainMetalFXSpatialCreateInfoMVK {
@@ -5640,7 +5656,7 @@ index d0452973..15b05d49 100644
 +	return true;
 +}
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
-index 5119f856..a1ee183c 100644
+index 5119f856..b9a68339 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
 @@ -22,12 +22,14 @@
@@ -5666,7 +5682,7 @@ index 5119f856..a1ee183c 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -99,6 +102,32 @@ typedef MVKCmdPipelineBarrier<4> MVKCmdPipelineBarrier4;
+@@ -99,6 +102,34 @@ typedef MVKCmdPipelineBarrier<4> MVKCmdPipelineBarrier4;
  typedef MVKCmdPipelineBarrier<32> MVKCmdPipelineBarrierMulti;
  
  
@@ -5688,10 +5704,12 @@ index 5119f856..a1ee183c 100644
 +protected:
 +	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 +	id<MTLTexture> getTexture(VkMetalFXImageMVK index, MTLPixelFormat* pFormat);
++	void setTemporalContentOffsets(id scaler, bool motionResampled);
 +	void encodeFrameInterpolation(MVKCommandEncoder* cmdEncoder);
 +
 +	VkMetalFXScaleInfoMVK _info;
 +	VkMetalFXFrameInterpolationInfoMVK _interpolation = {};
++	VkMetalFXContentOffsetsMVK _offsets = {};
 +	MVKImage* _images[VK_METALFX_IMAGE_COUNT_MVK];
 +};
 +
@@ -5699,7 +5717,7 @@ index 5119f856..a1ee183c 100644
  #pragma mark -
  #pragma mark MVKCmdBindPipeline
  
-@@ -109,6 +138,8 @@ public:
+@@ -109,6 +140,8 @@ public:
  	VkResult setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline);
  
  	virtual bool isTessellationPipeline() { return false; };
@@ -5708,7 +5726,7 @@ index 5119f856..a1ee183c 100644
  
  protected:
  	MVKPipeline* _pipeline;
-@@ -125,6 +156,8 @@ public:
+@@ -125,6 +158,8 @@ public:
  	void encode(MVKCommandEncoder* cmdEncoder) override;
  
  	bool isTessellationPipeline() override;
@@ -5717,7 +5735,7 @@ index 5119f856..a1ee183c 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -139,6 +172,28 @@ class MVKCmdBindComputePipeline : public MVKCmdBindPipeline {
+@@ -139,6 +174,28 @@ class MVKCmdBindComputePipeline : public MVKCmdBindPipeline {
  
  public:
  	void encode(MVKCommandEncoder* cmdEncoder) override;
@@ -5746,7 +5764,7 @@ index 5119f856..a1ee183c 100644
  
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
-@@ -273,6 +328,13 @@ protected:
+@@ -273,6 +330,13 @@ protected:
  	void clearDescriptorWrites();
  
  	MVKSmallVector<VkWriteDescriptorSet, 1> _descriptorWrites;
@@ -5760,7 +5778,7 @@ index 5119f856..a1ee183c 100644
  	MVKPipelineLayout* _pipelineLayout = nullptr;
  	VkPipelineBindPoint _pipelineBindPoint;
  	uint32_t _set;
-@@ -300,6 +362,7 @@ protected:
+@@ -300,6 +364,7 @@ protected:
  
  	MVKDescriptorUpdateTemplate* _descUpdateTemplate = nullptr;
  	MVKPipelineLayout* _pipelineLayout = nullptr;
@@ -5768,7 +5786,7 @@ index 5119f856..a1ee183c 100644
  	void* _pData = nullptr;
  	size_t _dataSize = 0;
  	uint32_t _set = 0;
-@@ -378,6 +441,7 @@ public:
+@@ -378,6 +443,7 @@ public:
  						const VkImageMemoryBarrier* pImageMemoryBarriers);
  
  	void encode(MVKCommandEncoder* cmdEncoder) override;
@@ -5777,7 +5795,7 @@ index 5119f856..a1ee183c 100644
  protected:
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-index 3e9fc79f..560bd29a 100644
+index 3e9fc79f..47229ca4 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 @@ -22,9 +22,14 @@
@@ -5876,7 +5894,7 @@ index 3e9fc79f..560bd29a 100644
  			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
  		}
  	}
-@@ -237,6 +299,337 @@
+@@ -237,6 +299,398 @@
  template class MVKCmdPipelineBarrier<32>;
  
  
@@ -5887,10 +5905,14 @@ index 3e9fc79f..560bd29a 100644
 +	_info = *pInfo;
 +	_info.pNext = nullptr;
 +	_interpolation = {};
++	_offsets = {};
 +	for (auto* next = (const VkBaseInStructure*)pInfo->pNext; next; next = next->pNext) {
 +		if (next->sType == VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK) {
 +			_interpolation = *(const VkMetalFXFrameInterpolationInfoMVK*)next;
 +			_interpolation.pNext = nullptr;
++		} else if (next->sType == VK_STRUCTURE_TYPE_METALFX_CONTENT_OFFSETS_MVK) {
++			_offsets = *(const VkMetalFXContentOffsetsMVK*)next;
++			_offsets.pNext = nullptr;
 +		}
 +	}
 +	_info.releaseScalerIdCount = 0;
@@ -6015,6 +6037,34 @@ index 3e9fc79f..560bd29a 100644
 +	}
 +}
 +
++// Where each image's region starts (DLSS's subrect bases), where the temporal scaler reads regions in place (macOS 27,
++// set by name for builds with older SDKs). Before that, offsets other than zero are not applied: warned once.
++// Motion vectors brought to the input resolution start at the origin of the image made for them.
++void MVKCmdMetalFXScale::setTemporalContentOffsets(id scaler, bool motionResampled) {
++	static const struct { VkMetalFXImageMVK image; const char* x; const char* y; } offsets[] = {
++		{ VK_METALFX_IMAGE_COLOR_MVK, "setColorContentOffsetX:", "setColorContentOffsetY:" },
++		{ VK_METALFX_IMAGE_DEPTH_MVK, "setDepthContentOffsetX:", "setDepthContentOffsetY:" },
++		{ VK_METALFX_IMAGE_MOTION_MVK, "setMotionContentOffsetX:", "setMotionContentOffsetY:" },
++		{ VK_METALFX_IMAGE_REACTIVE_MVK, "setReactiveMaskContentOffsetX:", "setReactiveMaskContentOffsetY:" },
++		{ VK_METALFX_IMAGE_OUTPUT_MVK, "setOutputOffsetX:", "setOutputOffsetY:" },
++	};
++	for (const auto& o : offsets) {
++		NSUInteger x = _offsets.offsetX[o.image], y = _offsets.offsetY[o.image];
++		if (o.image == VK_METALFX_IMAGE_MOTION_MVK && motionResampled) { x = y = 0; }
++		SEL setX = sel_registerName(o.x), setY = sel_registerName(o.y);
++		if ([scaler respondsToSelector: setX] && [scaler respondsToSelector: setY]) {
++			((void (*)(id, SEL, NSUInteger))objc_msgSend)(scaler, setX, x);
++			((void (*)(id, SEL, NSUInteger))objc_msgSend)(scaler, setY, y);
++		} else if (x || y) {
++			static bool warned = false;
++			if ( !warned ) {
++				warned = true;
++				MVKLogWarn("MetalFX: image regions that don't start at the origin are read from it before macOS 27.");
++			}
++		}
++	}
++}
++
 +void MVKCmdMetalFXScale::encode(MVKCommandEncoder* cmdEncoder) {
 +	if (_info.scalerType == VK_METALFX_SCALER_TYPE_FRAME_INTERPOLATION_MVK) {
 +		encodeFrameInterpolation(cmdEncoder);
@@ -6058,9 +6108,26 @@ index 3e9fc79f..560bd29a 100644
 +								  [MTLFXTemporalScalerDescriptor instancesRespondToSelector: takesOutputMotion];
 +		bool displayMotion = outputMotion && !nativeOutputMotion;
 +		if (displayMotion) { formats[VK_METALFX_IMAGE_MOTION_MVK] = MTLPixelFormatRG32Float; }
++		// Motion vectors with the camera jitter in them (DLSS's MVJittered), which the temporal scaler takes out with the
++		// jitter offset where it can (jitteredMotionVectorsEnabled, macOS 27); before that they are taken as they are.
++		static const SEL takesJitteredMotion = sel_registerName("setJitteredMotionVectorsEnabled:");
++		bool jitteredMotion = !denoised && mvkIsAnyFlagEnabled(_info.flags, VK_METALFX_SCALE_JITTERED_MOTION_BIT_MVK);
++		bool nativeJitteredMotion = jitteredMotion && [MTLFXTemporalScalerDescriptor instancesRespondToSelector: takesJitteredMotion];
++		if (jitteredMotion && !nativeJitteredMotion) {
++			static bool warned = false;
++			if ( !warned ) {
++				warned = true;
++				MVKLogWarn("MetalFX: motion vectors with the jitter in them are taken as they are before macOS 27.");
++			}
++		}
++		// The reactive mask, for the temporal scaler (macOS 14.4): a denoised scale's image at this index is its albedo.
++		id<MTLTexture> reactive = nil;
++		if ( !denoised ) {
++			if (@available(macOS 14.4, iOS 17.4, *)) { reactive = textures[VK_METALFX_IMAGE_REACTIVE_MVK]; }
++		}
 +		std::vector<uint32_t> key = { _info.scalerType, (uint32_t)color.width, (uint32_t)color.height,
 +									  (uint32_t)output.width, (uint32_t)output.height, autoExposure, displayMotion,
-+									  nativeOutputMotion };
++									  nativeOutputMotion, nativeJitteredMotion, reactive != nil };
 +		for (uint32_t i = 0; i < VK_METALFX_IMAGE_COUNT_MVK; i++) {
 +			if (i != VK_METALFX_IMAGE_EXPOSURE_MVK) { key.push_back((uint32_t)formats[i]); }
 +		}
@@ -6094,6 +6161,13 @@ index 3e9fc79f..560bd29a 100644
 +				desc.inputContentMinScale = minScale;
 +				desc.inputContentMaxScale = maxScale;
 +				if (nativeOutputMotion) { ((void (*)(id, SEL, BOOL))objc_msgSend)(desc, takesOutputMotion, YES); }
++				if (nativeJitteredMotion) { ((void (*)(id, SEL, BOOL))objc_msgSend)(desc, takesJitteredMotion, YES); }
++				if (reactive) {
++					if (@available(macOS 14.4, iOS 17.4, *)) {
++						desc.reactiveMaskTextureEnabled = YES;
++						desc.reactiveMaskTextureFormat = formats[VK_METALFX_IMAGE_REACTIVE_MVK];
++					}
++				}
 +				// Made on a MetalFX thread rather than while this command buffer is encoded, so turning DLSS on or
 +				// changing its resolution doesn't stop the queue; MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1 waits for it.
 +				static const bool synchronous = mvkGetEnvVarNumber("MVK_CONFIG_METALFX_SYNCHRONOUS_INIT", 0) != 0;
@@ -6124,8 +6198,9 @@ index 3e9fc79f..560bd29a 100644
 +				[desc release];
 +			}
 +			if (made) {
-+				MVKLogInfo("MetalFX: %s upscaling %lux%lu to %lux%lu.", scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK ? "temporal" : "denoised",
-+						   (unsigned long)color.width, (unsigned long)color.height, (unsigned long)output.width, (unsigned long)output.height);
++				MVKLogInfo("MetalFX: %s upscaling %lux%lu to %lux%lu%s%s.", scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK ? "temporal" : "denoised",
++						   (unsigned long)color.width, (unsigned long)color.height, (unsigned long)output.width, (unsigned long)output.height,
++						   reactive ? ", with a reactive mask" : "", nativeJitteredMotion ? ", motion vectors with the jitter" : "");
 +			} else {
 +				MVKLogError("MetalFX: no %s scaler for %lux%lu to %lux%lu (color format %lu, depth %lu, motion %lu, output %lu).",
 +							scalerType == VK_METALFX_SCALER_TYPE_TEMPORAL_MVK ? "temporal" : "denoised",
@@ -6175,6 +6250,10 @@ index 3e9fc79f..560bd29a 100644
 +			temporal.jitterOffsetX = _info.jitterOffsetX;
 +			temporal.jitterOffsetY = _info.jitterOffsetY;
 +			temporal.preExposure = preExposure;
++			if (reactive) {
++				if (@available(macOS 14.4, iOS 17.4, *)) { temporal.reactiveMaskTexture = reactive; }
++			}
++			setTemporalContentOffsets(temporal, displayMotion);
 +			[temporal encodeToCommandBuffer: mtlCmdBuff];
 +		} else if (@available(macOS 26.0, iOS 26.0, *)) {
 +			id<MTLFXTemporalDenoisedScaler> denoiser = (id<MTLFXTemporalDenoisedScaler>)scaler;
@@ -6214,7 +6293,7 @@ index 3e9fc79f..560bd29a 100644
  #pragma mark -
  #pragma mark MVKCmdBindPipeline
  
-@@ -260,6 +653,14 @@
+@@ -260,6 +714,14 @@
  	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
  }
  
@@ -6229,7 +6308,7 @@ index 3e9fc79f..560bd29a 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindComputePipeline
-@@ -268,6 +669,18 @@
+@@ -268,6 +730,18 @@
  	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
  }
  
@@ -6248,7 +6327,7 @@ index 3e9fc79f..560bd29a 100644
  
  #pragma mark -
  #pragma mark MVKCmdBindDescriptorSetsStatic
-@@ -279,14 +692,16 @@
+@@ -279,14 +753,16 @@
  													   uint32_t firstSet,
  													   uint32_t setCount,
  													   const VkDescriptorSet* pDescriptorSets) {
@@ -6268,7 +6347,7 @@ index 3e9fc79f..560bd29a 100644
  	// Add the descriptor sets
  	_descriptorSets.clear();	// Clear for reuse
  	_descriptorSets.reserve(setCount);
-@@ -373,7 +788,7 @@
+@@ -373,7 +849,7 @@
  
  template <size_t N>
  void MVKCmdPushConstants<N>::encode(MVKCommandEncoder* cmdEncoder) {
@@ -6277,7 +6356,7 @@ index 3e9fc79f..560bd29a 100644
  }
  
  template class MVKCmdPushConstants<64>;
-@@ -384,57 +799,188 @@
+@@ -384,57 +860,188 @@
  #pragma mark -
  #pragma mark MVKCmdPushDescriptorSet
  
@@ -6487,7 +6566,7 @@ index 3e9fc79f..560bd29a 100644
  		}
  	}
  
-@@ -442,7 +988,11 @@
+@@ -442,7 +1049,11 @@
  }
  
  void MVKCmdPushDescriptorSet::encode(MVKCommandEncoder* cmdEncoder) {
@@ -6500,7 +6579,7 @@ index 3e9fc79f..560bd29a 100644
  }
  
  MVKCmdPushDescriptorSet::~MVKCmdPushDescriptorSet() {
-@@ -452,24 +1002,24 @@
+@@ -452,24 +1063,24 @@
  
  void MVKCmdPushDescriptorSet::clearDescriptorWrites() {
  	for (VkWriteDescriptorSet &descWrite : _descriptorWrites) {
@@ -6539,7 +6618,7 @@ index 3e9fc79f..560bd29a 100644
  }
  
  
-@@ -481,11 +1031,21 @@
+@@ -481,11 +1092,21 @@
  														 VkPipelineLayout layout,
  														 uint32_t set,
  														 const void* pData) {
@@ -6565,7 +6644,7 @@ index 3e9fc79f..560bd29a 100644
  
  	size_t oldSize = _dataSize;
  	_dataSize = _descUpdateTemplate->getSize();
-@@ -495,6 +1055,15 @@
+@@ -495,6 +1116,15 @@
  	}
  	if (_pData && pData) {
  		mvkCopy(_pData, pData, _dataSize);
@@ -6581,7 +6660,7 @@ index 3e9fc79f..560bd29a 100644
  	}
  
  	return VK_SUCCESS;
-@@ -505,6 +1074,8 @@
+@@ -505,6 +1135,8 @@
  }
  
  MVKCmdPushDescriptorSetWithTemplate::~MVKCmdPushDescriptorSetWithTemplate() {

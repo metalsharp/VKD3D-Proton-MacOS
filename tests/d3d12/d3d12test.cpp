@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <vector>
 #include <algorithm>
+// ID3D12GraphicsCommandListMetalFX, which this lane's NGX core uses for DLSS
+#include "../../sources/vkd3d-proton/include/private/vkd3d_metalfx.h"
 
 static int g_failures, g_checks;
 #define CHECK_HR(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("  %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); return false; } } while (0)
@@ -14493,6 +14495,173 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+
+// MetalFX temporal upscaling through ID3D12GraphicsCommandListMetalFX, as the NGX core runs DLSS Super Resolution:
+// TemporalUpscale, then TemporalUpscale1 (ID3D12GraphicsCommandListMetalFX1) with a reactive mask, jittered motion
+// vectors and regions that start inside their textures. The inputs are flat, so the output is the color's color.
+// MetalFX makes its scaler on a thread of its own, so the first frames may write nothing.
+static bool test_metalfx_temporal()
+{
+    ID3D12GraphicsCommandListMetalFX *metalfx = nullptr, *metalfx1 = nullptr;
+    if (FAILED(g.list->QueryInterface(IID_ID3D12GraphicsCommandListMetalFX, (void **)&metalfx)))
+    {
+        printf("  skipped: no ID3D12GraphicsCommandListMetalFX\n");
+        return true;
+    }
+    if (!metalfx->lpVtbl->SupportsTemporalUpscale(metalfx))
+    {
+        printf("  skipped: no MetalFX temporal upscaling\n");
+        metalfx->lpVtbl->Release(metalfx);
+        return true;
+    }
+    EXPECT(SUCCEEDED(g.list->QueryInterface(IID_ID3D12GraphicsCommandListMetalFX1, (void **)&metalfx1)),
+           "QueryInterface(IID_ID3D12GraphicsCommandListMetalFX1) failed");
+
+    const UINT in = 80, content = 64, base = 8, out = 128;
+    auto texture = [](DXGI_FORMAT format, UINT size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                      const D3D12_CLEAR_VALUE *clear) {
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = rd.Height = size;
+        rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.Format = format;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = flags;
+        ID3D12Resource *r = nullptr;
+        g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r));
+        return r;
+    };
+    const float color_value[4] = { 0.25f, 0.5f, 0.75f, 1.0f }, zero[4] = {}, half[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+    D3D12_CLEAR_VALUE color_clear = { DXGI_FORMAT_R16G16B16A16_FLOAT }, depth_clear = { DXGI_FORMAT_D32_FLOAT };
+    memcpy(color_clear.Color, color_value, sizeof(color_value));
+    depth_clear.DepthStencil.Depth = 1.0f;
+    const D3D12_RESOURCE_FLAGS rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *color = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, &color_clear);
+    ID3D12Resource *depth = texture(DXGI_FORMAT_D32_FLOAT, in, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                                    D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear);
+    ID3D12Resource *motion = texture(DXGI_FORMAT_R16G16_FLOAT, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    ID3D12Resource *reactive = texture(DXGI_FORMAT_R8_UNORM, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    ID3D12Resource *output[2];
+    for (auto &o : output)
+        o = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, out, rt | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    if (!color || !depth || !motion || !reactive || !output[0] || !output[1])
+    {
+        printf("  texture creation failed\n");
+        return false;
+    }
+
+    ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5 };
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap)));
+    UINT rtv_size = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ID3D12Resource *targets[] = { color, motion, reactive, output[0], output[1] };
+    const float *values[] = { color_value, zero, half, zero, zero };
+    for (UINT i = 0; i < 5; i++)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * rtv_size;
+        g.device->CreateRenderTargetView(targets[i], nullptr, h);
+        g.list->ClearRenderTargetView(h, values[i], 0, nullptr);
+    }
+    g.device->CreateDepthStencilView(depth, nullptr, dsv_heap->GetCPUDescriptorHandleForHeapStart());
+    g.list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    for (ID3D12Resource *r : { color, motion, reactive })
+        transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    for (auto &o : output)
+        transition(o, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!execute_and_wait())
+        return false;
+
+    D3D12_RESOURCE_DESC od = output[0]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows;
+    UINT64 row_size, total;
+    g.device->GetCopyableFootprints(&od, 0, 1, 0, &fp, &rows, &row_size, &total);
+    ID3D12Resource *readback = create_buffer(total, D3D12_HEAP_TYPE_READBACK);
+
+    ID3D12MetalFXScaler *scalers[2] = {};
+    bool done[2] = {};
+    for (int frame = 0; frame < 80 && !(done[0] && done[1]); frame++)
+    {
+        VKD3D_METALFX_TEMPORAL_DESC desc = {};
+        desc.Color = color;
+        desc.Depth = depth;
+        desc.MotionVector = motion;
+        desc.MotionVectorScaleX = desc.MotionVectorScaleY = 1.0f;
+        desc.PreExposure = 1.0f;
+        desc.InReset = frame == 0;
+        desc.Output = output[0];
+        EXPECT(SUCCEEDED(metalfx->lpVtbl->TemporalUpscale(metalfx, &desc, &scalers[0])), "TemporalUpscale failed");
+        if (metalfx1)
+        {
+            VKD3D_METALFX_TEMPORAL_DESC1 desc1 = {};
+            desc1.Desc = desc;
+            desc1.Desc.Output = output[1];
+            desc1.Desc.InputContentWidth = desc1.Desc.InputContentHeight = content;
+            desc1.Desc.JitterOffsetX = 0.25f;
+            desc1.Desc.JitterOffsetY = -0.25f;
+            desc1.JitteredMotionVectors = TRUE;
+            desc1.ReactiveMask = reactive;
+            desc1.ColorOffsetX = desc1.ColorOffsetY = base;
+            desc1.DepthOffsetX = desc1.DepthOffsetY = base;
+            desc1.MotionVectorOffsetX = desc1.MotionVectorOffsetY = base;
+            desc1.ReactiveMaskOffsetX = desc1.ReactiveMaskOffsetY = base;
+            EXPECT(SUCCEEDED(metalfx1->lpVtbl->TemporalUpscale1(metalfx1, &desc1, &scalers[1])), "TemporalUpscale1 failed");
+        }
+        if (!execute_and_wait())
+            return false;
+
+        for (int i = 0; i < (metalfx1 ? 2 : 1); i++)
+        {
+            if (done[i])
+                continue;
+            transition(output[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, src = { output[i] };
+            dst.PlacedFootprint = fp;
+            src.SubresourceIndex = 0;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(output[i], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!execute_and_wait())
+                return false;
+            const uint8_t *p = nullptr;
+            D3D12_RANGE range = { 0, (SIZE_T)total };
+            readback->Map(0, &range, (void **)&p);
+            const uint16_t *texel = (const uint16_t *)(p + (out / 2) * fp.Footprint.RowPitch + (out / 2) * 8);
+            float r = typedbuffer_half(texel[0]), gr = typedbuffer_half(texel[1]), b = typedbuffer_half(texel[2]);
+            readback->Unmap(0, nullptr);
+            if (r != 0.0f || gr != 0.0f || b != 0.0f)
+            {
+                done[i] = true;
+                EXPECT(fabsf(r - 0.25f) < 0.05f && fabsf(gr - 0.5f) < 0.05f && fabsf(b - 0.75f) < 0.05f,
+                       "%s: output (%.3f, %.3f, %.3f), expected (0.25, 0.5, 0.75)", i ? "TemporalUpscale1" : "TemporalUpscale",
+                       r, gr, b);
+            }
+        }
+        if (!(done[0] && done[1]))
+            Sleep(25);
+        if (!metalfx1)
+            done[1] = true;
+    }
+    EXPECT(done[0], "TemporalUpscale wrote no output");
+    EXPECT(done[1], "TemporalUpscale1 wrote no output");
+
+    for (auto *s : scalers)
+        if (s)
+            s->lpVtbl->Destroy(s);
+    readback->Release(); rtv_heap->Release(); dsv_heap->Release();
+    for (ID3D12Resource *r : { color, depth, motion, reactive, output[0], output[1] })
+        r->Release();
+    if (metalfx1)
+        metalfx1->lpVtbl->Release(metalfx1);
+    metalfx->lpVtbl->Release(metalfx);
+    return true;
+}
+
 // 100 command lists recorded and closed before any is executed, as engines record a frame's (or a loading screen's)
 // lists on many threads and submit them together: each copies its own value, all of which must arrive.
 static bool test_many_recorded_lists()
@@ -15606,6 +15775,7 @@ static const Test tests[] = {
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_count_draws", test_executeindirect_count_draws },
     { "many_recorded_lists", test_many_recorded_lists },
+    { "metalfx_temporal", test_metalfx_temporal },
     { "executeindirect_count_dispatches", test_executeindirect_count_dispatches },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
