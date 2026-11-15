@@ -15382,7 +15382,7 @@ index 534a414f..6e23cc05 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..d336e5c8 100644
+index 359f8a2b..467b8da5 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -15505,10 +15505,18 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
  				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
  				barycentricFeatures->fragmentShaderBarycentric = true;
-@@ -631,11 +681,26 @@
+@@ -631,11 +681,34 @@
  				presentWait2Features->presentWait2 = true;
  				break;
  			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT: {
++				// Only relative targets: a drawable is shown no sooner than a duration after the one before it.
++				auto* presentTimingFeatures = (VkPhysicalDevicePresentTimingFeaturesEXT*)next;
++				presentTimingFeatures->presentTiming = true;
++				presentTimingFeatures->presentAtAbsoluteTime = false;
++				presentTimingFeatures->presentAtRelativeTime = true;
++				break;
++			}
 +			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR: {
 +				auto* rayQueryFeatures = (VkPhysicalDeviceRayQueryFeaturesKHR*)next;
 +				rayQueryFeatures->rayQuery = _metalFeatures.accelerationStructures && _supportsRaytracingFromRender &&
@@ -15534,7 +15542,7 @@ index 359f8a2b..d336e5c8 100644
  				break;
  			}
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR: {
-@@ -650,6 +715,20 @@
+@@ -650,6 +723,20 @@
  				shaderReconvergenceFeatures->shaderMaximalReconvergence = _metalFeatures.maximalReconvergence;
  				break;
  			}
@@ -15555,7 +15563,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR: {
  				auto* shaderQuadControlFeatures = (VkPhysicalDeviceShaderQuadControlFeaturesKHR*)next;
  				shaderQuadControlFeatures->shaderQuadControl = _metalFeatures.quadControlFlow && _metalFeatures.quadPermute;
-@@ -677,6 +756,19 @@
+@@ -677,6 +764,19 @@
  				formatFeatures->formatA4B4G4R4 = canSupport4444;
  				break;
  			}
@@ -15575,7 +15583,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT: {
  				auto* depthFeatures = (VkPhysicalDeviceDepthClipControlFeaturesEXT*)next;
  				depthFeatures->depthClipControl = true;
-@@ -741,6 +833,13 @@
+@@ -741,6 +841,13 @@
  				interlockFeatures->fragmentShaderShadingRateInterlock = false;    // Requires variable rate shading; not supported yet in Metal
  				break;
  			}
@@ -15589,7 +15597,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT: {
  				auto* extFeatures = (VkPhysicalDeviceImage2DViewOf3DFeaturesEXT*)next;
  				extFeatures->image2DViewOf3D = _metalFeatures.placementHeaps;
-@@ -752,6 +851,16 @@
+@@ -752,6 +859,16 @@
  				legacyDitheringFeatures->legacyDithering = getMVKConfig().useMetalPrivateAPI;
  				break;
  			}
@@ -15606,7 +15614,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT: {
  				auto* multiDrawFeatures = (VkPhysicalDeviceMultiDrawFeaturesEXT*)next;
  				multiDrawFeatures->multiDraw = true;
-@@ -811,6 +920,14 @@
+@@ -811,6 +928,14 @@
  				ycbcr2Plane444Features->ycbcr2plane444Formats = true;
  				break;
  			}
@@ -15621,7 +15629,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_FUNCTIONS_2_FEATURES_INTEL: {
  				auto* shaderIntFuncsFeatures = (VkPhysicalDeviceShaderIntegerFunctions2FeaturesINTEL*)next;
  				shaderIntFuncsFeatures->shaderIntegerFunctions2 = true;
-@@ -859,17 +976,33 @@
+@@ -859,17 +984,33 @@
  	supportedProps12.driverID = VK_DRIVER_ID_MOLTENVK;
  	strcpy(supportedProps12.driverName, kMVKMoltenVKDriverLayerName);
  	strcpy(supportedProps12.driverInfo, MVK_VERSION_STRING);
@@ -15658,7 +15666,7 @@ index 359f8a2b..d336e5c8 100644
  	supportedProps12.shaderDenormFlushToZeroFloat64 = false;
  	supportedProps12.shaderRoundingModeRTEFloat16 = true;
  	supportedProps12.shaderRoundingModeRTEFloat32 = true;
-@@ -906,8 +1039,8 @@
+@@ -906,8 +1047,8 @@
  	supportedProps12.supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;	// Metal allows you to set the stencil resolve filter to either Sample0 or the same sample used for depth resolve. This is impossible to express in Vulkan.
  	supportedProps12.independentResolveNone = true;
  	supportedProps12.independentResolve = true;
@@ -15669,7 +15677,7 @@ index 359f8a2b..d336e5c8 100644
  	supportedProps12.maxTimelineSemaphoreValueDifference = std::numeric_limits<uint64_t>::max();
  	supportedProps12.framebufferIntegerColorSampleCounts = _metalFeatures.supportedSampleCounts;
  
-@@ -1284,6 +1417,31 @@
+@@ -1284,6 +1425,31 @@
  				shaderIntDotProperties->integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = supportedProps13.integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated;
  				break;
  			}
@@ -15701,7 +15709,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES: {
  				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorProperties*)next;
  				divisorProps->maxVertexAttribDivisor = supportedProps14.maxVertexAttribDivisor;
-@@ -1311,6 +1469,43 @@
+@@ -1311,6 +1477,43 @@
  				nestedCmdBuffProps->maxCommandBufferNestingLevel = std::numeric_limits<uint32_t>::max();
  				break;
  			}
@@ -15745,7 +15753,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
  				auto* multiDrawProps = (VkPhysicalDeviceMultiDrawPropertiesEXT*)next;
  				// Each draw is encoded as a separate command, so no limit is imposed.
-@@ -1340,6 +1535,53 @@
+@@ -1340,6 +1543,53 @@
  				sampLocnProps->variableSampleLocations = true;
  				break;
  			}
@@ -15799,7 +15807,7 @@ index 359f8a2b..d336e5c8 100644
  			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT: {
  				// VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT is different than the promoted VkPhysicalDeviceVertexAttributeDivisorProperties.
  				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*)next;
-@@ -1588,6 +1830,13 @@
+@@ -1588,6 +1838,13 @@
  	const auto placementHeapFlags = VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT |
  	                                VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
  	                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
@@ -15813,7 +15821,7 @@ index 359f8a2b..d336e5c8 100644
  	if (!_metalFeatures.placementHeaps && mvkIsAnyFlagEnabled(flags, placementHeapFlags)) {
  		return VK_ERROR_FORMAT_NOT_SUPPORTED;
  	}
-@@ -1742,7 +1991,7 @@
+@@ -1742,7 +1999,7 @@
  	pImageFormatProperties->maxExtent = maxExt;
  	pImageFormatProperties->maxMipLevels = maxLevels;
  	pImageFormatProperties->maxArrayLayers = maxLayers;
@@ -15822,7 +15830,22 @@ index 359f8a2b..d336e5c8 100644
  	pImageFormatProperties->maxResourceSize = kMVKUndefinedLargeUInt64;
  
  	return VK_SUCCESS;
-@@ -2242,24 +2491,26 @@
+@@ -1992,6 +2249,14 @@
+ 				((VkSurfaceCapabilitiesPresentWait2KHR*)next)->presentWait2Supported = true;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT: {
++				auto* timingCaps = (VkPresentTimingSurfaceCapabilitiesEXT*)next;
++				timingCaps->presentTimingSupported = true;
++				timingCaps->presentAtAbsoluteTimeSupported = false;
++				timingCaps->presentAtRelativeTimeSupported = true;
++				timingCaps->presentStageQueries = 0;
++				break;
++			}
+ 			default:
+ 				break;
+ 		}
+@@ -2242,24 +2507,26 @@
  		qfProps.queueCount = kMVKQueueCountPerQueueFamily;
  		qfProps.timestampValidBits = 64;
  		qfProps.minImageTransferGranularity = { 1, 1, 1};
@@ -15853,7 +15876,7 @@ index 359f8a2b..d336e5c8 100644
  			_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
  		}
  
-@@ -2569,8 +2820,10 @@
+@@ -2569,8 +2836,10 @@
  		_metalFeatures.subgroupUniformControlFlow = true;
  		_metalFeatures.maximalReconvergence = true;
  
@@ -15866,7 +15889,7 @@ index 359f8a2b..d336e5c8 100644
  
  		// Don't use barriers in render passes on Apple GPUs. Apple GPUs don't support them,
  		// and in fact Metal's validation layer will complain if you try to use them.
-@@ -2629,8 +2882,8 @@
+@@ -2629,8 +2898,8 @@
  
  	if (supportsMTLGPUFamily(Apple10)) {
  		_metalFeatures.maxTextureDimension = (32 * KIBI);
@@ -15877,7 +15900,7 @@ index 359f8a2b..d336e5c8 100644
  	}
  
  // iOS, tvOS and visionOS adjustments necessary when running on the simulator.
-@@ -2643,7 +2896,7 @@
+@@ -2643,7 +2912,7 @@
  	_metalFeatures.mslVersion = SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::make_msl_version(maj, min);
  
  #if MVK_XCODE_26
@@ -15886,12 +15909,19 @@ index 359f8a2b..d336e5c8 100644
  		_metalFeatures.mslVersionEnum = MTLLanguageVersion4_0;
  		setMSLVersion(4, 0);
  	} else
-@@ -2668,6 +2921,15 @@
+@@ -2668,6 +2937,22 @@
  	_metalFeatures.programmableSamplePositions = _mtlDevice.areProgrammableSamplePositionsSupported;
  	_metalFeatures.rasterOrderGroups = _mtlDevice.areRasterOrderGroupsSupported;
  	_metalFeatures.pullModelInterpolation = _mtlDevice.supportsPullModelInterpolation;
 +	if ([_mtlDevice respondsToSelector: @selector(supportsRaytracing)]) {
 +		_metalFeatures.accelerationStructures = _mtlDevice.supportsRaytracing;
++		// MVK_CONFIG_RAY_TRACING_MIN_APPLE_FAMILY=N (off by default): no ray tracing on GPUs before Apple family N,
++		// such as 9 for those with ray tracing hardware. Without it, games turn ray tracing on where it is emulated
++		// in compute and runs far slower than their raster paths.
++		static const uint32_t minRayTracingFamily = (uint32_t)mvkGetEnvVarNumber("MVK_CONFIG_RAY_TRACING_MIN_APPLE_FAMILY", 0);
++		if (minRayTracingFamily && ![_mtlDevice supportsFamily: (MTLGPUFamily)(MTLGPUFamilyApple1 + minRayTracingFamily - 1)]) {
++			_metalFeatures.accelerationStructures = false;
++		}
 +	}
 +	if ([_mtlDevice respondsToSelector: @selector(supportsFunctionPointers)]) {
 +		_supportsFunctionPointers = _mtlDevice.supportsFunctionPointers;
@@ -15902,7 +15932,7 @@ index 359f8a2b..d336e5c8 100644
  
  	// Both current and deprecated properties are retrieved and OR'd together, due to a
  	// Metal bug that, in some environments, returned true for one and false for the other.
-@@ -2712,8 +2974,9 @@
+@@ -2712,8 +2997,9 @@
                  break;
              case kAppleVendorId:
                  _metalFeatures.maxSubgroupSize = 32;
@@ -15914,7 +15944,7 @@ index 359f8a2b..d336e5c8 100644
                  break;
              default:
                  // Apply a sane default.
-@@ -2726,6 +2989,9 @@
+@@ -2726,6 +3012,9 @@
  
  	// Argument buffers
  	_metalFeatures.argumentBuffersTier = _mtlDevice.argumentBuffersSupport;
@@ -15924,7 +15954,7 @@ index 359f8a2b..d336e5c8 100644
  
  	// Metal argument buffer support for descriptor sets is supported on macOS 11.0 or later,
  	// or on older versions of macOS using an Intel GPU, or on iOS & tvOS 16.0 or later (Metal 3).
-@@ -2738,6 +3004,8 @@
+@@ -2738,6 +3027,8 @@
  													_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  
  	_isUsingMetalArgumentBuffers = _metalFeatures.descriptorSetArgumentBuffers && getMVKConfig().useMetalArgumentBuffers;
@@ -15933,7 +15963,7 @@ index 359f8a2b..d336e5c8 100644
  
  #define checkSupportsMTLCounterSamplingPoint(mtlSP, mvkSP)  \
  	if ([_mtlDevice supportsCounterSampling: MTLCounterSamplingPointAt ##mtlSP ##Boundary]) {  \
-@@ -2787,6 +3055,74 @@
+@@ -2787,6 +3078,74 @@
  	_metalFeatures.renderWithoutAttachments = true;
  }
  
@@ -16008,7 +16038,7 @@ index 359f8a2b..d336e5c8 100644
  bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
  	return _isUsingMetalArgumentBuffers && (_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
  }
-@@ -2794,12 +3130,13 @@
+@@ -2794,12 +3153,13 @@
  // Initializes the physical device features of this instance.
  void MVKPhysicalDevice::initFeatures() {
  	mvkClear(&_features);	// Start with everything cleared
@@ -16023,7 +16053,7 @@ index 359f8a2b..d336e5c8 100644
      _features.depthBiasClamp = true;
      _features.fillModeNonSolid = true;
      _features.largePoints = true;
-@@ -2808,16 +3145,34 @@
+@@ -2808,16 +3168,34 @@
      _features.samplerAnisotropy = true;
      _features.shaderImageGatherExtended = true;
      _features.shaderStorageImageExtendedFormats = true;
@@ -16058,7 +16088,7 @@ index 359f8a2b..d336e5c8 100644
  
  	_features.shaderSampledImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
  	_features.textureCompressionBC = _gpuCapabilities.supportsBCTextureCompression;
-@@ -2828,7 +3183,7 @@
+@@ -2828,7 +3206,7 @@
      _features.depthClamp = true;
  
      _features.shaderStorageImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
@@ -16067,7 +16097,7 @@ index 359f8a2b..d336e5c8 100644
  
      if ( supportsMTLGPUFamily(Apple1) ) {
          _features.textureCompressionETC2 = true;
-@@ -2869,7 +3224,7 @@
+@@ -2869,7 +3247,7 @@
  	_vulkan12NoExtFeatures.samplerMirrorClampToEdge = _metalFeatures.samplerMirrorClampToEdge;
  	_vulkan12NoExtFeatures.drawIndirectCount = _metalFeatures.indirectDrawing;
  	_vulkan12NoExtFeatures.descriptorIndexing = _metalFeatures.arrayOfTextures && _metalFeatures.arrayOfSamplers;
@@ -16076,7 +16106,7 @@ index 359f8a2b..d336e5c8 100644
  	_vulkan12NoExtFeatures.shaderOutputViewportIndex = _features.multiViewport;
  	_vulkan12NoExtFeatures.shaderOutputLayer = _metalFeatures.layeredRendering;
  	_vulkan12NoExtFeatures.subgroupBroadcastDynamicId = _metalFeatures.simdPermute || _metalFeatures.quadPermute;
-@@ -2919,7 +3274,7 @@
+@@ -2919,7 +3297,7 @@
  	_properties.limits.maxSamplerAnisotropy = 16;
  
      _properties.limits.maxVertexInputAttributes = 31;
@@ -16085,7 +16115,7 @@ index 359f8a2b..d336e5c8 100644
  
      _properties.limits.maxVertexInputBindingStride = supportsMTLGPUFamily(Apple2) ? kMVKUndefinedLargeUInt32 : (4 * KIBI);
  	_properties.limits.maxVertexInputAttributeOffset = _properties.limits.maxVertexInputBindingStride - 1;
-@@ -2931,6 +3286,14 @@
+@@ -2931,6 +3309,14 @@
  	_properties.limits.maxPerStageDescriptorStorageImages = _metalFeatures.maxPerStageStorageTextureCount;
  	_properties.limits.maxPerStageDescriptorInputAttachments = _metalFeatures.maxPerStageTextureCount;
  
@@ -16100,7 +16130,7 @@ index 359f8a2b..d336e5c8 100644
      _properties.limits.maxPerStageResources = (_metalFeatures.maxPerStageBufferCount + _metalFeatures.maxPerStageTextureCount);
      _properties.limits.maxFragmentCombinedOutputResources = _properties.limits.maxPerStageResources;
  
-@@ -2944,7 +3307,7 @@
+@@ -2944,7 +3330,7 @@
  	_properties.limits.maxDescriptorSetInputAttachments = (_properties.limits.maxPerStageDescriptorInputAttachments * 5);
  
  	_properties.limits.maxClipDistances = 8;	// Per Apple engineers.
@@ -16109,7 +16139,7 @@ index 359f8a2b..d336e5c8 100644
  	_properties.limits.maxCombinedClipAndCullDistances = max(_properties.limits.maxClipDistances,
  															 _properties.limits.maxCullDistances);  // If supported, these consume the same slots.
  
-@@ -3143,13 +3506,21 @@
+@@ -3143,13 +3529,21 @@
  
      // Unsupported features - set to zeros generally
  
@@ -16137,7 +16167,7 @@ index 359f8a2b..d336e5c8 100644
  }
  
  #if MVK_MACOS
-@@ -3288,6 +3659,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3288,6 +3682,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  #endif	//MVK_MACOS
  
@@ -16157,7 +16187,7 @@ index 359f8a2b..d336e5c8 100644
  // Since this is a uint8_t array, use Big-Endian byte ordering,
  // so a hex dump of the array is human readable in its parts.
  void MVKPhysicalDevice::initPipelineCacheUUID() {
-@@ -3299,8 +3683,14 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3299,8 +3706,14 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  	// First 4 bytes contains MoltenVK revision.
  	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
@@ -16172,7 +16202,7 @@ index 359f8a2b..d336e5c8 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -3313,8 +3703,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3313,8 +3726,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// might affect the contents of the pipeline cache (mostly MSL content).
  	uint32_t mtlFeatures = 0;
  	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
@@ -16192,7 +16222,7 @@ index 359f8a2b..d336e5c8 100644
  }
  
  // Combine OS major (8 bits), OS minor (8 bits), Mac GPU family (8 bits), and
-@@ -3545,6 +3946,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3545,6 +3969,22 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -16215,7 +16245,7 @@ index 359f8a2b..d336e5c8 100644
  void MVKPhysicalDevice::initExtensions() {
  	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
  	pWritableExtns->disableAllButEnabledDeviceExtensions();
-@@ -3555,6 +3972,18 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3555,6 +3995,21 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.maximalReconvergence) {
  		pWritableExtns->vk_KHR_shader_maximal_reconvergence.enabled = false;
  	}
@@ -16225,7 +16255,10 @@ index 359f8a2b..d336e5c8 100644
 +	if (_metalFeatures.mslVersion < 30200 || !_gpuCapabilities.supportsApple7) {
 +		pWritableExtns->vk_EXT_shader_image_atomic_int64.enabled = false;
 +	}
-+	if (_metalFeatures.mslVersion < 30000 || !_gpuCapabilities.supportsApple7) {
++	// MVK_CONFIG_CONSERVATIVE_RASTERIZATION=0 (on by default) reports no conservative rasterization: it is emulated with
++	// a mesh stage here, and games that find it take voxelization and shadow paths slower than those without it.
++	static const bool conservativeRasterization = mvkGetEnvVarNumber("MVK_CONFIG_CONSERVATIVE_RASTERIZATION", 1) != 0;
++	if (_metalFeatures.mslVersion < 30000 || !_gpuCapabilities.supportsApple7 || !conservativeRasterization) {
 +		pWritableExtns->vk_EXT_conservative_rasterization.enabled = false;
 +	}
 +	if (!_metalFeatures.quadPermute) {
@@ -16234,7 +16267,7 @@ index 359f8a2b..d336e5c8 100644
  	if (!_metalFeatures.quadControlFlow || !_metalFeatures.quadPermute) {
  		pWritableExtns->vk_KHR_shader_quad_control.enabled = false;
  	}
-@@ -3592,15 +4021,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3592,15 +4047,30 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (!_metalFeatures.placementHeaps) {
  		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
  	}
@@ -16266,7 +16299,7 @@ index 359f8a2b..d336e5c8 100644
  
  	if (!_gpuCapabilities.isAppleGPU) {
  		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
-@@ -3763,6 +4207,67 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3763,6 +4233,67 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	[nsUUID release];																		// temp release
  }
  
@@ -16334,7 +16367,7 @@ index 359f8a2b..d336e5c8 100644
  MVKPhysicalDevice::~MVKPhysicalDevice() {
  	mvkDestroyContainerContents(_queueFamilies);
  	[_timestampMTLCounterSet release];
-@@ -4034,6 +4539,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4034,6 +4565,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
  			maxVarDescCount = mtlFeats.maxPerStageBufferCount - mtlBuffCnt;
  			break;
@@ -16344,7 +16377,7 @@ index 359f8a2b..d336e5c8 100644
  		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
  			maxVarDescCount = (uint32_t)min<VkDeviceSize>(mtlFeats.maxMTLBufferSize, numeric_limits<uint32_t>::max());
  			break;
-@@ -4045,7 +4553,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4045,7 +4579,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
  		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
  				maxVarDescCount = min(mtlFeats.maxPerStageTextureCount - mtlTexCnt,
@@ -16353,7 +16386,19 @@ index 359f8a2b..d336e5c8 100644
  			break;
  		case VK_DESCRIPTOR_TYPE_SAMPLER:
  				maxVarDescCount = mtlFeats.maxPerStageSamplerCount - mtlSampCnt;
-@@ -4185,12 +4693,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4133,6 +4667,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 			case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT:
+ 				pTimestamps[tsIdx] = cpuStart;
+ 				break;
++			// Drawables' presented times are on the host clock that sampleTimestamps returns.
++			case VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT:
++			case VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT:
++				pTimestamps[tsIdx] = cpuStamp;
++				break;
+ 			default:
+ 				continue;
+ 		}
+@@ -4185,12 +4724,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKBuffer* MVKDevice::createBuffer(const VkBufferCreateInfo* pCreateInfo,
  								   const VkAllocationCallbacks* pAllocator) {
@@ -16372,7 +16417,7 @@ index 359f8a2b..d336e5c8 100644
  	removeBuffer(mvkBuff);
  	mvkBuff->destroy();
  }
-@@ -4221,12 +4734,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4221,12 +4765,17 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
      MVKImage* mvkImg = (swapchainInfo)
          ? new MVKPeerSwapchainImage(this, pCreateInfo, (MVKSwapchain*)swapchainInfo->swapchain, uint32_t(-1))
          : new MVKImage(this, pCreateInfo);
@@ -16390,7 +16435,7 @@ index 359f8a2b..d336e5c8 100644
  	removeImage(mvkImg);
  	mvkImg->destroy();
  }
-@@ -4355,8 +4873,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4355,8 +4904,15 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  				return new MVKOcclusionQueryPool(this, pCreateInfo);
  			case VK_QUERY_TYPE_TIMESTAMP:
  				return new MVKTimestampQueryPool(this, pCreateInfo);
@@ -16406,7 +16451,7 @@ index 359f8a2b..d336e5c8 100644
  			default:
  				return new MVKUnsupportedQueryPool(this, pCreateInfo);
  		}
-@@ -4398,6 +4923,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4398,6 +4954,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	if (mvkPLL) { mvkPLL->destroy(); }
  }
  
@@ -16452,7 +16497,7 @@ index 359f8a2b..d336e5c8 100644
  template<typename PipelineType, typename PipelineInfoType>
  VkResult MVKDevice::createPipelines(VkPipelineCache pipelineCache,
                                      uint32_t count,
-@@ -4464,6 +5028,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4464,6 +5059,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
                                                                                                const VkAllocationCallbacks* pAllocator,
                                                                                                VkPipeline* pPipelines);
  
@@ -16465,7 +16510,7 @@ index 359f8a2b..d336e5c8 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4567,16 +5137,82 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4567,16 +5168,82 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKDeviceMemory* MVKDevice::allocateMemory(const VkMemoryAllocateInfo* pAllocateInfo,
  										   const VkAllocationCallbacks* pAllocator) {
@@ -16550,7 +16595,7 @@ index 359f8a2b..d336e5c8 100644
  VkResult MVKDevice::createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  										  const VkAllocationCallbacks* pAllocator,
  										  VkPrivateDataSlot* pPrivateDataSlot) {
-@@ -4629,6 +5265,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +5296,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -16558,7 +16603,7 @@ index 359f8a2b..d336e5c8 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5277,463 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5308,463 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -16569,14 +16614,14 @@ index 359f8a2b..d336e5c8 100644
  
 -void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
 +void MVKDevice::invalidateGPUAddressableBufferIndex() {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	_gpuAddressableBufferIndexDirty = true;
 +}
 +
 +void MVKDevice::retainGPUAddressableAccelerationStructures(MVKSmallVector<MVKAccelerationStructure*, 16>& accelerationStructures) {
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	accelerationStructures.reserve(_gpuAddressableAccelerationStructures.size());
 +	for (auto* accelerationStructure : _gpuAddressableAccelerationStructures) {
 +		accelerationStructure->retain();
@@ -17025,7 +17070,7 @@ index 359f8a2b..d336e5c8 100644
  	}
  }
  
-@@ -4696,6 +5782,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4696,6 +5813,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  								   MVKCommandUse cmdUse) {
  	if (!mvkIsAnyFlagEnabled(barrier.dstStageMask, VK_PIPELINE_STAGE_HOST_BIT) ||
  		!mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT) ) { return; }
@@ -17034,7 +17079,7 @@ index 359f8a2b..d336e5c8 100644
  	lock_guard<mutex> lock(_rezLock);
  	for (auto& rez : _resources) {
  		rez->applyMemoryBarrier(barrier, cmdEncoder, cmdUse);
-@@ -4841,6 +5929,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4841,6 +5960,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -17042,7 +17087,7 @@ index 359f8a2b..d336e5c8 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4917,11 +6006,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,11 +6037,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		// typically have stricter alignment requirements due to it being a 2-component format.
  		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
  	}
@@ -17089,7 +17134,7 @@ index 359f8a2b..d336e5c8 100644
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
-@@ -4967,6 +6090,247 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +6121,247 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -17337,7 +17382,7 @@ index 359f8a2b..d336e5c8 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +6352,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +6383,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -17366,7 +17411,7 @@ index 359f8a2b..d336e5c8 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,17 +6374,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,17 +6405,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -17397,7 +17442,7 @@ index 359f8a2b..d336e5c8 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6630,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6661,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -17675,7 +17720,7 @@ index 359f8a2b..d336e5c8 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6912,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6943,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -17688,7 +17733,7 @@ index 359f8a2b..d336e5c8 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5575,7 +7224,59 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +7255,59 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -17748,7 +17793,7 @@ index 359f8a2b..d336e5c8 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +7292,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +7323,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}
@@ -17789,7 +17834,7 @@ index 359f8a2b..d336e5c8 100644
  	stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_DEVICE);
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
-index 9342deb9..d31d78c7 100644
+index 9342deb9..08b23afa 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
 @@ -80,6 +80,8 @@ MVK_DEVICE_FEATURE(VariablePointer,                       VARIABLE_POINTER,
@@ -17817,7 +17862,7 @@ index 9342deb9..d31d78c7 100644
  MVK_DEVICE_FEATURE_EXTN(ShaderMaximalReconvergence,       SHADER_MAXIMAL_RECONVERGENCE,         KHR,   1)
  MVK_DEVICE_FEATURE_EXTN(ShaderQuadControl,                SHADER_QUAD_CONTROL,                  KHR,   1)
  MVK_DEVICE_FEATURE_EXTN(ShaderRelaxedExtendedInstruction, SHADER_RELAXED_EXTENDED_INSTRUCTION,  KHR,   1)
-@@ -99,12 +106,16 @@ MVK_DEVICE_FEATURE_EXTN(SwapchainMaintenance1,            SWAPCHAIN_MAINTENANCE_
+@@ -99,15 +106,20 @@ MVK_DEVICE_FEATURE_EXTN(SwapchainMaintenance1,            SWAPCHAIN_MAINTENANCE_
  MVK_DEVICE_FEATURE_EXTN(4444Formats,                      4444_FORMATS,                         EXT,   2)
  MVK_DEVICE_FEATURE_EXTN(DepthClipControl,                 DEPTH_CLIP_CONTROL,                   EXT,   1)
  MVK_DEVICE_FEATURE_EXTN(DepthClipEnable,                  DEPTH_CLIP_ENABLE,                    EXT,   1)
@@ -17834,6 +17879,10 @@ index 9342deb9..d31d78c7 100644
  MVK_DEVICE_FEATURE_EXTN(MultiDraw,                        MULTI_DRAW,                           EXT,   1)
  MVK_DEVICE_FEATURE_EXTN(NestedCommandBuffer,              NESTED_COMMAND_BUFFER,                EXT,   3)
  MVK_DEVICE_FEATURE_EXTN(NonSeamlessCubeMap,               NON_SEAMLESS_CUBE_MAP,                EXT,   1)
++MVK_DEVICE_FEATURE_EXTN(PresentTiming,                    PRESENT_TIMING,                       EXT,   3)
+ MVK_DEVICE_FEATURE_EXTN(PrimitiveTopologyListRestart,     PRIMITIVE_TOPOLOGY_LIST_RESTART,      EXT,   2)
+ MVK_DEVICE_FEATURE_EXTN(ProvokingVertex,                  PROVOKING_VERTEX,                     EXT,   2)
+ MVK_DEVICE_FEATURE_EXTN(ShaderAtomicFloat,                SHADER_ATOMIC_FLOAT,                  EXT,  12)
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h
 index b349d6ea..eb4da9a9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.h
@@ -18065,7 +18114,7 @@ index 00b182b8..81934068 100644
  	_mtlHeap = nil;
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-index 45ddd3a4..eb0d68ef 100644
+index 45ddd3a4..b407fea4 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 @@ -152,6 +152,21 @@ protected:
@@ -18143,7 +18192,23 @@ index 45ddd3a4..eb0d68ef 100644
  	bool _isLinearForAtomics;
  	bool _is2DViewOn3DImageCompatible = false;
  	bool _isBlockTexelViewCompatible = false;
-@@ -508,6 +552,7 @@ protected:
+@@ -455,6 +499,7 @@ typedef struct  {
+ 	uint64_t presentId;				// VK_KHR_present_id presentId
+ 	uint64_t desiredPresentTime;	// VK_GOOGLE_display_timing desired presentation time in nanoseconds
+ 	uint32_t presentIDGoogle;	// VK_GOOGLE_display_timing presentID
++	uint64_t minimumPresentDuration;	// VK_EXT_present_timing relative target, in nanoseconds
+ 	VkPresentModeKHR presentMode;	// VK_EXT_swapchain_maintenance1 present mode specialization
+ } MVKImagePresentInfo;
+ 
+@@ -500,6 +545,7 @@ protected:
+ 
+ 	id<CAMetalDrawable> getCAMetalDrawable();
+ 	void addPresentedHandler(id<CAMetalDrawable> mtlDrawable, MVKImagePresentInfo presentInfo, MVKSwapchainSignaler signaler);
++	void notePresentedTime(uint64_t presentedNS);
+ 	void releaseMetalDrawable();
+ 	MVKSwapchainImageAvailability getAvailability();
+ 	void makeAvailable();
+@@ -508,6 +554,7 @@ protected:
  
  	id<CAMetalDrawable> _mtlDrawable = nil;
  	id<MTLTexture> _mtlTextureHeadless = nil;
@@ -18151,7 +18216,7 @@ index 45ddd3a4..eb0d68ef 100644
  	MVKSwapchainImageAvailability _availability;
  	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
  	MVKSwapchainSignaler _preSignaler = {};
-@@ -570,6 +615,9 @@ protected:
+@@ -570,6 +617,9 @@ protected:
      friend MVKImageView;
      MVKImageView* _imageView;
  	id<MTLTexture> _mtlTexture;
@@ -18161,7 +18226,7 @@ index 45ddd3a4..eb0d68ef 100644
  	VkComponentMapping _componentSwizzle;
      MTLPixelFormat _mtlPixFmt;
  	uint8_t _planeIndex;
-@@ -622,6 +670,12 @@ public:
+@@ -622,6 +672,12 @@ public:
  	/** Returns the Metal texture type of this image view. */
  	MTLTextureType getMTLTextureType() { return _mtlTextureType; }
  
@@ -18174,7 +18239,7 @@ index 45ddd3a4..eb0d68ef 100644
  	bool getIs2dViewOf3d() {
  		return _image->_is2DViewOn3DImageCompatible &&
  				_image->getImageType() == VK_IMAGE_TYPE_3D &&
-@@ -661,6 +715,7 @@ protected:
+@@ -661,6 +717,7 @@ protected:
      VkImageUsageFlags _usage;
  	std::mutex _lock;
  	MTLTextureType _mtlTextureType;
@@ -18182,7 +18247,7 @@ index 45ddd3a4..eb0d68ef 100644
  };
  
  
-@@ -733,6 +788,13 @@ public:
+@@ -733,6 +790,13 @@ public:
  	/** Returns whether this sampler must be implemented as a hardcoded constant sampler in the shader MSL code. */
  	inline 	bool getRequiresConstExprSampler() { return _requiresConstExprSampler; }
  
@@ -18196,7 +18261,7 @@ index 45ddd3a4..eb0d68ef 100644
  	/** Returns the Metal MTLSamplerAddressMode corresponding to the specified Vulkan VkSamplerAddressMode. */
  	MTLSamplerAddressMode getMTLSamplerAddressMode(VkSamplerAddressMode vkMode);
  
-@@ -751,5 +813,6 @@ protected:
+@@ -751,5 +815,6 @@ protected:
  	id<MTLSamplerState> _mtlSamplerState;
  	SPIRV_CROSS_NAMESPACE::MSLConstexprSampler _constExprSampler;
  	MVKSamplerYcbcrConversion* _ycbcrConversion;
@@ -18204,7 +18269,7 @@ index 45ddd3a4..eb0d68ef 100644
  	bool _requiresConstExprSampler;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index 2b394922..b70c7673 100644
+index 2b394922..06956660 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -78,6 +78,10 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
@@ -18578,19 +18643,53 @@ index 2b394922..b70c7673 100644
  	// Attach present handler before presenting to avoid race condition.
  	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
  	MVKSwapchainSignaler signaler = getPresentationSignaler();
-+	MVK_MS_TRACE(Present, "present image %u, present id %llu, mode %d, desired time %llu ns", _swapchainIndex,
-+				 (unsigned long long)presentInfo.presentId, (int)presentInfo.presentMode,
-+				 (unsigned long long)presentInfo.desiredPresentTime);
++	MVK_MS_TRACE(Present, "present image %u, present id %llu, mode %d, desired time %llu ns, minimum duration %llu ns",
++				 _swapchainIndex, (unsigned long long)presentInfo.presentId, (int)presentInfo.presentMode,
++				 (unsigned long long)presentInfo.desiredPresentTime, (unsigned long long)presentInfo.minimumPresentDuration);
  	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
 +		MVK_MS_TRACE(Present, "image %u scheduled, presenting the drawable", _swapchainIndex);
  
  		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
  
-@@ -1751,6 +2026,15 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1667,6 +1942,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		}
+ 		if (presentInfo.desiredPresentTime) {
+ 			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
++		} else if (presentInfo.minimumPresentDuration) {
++			double presentTime = _swapchain ? _swapchain->getMinimumDurationPresentTime(presentInfo.minimumPresentDuration) : 0;
++			if (presentTime > 0) { [mtlDrwbl presentAtTime: presentTime]; } else { [mtlDrwbl present]; }
+ 		} else {
+ 			[mtlDrwbl present];
+ 		}
+@@ -1725,6 +2003,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ #if !MVK_OS_SIMULATOR
+ 	[mtlDrawable addPresentedHandler: ^(id<MTLDrawable> mtlDrwbl) {
++		if (mtlDrwbl.presentedTime > 0) { notePresentedTime(mtlDrwbl.presentedTime * 1.0e9); }
+ 		endPresentation(presentInfo, signaler, mtlDrwbl.presentedTime * 1.0e9);
+ 	}];
+ #else
+@@ -1734,6 +2013,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ #endif
+ }
+ 
++void MVKPresentableSwapchainImage::notePresentedTime(uint64_t presentedNS) {
++	lock_guard<mutex> lock(_detachmentLock);
++	if (_swapchain) { _swapchain->notePresentedTime(presentedNS); }
++}
++
+ // Ensure this image and the swapchain are not destroyed while awaiting presentation
+ void MVKPresentableSwapchainImage::beginPresentation(const MVKImagePresentInfo& presentInfo) {
+ 	retain();
+@@ -1750,7 +2034,19 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	// which should be reasonably accurate (sub-ms) to the presentation time. The presentation
  	// time will not be available if the presentation did not actually happen, such as when
  	// running headless, or on a test harness that is not attached to the windowing system.
++	bool shown = actualPresentTime != 0;
  	if (actualPresentTime == 0) { actualPresentTime = mvkGetRuntimeNanoseconds(); }
-+	if (MVK_MS_TRACE_ON(Present)) {
++	if (MVK_MS_TRACE_ON(Present) && !shown) {
++		mvkMSTracePrintf(kMVKMSTracePresent, "image %u never shown", _swapchainIndex);
++	} else if (MVK_MS_TRACE_ON(Present)) {
 +		// presentedTime is on the host clock in seconds; 0 means the drawable was never shown.
 +		static std::atomic<uint64_t> lastPresentedNS{0};
 +		uint64_t lastNS = lastPresentedNS.exchange(actualPresentTime);
@@ -18602,7 +18701,7 @@ index 2b394922..b70c7673 100644
  
  	{	// Scope to avoid deadlock if release() is run within detachment lock
  		// If I have become detached from the swapchain, it means the swapchain, and possibly the
-@@ -1811,6 +2095,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1811,6 +2107,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  			_mtlTextureHeadless = [[getMTLDevice() newTextureWithDescriptor: mtlTexDesc] retain];	// retained
  		}
@@ -18623,7 +18722,7 @@ index 2b394922..b70c7673 100644
  	}
  }
  
-@@ -1819,6 +2117,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1819,6 +2129,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  	releaseMetalDrawable();
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
@@ -18632,7 +18731,7 @@ index 2b394922..b70c7673 100644
  	MVKSwapchainImage::destroy();
  }
  
-@@ -1903,6 +2203,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1903,6 +2215,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
              MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
              initializeMTLTexture(newMTLTextureFromBaseMTLTexture(baseMTLTexture)); // retained
@@ -18640,7 +18739,7 @@ index 2b394922..b70c7673 100644
          }
          return _mtlTexture;
      } else {
-@@ -1911,6 +2212,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1911,6 +2224,9 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  }
  
  bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
@@ -18650,7 +18749,7 @@ index 2b394922..b70c7673 100644
      id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
      if (cachedBaseMTLTexture == mtlTexture) { return true; }
  
-@@ -2202,6 +2506,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2202,6 +2518,8 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		[tex release];
  		_mtlTexture = nil;
  	}
@@ -18659,7 +18758,7 @@ index 2b394922..b70c7673 100644
  }
  
  MVKImageViewPlane::~MVKImageViewPlane() {
-@@ -2292,6 +2598,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2292,6 +2610,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  				if (mvkAreAllFlagsEnabled(_usage, newUsage)) { _usage = newUsage; }
  				break;
  			}
@@ -18672,7 +18771,7 @@ index 2b394922..b70c7673 100644
              /* case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR: {
                  const VkSamplerYcbcrConversionInfoKHR* sampConvInfo = (const VkSamplerYcbcrConversionInfoKHR*)next;
                  break;
-@@ -2570,6 +2882,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
+@@ -2570,6 +2894,31 @@ static MSLSamplerYCbCrRange getSpvSamplerYcbcrRangeFromVkSamplerYcbcrRange(VkSam
  
  	_requiresConstExprSampler = (pCreateInfo->compareEnable && !getMetalFeatures().depthSampleCompare) || _ycbcrConversion;
  
@@ -18727,7 +18826,7 @@ index 1d2c08f5..0e5dab22 100644
  	MVKSmallVector<MVKDebugReportCallback*> _debugReportCallbacks;
  	MVKSmallVector<MVKDebugUtilsMessenger*> _debugUtilMessengers;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
-index ef69994a..f891c5c1 100644
+index ef69994a..f6745ee2 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
 @@ -283,6 +283,9 @@
@@ -18773,7 +18872,18 @@ index ef69994a..f891c5c1 100644
  	ADD_DVC_EXT_ENTRY_POINT(vkGetCalibratedTimestampsKHR, KHR_CALIBRATED_TIMESTAMPS);
  	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, KHR_CALIBRATED_TIMESTAMPS);
      ADD_DVC_EXT_ENTRY_POINT(vkCreateDeferredOperationKHR, KHR_DEFERRED_HOST_OPERATIONS);
-@@ -787,12 +816,30 @@
+@@ -777,6 +806,10 @@
+ 	ADD_DVC_EXT_VER_OR_EXT_ENTRY_POINT(vkAcquireNextImage2KHR, KHR_SWAPCHAIN, 1_1, KHR_DEVICE_GROUP);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkWaitForPresentKHR, KHR_PRESENT_WAIT);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkWaitForPresent2KHR, KHR_PRESENT_WAIT_2);
++	ADD_DVC_EXT_ENTRY_POINT(vkSetSwapchainPresentTimingQueueSizeEXT, EXT_PRESENT_TIMING);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetSwapchainTimingPropertiesEXT, EXT_PRESENT_TIMING);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetSwapchainTimeDomainPropertiesEXT, EXT_PRESENT_TIMING);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetPastPresentationTimingEXT, EXT_PRESENT_TIMING);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkReleaseSwapchainImagesKHR, KHR_SWAPCHAIN_MAINTENANCE_1);
+ 	ADD_DVC_EXT_ENTRY_POINT_ALIAS(vkGetCalibratedTimestampsEXT, vkGetCalibratedTimestampsKHR, EXT_CALIBRATED_TIMESTAMPS);
+ 	ADD_DVC_EXT_ENTRY_POINT_ALIAS(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, EXT_CALIBRATED_TIMESTAMPS);
+@@ -787,12 +820,30 @@
  	ADD_DVC_EXT_ENTRY_POINT(vkCmdDebugMarkerInsertEXT, EXT_DEBUG_MARKER);
  	ADD_DVC_EXT_ENTRY_POINT(vkGetMemoryHostPointerPropertiesEXT, EXT_EXTERNAL_MEMORY_HOST);
  	ADD_DVC_EXT_ENTRY_POINT(vkSetHdrMetadataEXT, EXT_HDR_METADATA);
@@ -18804,7 +18914,7 @@ index ef69994a..f891c5c1 100644
  	ADD_DVC_EXT_ENTRY_POINT(vkGetRefreshCycleDurationGOOGLE, GOOGLE_DISPLAY_TIMING);
  	ADD_DVC_EXT_ENTRY_POINT(vkGetPastPresentationTimingGOOGLE, GOOGLE_DISPLAY_TIMING);
  	ADD_DVC_EXT_ENTRY_POINT(vkCmdSetLogicOpEXT, EXT_EXTENDED_DYNAMIC_STATE_2);
-@@ -820,6 +867,9 @@
+@@ -820,6 +871,9 @@
  	ADD_DVC_EXT_ENTRY_POINT(vkCmdSetTessellationDomainOriginEXT, EXT_EXTENDED_DYNAMIC_STATE_3);
  	ADD_DVC_EXT_ENTRY_POINT(vkGetMemoryMetalHandleEXT, EXT_EXTERNAL_MEMORY_METAL);
  	ADD_DVC_EXT_ENTRY_POINT(vkGetMemoryMetalHandlePropertiesEXT, EXT_EXTERNAL_MEMORY_METAL);
@@ -18814,7 +18924,7 @@ index ef69994a..f891c5c1 100644
  }
  
  void MVKInstance::logVersions() {
-@@ -856,4 +906,3 @@
+@@ -856,4 +910,3 @@
  	mvkDestroyContainerContents(_debugReportCallbacks);
  	mvkDestroyContainerContents(_debugUtilMessengers);
  }
@@ -24381,7 +24491,7 @@ index b18549c7..85587053 100644
  };
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-index dec4b452..bd6fdebc 100644
+index dec4b452..61cdee17 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 @@ -18,6 +18,8 @@
@@ -25096,7 +25206,38 @@ index dec4b452..bd6fdebc 100644
  		[mtlCmdBuff commit];
  	} else {
  		finish();
-@@ -851,3 +1320,246 @@
+@@ -771,6 +1240,7 @@
+ 	: MVKQueueSubmission(queue, pPresentInfo->waitSemaphoreCount, pPresentInfo->pWaitSemaphores, nullptr) {
+ 
+ 	const VkPresentTimesInfoGOOGLE* pPresentTimesInfo = nullptr;
++	const VkPresentTimingsInfoEXT* pPresentTimingsInfo = nullptr;
+ 	const VkSwapchainPresentFenceInfoKHR* pPresentFenceInfo = nullptr;
+ 	const VkSwapchainPresentModeInfoKHR* pPresentModeInfo = nullptr;
+ 	const VkPresentRegionsKHR* pPresentRegions = nullptr;
+@@ -796,6 +1266,9 @@
+ 			case VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE:
+ 				pPresentTimesInfo = (const VkPresentTimesInfoGOOGLE*) next;
+ 				break;
++			case VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT:
++				pPresentTimingsInfo = (const VkPresentTimingsInfoEXT*) next;
++				break;
+ 			default:
+ 				break;
+ 		}
+@@ -843,6 +1316,12 @@
+ 			presentInfo.presentIDGoogle = pPresentTimes[scIdx].presentID;
+ 			presentInfo.desiredPresentTime = pPresentTimes[scIdx].desiredPresentTime;
+ 		}
++		if (pPresentTimingsInfo && scIdx < pPresentTimingsInfo->swapchainCount && pPresentTimingsInfo->pTimingInfos) {
++			const auto& timing = pPresentTimingsInfo->pTimingInfos[scIdx];
++			if (mvkIsAnyFlagEnabled(timing.flags, VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT)) {
++				presentInfo.minimumPresentDuration = timing.targetTime;
++			}
++		}
+ 		mvkSC->setLayerNeedsDisplay(pRegions ? &pRegions[scIdx] : nullptr);
+ 		_presentInfo.push_back(presentInfo);
+ 		VkResult scRslt = mvkSC->getSurfaceStatus();
+@@ -851,3 +1330,246 @@
  	}
  }
  
@@ -25625,7 +25766,7 @@ index c5b74991..d4672547 100644
  
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a44..776fd46d 100644
+index 3aa44a44..1e9945aa 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -19,7 +19,18 @@
@@ -25915,7 +26056,7 @@ index 3aa44a44..776fd46d 100644
  		default:
  			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule(): The SPIR-V contains an invalid magic number %x.", magicNum));
  			break;
-@@ -548,6 +709,766 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -548,6 +709,817 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  MVKShaderModule::~MVKShaderModule() {
  	if (_directMSLLibrary) { _directMSLLibrary->destroy(); }
@@ -26184,6 +26325,47 @@ index 3aa44a44..776fd46d 100644
 +struct MVKMSCConversionCacheKeyHash {
 +	size_t operator()(const MVKMSCConversionCacheKey& k) const { return size_t(k.hash ^ (k.size * 0x9e3779b97f4a7c15ull)); }
 +};
++// DXIL converted from DXBC, by the DXBC's bytes: a DXBC shader is converted once however many root signatures it is
++// paired with (a conversion's key has its root signature, the DXBC to DXIL step doesn't depend on it). Holds up to
++// kMaxBytes of DXIL, and empties when it would hold more.
++struct MVKDxbcToDxilCache {
++	static constexpr size_t kMaxBytes = 64 * 1024 * 1024;
++	struct Key {
++		uint64_t hash;
++		uint32_t size;
++		bool operator==(const Key& o) const { return hash == o.hash && size == o.size; }
++	};
++	struct KeyHash { size_t operator()(const Key& k) const { return size_t(k.hash ^ k.size); } };
++	mutex lock;
++	size_t bytes = 0;
++	unordered_map<Key, shared_ptr<const vector<uint8_t>>, KeyHash> entries;
++
++	static Key keyOf(const void* dxbc, uint32_t size) {
++		uint64_t h = 1469598103934665603ull;
++		auto* p = (const uint8_t*)dxbc;
++		for (uint32_t i = 0; i < size; i++) { h = (h ^ p[i]) * 1099511628211ull; }
++		return { h, size };
++	}
++	shared_ptr<const vector<uint8_t>> find(const Key& key) {
++		lock_guard<mutex> guard(lock);
++		auto it = entries.find(key);
++		return it == entries.end() ? nullptr : it->second;
++	}
++	void add(const Key& key, const void* dxil, uint32_t size) {
++		auto data = make_shared<const vector<uint8_t>>((const uint8_t*)dxil, (const uint8_t*)dxil + size);
++		lock_guard<mutex> guard(lock);
++		if (bytes + size > kMaxBytes) {
++			entries.clear();
++			bytes = 0;
++		}
++		if (entries.emplace(key, data).second) { bytes += size; }
++	}
++	static MVKDxbcToDxilCache& get() {
++		static MVKDxbcToDxilCache* cache = new MVKDxbcToDxilCache();
++		return *cache;
++	}
++};
++
 +// Converted shaders on disk, one file each, beside the implicit pipeline cache (<cache>.msc/), so a relaunch loads
 +// what it converted before rather than converting every shader again (DXBC to DXIL and DXIL to AIR are most of a
 +// bridged pipeline's creation time). A file's name is a hash of everything the conversion depends on; its header
@@ -26522,6 +26704,7 @@ index 3aa44a44..776fd46d 100644
 +	IRShaderReflection* reflection = nullptr;
 +	IRError* irErr = nullptr;
 +	uint8_t* convertedDXIL = nullptr;		// From DXBC, freed by MVKDxbcConverter
++	shared_ptr<const vector<uint8_t>> convertedFromCache;	// From DXBC converted before (MVKDxbcToDxilCache)
 +	uint32_t convertedDXILSize = 0;
 +	rslt.error = [&]() -> string {
 +		rootSig = msc.IRRootSignatureCreateFromDescriptor(&rsDesc, &irErr);
@@ -26566,8 +26749,16 @@ index 3aa44a44..776fd46d 100644
 +		const uint8_t* dxilData = blob + hdr.dxilOffset;
 +		size_t dxilSize = hdr.dxilSize;
 +		if (hdr.flags & kMVKMSCBlobFlagDXBC) {
++			auto dxbcKey = MVKDxbcToDxilCache::keyOf(dxilData, (uint32_t)dxilSize);
++			convertedFromCache = MVKDxbcToDxilCache::get().find(dxbcKey);
++		}
++		if ((hdr.flags & kMVKMSCBlobFlagDXBC) && convertedFromCache) {
++			dxilData = convertedFromCache->data();
++			dxilSize = convertedFromCache->size();
++		} else if (hdr.flags & kMVKMSCBlobFlagDXBC) {
 +			const auto& conv = MVKDxbcConverter::get();
 +			if ( !conv.error.empty() ) { return conv.error; }
++			auto dxbcKey = MVKDxbcToDxilCache::keyOf(dxilData, (uint32_t)dxilSize);
 +			char* convErr = nullptr;
 +			uint64_t convStart = mvkGetTimestamp();
 +			int convRslt = conv.convert(dxilData, (uint32_t)dxilSize, (void**)&convertedDXIL, &convertedDXILSize, &convErr);
@@ -26579,6 +26770,7 @@ index 3aa44a44..776fd46d 100644
 +				return why;
 +			}
 +			if (convErr) { conv.free(convErr); }
++			MVKDxbcToDxilCache::get().add(dxbcKey, convertedDXIL, convertedDXILSize);
 +			dxilData = convertedDXIL;
 +			dxilSize = convertedDXILSize;
 +		}
@@ -26682,26 +26874,39 @@ index 3aa44a44..776fd46d 100644
  }
  
  
-@@ -741,4 +1662,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -741,4 +1713,3 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  MVKFunctionSpecializer::~MVKFunctionSpecializer() {
  	[_mtlFunction release];
  }
 -
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
-index 1665b514..31dc526f 100644
+index 1665b514..ac626ae7 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
-@@ -125,6 +125,9 @@ protected:
+@@ -125,6 +125,11 @@ protected:
  	void endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime = 0);
  	void notifyPresentComplete(const MVKImagePresentInfo& presentInfo);
  	void forceUnpresentedImageCompletion();
 +	void initMetalFXSpatialScaler(const VkSwapchainCreateInfoKHR* pCreateInfo);
 +	void encodeMetalFXSpatialScale(id<MTLTexture> mtlTexture, id<CAMetalDrawable> mtlDrawable, id<MTLCommandBuffer> mtlCmdBuff);
 +	void sampleMetalFXOnScreenExtent();
++	double getMinimumDurationPresentTime(uint64_t durationNS);
++	void notePresentedTime(uint64_t presentedNS);
  
  	MVKSurface* _surface = nullptr;
      MVKWatermark* _licenseWatermark = nullptr;
-@@ -145,4 +148,19 @@ protected:
+@@ -134,6 +139,10 @@ protected:
+ 	VkPastPresentationTimingGOOGLE _presentTimingHistory[kMaxPresentationHistory];
+ 	std::atomic<uint64_t> _currentAcquisitionID = 0;
+ 	std::mutex _presentHistoryLock;
++	std::mutex _minimumDurationLock;
++	uint64_t _lastPresentedNS = 0;		// Host clock time the last drawable shown appeared, under _minimumDurationLock
++	uint64_t _lastMinimumDurationTargetNS = 0;
++	uint64_t _minimumDurationRefreshNS = 0;
+ 	std::mutex _currentPresentIdMutex;
+ 	std::condition_variable _currentPresentIdCondVar;
+ 	uint64_t _currentPresentId = 0;
+@@ -145,4 +154,19 @@ protected:
  	uint32_t _presentHistoryIndex = 0;
  	uint32_t _presentHistoryHeadIndex = 0;
  	bool _isDeliberatelyScaled = false;
@@ -26722,7 +26927,7 @@ index 1665b514..31dc526f 100644
 +	bool _metalFXRequested = false;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
-index 4c908669..7db8e029 100644
+index 4c908669..cc7e9ef8 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
 @@ -26,10 +26,12 @@
@@ -26757,7 +26962,47 @@ index 4c908669..7db8e029 100644
  	if (_isDeliberatelyScaled || isHeadless()) { return true; }
  
  	VkExtent2D surfExtent = _surface->getExtent();
-@@ -437,6 +451,7 @@ static inline CIE1931XY VkXYColorEXTToCIE1931XY(VkXYColorEXT xy) {
+@@ -256,6 +270,39 @@
+ 	_unpresentedImageCount++;
+ }
+ 
++// A relative present target: the host time a duration after the previous frame appears, or now if that has passed.
++// Presenting at a time paces windowed presents, where a minimum duration does not. The previous frame may not be
++// on screen yet, so when it appears is predicted: the first refresh at or after its target, on the grid of refreshes
++// through the last frame shown.
++double MVKSwapchain::getMinimumDurationPresentTime(uint64_t durationNS) {
++	if ( !_minimumDurationRefreshNS ) {
++		VkRefreshCycleDurationGOOGLE refresh = {};
++		if (getRefreshCycleDuration(&refresh) == VK_SUCCESS) { _minimumDurationRefreshNS = refresh.refreshDuration; }
++	}
++	uint64_t nowNS = (uint64_t)(CACurrentMediaTime() * 1.0e9);
++	lock_guard<mutex> lock(_minimumDurationLock);
++	uint64_t previousNS = _lastMinimumDurationTargetNS;
++	uint64_t shownNS = _lastPresentedNS;
++	uint64_t refreshNS = _minimumDurationRefreshNS;
++	uint64_t baseNS;
++	if (previousNS <= shownNS) {
++		baseNS = shownNS;
++	} else if (shownNS && refreshNS) {
++		baseNS = shownNS + (previousNS - shownNS + refreshNS - 1) / refreshNS * refreshNS;
++	} else {
++		baseNS = previousNS;
++	}
++	uint64_t targetNS = baseNS ? baseNS + durationNS : nowNS;
++	if (targetNS < nowNS) { targetNS = nowNS; }
++	_lastMinimumDurationTargetNS = targetNS;
++	return (double)targetNS * 1.0e-9;
++}
++
++void MVKSwapchain::notePresentedTime(uint64_t presentedNS) {
++	lock_guard<mutex> lock(_minimumDurationLock);
++	_lastPresentedNS = std::max(_lastPresentedNS, presentedNS);
++}
++
+ void MVKSwapchain::endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime) {
+ 	_unpresentedImageCount--;
+ 
+@@ -437,6 +484,7 @@ static inline CIE1931XY VkXYColorEXTToCIE1931XY(VkXYColorEXT xy) {
  	uint32_t imgCnt = mvkClamp(pCreateInfo->minImageCount,
  							   mtlFeats.minSwapchainImageCount,
  							   mtlFeats.maxSwapchainImageCount);
@@ -26765,7 +27010,7 @@ index 4c908669..7db8e029 100644
  	initCAMetalLayer(pCreateInfo, pScalingInfo, imgCnt);
      initSurfaceImages(pCreateInfo, imgCnt);		// After initCAMetalLayer()
  }
-@@ -499,7 +514,7 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+@@ -499,7 +547,7 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
  	}
  
  	auto minMagFilter = getMVKConfig().swapchainMinMagFilterUseNearest ? kCAFilterNearest : kCAFilterLinear;
@@ -26774,7 +27019,7 @@ index 4c908669..7db8e029 100644
  	mtlLayer.device = getMTLDevice();
  	mtlLayer.pixelFormat = getPixelFormats()->getMTLPixelFormat(pCreateInfo->imageFormat);
  	mtlLayer.maximumDrawableCount = imgCnt;
-@@ -511,7 +526,8 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+@@ -511,7 +559,8 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
  																			  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
  																			  VK_IMAGE_USAGE_SAMPLED_BIT |
  																			  VK_IMAGE_USAGE_STORAGE_BIT)) &&
@@ -26784,7 +27029,7 @@ index 4c908669..7db8e029 100644
  
  	if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
  		mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-@@ -658,5 +674,103 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+@@ -658,5 +707,103 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
  
  MVKSwapchain::~MVKSwapchain() {
      if (_licenseWatermark) { _licenseWatermark->destroy(); }
@@ -27256,7 +27501,7 @@ index b15e6b8a..aa03a63b 100644
  }
 -
 diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
-index bb0935b1..85220326 100644
+index bb0935b1..73eade11 100644
 --- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
 +++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
 @@ -43,9 +43,11 @@
@@ -27328,7 +27573,15 @@ index bb0935b1..85220326 100644
  MVK_EXTENSION(EXT_metal_objects,                        EXT_METAL_OBJECTS,                        DEVICE,   10.11,  8.0,  1.0)
  MVK_EXTENSION(EXT_metal_surface,                        EXT_METAL_SURFACE,                        INSTANCE, 10.11,  8.0,  1.0)
  MVK_EXTENSION(EXT_multi_draw,                           EXT_MULTI_DRAW,                           DEVICE,   10.11,  8.0,  1.0)
-@@ -178,6 +190,7 @@ MVK_EXTENSION(EXT_scalar_block_layout,                  EXT_SCALAR_BLOCK_LAYOUT,
+@@ -168,6 +180,7 @@ MVK_EXTENSION(EXT_pipeline_creation_cache_control,      EXT_PIPELINE_CREATION_CA
+ MVK_EXTENSION(EXT_pipeline_creation_feedback,           EXT_PIPELINE_CREATION_FEEDBACK,           DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_pipeline_robustness,                  EXT_PIPELINE_ROBUSTNESS,                  DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_post_depth_coverage,                  EXT_POST_DEPTH_COVERAGE,                  DEVICE,   11.0,  11.0,  1.0)
++MVK_EXTENSION(EXT_present_timing,                       EXT_PRESENT_TIMING,                       DEVICE,   10.15,  11.0,  1.0)
+ MVK_EXTENSION(EXT_primitive_topology_list_restart,      EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART,      DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_private_data,                         EXT_PRIVATE_DATA,                         DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_provoking_vertex,                     EXT_PROVOKING_VERTEX,                     DEVICE,   10.11,  8.0,  1.0)
+@@ -178,6 +191,7 @@ MVK_EXTENSION(EXT_scalar_block_layout,                  EXT_SCALAR_BLOCK_LAYOUT,
  MVK_EXTENSION(EXT_separate_stencil_usage,               EXT_SEPARATE_STENCIL_USAGE,               DEVICE,   10.11,  8.0,  1.0)
  MVK_EXTENSION(EXT_shader_atomic_float,                  EXT_SHADER_ATOMIC_FLOAT,                  DEVICE,   13.0,  16.0,  1.0)
  MVK_EXTENSION(EXT_shader_demote_to_helper_invocation,   EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION,   DEVICE,   11.0,  14.0,  1.0)
@@ -27336,7 +27589,7 @@ index bb0935b1..85220326 100644
  MVK_EXTENSION(EXT_shader_stencil_export,                EXT_SHADER_STENCIL_EXPORT,                DEVICE,   10.14, 12.0,  1.0)
  MVK_EXTENSION(EXT_shader_subgroup_ballot,               EXT_SHADER_SUBGROUP_BALLOT,               DEVICE,   10.14, 13.0,  1.0)
  MVK_EXTENSION(EXT_shader_subgroup_vote,                 EXT_SHADER_SUBGROUP_VOTE,                 DEVICE,   10.14, 13.0,  1.0)
-@@ -189,6 +202,7 @@ MVK_EXTENSION(EXT_swapchain_maintenance1,               EXT_SWAPCHAIN_MAINTENANC
+@@ -189,6 +203,7 @@ MVK_EXTENSION(EXT_swapchain_maintenance1,               EXT_SWAPCHAIN_MAINTENANC
  MVK_EXTENSION(EXT_texel_buffer_alignment,               EXT_TEXEL_BUFFER_ALIGNMENT,               DEVICE,   10.13, 11.0,  1.0)
  MVK_EXTENSION(EXT_texture_compression_astc_hdr,         EXT_TEXTURE_COMPRESSION_ASTC_HDR,         DEVICE,   11.0,  13.0,  1.0)
  MVK_EXTENSION(EXT_tooling_info,                         EXT_TOOLING_INFO,                         DEVICE,   10.11,  8.0,  1.0)
@@ -27344,7 +27597,7 @@ index bb0935b1..85220326 100644
  MVK_EXTENSION(EXT_vertex_attribute_divisor,             EXT_VERTEX_ATTRIBUTE_DIVISOR,             DEVICE,   10.11,  8.0,  1.0)
  MVK_EXTENSION(EXT_ycbcr_2plane_444_formats,             EXT_YCBCR_2PLANE_444_FORMATS,             DEVICE,   10.11,  8.0,  1.0)
  MVK_EXTENSION(AMD_draw_indirect_count,                  AMD_DRAW_INDIRECT_COUNT,                  DEVICE,   MVK_NA, MVK_NA, MVK_NA)
-@@ -202,6 +216,7 @@ MVK_EXTENSION(INTEL_shader_integer_functions2,          INTEL_SHADER_INTEGER_FUN
+@@ -202,6 +217,7 @@ MVK_EXTENSION(INTEL_shader_integer_functions2,          INTEL_SHADER_INTEGER_FUN
  MVK_EXTENSION(MVK_ios_surface,                          MVK_IOS_SURFACE,                          INSTANCE, MVK_NA, 8.0, MVK_NA)
  MVK_EXTENSION(MVK_macos_surface,                        MVK_MACOS_SURFACE,                        INSTANCE, 10.11, MVK_NA, MVK_NA)
  MVK_EXTENSION(MVK_moltenvk,                             MVK_MOLTENVK,                             INSTANCE, 10.11,  8.0,  1.0)
@@ -30633,7 +30886,7 @@ index 9ee4db10..e18d611a 100644
          result |= 1 << kMVKBarrierStageCopy;
  
 diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
-index 9ee0c4eb..92688b8e 100644
+index 9ee0c4eb..66be9531 100644
 --- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 +++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 @@ -41,6 +41,7 @@
@@ -31213,7 +31466,86 @@ index 9ee0c4eb..92688b8e 100644
  #pragma mark -
  #pragma mark VK_KHR_bind_memory2 extension
  
-@@ -3562,6 +3934,8 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueuePresentKHR(
+@@ -3482,6 +3854,78 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkWaitForPresent2KHR(
+ }
+ 
+ 
++#pragma mark -
++#pragma mark VK_EXT_present_timing extension
++
++// Only relative targets are honoured (a drawable is shown no sooner than a duration after the one before it), and
++// no stage times are reported: there is one time domain, the host clock drawables are presented on.
++
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkSetSwapchainPresentTimingQueueSizeEXT(
++	VkDevice                                    device,
++	VkSwapchainKHR                              swapchain,
++	uint32_t                                    size) {
++
++	MVKTraceVulkanCallStart();
++	MVKTraceVulkanCallEnd();
++	return VK_SUCCESS;
++}
++
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetSwapchainTimingPropertiesEXT(
++	VkDevice                                    device,
++	VkSwapchainKHR                              swapchain,
++	VkSwapchainTimingPropertiesEXT*             pSwapchainTimingProperties,
++	uint64_t*                                   pSwapchainTimingPropertiesCounter) {
++
++	MVKTraceVulkanCallStart();
++	VkRefreshCycleDurationGOOGLE refresh = {};
++	VkResult rslt = ((MVKSwapchain*)swapchain)->getRefreshCycleDuration(&refresh);
++	if (rslt == VK_SUCCESS) {
++		pSwapchainTimingProperties->refreshDuration = refresh.refreshDuration;
++		pSwapchainTimingProperties->refreshInterval = refresh.refreshDuration;
++		if (pSwapchainTimingPropertiesCounter) { *pSwapchainTimingPropertiesCounter = 1; }
++	}
++	MVKTraceVulkanCallEnd();
++	return rslt;
++}
++
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetSwapchainTimeDomainPropertiesEXT(
++	VkDevice                                    device,
++	VkSwapchainKHR                              swapchain,
++	VkSwapchainTimeDomainPropertiesEXT*         pSwapchainTimeDomainProperties,
++	uint64_t*                                   pTimeDomainsCounter) {
++
++	MVKTraceVulkanCallStart();
++	VkResult rslt = VK_SUCCESS;
++	if (pTimeDomainsCounter) { *pTimeDomainsCounter = 1; }
++	if ( !pSwapchainTimeDomainProperties->pTimeDomains && !pSwapchainTimeDomainProperties->pTimeDomainIds ) {
++		pSwapchainTimeDomainProperties->timeDomainCount = 1;
++	} else if (pSwapchainTimeDomainProperties->timeDomainCount < 1) {
++		rslt = VK_INCOMPLETE;
++	} else {
++		if (pSwapchainTimeDomainProperties->pTimeDomains) {
++			pSwapchainTimeDomainProperties->pTimeDomains[0] = VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
++		}
++		if (pSwapchainTimeDomainProperties->pTimeDomainIds) { pSwapchainTimeDomainProperties->pTimeDomainIds[0] = 0; }
++		pSwapchainTimeDomainProperties->timeDomainCount = 1;
++	}
++	MVKTraceVulkanCallEnd();
++	return rslt;
++}
++
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPastPresentationTimingEXT(
++	VkDevice                                    device,
++	const VkPastPresentationTimingInfoEXT*      pPastPresentationTimingInfo,
++	VkPastPresentationTimingPropertiesEXT*      pPastPresentationTimingProperties) {
++
++	MVKTraceVulkanCallStart();
++	pPastPresentationTimingProperties->timingPropertiesCounter = 1;
++	pPastPresentationTimingProperties->timeDomainsCounter = 1;
++	pPastPresentationTimingProperties->presentationTimingCount = 0;
++	MVKTraceVulkanCallEnd();
++	return VK_SUCCESS;
++}
++
++
+ #pragma mark -
+ #pragma mark VK_KHR_push_descriptor extension
+ 
+@@ -3562,6 +4006,8 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueuePresentKHR(
      const VkPresentInfoKHR*                      pPresentInfo) {
  
  	MVKTraceVulkanCallStart();
@@ -31222,7 +31554,7 @@ index 9ee0c4eb..92688b8e 100644
      MVKQueue* mvkQ = MVKQueue::getMVKQueue(queue);
      VkResult rslt = mvkQ->submit(pPresentInfo);
  	MVKTraceVulkanCallEnd();
-@@ -4297,6 +4671,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
+@@ -4297,6 +4743,47 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateHeadlessSurfaceEXT(
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkCmdSetLineStipple, EXT);
  
  
@@ -31270,7 +31602,7 @@ index 9ee0c4eb..92688b8e 100644
  #pragma mark -
  #pragma mark VK_EXT_multi_draw extension
  
-@@ -4383,7 +4798,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkExportMetalObjectsEXT(
+@@ -4383,7 +4870,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkExportMetalObjectsEXT(
  #pragma mark -
  #pragma mark VK_EXT_sample_locations extension
  
@@ -31279,7 +31611,7 @@ index 9ee0c4eb..92688b8e 100644
  	VkPhysicalDevice                            physicalDevice,
  	VkSampleCountFlagBits                       samples,
  	VkMultisamplePropertiesEXT*                 pMultisampleProperties) {
-@@ -4394,7 +4809,7 @@ void vkGetPhysicalDeviceMultisamplePropertiesEXT(
+@@ -4394,7 +4881,7 @@ void vkGetPhysicalDeviceMultisamplePropertiesEXT(
  	MVKTraceVulkanCallEnd();
  }
  
@@ -31288,7 +31620,7 @@ index 9ee0c4eb..92688b8e 100644
  	VkCommandBuffer                             commandBuffer,
  	const VkSampleLocationsInfoEXT*             pSampleLocationsInfo) {
  
-@@ -4409,6 +4824,163 @@ void vkCmdSetSampleLocationsEXT(
+@@ -4409,6 +4896,163 @@ void vkCmdSetSampleLocationsEXT(
  
  MVK_PUBLIC_VULKAN_CORE_ALIAS(vkGetPhysicalDeviceToolProperties, EXT);
  
@@ -31452,7 +31784,7 @@ index 9ee0c4eb..92688b8e 100644
  
  #pragma mark -
  #pragma mark VK_GOOGLE_display_timing extension
-@@ -4439,6 +5011,41 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPastPresentationTimingGOOGLE(
+@@ -4439,6 +5083,41 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPastPresentationTimingGOOGLE(
  }
  
  

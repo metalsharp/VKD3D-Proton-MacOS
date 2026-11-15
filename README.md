@@ -92,6 +92,12 @@ ExecuteIndirect of 25 or more draws whose signature has only root constants runs
 without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
 lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
 
+`Present` with a SyncInterval of 2 to 4 holds each frame for that many refreshes (through relative present targets),
+so a game capped at half or a third of the refresh rate stays capped. Two options leave out features that run slowly
+here, for games that pick a faster path without them: `MVK_CONFIG_RAY_TRACING_MIN_APPLE_FAMILY=9` reports no ray
+tracing on GPUs before Apple family 9, which trace rays in compute, and `MVK_CONFIG_CONSERVATIVE_RASTERIZATION=0`
+reports no conservative rasterization, which is emulated (D3D12 feature level 12_1 needs it, so 12_0 is reported).
+
 Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
 (compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
 tessellation shaders, stream output, logic operations, conservative rasterization, the depth bounds test, view

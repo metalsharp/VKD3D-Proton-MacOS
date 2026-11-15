@@ -1926,6 +1926,7 @@ static std::vector<Scene> more_scenes()
         { "sample_bc7", "20 full-screen quads sampling 8 BC7 textures each (compressed bandwidth)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_BC7, f); } },
         { "sample_rgba8", "the same with RGBA8 textures (baseline for sample_bc7)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_RGBA8, f); } },
         { "present_vsync", "clear + Present(1): the display-locked frame", [] {}, [](UINT) {}, true, 1 },
+        { "present_interval2", "clear + Present(2): every other refresh, a game's half-rate cap", [] {}, [](UINT) {}, true, 2 },
     };
 }
 
