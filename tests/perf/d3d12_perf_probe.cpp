@@ -3256,6 +3256,15 @@ static std::vector<Scene> feature_scenes()
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); } },
         { "tess_dxil", "the same compiled as DXIL", tess_init("vs_6_0"),
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); }, false, 0, true },
+        { "tess_dxil_many", "tess_dxil split into 100 draws of 10 patches, with an ordinary draw between each (terrain tiles)", tess_init("vs_6_0"),
+          [](UINT) {
+              set_quad_state(p.list, pso_a);
+              for (UINT i = 0; i < 100; i++)
+              {
+                  p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+                  p.list->DrawInstanced(30, 1, i * 30, 0);
+              }
+          }, false, 0, true },
         { "tess_baseline", "the same 256000 triangles drawn without tessellation (baseline for tess_*)", [] {
             PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_grid"; pso_a = create_pso(d);
         }, [](UINT) { set_quad_state(p.list, pso_a); p.list->DrawInstanced(1000 * 256 * 3, 1, 0, 0); } },

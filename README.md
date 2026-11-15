@@ -105,8 +105,11 @@ tracing on GPUs before Apple family 9, which trace rays in compute, and `MVK_CON
 reports no conservative rasterization, which is emulated (D3D12 feature level 12_1 needs it, so 12_0 is reported).
 
 Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
-(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
-tessellation shaders, stream output, logic operations, conservative rasterization, the depth bounds test, view
+(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Tessellation pipelines of DXIL
+shaders run in the converter's emulation, a mesh pipeline whose object stage runs the vertex and hull shaders and whose
+mesh stage runs the tessellator and the domain shader, so a tessellated draw no longer ends the render pass for compute
+passes (`VKD3D_MSC_TESSELLATION=0` keeps them on SPIR-V; isolines, DXBC tessellation and ExecuteIndirect with such a
+PSO use SPIR-V). Pipelines with geometry shaders, tessellation with a geometry shader, stream output, logic operations, conservative rasterization, the depth bounds test, view
 instancing, ray queries, 64-bit atomics, barycentrics, residency feedback, min/max sampler filtering or a
 three-component 32-bit typed buffer stay on SPIR-V. `METALSHARP_MSC=0` keeps every pipeline on SPIR-V,
 `METALSHARP_MSC=compute` keeps graphics ones there, and `METALSHARP_MSC_DXBC=0` keeps DXBC (SM 4.x and 5.x)
