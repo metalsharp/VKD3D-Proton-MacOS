@@ -3104,7 +3104,7 @@ index 2a7eff45..9ebbf2ca 100644
 +	}
 +}
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
-index 9afc3ed8..4a26505b 100644
+index 9afc3ed8..f73f18c0 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
 @@ -24,6 +24,8 @@
@@ -3136,7 +3136,7 @@ index 9afc3ed8..4a26505b 100644
  	void encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig);
  
  protected:
-@@ -218,3 +225,201 @@ protected:
+@@ -218,3 +225,206 @@ protected:
  	id<MTLBuffer> _mtlCountBuffer;
  	VkDeviceSize _mtlCountBufferOffset;
  };
@@ -3322,7 +3322,12 @@ index 9afc3ed8..4a26505b 100644
 +
 +	void encode(MVKCommandEncoder* cmdEncoder) override;
 +
++	bool hoistDrawConversions(MVKCommandEncoder* cmdEncoder) override;
++
 +protected:
++	void encodeSequences(MVKCommandEncoder* cmdEncoder, const MVKMTLBufferAllocation* args, uint32_t argsSize,
++						 const MVKMTLBufferAllocation* pcBuff, uint32_t pcStride);
++	bool encodeHoisted(MVKCommandEncoder* cmdEncoder);
 +	void encodeIndirectCommandBuffer(MVKCommandEncoder* cmdEncoder, id<MTLIndirectCommandBuffer> icb,
 +									 id<MTLRenderPipelineState> icbPipelineState, const MVKMTLBufferAllocation* icbBindings,
 +									 const MVKMTLBufferAllocation* pcBuff, uint32_t pcStride);
@@ -3339,7 +3344,7 @@ index 9afc3ed8..4a26505b 100644
 +	uint32_t _maxSequenceCount = 0;
 +};
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
-index d0452973..dfefc9a7 100644
+index d0452973..48a35a29 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 @@ -19,10 +19,7 @@
@@ -4399,7 +4404,7 @@ index d0452973..dfefc9a7 100644
                          [cmdEncoder->_mtlRenderEncoder drawIndexedPrimitives: cmdEncoder->getMtlGraphics().getPrimitiveType()
                                                                     indexType: (MTLIndexType)ibb.mtlIndexType
                                                                   indexBuffer: ibb.mtlBuffer
-@@ -1535,3 +2146,1000 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
+@@ -1535,3 +2146,1131 @@ static void bindIndirectZeroDivisorVertexBuffers(MVKCommandEncoder* cmdEncoder,
          }
      }
  }
@@ -4986,6 +4991,7 @@ index d0452973..dfefc9a7 100644
 +	if ( !_maxSequenceCount || !_layout || _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT ) { return; }
 +	if (_layout->_actionType != VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT && mvkSkipsUnsupportedDraw(cmdEncoder)) { return; }
 +	mvkLogGeneratedCommandsStats(_layout->_actionType, _maxSequenceCount, _mtlCount != nil);
++	if (encodeHoisted(cmdEncoder)) { return; }
 +
 +	uint32_t argsSize;
 +	switch (_layout->_actionType) {
@@ -5098,6 +5104,13 @@ index d0452973..dfefc9a7 100644
 +		}
 +	}
 +
++	encodeSequences(cmdEncoder, args, argsSize, pcBuff, pcStride);
++}
++
++
++// Each sequence as a draw or dispatch of its own, with its push constants of pcBuff (if any) and arguments of args.
++void MVKCmdExecuteGeneratedCommands::encodeSequences(MVKCommandEncoder* cmdEncoder, const MVKMTLBufferAllocation* args, uint32_t argsSize,
++													 const MVKMTLBufferAllocation* pcBuff, uint32_t pcStride) {
 +	for (uint32_t i = 0; i < _maxSequenceCount; i++) {
 +		if (pcBuff) { cmdEncoder->getState().setPushConstantsBuffer(pcBuff->_mtlBuffer, pcBuff->_offset + i * pcStride); }
 +		NSUInteger argsOffset = args->_offset + i * argsSize;
@@ -5129,6 +5142,129 @@ index d0452973..dfefc9a7 100644
 +		}
 +	}
 +	if (pcBuff) { cmdEncoder->getState().setPushConstantsBuffer(nil, 0); }
++}
++
++
++// Generated draws in a render pass otherwise end it for their kernels and restart it, which stores and reloads every
++// attachment (one restart per ExecuteIndirect with a state template). The kernels run before the render pass
++// begins instead (MVKCommandEncoder::hoistDrawConversions(), whose reasoning holds for the stream and count too):
++// the expansion into per-sequence arguments and push constants, which takes the base push constants from a buffer
++// the draw fills, sized for its layout's pipeline layout; and, where the draws may run from an indirect command
++// buffer, its encoding, which takes the vertex buffer tokens' indexes and the bindings from buffers the draw fills.
++// MVK_CONFIG_DGC_HOIST=0 runs them where the draws are, as before.
++bool MVKCmdExecuteGeneratedCommands::hoistDrawConversions(MVKCommandEncoder* cmdEncoder) {
++	static const bool enabled = mvkGetEnvVarNumber("MVK_CONFIG_DGC_HOIST", 1) != 0;
++	if ( !enabled || !_maxSequenceCount || !_layout ) { return true; }
++	bool isDraw = _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT ||
++				  _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT;
++	if ( !isDraw ) { return true; }
++
++	MVKCommandEncoder::HoistedGeneratedCommands h = {};
++	h.drawCmd = this;
++	uint32_t argsSize = _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT ? sizeof(VkDrawIndirectCommand) : sizeof(VkDrawIndexedIndirectCommand);
++	h.pushConstantsSize = (std::max(_layout->_pushConstantsSize, _layout->_layoutPushConstantsSize) + 3) & ~3u;
++	h.pushConstantsStride = _layout->_pushConstantTokens.empty() ? 0 : (h.pushConstantsSize + 15) & ~15u;
++	cmdEncoder->beginHoistedDrawConversion();
++	h.args = cmdEncoder->getTempMTLBuffer(_maxSequenceCount * argsSize, true);
++	h.pushConstants = h.pushConstantsStride ? cmdEncoder->getTempMTLBuffer(_maxSequenceCount * h.pushConstantsStride, true) : nullptr;
++	h.basePushConstants = cmdEncoder->getTempMTLBuffer(std::max<uint32_t>(h.pushConstantsSize, 4));
++
++	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectConvertBuffers);
++	auto& mtlCompute = cmdEncoder->getMtlCompute();
++	id<MTLComputePipelineState> expandState = cmdEncoder->getCommandEncodingPool()->getCmdExecuteGeneratedCommandsExpandMTLComputePipelineState();
++	mtlCompute.bindPipeline(mtlEncoder, expandState);
++	mtlCompute.bindBuffer(mtlEncoder, _mtlStream, _mtlStreamOffset, 0);
++	mtlCompute.bindBuffer(mtlEncoder, _mtlCount ? _mtlCount : h.args->_mtlBuffer, _mtlCount ? _mtlCountOffset : h.args->_offset, 1);
++	MVKDGCParams params = { _maxSequenceCount, _layout->_stride, h.pushConstantsStride, h.pushConstantsSize, argsSize,
++							_layout->_actionOffset, (uint32_t)_layout->_pushConstantTokens.size(), _mtlCount != nil };
++	mtlCompute.bindBytes(mtlEncoder, &params, sizeof(params), 2);
++	MVKIndirectCommandsLayout::PushConstantToken noToken = {};
++	mtlCompute.bindBytes(mtlEncoder, params.tokenCount ? (const void*)_layout->_pushConstantTokens.data() : &noToken,
++						 std::max<size_t>(params.tokenCount, 1) * sizeof(noToken), 3);
++	mtlCompute.bindBuffer(mtlEncoder, h.basePushConstants->_mtlBuffer, h.basePushConstants->_offset, 4);
++	mtlCompute.bindBuffer(mtlEncoder, h.args->_mtlBuffer, h.args->_offset, 5);
++	mtlCompute.bindBuffer(mtlEncoder, h.pushConstants ? h.pushConstants->_mtlBuffer : h.args->_mtlBuffer,
++						  h.pushConstants ? h.pushConstants->_offset : h.args->_offset, 6);
++	[mtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxSequenceCount, expandState.threadExecutionWidth), 1, 1)
++			   threadsPerThreadgroup: MTLSizeMake(expandState.threadExecutionWidth, 1, 1)];
++
++	static const uint32_t icbMinSequences = (uint32_t)mvkGetEnvVarNumber("MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES", 25);
++	bool manySequences = icbMinSequences && _maxSequenceCount >= icbMinSequences && cmdEncoder->isUsingMetalArgumentBuffers();
++	if (_layout->hasBufferTokens() || manySequences) {
++		MVKDevice* device = cmdEncoder->getDevice();
++		h.icb = device->acquireDGCIndirectCommandBuffer(_maxSequenceCount);	// retained
++		if (h.icb) {
++			id<MTLIndirectCommandBuffer> icb = h.icb;
++			[cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer>) { device->releaseDGCIndirectCommandBuffer(icb); }];
++			h.icbBindings = cmdEncoder->getTempMTLBuffer(sizeof(MVKDGCBindings));
++			mvkClear((MVKDGCBindings*)h.icbBindings->getContents());
++			h.vertexBufferTokens = cmdEncoder->getTempMTLBuffer(std::max<size_t>(_layout->_vertexBufferTokens.size(), 1) * sizeof(MVKDGCVertexBufferToken));
++			MVKDGCICBParams icbParams = { _maxSequenceCount, _layout->_stride, _layout->_actionOffset,
++										  _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT, _mtlCount != nil,
++										  (uint32_t)_layout->_vertexBufferTokens.size(), _layout->_indexBufferStreamOffset, _layout->_indexBufferDXGI,
++										  (uint32_t)_layout->_descriptorBufferTokens.size(), {} };
++			id<MTLComputePipelineState> icbState = cmdEncoder->getCommandEncodingPool()->getCmdExecuteGeneratedCommandsICBMTLComputePipelineState();
++			MTLResourceID icbID = icb.gpuResourceID;
++			mtlCompute.bindPipeline(mtlEncoder, icbState);
++			mtlCompute.bindBytes(mtlEncoder, &icbID, sizeof(icbID), 0);
++			mtlCompute.bindBuffer(mtlEncoder, _mtlStream, _mtlStreamOffset, 1);
++			mtlCompute.bindBuffer(mtlEncoder, _mtlCount ? _mtlCount : h.args->_mtlBuffer, _mtlCount ? _mtlCountOffset : h.args->_offset, 2);
++			mtlCompute.bindBytes(mtlEncoder, &icbParams, sizeof(icbParams), 3);
++			mtlCompute.bindBuffer(mtlEncoder, h.vertexBufferTokens->_mtlBuffer, h.vertexBufferTokens->_offset, 4);
++			mtlCompute.bindBuffer(mtlEncoder, h.icbBindings->_mtlBuffer, h.icbBindings->_offset, 5);
++			bindDescriptorBufferTokens(mtlEncoder, mtlCompute, 6);
++			[mtlEncoder useResource: icb usage: MTLResourceUsageWrite];
++			[mtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxSequenceCount, icbState.threadExecutionWidth), 1, 1)
++					   threadsPerThreadgroup: MTLSizeMake(icbState.threadExecutionWidth, 1, 1)];
++		}
++	}
++	cmdEncoder->addHoistedGeneratedCommands(h);
++	return true;
++}
++
++// Encodes generated draws whose kernels ran before the render pass, if they did and the push constants fit: false
++// otherwise, and they encode as before.
++bool MVKCmdExecuteGeneratedCommands::encodeHoisted(MVKCommandEncoder* cmdEncoder) {
++	MVKCommandEncoder::HoistedGeneratedCommands h;
++	if ( !cmdEncoder->takeHoistedGeneratedCommands(this, h) ) { return false; }
++	const auto& pushConstants = cmdEncoder->getState().vkShared()._pushConstants;
++	if (pushConstants.size() > h.pushConstantsSize || !cmdEncoder->_mtlRenderEncoder) { return false; }
++	auto* base = (uint8_t*)h.basePushConstants->getContents();
++	memset(base, 0, std::max<uint32_t>(h.pushConstantsSize, 4));
++	if ( !pushConstants.empty() ) { memcpy(base, pushConstants.data(), pushConstants.size()); }
++
++	uint32_t argsSize = _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT ? sizeof(VkDrawIndirectCommand) : sizeof(VkDrawIndexedIndirectCommand);
++	MVKGraphicsPipeline* pipeline = cmdEncoder->getGraphicsPipeline();
++	id<MTLRenderPipelineState> icbPipelineState = nil;
++	if (h.icb && pipeline && !pipeline->isGeometryPipeline() && !cmdEncoder->getSubpass()->isMultiview() && !cmdEncoder->_transformFeedbackRunning) {
++		icbPipelineState = pipeline->getIndirectPipelineStateForAttachments(cmdEncoder->_mtlRenderPassFormats);
++	}
++	if (icbPipelineState) {
++		auto* vbTokens = (MVKDGCVertexBufferToken*)h.vertexBufferTokens->getContents();
++		bool dynamicStride = pipeline->getDynamicStateFlags().has(MVKRenderStateFlag::VertexStride);
++		for (size_t i = 0; i < _layout->_vertexBufferTokens.size(); i++) {
++			const auto& tok = _layout->_vertexBufferTokens[i];
++			vbTokens[i] = { tok.streamOffset, pipeline->getMetalBufferIndexForVertexAttributeBinding(tok.binding), dynamicStride, 0 };
++		}
++		// Preparing the draw binds again all the pipeline uses, so that the capture sees it.
++		auto& mtlGraphics = cmdEncoder->getMtlGraphics();
++		for (auto stage : { MVKMetalGraphicsStage::Vertex, MVKMetalGraphicsStage::Fragment }) {
++			mtlGraphics._exists[stage].buffers.reset();
++			mtlGraphics._exists[stage].descriptorSetData.reset();
++		}
++		setDescriptorBufferSizes(cmdEncoder, VK_PIPELINE_BIND_POINT_GRAPHICS);
++		encodeRenderICBCommands(cmdEncoder, h.icb, icbPipelineState, h.icbBindings, h.pushConstants, h.pushConstantsStride,
++								_maxSequenceCount, _layout->_actionType == VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT,
++								!_layout->_descriptorBufferTokens.empty(), true, _mtlStream);
++		return true;
++	}
++	static bool warned = false;
++	if ( !warned && _layout->hasBufferTokens() ) {
++		warned = true;
++		MVKLogWarn("vkCmdExecuteGeneratedCommandsEXT(): Vertex, index and push descriptor buffer tokens can't be applied with this pipeline, and are ignored.");
++	}
++	encodeSequences(cmdEncoder, h.args, argsSize, h.pushConstants, h.pushConstantsStride);
++	return true;
 +}
 +
 +// Dispatches run from an indirect command buffer that a kernel encodes with only the counted sequences, so that
@@ -6601,7 +6737,7 @@ index ca029013..dcf92f69 100644
  	friend MVKCommandBuffer;
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
-index f6c94625..83c81a27 100644
+index f6c94625..3d0266ca 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 @@ -26,7 +26,6 @@
@@ -6830,7 +6966,7 @@ index f6c94625..83c81a27 100644
      /**
  	 * Copy bytes into the Metal encoder at a Metal vertex buffer index, and optionally indicate
  	 * that this binding might override a desriptor binding. If so, the descriptor binding will
-@@ -438,9 +531,59 @@ public:
+@@ -438,9 +531,78 @@ public:
      /** Get a temporary MTLBuffer that will be returned to a pool after the command buffer is finished. */
      const MVKMTLBufferAllocation* getTempMTLBuffer(NSUInteger length, bool isPrivate = false, bool isDedicated = false);
  
@@ -6856,6 +6992,25 @@ index f6c94625..83c81a27 100644
 +	 * draw's counted draws, and the bindings buffer the kernel reads, which the draw fills when it encodes.
 +	 */
 +	void addHoistedIndirectICB(const MVKCommand* drawCmd, id<MTLIndirectCommandBuffer> icb, const MVKMTLBufferAllocation* bindings);
++
++	/**
++	 * The buffers generated draws expand into, by kernels hoisted out of the render pass: the per-sequence arguments
++	 * and push constants, the base push constants and, for an indirect command buffer, the vertex buffer tokens'
++	 * indexes and the bindings, which the draw fills when it encodes.
++	 */
++	struct HoistedGeneratedCommands {
++		const MVKCommand* drawCmd;
++		const MVKMTLBufferAllocation* args;
++		const MVKMTLBufferAllocation* pushConstants;
++		const MVKMTLBufferAllocation* basePushConstants;
++		id<MTLIndirectCommandBuffer> icb;
++		const MVKMTLBufferAllocation* icbBindings;
++		const MVKMTLBufferAllocation* vertexBufferTokens;
++		uint32_t pushConstantsSize;
++		uint32_t pushConstantsStride;
++	};
++	void addHoistedGeneratedCommands(const HoistedGeneratedCommands& hoisted);
++	bool takeHoistedGeneratedCommands(const MVKCommand* drawCmd, HoistedGeneratedCommands& hoisted);
 +
 +	/** Returns the draw's hoisted indirect command buffer and its bindings buffer, or false if there is none. */
 +	bool takeHoistedIndirectICB(const MVKCommand* drawCmd, id<MTLIndirectCommandBuffer>& icb, const MVKMTLBufferAllocation*& bindings);
@@ -6890,7 +7045,7 @@ index f6c94625..83c81a27 100644
      /** Returns the command encoding pool. */
      MVKCommandEncodingPool* getCommandEncodingPool();
  
-@@ -459,11 +602,13 @@ public:
+@@ -459,11 +621,13 @@ public:
  	void barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages);
  	void barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
  	void barrierWait(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder);
@@ -6904,7 +7059,7 @@ index f6c94625..83c81a27 100644
  
  #pragma mark Queries
  
-@@ -476,6 +621,21 @@ public:
+@@ -476,6 +640,21 @@ public:
      /** Marks a timestamp for the specified query. */
      void markTimestamp(MVKTimestampQueryPool* pQueryPool, uint32_t query);
  
@@ -6926,7 +7081,7 @@ index f6c94625..83c81a27 100644
      /** Reset a range of queries. */
      void resetQueries(MVKQueryPool* pQueryPool, uint32_t firstQuery, uint32_t queryCount);
  
-@@ -507,29 +667,86 @@ public:
+@@ -507,29 +686,86 @@ public:
  
  	/** Indicates whether the current draw is an indexed draw. */
  	bool _isIndexedDraw;
@@ -7015,7 +7170,7 @@ index f6c94625..83c81a27 100644
  
  	typedef struct GPUCounterQuery {
  		MVKGPUCounterQueryPool* queryPool = nullptr;
-@@ -539,22 +756,47 @@ protected:
+@@ -539,22 +775,49 @@ protected:
  	VkRect2D _renderArea;
  	MVKCommand* _lastMultiviewPassCmd;
      MVKActivatedQueries* _pActivatedQueries;
@@ -7027,6 +7182,8 @@ index f6c94625..83c81a27 100644
 +	struct HoistedIndirectICB { const MVKCommand* drawCmd; id<MTLIndirectCommandBuffer> icb; const MVKMTLBufferAllocation* bindings; };
 +	MVKSmallVector<HoistedIndirectICB, 4> _hoistedIndirectICBs;
 +	size_t _nextHoistedIndirectICB = 0;
++	MVKSmallVector<HoistedGeneratedCommands, 4> _hoistedGeneratedCommands;
++	size_t _nextHoistedGeneratedCommands = 0;
 +	MVKRenderPass* _hoistingRenderPass = nullptr;	// Whose dependencies on earlier work the hoisted conversions still need.
  	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
 +	bool _sampledStageCounters = false;
@@ -7063,7 +7220,7 @@ index f6c94625..83c81a27 100644
  };
  
  
-@@ -569,3 +811,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
+@@ -569,3 +832,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
  
  /** Returns a name, suitable for use as a MTLComputeCommandEncoder label, based on the MVKCommandUse. */
  NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse);
@@ -7071,7 +7228,7 @@ index f6c94625..83c81a27 100644
 +/** Returns a name, suitable for use as a MTLAccelerationStructureCommandEncoder label, based on the MVKCommandUse. */
 +NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse);
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-index de39c961..4447e312 100644
+index de39c961..8dce92b3 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 @@ -21,6 +21,7 @@
@@ -7283,7 +7440,7 @@ index de39c961..4447e312 100644
  
      _subpassContents = VK_SUBPASS_CONTENTS_INLINE;
      _renderSubpassIndex = 0;
-@@ -433,6 +525,11 @@
+@@ -433,6 +525,13 @@
      _canUseLayeredRendering = false;
  
      _mtlCmdBuffer = mtlCmdBuff;        // not retained
@@ -7292,10 +7449,12 @@ index de39c961..4447e312 100644
 +	_nextHoistedDrawConversion = 0;
 +	_hoistedIndirectICBs.clear();
 +	_nextHoistedIndirectICB = 0;
++	_hoistedGeneratedCommands.clear();
++	_nextHoistedGeneratedCommands = 0;
  
  	_cmdBuffer->setMetalObjectLabel(_mtlCmdBuffer, _cmdBuffer->_debugName);
  }
-@@ -466,7 +563,9 @@
+@@ -466,7 +565,9 @@
  
  void MVKCommandEncoder::endEncoding() {
  	endCurrentMetalEncoding();
@@ -7305,7 +7464,7 @@ index de39c961..4447e312 100644
  }
  
  void MVKCommandEncoder::encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer) {
-@@ -639,12 +738,17 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -639,12 +740,17 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	case kMVKCommandUseClearDepthStencilImage:       return kMVKBarrierStageCopy; /**< vkCmdClearDepthStencilImage. */
  	case kMVKCommandUseResetQueryPool:               return kMVKBarrierStageCopy; /**< vkCmdResetQueryPool. */
  	case kMVKCommandUseDispatch:                     return kMVKBarrierStageCompute; /**< vkCmdDispatch. */
@@ -7323,7 +7482,7 @@ index de39c961..4447e312 100644
  	}
  }
  
-@@ -677,6 +781,15 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -677,6 +783,15 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	}
  }
  
@@ -7339,7 +7498,7 @@ index de39c961..4447e312 100644
  void MVKCommandEncoder::barrierUpdate(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages afterStages) {
  	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
  	auto fence = getBarrierStageFence(stage);
-@@ -695,6 +808,12 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -695,6 +810,12 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	[mtlEncoder updateFence:fence];
  }
  
@@ -7352,7 +7511,7 @@ index de39c961..4447e312 100644
  id<MTLFence> MVKCommandEncoder::getBarrierStageFence(MVKBarrierStage stage) {
  	auto &fenceSlots = _pEncodingContext->fenceSlots;
  	if (mvkAreAllFlagsEnabled(fenceSlots.updateDirtyBits, 1 << stage)) {
-@@ -709,6 +828,10 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -709,6 +830,10 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  
  void MVKCommandEncoder::setBarrier(uint64_t sourceStageMask, uint64_t destStageMask) {
  	auto &fenceSlots = _pEncodingContext->fenceSlots;
@@ -7363,7 +7522,7 @@ index de39c961..4447e312 100644
  	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
  	   if (!mvkIsAnyFlagEnabled(sourceStageMask, 1ull << i)) continue;
  
-@@ -716,6 +839,13 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -716,6 +841,13 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  			if (!mvkIsAnyFlagEnabled(destStageMask, 1ull << j)) continue;
  
  			fenceSlots.wait[j][i] = fenceSlots.update[i];
@@ -7377,7 +7536,7 @@ index de39c961..4447e312 100644
  		}
  
  		fenceSlots.wait[i][i] = fenceSlots.update[i];
-@@ -727,13 +857,16 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -727,13 +859,16 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  void MVKCommandEncoder::encodeBarrierWaits(MVKCommandUse use) {
  	if (_mtlRenderEncoder) {
  		[_mtlRenderEncoder insertDebugSignpost:@"Encoding waits"];
@@ -7395,7 +7554,7 @@ index de39c961..4447e312 100644
  		}
  	}
  	if (_mtlBlitEncoder) {
-@@ -742,11 +875,17 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -742,11 +877,17 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  			barrierWait(stage, _mtlBlitEncoder);
  		}
  	}
@@ -7414,7 +7573,7 @@ index de39c961..4447e312 100644
  		barrierUpdate(kMVKBarrierStageFragment, _mtlRenderEncoder, MTLRenderStageFragment);
  	}
  
-@@ -764,6 +903,13 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -764,6 +905,13 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  			barrierUpdate(stage, _mtlBlitEncoder);
  		}
  	}
@@ -7428,7 +7587,7 @@ index de39c961..4447e312 100644
  }
  
  
-@@ -773,6 +919,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -773,6 +921,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
      endCurrentMetalEncoding();
  
  	bool isRestart = cmdUse == kMVKCommandUseRestartSubpass;
@@ -7436,7 +7595,7 @@ index de39c961..4447e312 100644
      MTLRenderPassDescriptor* mtlRPDesc = [MTLRenderPassDescriptor renderPassDescriptor];
  	getSubpass()->populateMTLRenderPassDescriptor(mtlRPDesc,
  												  _multiviewPassIndex,
-@@ -792,6 +939,18 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -792,6 +941,18 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	}
  	_hasMTLRenderEncoderVisibilityResultBuffer = (mtlRPDesc.visibilityResultBuffer != nil);
  
@@ -7455,7 +7614,7 @@ index de39c961..4447e312 100644
  	// Metal uses MTLRenderPassDescriptor properties renderTargetWidth, renderTargetHeight,
  	// and renderTargetArrayLength to preallocate tile memory storage on machines using tiled
  	// rendering. This memory preallocation is not necessary if we are not rendering to
-@@ -825,6 +984,16 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -825,6 +986,16 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
          } else {
  			renderTargetArrayLength = getFramebufferLayerCount();
          }
@@ -7472,7 +7631,7 @@ index de39c961..4447e312 100644
          // Metal does not allow layered render passes where some RTs are 3D and others are 2D.
          if (!(found3D && found2D) || renderTargetArrayLength > 1) {
              mtlRPDesc.renderTargetArrayLength = renderTargetArrayLength;
-@@ -839,6 +1008,40 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -839,6 +1010,40 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  		[mtlRPDesc setSamplePositions: sampPosns.data() count: sampPosns.size()];
  	}
  
@@ -7513,7 +7672,7 @@ index de39c961..4447e312 100644
      _mtlRenderEncoder = [_mtlCmdBuffer renderCommandEncoderWithDescriptor: mtlRPDesc];
  	retainIfImmediatelyEncoding(_mtlRenderEncoder);
  	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
-@@ -852,8 +1055,20 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -852,8 +1057,20 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
      if ( !isRestart && !_isRenderingEntireAttachment ) { clearRenderArea(cmdUse); }
  }
  
@@ -7536,7 +7695,7 @@ index de39c961..4447e312 100644
  		(_cmdBuffer->_needsVisibilityResultMTLBuffer && !_hasMTLRenderEncoderVisibilityResultBuffer) ) {
  		encodeStoreActions(true);
  		beginMetalRenderPass(kMVKCommandUseRestartSubpass);
-@@ -906,6 +1121,10 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -906,6 +1123,10 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
              _state.bindComputePipeline(static_cast<MVKComputePipeline*>(pipeline));
              break;
  
@@ -7547,7 +7706,7 @@ index de39c961..4447e312 100644
          default:
              break;
      }
-@@ -962,20 +1181,191 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -962,20 +1183,191 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	}
  }
  
@@ -7739,7 +7898,7 @@ index de39c961..4447e312 100644
  // Clears the render area of the framebuffer attachments.
  void MVKCommandEncoder::clearRenderArea(MVKCommandUse cmdUse) {
  
-@@ -1027,6 +1417,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1027,6 +1419,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	prepareComputeDispatch();
  }
  
@@ -7751,7 +7910,7 @@ index de39c961..4447e312 100644
  void MVKCommandEncoder::endRendering() {
  	endRenderpass();
  }
-@@ -1050,6 +1445,8 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1050,6 +1447,8 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  
  void MVKCommandEncoder::endMetalRenderEncoding() {
      if (_mtlRenderEncoder == nil) { return; }
@@ -7760,7 +7919,7 @@ index de39c961..4447e312 100644
  
  	if (_cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlRenderEncoder updateFence: getStageCountersMTLFence() afterStages: MTLRenderStageFragment]; }
  	encodeBarrierUpdates();
-@@ -1064,6 +1461,12 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1064,6 +1463,12 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  void MVKCommandEncoder::endCurrentMetalEncoding() {
  	endMetalRenderEncoding();
  	encodeBarrierUpdates();
@@ -7773,7 +7932,7 @@ index de39c961..4447e312 100644
  
  	if (_mtlComputeEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlComputeEncoder updateFence: getStageCountersMTLFence()]; }
  	endMetalEncoding(_mtlComputeEncoder);
-@@ -1074,13 +1477,43 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1074,13 +1479,43 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	endMetalEncoding(_mtlBlitEncoder);
      _mtlBlitEncoderUse = kMVKCommandUseNone;
  
@@ -7818,7 +7977,7 @@ index de39c961..4447e312 100644
  		default:
  			return MTLDispatchTypeSerial;
  	}
-@@ -1103,12 +1536,44 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1103,12 +1538,44 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	return wantsSeparateComputeEncoder(prev) || wantsSeparateComputeEncoder(next);
  }
  
@@ -7864,7 +8023,7 @@ index de39c961..4447e312 100644
  		retainIfImmediatelyEncoding(_mtlComputeEncoder);
  		beginMetalComputeEncoding(cmdUse);
  	}
-@@ -1132,6 +1597,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1132,6 +1599,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	if ( !_mtlBlitEncoder ) {
  		needWaits = true;
  		endCurrentMetalEncoding();
@@ -7872,7 +8031,7 @@ index de39c961..4447e312 100644
  		_mtlBlitEncoder = [_mtlCmdBuffer blitCommandEncoder];
  		retainIfImmediatelyEncoding(_mtlBlitEncoder);
  	}
-@@ -1146,10 +1612,31 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1146,10 +1614,31 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	return _mtlBlitEncoder;
  }
  
@@ -7904,7 +8063,7 @@ index de39c961..4447e312 100644
  	return nil;
  }
  
-@@ -1192,24 +1679,246 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1192,24 +1681,261 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	}
  }
  
@@ -7933,6 +8092,8 @@ index de39c961..4447e312 100644
 +	_nextHoistedDrawConversion = 0;
 +	_hoistedIndirectICBs.clear();
 +	_nextHoistedIndirectICB = 0;
++	_hoistedGeneratedCommands.clear();
++	_nextHoistedGeneratedCommands = 0;
 +	if ( !hoistConversions || isMultiview ) { return; }
 +
 +	_hoistingRenderPass = renderPass;
@@ -7957,6 +8118,19 @@ index de39c961..4447e312 100644
 +
 +void MVKCommandEncoder::addHoistedIndirectICB(const MVKCommand* drawCmd, id<MTLIndirectCommandBuffer> icb, const MVKMTLBufferAllocation* bindings) {
 +	_hoistedIndirectICBs.push_back({ drawCmd, icb, bindings });
++}
++
++void MVKCommandEncoder::addHoistedGeneratedCommands(const HoistedGeneratedCommands& hoisted) {
++	_hoistedGeneratedCommands.push_back(hoisted);
++}
++
++bool MVKCommandEncoder::takeHoistedGeneratedCommands(const MVKCommand* drawCmd, HoistedGeneratedCommands& hoisted) {
++	if (_nextHoistedGeneratedCommands < _hoistedGeneratedCommands.size() &&
++		_hoistedGeneratedCommands[_nextHoistedGeneratedCommands].drawCmd == drawCmd) {
++		hoisted = _hoistedGeneratedCommands[_nextHoistedGeneratedCommands++];
++		return true;
++	}
++	return false;
 +}
 +
 +bool MVKCommandEncoder::takeHoistedIndirectICB(const MVKCommand* drawCmd, id<MTLIndirectCommandBuffer>& icb, const MVKMTLBufferAllocation*& bindings) {
@@ -8156,7 +8330,7 @@ index de39c961..4447e312 100644
  }
  
  
-@@ -1219,16 +1928,18 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1219,16 +1945,18 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // encoder is currently in use, creating a temporary BLIT encoder if no encoder is currently active.
  // We only encode the GPU sample if the platform allows encoding at the associated pipeline point.
  void MVKCommandEncoder::encodeGPUCounterSample(MVKGPUCounterQueryPool* mvkQryPool, uint32_t sampleIndex, MVKCounterSamplingFlags samplingPoints){
@@ -8178,7 +8352,7 @@ index de39c961..4447e312 100644
  	}
  }
  
-@@ -1264,6 +1975,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1264,6 +1992,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	}
  }
  
@@ -8189,7 +8363,7 @@ index de39c961..4447e312 100644
  // Metal stage GPU counters need to be configured in a Metal render, compute, or BLIT encoder, meaning that the
  // Metal encoder needs to know about any Vulkan timestamp commands that will be executed during the execution
  // of a renderpass, or set of Vulkan dispatch or BLIT commands. In addition, there are a very small number of
-@@ -1274,41 +1989,99 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1274,41 +2006,99 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // by deferring all timestamps to the end of any batch of Metal encoding, and add a lightweight Metal encoder
  // that does minimal work (it won't timestamp if completely empty), and timestamps that work into all of the
  // Vulkan timestamp queries that have been executed during the execution of the previous Metal encoder.
@@ -8209,16 +8383,7 @@ index de39c961..4447e312 100644
 +}
 +
 +bool MVKCommandEncoder::takeTimestampForNextEncoder(id<MTLCounterSampleBuffer>& mtlCounterBuffer, NSUInteger& mtlSampleIndex) {
- 	size_t qCnt = _timestampStageCounterQueries.size();
--	uint32_t qIdx = 0;
--	while (qIdx < qCnt) {
--
--		// With each BLIT pass, consume as many outstanding timestamp queries as possible.
--		// Attach an query result to each of the available sample buffer attachments in the BLIT pass descriptor.
--		// MTLMaxBlitPassSampleBuffers was defined in the Metal API as 4, but according to Apple, will be removed
--		// in Xcode 13 as inaccurate for all platforms. Leave this value at 1 until we can figure out how to
--		// accurately determine the length of sampleBufferAttachments on each platform.
--		uint32_t maxMTLBlitPassSampleBuffers = 1;		// Was MTLMaxBlitPassSampleBuffers API definition
++	size_t qCnt = _timestampStageCounterQueries.size();
 +	size_t first = 0;
 +	while (first < qCnt && !_timestampStageCounterQueries[first].queryPool) { first++; }
 +	if (first == qCnt) {
@@ -8245,7 +8410,16 @@ index de39c961..4447e312 100644
 +	// queries take that sample. (MTLMaxBlitPassSampleBuffers was 4, but Apple calls it inaccurate, and on an M6 a second
 +	// attachment's samples weren't written: test timestamps, two heaps interleaved.)
 +	static constexpr uint32_t kMaxBlitPassSampleBuffers = 1;
-+	size_t qCnt = _timestampStageCounterQueries.size();
+ 	size_t qCnt = _timestampStageCounterQueries.size();
+-	uint32_t qIdx = 0;
+-	while (qIdx < qCnt) {
+-
+-		// With each BLIT pass, consume as many outstanding timestamp queries as possible.
+-		// Attach an query result to each of the available sample buffer attachments in the BLIT pass descriptor.
+-		// MTLMaxBlitPassSampleBuffers was defined in the Metal API as 4, but according to Apple, will be removed
+-		// in Xcode 13 as inaccurate for all platforms. Leave this value at 1 until we can figure out how to
+-		// accurately determine the length of sampleBufferAttachments on each platform.
+-		uint32_t maxMTLBlitPassSampleBuffers = 1;		// Was MTLMaxBlitPassSampleBuffers API definition
 +	size_t qIdx = 0;
 +	bool syncedFences = false;
 +	while (true) {
@@ -8309,7 +8483,7 @@ index de39c961..4447e312 100644
  	if ( !_stageCountersMTLFence ) {
  		// Create MTLFence as local ref and pass to completion handler
  		// block to release once MTLCommandBuffer no longer needs it.
-@@ -1358,10 +2131,14 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1358,10 +2148,14 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  
  #pragma mark Construction
  
@@ -8325,7 +8499,7 @@ index de39c961..4447e312 100644
  	_pActivatedQueries = nullptr;
  	_mtlCmdBuffer = nil;
  	_mtlRenderEncoder = nil;
-@@ -1371,15 +2148,25 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1371,15 +2165,25 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	_mtlComputeEncoderStages = 0;
  	_mtlBlitEncoder = nil;
  	_mtlBlitEncoderUse = kMVKCommandUseNone;
@@ -8351,7 +8525,7 @@ index de39c961..4447e312 100644
  	// _stageCountersMTLFence is released after Metal command buffer completion
  }
  
-@@ -1415,6 +2202,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1415,6 +2219,9 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseUpdateBuffer:                    return @"vkCmdUpdateBuffer BlitEncoder";
          case kMVKCommandUseResetQueryPool:                  return @"vkCmdResetQueryPool BlitEncoder";
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
@@ -8361,7 +8535,7 @@ index de39c961..4447e312 100644
  		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
          default:                                            return @"Unknown Use BlitEncoder";
      }
-@@ -1423,6 +2213,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1423,6 +2230,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
      switch (cmdUse) {
          case kMVKCommandUseDispatch:                        return @"vkCmdDispatch ComputeEncoder";
@@ -8369,7 +8543,7 @@ index de39c961..4447e312 100644
          case kMVKCommandUseCopyBuffer:                      return @"vkCmdCopyBuffer ComputeEncoder";
          case kMVKCommandUseCopyBufferToImage:               return @"vkCmdCopyBufferToImage ComputeEncoder";
          case kMVKCommandUseCopyImageToBuffer:               return @"vkCmdCopyImageToBuffer ComputeEncoder";
-@@ -1434,6 +2225,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1434,6 +2242,16 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
          case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults ComputeEncoder";
          case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
          case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
@@ -14901,7 +15075,7 @@ index 3cdc6234..4c15129c 100644
  					break;
  			}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414f..6e23cc05 100644
+index 534a414f..07660e3f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -27,8 +27,13 @@
@@ -15472,7 +15646,7 @@ index 534a414f..6e23cc05 100644
  #include "MVKDeviceFeatureStructs.def"
  
  	/** Pointer to the Metal-specific features of the underlying physical device. */
-@@ -1275,6 +1620,61 @@ protected:
+@@ -1275,6 +1620,62 @@ protected:
  };
  
  
@@ -15499,6 +15673,7 @@ index 534a414f..6e23cc05 100644
 +	};
 +	MVKSmallVector<PushConstantToken, 4> _pushConstantTokens;
 +	uint32_t _pushConstantsSize = 0;		// The end of the push constant ranges the tokens set.
++	uint32_t _layoutPushConstantsSize = 0;	// The push constants of the pipeline layout it was made with, if any.
 +	VkIndirectCommandsTokenTypeEXT _actionType = VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT;
 +	uint32_t _actionOffset = 0;
 +	uint32_t _stride = 0;
@@ -15535,7 +15710,7 @@ index 534a414f..6e23cc05 100644
  #pragma mark MVKDeviceObjectPool
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 359f8a2b..467b8da5 100644
+index 359f8a2b..3200a55f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -18,9 +18,11 @@
@@ -16663,7 +16838,7 @@ index 359f8a2b..467b8da5 100644
  void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                  const VkAllocationCallbacks* pAllocator) {
  	if (mvkPL) { mvkPL->destroy(); }
-@@ -4567,16 +5168,82 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4567,16 +5168,85 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKDeviceMemory* MVKDevice::allocateMemory(const VkMemoryAllocateInfo* pAllocateInfo,
  										   const VkAllocationCallbacks* pAllocator) {
@@ -16699,6 +16874,9 @@ index 359f8a2b..467b8da5 100644
 +	: MVKVulkanAPIDeviceObject(device) {
 +	_stride = pCreateInfo->indirectStride;
 +	_shaderStages = pCreateInfo->shaderStages;
++	if (pCreateInfo->pipelineLayout) {
++		_layoutPushConstantsSize = ((MVKPipelineLayout*)pCreateInfo->pipelineLayout)->getPushConstantsLength();
++	}
 +	for (uint32_t i = 0; i < pCreateInfo->tokenCount; i++) {
 +		const VkIndirectCommandsLayoutTokenEXT& token = pCreateInfo->pTokens[i];
 +		switch (token.type) {
@@ -16748,7 +16926,7 @@ index 359f8a2b..467b8da5 100644
  VkResult MVKDevice::createPrivateDataSlot(const VkPrivateDataSlotCreateInfoEXT* pCreateInfo,
  										  const VkAllocationCallbacks* pAllocator,
  										  VkPrivateDataSlot* pPrivateDataSlot) {
-@@ -4629,6 +5296,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4629,6 +5299,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	_resources.push_back(mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		_gpuAddressableBuffers.push_back(mvkBuff);
@@ -16756,7 +16934,7 @@ index 359f8a2b..467b8da5 100644
  	}
  	return mvkBuff;
  }
-@@ -4640,14 +5308,463 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4640,14 +5311,463 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	mvkRemoveFirstOccurance(_resources, mvkBuff);
  	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
  		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
@@ -16772,9 +16950,7 @@ index 359f8a2b..467b8da5 100644
 +}
 +
 +void MVKDevice::retainGPUAddressableAccelerationStructures(MVKSmallVector<MVKAccelerationStructure*, 16>& accelerationStructures) {
- 	lock_guard<mutex> lock(_rezLock);
--	for (auto& buff : _gpuAddressableBuffers) {
--		resources.add(buff->getMTLBuffer(), stage, true);
++	lock_guard<mutex> lock(_rezLock);
 +	accelerationStructures.reserve(_gpuAddressableAccelerationStructures.size());
 +	for (auto* accelerationStructure : _gpuAddressableAccelerationStructures) {
 +		accelerationStructure->retain();
@@ -17088,7 +17264,9 @@ index 359f8a2b..467b8da5 100644
 +}
 +
 +void MVKDevice::removeGPUAddressableAccelerationStructure(MVKAccelerationStructure* accelerationStructure) {
-+	lock_guard<mutex> lock(_rezLock);
+ 	lock_guard<mutex> lock(_rezLock);
+-	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
 +	mvkRemoveFirstOccurance(_gpuAddressableAccelerationStructures, accelerationStructure);
 +}
 +
@@ -17223,7 +17401,7 @@ index 359f8a2b..467b8da5 100644
  	}
  }
  
-@@ -4696,6 +5813,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4696,6 +5816,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  								   MVKCommandUse cmdUse) {
  	if (!mvkIsAnyFlagEnabled(barrier.dstStageMask, VK_PIPELINE_STAGE_HOST_BIT) ||
  		!mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT) ) { return; }
@@ -17232,7 +17410,7 @@ index 359f8a2b..467b8da5 100644
  	lock_guard<mutex> lock(_rezLock);
  	for (auto& rez : _resources) {
  		rez->applyMemoryBarrier(barrier, cmdEncoder, cmdUse);
-@@ -4841,6 +5960,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4841,6 +5963,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -17240,7 +17418,7 @@ index 359f8a2b..467b8da5 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4917,11 +6037,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,11 +6040,45 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		// typically have stricter alignment requirements due to it being a 2-component format.
  		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
  	}
@@ -17287,7 +17465,7 @@ index 359f8a2b..467b8da5 100644
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
-@@ -4967,6 +6121,247 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4967,6 +6124,247 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	return _dummyBlitMTLBuffer;
  }
  
@@ -17535,7 +17713,7 @@ index 359f8a2b..467b8da5 100644
  MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
  												   bool preserveInvariance) {
  	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
-@@ -4988,15 +6383,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4988,15 +6386,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
  	// during shader compilation. For example, MSL fract() doesn't handle Inf->NaN like Vulkan.
  	if ([mtlCompOpt respondsToSelector: @selector(mathMode)]) {
@@ -17564,7 +17742,7 @@ index 359f8a2b..467b8da5 100644
  		}
  		mtlCompOpt.mathMode = mtlMathMode;
  		mtlCompOpt.mathFloatingPointFunctions = mtlFPFuncs;
-@@ -5006,17 +6405,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5006,17 +6408,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		mtlCompOpt.fastMathEnabled = mvkAreAllFlagsEnabled(fpFastMathFlags, mvk::kSPIRVFPFastMathModesSupported);
  	}
  
@@ -17595,7 +17773,7 @@ index 359f8a2b..467b8da5 100644
  			!(_enabledDescriptorIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind ||
  			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind ||
-@@ -5252,10 +6661,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5252,10 +6664,277 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  	}
  
@@ -17873,7 +18051,7 @@ index 359f8a2b..467b8da5 100644
  // Perf stats that last the duration of the app process.
  static MVKPerformanceStatistics _processPerformanceStats = {};
  
-@@ -5267,7 +6943,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5267,7 +6946,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -17886,7 +18064,7 @@ index 359f8a2b..467b8da5 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5575,7 +7255,59 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5575,7 +7258,59 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -17946,7 +18124,7 @@ index 359f8a2b..467b8da5 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5591,16 +7323,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5591,16 +7326,39 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	for (auto& queues : _queuesByQueueFamilyIndex) {
  		mvkDestroyContainerContents(queues);
  	}

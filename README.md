@@ -93,7 +93,8 @@ constants or root descriptors writes them into a converted pipeline's top-level 
 the converter's instead of switching to a SPIR-V one compiled for it. An indirect draw with a count buffer of 25 or more
 draws (ExecuteIndirect of draws alone) runs only the counted draws, from an indirect command buffer encoded before the
 render pass (`MVK_CONFIG_INDIRECT_COUNT_ICB_MIN_DRAWS` sets the threshold; `0` turns it off). ExecuteIndirect of
-dispatches alone with a count buffer runs only the counted dispatches. MetalFX's temporal scaler is made
+dispatches alone with a count buffer runs only the counted dispatches. ExecuteIndirect inside a render pass doesn't
+end it: its kernels run before the pass begins (`MVK_CONFIG_DGC_HOIST=0` runs them in place). MetalFX's temporal scaler is made
 without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
 lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
 

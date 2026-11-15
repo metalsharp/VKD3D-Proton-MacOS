@@ -3595,6 +3595,60 @@ static std::vector<Scene> engine_scenes()
             p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_MRT));
             fullscreen(p.list, 1.0f);
         } },
+        { "gbuffer_execute_indirect", "gbuffer_mrt with 4 ExecuteIndirects of 100 root-constant draws among its 1500 draws (generated draws inside a G-buffer pass)", [] {
+            const DXGI_FORMAT formats[4] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT };
+            for (int i = 0; i < 4; i++)
+            {
+                D3D12_CLEAR_VALUE cv = { formats[i], { 0, 0, 0, 0 } };
+                mrt[i] = create_texture(W, H, formats[i], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, 1, &cv);
+                p.device->CreateRenderTargetView(mrt[i], nullptr, rtv(RTV_MRT + i));
+                p.device->CreateShaderResourceView(mrt[i], nullptr, srv_cpu(SRV_MRT + i));
+            }
+            for (int i = 4; i < 8; i++) p.device->CreateShaderResourceView(p.textures[i], nullptr, srv_cpu(SRV_MRT + i));
+            PsoDesc d; d.hlsl = eng_src.c_str(); d.ps = "ps_gbuffer"; d.depth = true;
+            d.tweak = [formats](D3D12_GRAPHICS_PIPELINE_STATE_DESC &g) {
+                g.NumRenderTargets = 4;
+                for (int i = 0; i < 4; i++) { g.RTVFormats[i] = formats[i]; g.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL; }
+            };
+            pso_a = create_pso(d);
+            D3D12_INDIRECT_ARGUMENT_DESC a[2] = {};
+            a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+            a[0].Constant = { 0, 0, 4 };
+            a[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 2, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, p.root_signature, IID_PPV_ARGS(&sig)));
+            res_c = create_buffer(100 * 32, D3D12_HEAP_TYPE_UPLOAD);
+            float *v; CHECK(res_c->Map(0, nullptr, (void **)&v));
+            for (UINT i = 0; i < 100; i++)
+            {
+                float rc[4] = { (float)(i % 10) / 5.0f - 1.0f, (float)(i / 10) / 5.0f - 1.0f, 0.06f, 0.5f };
+                memcpy(v + i * 8, rc, 16);
+                uint32_t draw[4] = { 3, 1, 0, 0 };
+                memcpy(v + i * 8 + 4, draw, 16);
+            }
+            res_c->Unmap(0, nullptr);
+            d = {}; d.hlsl = eng_src.c_str(); d.ps = "ps_lighting"; pso_b = create_pso(d);
+        }, [quads](UINT f) {
+            for (int i = 0; i < 4; i++) barrier(p.list, mrt[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            D3D12_CPU_DESCRIPTOR_HANDLE h[4] = { rtv(RTV_MRT), rtv(RTV_MRT + 1), rtv(RTV_MRT + 2), rtv(RTV_MRT + 3) };
+            auto d = dsv(0);
+            float c[4] = { 0, 0, 0, 0 };
+            for (int i = 0; i < 4; i++) p.list->ClearRenderTargetView(h[i], c, 0, nullptr);
+            p.list->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            p.list->OMSetRenderTargets(4, h, FALSE, &d);
+            set_quad_state(p.list, pso_a);
+            for (int i = 0; i < 4; i++)
+            {
+                quads(p.list, 375, 0.06f, f);
+                p.list->ExecuteIndirect(sig, 100, res_c, 0, nullptr, 0);
+            }
+            for (int i = 0; i < 4; i++) barrier(p.list, mrt[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            auto bb = rtv(p.frame_index);
+            p.list->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+            set_quad_state(p.list, pso_b);
+            p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_MRT));
+            fullscreen(p.list, 1.0f);
+        } },
         { "async_compute", "a compute queue running 40 ALU dispatches while the direct queue renders 20 heavy full-screen quads; joined by a fence", [make_cs_rs, make_other_queue] {
             make_cs_rs();
             pso_a = compute_pso_from(cs_rs, shader_code(engine_cs_hlsl, "cs_alu", "cs_5_0"));
