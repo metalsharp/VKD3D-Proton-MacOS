@@ -3476,6 +3476,7 @@ static std::vector<Scene> engine_scenes()
     static ID3D12Fence *other_fence;
     static UINT64 other_value;
     static ID3D12CommandSignature *sig;
+    static ID3D12CommandSignature *dispatch_only_sig;
     static ID3D12QueryHeap *occlusion;
     static std::vector<char> library_blob;
     static std::string eng_src;
@@ -3711,6 +3712,20 @@ static std::vector<Scene> engine_scenes()
             p.list->SetPipelineState(pso_a);
             for (UINT i = 0; i < 20; i++)
                 p.list->ExecuteIndirect(sig, 1024, res_b, i * 64 * 32, res_c, 0);
+        } },
+        { "execute_indirect_dispatch_only", "20 compute ExecuteIndirects of dispatches alone: up to 1024 each, 64 counted (DXIL)", [make_cs_rs, make_dispatch_args] {
+            make_cs_rs();
+            pso_a = compute_pso_from(cs_rs, shader_code(engine_cs_hlsl, "cs_small", "cs_6_0"));
+            make_dispatch_args(1024, 64);
+            D3D12_INDIRECT_ARGUMENT_DESC a = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 1, &a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&dispatch_only_sig)));
+        }, [](UINT) {
+            p.list->SetComputeRootSignature(cs_rs);
+            p.list->SetComputeRootDescriptorTable(1, srv_gpu(UAV_ENGINE));
+            p.list->SetPipelineState(pso_a);
+            for (UINT i = 0; i < 20; i++)
+                p.list->ExecuteIndirect(dispatch_only_sig, 1024, res_b, i * 64 * 32 + 16, res_c, 0);
         } },
         { "execute_indirect_dispatch_exact", "20 compute ExecuteIndirects of 64 root constants + dispatch each, no count buffer (compare execute_indirect_dispatch)", [make_cs_rs, make_dispatch_args] {
             make_cs_rs();

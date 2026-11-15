@@ -14493,6 +14493,59 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+// ExecuteIndirect of dispatches alone with a count buffer: up to 64, 23 counted, dispatch i of i + 1 groups, each of
+// which counts itself: 276 groups, where all 64 would be 2080.
+static bool test_executeindirect_count_dispatches()
+{
+    static const char *src = R"(
+RWByteAddressBuffer counter : register(u0);
+[numthreads(1, 1, 1)] void cs() { counter.InterlockedAdd(0, 1); }
+)";
+    std::vector<char> cs = compile_dxc(src, "cs", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.CS = { cs.data(), cs.size() };
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
+    D3D12_INDIRECT_ARGUMENT_DESC iad = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &iad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+
+    const UINT MAX = 64, COUNT = 23;
+    ID3D12Resource *args = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    args->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 4096);
+    for (UINT i = 0; i < MAX; i++)
+    {
+        D3D12_DISPATCH_ARGUMENTS d = { i + 1, 1, 1 };
+        memcpy(u + i * sizeof(d), &d, sizeof(d));
+    }
+    memcpy(u + 2048, &COUNT, sizeof(COUNT));
+    args->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(pso);
+    g.list->ExecuteIndirect(sig, MAX, args, 0, args, 2048);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    EXPECT(r[0] == COUNT * (COUNT + 1) / 2, "%u groups ran, want %u", r[0], COUNT * (COUNT + 1) / 2);
+    rb->Release(); out->Release(); args->Release(); sig->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // ExecuteIndirect of draws alone with a count buffer, as GPU-driven renderers make it: up to 32 draws, fewer counted,
 // each drawing one column of a 32x2 target from the vertices at its start vertex (row 0) or start index (row 1).
 static bool test_executeindirect_count_draws()
@@ -15516,6 +15569,7 @@ static const Test tests[] = {
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
     { "executeindirect_count_draws", test_executeindirect_count_draws },
+    { "executeindirect_count_dispatches", test_executeindirect_count_dispatches },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
     { "uav_global_barrier_deferred", test_uav_global_barrier_deferred },
