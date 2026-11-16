@@ -38,6 +38,18 @@ ninja -C "$OUT"
 mkdir -p "$STAGE"
 cp "$OUT/nvngx.dll" "$OUT/nvapi64.dll" "$STAGE/"
 
+# MetalSharp Wine loads both as Wine builtins, as the x86_64 one does (scripts/build-ngx-x86_64.sh), so they carry
+# Wine's builtin marker. It is in the signed bytes, so it goes in first.
+python3 -I - "$STAGE/nvngx.dll" "$STAGE/nvapi64.dll" <<'PY'
+import struct, sys
+for path in sys.argv[1:]:
+    with open(path, "r+b") as f:
+        header = f.read(64)
+        assert header[:2] == b"MZ" and struct.unpack_from("<I", header, 60)[0] >= 96, path
+        f.seek(64)
+        f.write(b"Wine builtin DLL".ljust(32, b"\0"))
+PY
+
 # NGX loads only a core whose Authenticode signature chains to a trusted root: nvngx.dll is signed with the Mullion
 # NGX key, whose certificate (ngx/signing/mullion-ngx.pem) the lane's DXGI trusts in the prefix (ngx/signing/README.md).
 # The key: NGX_SIGNING_KEY_FILE, else ~/.metalsharp/ngx-signing/key.pem; without one nvngx.dll stays unsigned.

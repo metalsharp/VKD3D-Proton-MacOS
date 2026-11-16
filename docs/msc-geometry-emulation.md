@@ -1,9 +1,21 @@
 # Metal Shader Converter geometry and tessellation emulation: what the converted code expects
 
-Not used yet: geometry shaders and tessellation still go through SPIR-V and MoltenVK's own mesh-shader emulation.
-These are notes for a bridge path, read from the converter's output (`IRCompilerEnableGeometryAndTessellationEmulation`,
-then `metal-objdump -d` on the metallib, which prints the AIR), since Apple's runtime header with the draw helpers is
-not available here.
+Tessellation (vertex, hull and domain shaders of DXIL) now runs through this emulation
+(`MVKGraphicsPipeline::newMSCTessellationPipelineDescriptor()` and `encodeMSCTessellationDraw()` in MoltenVK, blob
+version 4 in VKD3D-Proton's `msc_bridge.c`), assembled and drawn as the converter's runtime header
+(`metal_irconverter_runtime.h`) does; its tessellator tables are vendored in MoltenVK's
+`MetalShaderConverter/metal_irconverter_runtime`. Geometry shaders still go through SPIR-V and MoltenVK's own
+mesh-shader emulation. The notes below were read from the converter's output (`metal-objdump -d` on the metallib).
+
+Tessellation: the object function is the vertex library's `<entry>.dxil_irconverter_object_shader` (function constant
+`tessellationEnabled`), linked with the stage-in function (`IRMetalLibSynthesizeStageInFunction` from the input layout)
+and `irconverter_hull_shader` (constants `vertex_shader_output_size_fc`, `max_tessellation_factor_fc`); the mesh
+function is the domain library's `irconverter_domain_shader_{triangle,line,point}_passthrough`, linked with
+`irconverter_tessellator` and `irconverter_dxil_domain_shader`. Draws bind the top-level argument buffer at 2 and 3,
+the draw arguments at 4, the 24-byte draw info at 5, the vertex buffers' table at 6 and the tessellator tables at 7,
+with 15360 bytes of object threadgroup memory, and dispatch ceil(count / (patches per object threadgroup x control
+points)) x instances object threadgroups. Isoline patches come out with their two factors swapped, so they stay on
+SPIR-V.
 
 ## Pipeline
 

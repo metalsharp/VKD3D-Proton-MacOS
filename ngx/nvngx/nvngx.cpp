@@ -145,6 +145,16 @@ static ID3D12GraphicsCommandListMetalFX *GetMetalFX(ID3D12GraphicsCommandList *l
   return static_cast<ID3D12GraphicsCommandListMetalFX *>(metalfx);
 }
 
+// whether the command list's MetalFX has TemporalUpscale1 (a VKD3D-Proton from after this NGX core's first)
+static bool HasTemporalUpscale1(ID3D12GraphicsCommandList *list) {
+  void *metalfx1 = nullptr;
+  if (!list || FAILED(list->QueryInterface(IID_ID3D12GraphicsCommandListMetalFX1, &metalfx1)))
+    return false;
+  static_cast<ID3D12GraphicsCommandListMetalFX *>(metalfx1)->lpVtbl->Release(
+      static_cast<ID3D12GraphicsCommandListMetalFX *>(metalfx1));
+  return true;
+}
+
 struct MetalFXRef {
   ID3D12GraphicsCommandListMetalFX *iface;
   explicit MetalFXRef(ID3D12GraphicsCommandList *list) : iface(GetMetalFX(list)) {}
@@ -608,8 +618,26 @@ NVNGX_EXPORT NVNGX_RESULT NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandL
     desc.MotionVectorInDisplayRes = !bool(dlss->flag & NVNGX_DLSS_FLAG_MV_LOWRES);
     ReadCommon(parameters, desc.MotionVectorScaleX, desc.MotionVectorScaleY, desc.JitterOffsetX, desc.JitterOffsetY,
                desc.PreExposure, desc.InReset);
-    return FAILED(metalfx.iface->lpVtbl->TemporalUpscale(metalfx.iface, &desc, &dlss->scaler)) ? NVNGX_RESULT_FAIL
-                                                                                                 : NVNGX_RESULT_OK;
+    if (!HasTemporalUpscale1(list))
+      return FAILED(metalfx.iface->lpVtbl->TemporalUpscale(metalfx.iface, &desc, &dlss->scaler)) ? NVNGX_RESULT_FAIL
+                                                                                                   : NVNGX_RESULT_OK;
+    // MVJittered, the bias mask (MetalFX's reactive mask) and the subrect bases
+    VKD3D_METALFX_TEMPORAL_DESC1 desc1 = {};
+    desc1.Desc = desc;
+    desc1.JitteredMotionVectors = bool(dlss->flag & NVNGX_DLSS_FLAG_MV_JITTERED);
+    desc1.ReactiveMask = GetResource(parameters, "DLSS.Input.Bias.Current.Color.Mask");
+    desc1.ColorOffsetX = GetOr(parameters, "DLSS.Input.Color.Subrect.Base.X", 0u);
+    desc1.ColorOffsetY = GetOr(parameters, "DLSS.Input.Color.Subrect.Base.Y", 0u);
+    desc1.DepthOffsetX = GetOr(parameters, "DLSS.Input.Depth.Subrect.Base.X", 0u);
+    desc1.DepthOffsetY = GetOr(parameters, "DLSS.Input.Depth.Subrect.Base.Y", 0u);
+    desc1.MotionVectorOffsetX = GetOr(parameters, "DLSS.Input.MV.Subrect.Base.X", 0u);
+    desc1.MotionVectorOffsetY = GetOr(parameters, "DLSS.Input.MV.Subrect.Base.Y", 0u);
+    desc1.ReactiveMaskOffsetX = GetOr(parameters, "DLSS.Input.Bias.Current.Color.Subrect.Base.X", 0u);
+    desc1.ReactiveMaskOffsetY = GetOr(parameters, "DLSS.Input.Bias.Current.Color.Subrect.Base.Y", 0u);
+    desc1.OutputOffsetX = GetOr(parameters, "DLSS.Output.Subrect.Base.X", 0u);
+    desc1.OutputOffsetY = GetOr(parameters, "DLSS.Output.Subrect.Base.Y", 0u);
+    return FAILED(metalfx.iface->lpVtbl->TemporalUpscale1(metalfx.iface, &desc1, &dlss->scaler)) ? NVNGX_RESULT_FAIL
+                                                                                                  : NVNGX_RESULT_OK;
   }
   case NVNGX_FEATURE_RAYRECONSTRUCTION: {
     auto dlssd = static_cast<DLSSDFeature *>(common);

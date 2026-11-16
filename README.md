@@ -76,14 +76,42 @@ from `env.sh`. MetalSharp writes its own; other Wines use these:
 
 A path in either variable may be a Unix path or a Windows one (`Z:/...`).
 
-MoltenVK compiles each Metal pipeline on the thread that creates it. `MVK_CONFIG_DEFERRED_PIPELINES=1` compiles
-pipelines on background threads instead, and `MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment
-shader alongside its vertex shader. Both are off by default: their compiles wait on Metal from GCD worker threads,
-and a game creating pipelines from many threads can take every worker, which leaves Metal none to finish them on.
+Creating a pipeline returns once its shaders are converted: Metal compiles it meanwhile, started from the creating
+thread and finished by its completion handler, so no thread waits for it, and the first draw or dispatch that uses
+the pipeline waits if it isn't done. `MVK_CONFIG_DEFERRED_PIPELINES=0` compiles in the creating call instead.
+`MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment shader alongside its vertex shader; it is off by
+default, as its compiles wait on Metal from GCD worker threads. Metal compiles with as many threads as the machine has
+(`MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=0` turns that off).
+
+Shaders the Metal Shader Converter converts are kept on disk beside MoltenVK's pipeline cache (`<cache>.msc/`, one
+file each), so a relaunch converts none of them again (`MVK_CONFIG_MSC_DISK_CACHE=0` turns that off). The converter
+targets the GPU's Apple family and the running macOS (`MVK_CONFIG_MSC_TARGET_DEVICE=0` keeps its oldest targets).
+
+ExecuteIndirect of 25 or more draws whose signature has only root constants runs from one Metal indirect command buffer
+(`MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES` sets the threshold; `0` turns it off). ExecuteIndirect that sets root
+constants or root descriptors writes them into a converted pipeline's top-level argument buffer, so the pipeline stays
+the converter's instead of switching to a SPIR-V one compiled for it. An indirect draw with a count buffer of 25 or more
+draws (ExecuteIndirect of draws alone) runs only the counted draws, from an indirect command buffer encoded before the
+render pass (`MVK_CONFIG_INDIRECT_COUNT_ICB_MIN_DRAWS` sets the threshold; `0` turns it off). ExecuteIndirect of
+dispatches alone with a count buffer runs only the counted dispatches. ExecuteIndirect inside a render pass doesn't
+end it: its kernels run before the pass begins (`MVK_CONFIG_DGC_HOIST=0` runs them in place). Command lists encode
+into Metal when their recording ends, on the thread that recorded them, not all at once on the submitting thread
+(`MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=0` encodes at submission). MetalFX's temporal scaler is made
+without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
+lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
+
+`Present` with a SyncInterval of 2 to 4 holds each frame for that many refreshes (through relative present targets),
+so a game capped at half or a third of the refresh rate stays capped. Two options leave out features that run slowly
+here, for games that pick a faster path without them: `MVK_CONFIG_RAY_TRACING_MIN_APPLE_FAMILY=9` reports no ray
+tracing on GPUs before Apple family 9, which trace rays in compute, and `MVK_CONFIG_CONSERVATIVE_RASTERIZATION=0`
+reports no conservative rasterization, which is emulated (D3D12 feature level 12_1 needs it, so 12_0 is reported).
 
 Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
-(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Pipelines with geometry or
-tessellation shaders, stream output, logic operations, conservative rasterization, the depth bounds test, view
+(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Tessellation pipelines of DXIL
+shaders run in the converter's emulation, a mesh pipeline whose object stage runs the vertex and hull shaders and whose
+mesh stage runs the tessellator and the domain shader, so a tessellated draw no longer ends the render pass for compute
+passes (`VKD3D_MSC_TESSELLATION=0` keeps them on SPIR-V; isolines, DXBC tessellation and ExecuteIndirect with such a
+PSO use SPIR-V). Pipelines with geometry shaders, tessellation with a geometry shader, stream output, logic operations, conservative rasterization, the depth bounds test, view
 instancing, ray queries, 64-bit atomics, barycentrics, residency feedback, min/max sampler filtering or a
 three-component 32-bit typed buffer stay on SPIR-V. `METALSHARP_MSC=0` keeps every pipeline on SPIR-V,
 `METALSHARP_MSC=compute` keeps graphics ones there, and `METALSHARP_MSC_DXBC=0` keeps DXBC (SM 4.x and 5.x)

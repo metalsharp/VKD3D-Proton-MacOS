@@ -1909,6 +1909,28 @@ static std::vector<Scene> more_scenes()
             set_quad_state(p.list, flat);
             p.list->ExecuteIndirect(draw_sig, 4000, args, 0, count_buffer, 0);
         } },
+        { "execute_indirect_count_draws", "ExecuteIndirect of draws alone with a count buffer: up to 4000, 200 executed (GPU-driven multi-draw)", [] {
+            flat = create_pso({});
+            D3D12_INDIRECT_ARGUMENT_DESC a[1] = {};
+            a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 16, 1, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&draw_sig)));
+            args = create_buffer(4000 * 16, D3D12_HEAP_TYPE_UPLOAD);
+            uint32_t *v; CHECK(args->Map(0, nullptr, (void **)&v));
+            for (UINT i = 0; i < 4000; i++)
+            {
+                uint32_t draw[4] = { 3, 1, 0, 0 };
+                memcpy(v + i * 4, draw, 16);
+            }
+            args->Unmap(0, nullptr);
+            count_buffer = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+            uint32_t *c; CHECK(count_buffer->Map(0, nullptr, (void **)&c));
+            *c = 200;
+            count_buffer->Unmap(0, nullptr);
+        }, [](UINT) {
+            set_quad_state(p.list, flat);
+            p.list->ExecuteIndirect(draw_sig, 4000, args, 0, count_buffer, 0);
+        } },
         { "instancing", "one draw of 160000 small instances (vertex/instance throughput)", [] {
             PsoDesc d; d.vs = "vs_instanced"; inst = create_pso(d);
         }, [](UINT) {
@@ -1926,6 +1948,7 @@ static std::vector<Scene> more_scenes()
         { "sample_bc7", "20 full-screen quads sampling 8 BC7 textures each (compressed bandwidth)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_BC7, f); } },
         { "sample_rgba8", "the same with RGBA8 textures (baseline for sample_bc7)", make_bc, [sample_frame](UINT f) { sample_frame(SRV_RGBA8, f); } },
         { "present_vsync", "clear + Present(1): the display-locked frame", [] {}, [](UINT) {}, true, 1 },
+        { "present_interval2", "clear + Present(2): every other refresh, a game's half-rate cap", [] {}, [](UINT) {}, true, 2 },
     };
 }
 
@@ -3233,6 +3256,15 @@ static std::vector<Scene> feature_scenes()
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); } },
         { "tess_dxil", "the same compiled as DXIL", tess_init("vs_6_0"),
           [](UINT) { set_quad_state(p.list, pso_a); p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST); p.list->DrawInstanced(3000, 1, 0, 0); }, false, 0, true },
+        { "tess_dxil_many", "tess_dxil split into 100 draws of 10 patches, with an ordinary draw between each (terrain tiles)", tess_init("vs_6_0"),
+          [](UINT) {
+              set_quad_state(p.list, pso_a);
+              for (UINT i = 0; i < 100; i++)
+              {
+                  p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+                  p.list->DrawInstanced(30, 1, i * 30, 0);
+              }
+          }, false, 0, true },
         { "tess_baseline", "the same 256000 triangles drawn without tessellation (baseline for tess_*)", [] {
             PsoDesc d; d.hlsl = feat_src.c_str(); d.vs = "vs_grid"; pso_a = create_pso(d);
         }, [](UINT) { set_quad_state(p.list, pso_a); p.list->DrawInstanced(1000 * 256 * 3, 1, 0, 0); } },
@@ -3453,6 +3485,7 @@ static std::vector<Scene> engine_scenes()
     static ID3D12Fence *other_fence;
     static UINT64 other_value;
     static ID3D12CommandSignature *sig;
+    static ID3D12CommandSignature *dispatch_only_sig;
     static ID3D12QueryHeap *occlusion;
     static std::vector<char> library_blob;
     static std::string eng_src;
@@ -3564,6 +3597,60 @@ static std::vector<Scene> engine_scenes()
             p.list->OMSetRenderTargets(4, h, FALSE, &d);
             set_quad_state(p.list, pso_a);
             quads(p.list, 1500, 0.06f, f);
+            for (int i = 0; i < 4; i++) barrier(p.list, mrt[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            auto bb = rtv(p.frame_index);
+            p.list->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+            set_quad_state(p.list, pso_b);
+            p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_MRT));
+            fullscreen(p.list, 1.0f);
+        } },
+        { "gbuffer_execute_indirect", "gbuffer_mrt with 4 ExecuteIndirects of 100 root-constant draws among its 1500 draws (generated draws inside a G-buffer pass)", [] {
+            const DXGI_FORMAT formats[4] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT };
+            for (int i = 0; i < 4; i++)
+            {
+                D3D12_CLEAR_VALUE cv = { formats[i], { 0, 0, 0, 0 } };
+                mrt[i] = create_texture(W, H, formats[i], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, 1, &cv);
+                p.device->CreateRenderTargetView(mrt[i], nullptr, rtv(RTV_MRT + i));
+                p.device->CreateShaderResourceView(mrt[i], nullptr, srv_cpu(SRV_MRT + i));
+            }
+            for (int i = 4; i < 8; i++) p.device->CreateShaderResourceView(p.textures[i], nullptr, srv_cpu(SRV_MRT + i));
+            PsoDesc d; d.hlsl = eng_src.c_str(); d.ps = "ps_gbuffer"; d.depth = true;
+            d.tweak = [formats](D3D12_GRAPHICS_PIPELINE_STATE_DESC &g) {
+                g.NumRenderTargets = 4;
+                for (int i = 0; i < 4; i++) { g.RTVFormats[i] = formats[i]; g.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL; }
+            };
+            pso_a = create_pso(d);
+            D3D12_INDIRECT_ARGUMENT_DESC a[2] = {};
+            a[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+            a[0].Constant = { 0, 0, 4 };
+            a[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 2, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, p.root_signature, IID_PPV_ARGS(&sig)));
+            res_c = create_buffer(100 * 32, D3D12_HEAP_TYPE_UPLOAD);
+            float *v; CHECK(res_c->Map(0, nullptr, (void **)&v));
+            for (UINT i = 0; i < 100; i++)
+            {
+                float rc[4] = { (float)(i % 10) / 5.0f - 1.0f, (float)(i / 10) / 5.0f - 1.0f, 0.06f, 0.5f };
+                memcpy(v + i * 8, rc, 16);
+                uint32_t draw[4] = { 3, 1, 0, 0 };
+                memcpy(v + i * 8 + 4, draw, 16);
+            }
+            res_c->Unmap(0, nullptr);
+            d = {}; d.hlsl = eng_src.c_str(); d.ps = "ps_lighting"; pso_b = create_pso(d);
+        }, [quads](UINT f) {
+            for (int i = 0; i < 4; i++) barrier(p.list, mrt[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            D3D12_CPU_DESCRIPTOR_HANDLE h[4] = { rtv(RTV_MRT), rtv(RTV_MRT + 1), rtv(RTV_MRT + 2), rtv(RTV_MRT + 3) };
+            auto d = dsv(0);
+            float c[4] = { 0, 0, 0, 0 };
+            for (int i = 0; i < 4; i++) p.list->ClearRenderTargetView(h[i], c, 0, nullptr);
+            p.list->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            p.list->OMSetRenderTargets(4, h, FALSE, &d);
+            set_quad_state(p.list, pso_a);
+            for (int i = 0; i < 4; i++)
+            {
+                quads(p.list, 375, 0.06f, f);
+                p.list->ExecuteIndirect(sig, 100, res_c, 0, nullptr, 0);
+            }
             for (int i = 0; i < 4; i++) barrier(p.list, mrt[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             auto bb = rtv(p.frame_index);
             p.list->OMSetRenderTargets(1, &bb, FALSE, nullptr);
@@ -3688,6 +3775,20 @@ static std::vector<Scene> engine_scenes()
             p.list->SetPipelineState(pso_a);
             for (UINT i = 0; i < 20; i++)
                 p.list->ExecuteIndirect(sig, 1024, res_b, i * 64 * 32, res_c, 0);
+        } },
+        { "execute_indirect_dispatch_only", "20 compute ExecuteIndirects of dispatches alone: up to 1024 each, 64 counted (DXIL)", [make_cs_rs, make_dispatch_args] {
+            make_cs_rs();
+            pso_a = compute_pso_from(cs_rs, shader_code(engine_cs_hlsl, "cs_small", "cs_6_0"));
+            make_dispatch_args(1024, 64);
+            D3D12_INDIRECT_ARGUMENT_DESC a = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+            D3D12_COMMAND_SIGNATURE_DESC cs = { 32, 1, &a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&dispatch_only_sig)));
+        }, [](UINT) {
+            p.list->SetComputeRootSignature(cs_rs);
+            p.list->SetComputeRootDescriptorTable(1, srv_gpu(UAV_ENGINE));
+            p.list->SetPipelineState(pso_a);
+            for (UINT i = 0; i < 20; i++)
+                p.list->ExecuteIndirect(dispatch_only_sig, 1024, res_b, i * 64 * 32 + 16, res_c, 0);
         } },
         { "execute_indirect_dispatch_exact", "20 compute ExecuteIndirects of 64 root constants + dispatch each, no count buffer (compare execute_indirect_dispatch)", [make_cs_rs, make_dispatch_args] {
             make_cs_rs();

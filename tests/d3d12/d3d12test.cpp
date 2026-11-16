@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <vector>
 #include <algorithm>
+// ID3D12GraphicsCommandListMetalFX, which this lane's NGX core uses for DLSS
+#include "../../sources/vkd3d-proton/include/private/vkd3d_metalfx.h"
 
 static int g_failures, g_checks;
 #define CHECK_HR(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("  %s:%d: %s = 0x%08lx\n", __FILE__, __LINE__, #x, (unsigned long)hr_); return false; } } while (0)
@@ -14493,6 +14495,391 @@ float4 ps() : SV_Target { return color * tex.Load(int3(0, 0, 0)) * sb[0]; }
     return true;
 }
 
+
+// MetalFX temporal upscaling through ID3D12GraphicsCommandListMetalFX, as the NGX core runs DLSS Super Resolution:
+// TemporalUpscale, then TemporalUpscale1 (ID3D12GraphicsCommandListMetalFX1) with a reactive mask, jittered motion
+// vectors and regions that start inside their textures. The inputs are flat, so the output is the color's color.
+// MetalFX makes its scaler on a thread of its own, so the first frames may write nothing.
+static bool test_metalfx_temporal()
+{
+    ID3D12GraphicsCommandListMetalFX *metalfx = nullptr, *metalfx1 = nullptr;
+    if (FAILED(g.list->QueryInterface(IID_ID3D12GraphicsCommandListMetalFX, (void **)&metalfx)))
+    {
+        printf("  skipped: no ID3D12GraphicsCommandListMetalFX\n");
+        return true;
+    }
+    if (!metalfx->lpVtbl->SupportsTemporalUpscale(metalfx))
+    {
+        printf("  skipped: no MetalFX temporal upscaling\n");
+        metalfx->lpVtbl->Release(metalfx);
+        return true;
+    }
+    EXPECT(SUCCEEDED(g.list->QueryInterface(IID_ID3D12GraphicsCommandListMetalFX1, (void **)&metalfx1)),
+           "QueryInterface(IID_ID3D12GraphicsCommandListMetalFX1) failed");
+
+    const UINT in = 80, content = 64, base = 8, out = 128;
+    auto texture = [](DXGI_FORMAT format, UINT size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                      const D3D12_CLEAR_VALUE *clear) {
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = rd.Height = size;
+        rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.Format = format;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = flags;
+        ID3D12Resource *r = nullptr;
+        g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r));
+        return r;
+    };
+    const float color_value[4] = { 0.25f, 0.5f, 0.75f, 1.0f }, zero[4] = {}, half[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+    D3D12_CLEAR_VALUE color_clear = { DXGI_FORMAT_R16G16B16A16_FLOAT }, depth_clear = { DXGI_FORMAT_D32_FLOAT };
+    memcpy(color_clear.Color, color_value, sizeof(color_value));
+    depth_clear.DepthStencil.Depth = 1.0f;
+    const D3D12_RESOURCE_FLAGS rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *color = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, &color_clear);
+    ID3D12Resource *depth = texture(DXGI_FORMAT_D32_FLOAT, in, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                                    D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear);
+    ID3D12Resource *motion = texture(DXGI_FORMAT_R16G16_FLOAT, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    ID3D12Resource *reactive = texture(DXGI_FORMAT_R8_UNORM, in, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    ID3D12Resource *output[2];
+    for (auto &o : output)
+        o = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, out, rt | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    if (!color || !depth || !motion || !reactive || !output[0] || !output[1])
+    {
+        printf("  texture creation failed\n");
+        return false;
+    }
+
+    ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5 };
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap)));
+    UINT rtv_size = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ID3D12Resource *targets[] = { color, motion, reactive, output[0], output[1] };
+    const float *values[] = { color_value, zero, half, zero, zero };
+    for (UINT i = 0; i < 5; i++)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * rtv_size;
+        g.device->CreateRenderTargetView(targets[i], nullptr, h);
+        g.list->ClearRenderTargetView(h, values[i], 0, nullptr);
+    }
+    g.device->CreateDepthStencilView(depth, nullptr, dsv_heap->GetCPUDescriptorHandleForHeapStart());
+    g.list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    for (ID3D12Resource *r : { color, motion, reactive })
+        transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    for (auto &o : output)
+        transition(o, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!execute_and_wait())
+        return false;
+
+    D3D12_RESOURCE_DESC od = output[0]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows;
+    UINT64 row_size, total;
+    g.device->GetCopyableFootprints(&od, 0, 1, 0, &fp, &rows, &row_size, &total);
+    ID3D12Resource *readback = create_buffer(total, D3D12_HEAP_TYPE_READBACK);
+
+    ID3D12MetalFXScaler *scalers[2] = {};
+    bool done[2] = {};
+    for (int frame = 0; frame < 80 && !(done[0] && done[1]); frame++)
+    {
+        VKD3D_METALFX_TEMPORAL_DESC desc = {};
+        desc.Color = color;
+        desc.Depth = depth;
+        desc.MotionVector = motion;
+        desc.MotionVectorScaleX = desc.MotionVectorScaleY = 1.0f;
+        desc.PreExposure = 1.0f;
+        desc.InReset = frame == 0;
+        desc.Output = output[0];
+        EXPECT(SUCCEEDED(metalfx->lpVtbl->TemporalUpscale(metalfx, &desc, &scalers[0])), "TemporalUpscale failed");
+        if (metalfx1)
+        {
+            VKD3D_METALFX_TEMPORAL_DESC1 desc1 = {};
+            desc1.Desc = desc;
+            desc1.Desc.Output = output[1];
+            desc1.Desc.InputContentWidth = desc1.Desc.InputContentHeight = content;
+            desc1.Desc.JitterOffsetX = 0.25f;
+            desc1.Desc.JitterOffsetY = -0.25f;
+            desc1.JitteredMotionVectors = TRUE;
+            desc1.ReactiveMask = reactive;
+            desc1.ColorOffsetX = desc1.ColorOffsetY = base;
+            desc1.DepthOffsetX = desc1.DepthOffsetY = base;
+            desc1.MotionVectorOffsetX = desc1.MotionVectorOffsetY = base;
+            desc1.ReactiveMaskOffsetX = desc1.ReactiveMaskOffsetY = base;
+            EXPECT(SUCCEEDED(metalfx1->lpVtbl->TemporalUpscale1(metalfx1, &desc1, &scalers[1])), "TemporalUpscale1 failed");
+        }
+        if (!execute_and_wait())
+            return false;
+
+        for (int i = 0; i < (metalfx1 ? 2 : 1); i++)
+        {
+            if (done[i])
+                continue;
+            transition(output[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, src = { output[i] };
+            dst.PlacedFootprint = fp;
+            src.SubresourceIndex = 0;
+            g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(output[i], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!execute_and_wait())
+                return false;
+            const uint8_t *p = nullptr;
+            D3D12_RANGE range = { 0, (SIZE_T)total };
+            readback->Map(0, &range, (void **)&p);
+            const uint16_t *texel = (const uint16_t *)(p + (out / 2) * fp.Footprint.RowPitch + (out / 2) * 8);
+            float r = typedbuffer_half(texel[0]), gr = typedbuffer_half(texel[1]), b = typedbuffer_half(texel[2]);
+            readback->Unmap(0, nullptr);
+            if (r != 0.0f || gr != 0.0f || b != 0.0f)
+            {
+                done[i] = true;
+                EXPECT(fabsf(r - 0.25f) < 0.05f && fabsf(gr - 0.5f) < 0.05f && fabsf(b - 0.75f) < 0.05f,
+                       "%s: output (%.3f, %.3f, %.3f), expected (0.25, 0.5, 0.75)", i ? "TemporalUpscale1" : "TemporalUpscale",
+                       r, gr, b);
+            }
+        }
+        if (!(done[0] && done[1]))
+            Sleep(25);
+        if (!metalfx1)
+            done[1] = true;
+    }
+    EXPECT(done[0], "TemporalUpscale wrote no output");
+    EXPECT(done[1], "TemporalUpscale1 wrote no output");
+
+    for (auto *s : scalers)
+        if (s)
+            s->lpVtbl->Destroy(s);
+    readback->Release(); rtv_heap->Release(); dsv_heap->Release();
+    for (ID3D12Resource *r : { color, depth, motion, reactive, output[0], output[1] })
+        r->Release();
+    if (metalfx1)
+        metalfx1->lpVtbl->Release(metalfx1);
+    metalfx->lpVtbl->Release(metalfx);
+    return true;
+}
+
+// 100 command lists recorded and closed before any is executed, as engines record a frame's (or a loading screen's)
+// lists on many threads and submit them together: each copies its own value, all of which must arrive.
+static bool test_many_recorded_lists()
+{
+    const UINT N = 100;
+    ID3D12Resource *src = create_buffer(N * 4, D3D12_HEAP_TYPE_UPLOAD);
+    uint32_t *u = nullptr;
+    src->Map(0, nullptr, (void **)&u);
+    for (UINT i = 0; i < N; i++)
+        u[i] = 0x1000 + i;
+    src->Unmap(0, nullptr);
+    ID3D12Resource *dst = create_buffer(N * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12CommandAllocator *alloc[N] = {};
+    ID3D12GraphicsCommandList *lists[N] = {};
+    for (UINT i = 0; i < N; i++)
+    {
+        CHECK_HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[i])));
+        CHECK_HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[i], nullptr, IID_PPV_ARGS(&lists[i])));
+        lists[i]->CopyBufferRegion(dst, i * 4, src, i * 4, 4);
+        CHECK_HR(lists[i]->Close());
+    }
+    g.queue->ExecuteCommandLists(N, (ID3D12CommandList *const *)lists);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(dst, D3D12_RESOURCE_STATE_COPY_DEST, N * 4, &rb);
+    if (!r)
+        return false;
+    UINT wrong = 0;
+    for (UINT i = 0; i < N; i++)
+        wrong += r[i] != 0x1000 + i;
+    EXPECT(!wrong, "%u of %u lists' copies missing", wrong, N);
+    rb->Release();
+    for (UINT i = 0; i < N; i++) { lists[i]->Release(); alloc[i]->Release(); }
+    dst->Release(); src->Release();
+    return true;
+}
+
+// ExecuteIndirect of dispatches alone with a count buffer: up to 64, 23 counted, dispatch i of i + 1 groups, each of
+// which counts itself: 276 groups, where all 64 would be 2080.
+static bool test_executeindirect_count_dispatches()
+{
+    static const char *src = R"(
+RWByteAddressBuffer counter : register(u0);
+[numthreads(1, 1, 1)] void cs() { counter.InterlockedAdd(0, 1); }
+)";
+    std::vector<char> cs = compile_dxc(src, "cs", "cs_6_0");
+    if (cs.empty())
+        return false;
+    D3D12_ROOT_PARAMETER rp = {};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &rp };
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.CS = { cs.data(), cs.size() };
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
+    D3D12_INDIRECT_ARGUMENT_DESC iad = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &iad, 0 };
+    ID3D12CommandSignature *sig = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+
+    const UINT MAX = 64, COUNT = 23;
+    ID3D12Resource *args = create_buffer(4096, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    args->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 4096);
+    for (UINT i = 0; i < MAX; i++)
+    {
+        D3D12_DISPATCH_ARGUMENTS d = { i + 1, 1, 1 };
+        memcpy(u + i * sizeof(d), &d, sizeof(d));
+    }
+    memcpy(u + 2048, &COUNT, sizeof(COUNT));
+    args->Unmap(0, nullptr);
+    ID3D12Resource *out = create_buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g.list->SetComputeRootSignature(rs);
+    g.list->SetComputeRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    g.list->SetPipelineState(pso);
+    g.list->ExecuteIndirect(sig, MAX, args, 0, args, 2048);
+    ID3D12Resource *rb = nullptr;
+    const uint32_t *r = read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 256, &rb);
+    if (!r)
+        return false;
+    EXPECT(r[0] == COUNT * (COUNT + 1) / 2, "%u groups ran, want %u", r[0], COUNT * (COUNT + 1) / 2);
+    rb->Release(); out->Release(); args->Release(); sig->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
+// ExecuteIndirect of draws alone with a count buffer, as GPU-driven renderers make it: up to 32 draws, fewer counted,
+// each drawing one column of a 32x2 target from the vertices at its start vertex (row 0) or start index (row 1).
+static bool test_executeindirect_count_draws()
+{
+    static const char *src = R"(
+float4 vs(float2 pos : POSITION) : SV_Position { return float4(pos, 0, 1); }
+float4 ps() : SV_Target { return float4(1, 1, 1, 1); }
+)";
+    std::vector<char> vs = compile_dxc(src, "vs", "vs_6_0"), ps = compile_dxc(src, "ps", "ps_6_0");
+    if (vs.empty() || ps.empty())
+        return false;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ID3D12RootSignature *rs = create_root_signature(rsd);
+    D3D12_INPUT_ELEMENT_DESC ie = { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { vs.data(), vs.size() };
+    pd.PS = { ps.data(), ps.size() };
+    pd.InputLayout = { &ie, 1 };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = ~0u;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    CHECK_HR(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+
+    D3D12_INDIRECT_ARGUMENT_DESC draw = {}, draw_indexed = {};
+    draw.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    draw_indexed.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    D3D12_COMMAND_SIGNATURE_DESC csd = { sizeof(D3D12_DRAW_ARGUMENTS), 1, &draw, 0 };
+    D3D12_COMMAND_SIGNATURE_DESC csdi = { sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), 1, &draw_indexed, 0 };
+    ID3D12CommandSignature *sig = nullptr, *sigi = nullptr;
+    CHECK_HR(g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)));
+    CHECK_HR(g.device->CreateCommandSignature(&csdi, nullptr, IID_PPV_ARGS(&sigi)));
+
+    const UINT W = 32, H = 2, MAX = 32, COUNT0 = 20, COUNT1 = 13;
+    ID3D12Resource *buf = create_buffer(8192, D3D12_HEAP_TYPE_UPLOAD);
+    uint8_t *u = nullptr;
+    buf->Map(0, nullptr, (void **)&u);
+    memset(u, 0, 8192);
+    uint32_t indices[6 * 32];
+    for (UINT i = 0; i < MAX; i++)
+    {
+        // Six vertex IDs from 6 * i: the start vertex, or the indices from the start index.
+        D3D12_DRAW_ARGUMENTS d = { 6, 1, 6 * i, 0 };
+        memcpy(u + i * sizeof(d), &d, sizeof(d));
+        D3D12_DRAW_INDEXED_ARGUMENTS di = { 6, 1, 6 * i, 0, 0 };
+        memcpy(u + 1024 + i * sizeof(di), &di, sizeof(di));
+        // Column i's quad: corners 0, 1, 2 and 0, 2, 3.
+        float x0 = -1.0f + i / 16.0f, x1 = x0 + 1.0f / 16.0f;
+        const float corner[4][2] = { { x0, -1 }, { x1, -1 }, { x1, 1 }, { x0, 1 } };
+        const UINT order[6] = { 0, 1, 2, 0, 2, 3 };
+        for (UINT c = 0; c < 6; c++)
+        {
+            indices[6 * i + c] = 6 * i + c;
+            memcpy(u + 4096 + (6 * i + c) * 8, corner[order[c]], 8);
+        }
+    }
+    memcpy(u + 2048, indices, sizeof(indices));
+    const uint32_t counts[2] = { COUNT0, COUNT1 };
+    memcpy(u + 3072, &counts[0], 4);
+    memcpy(u + 3328, &counts[1], 4);
+    static_assert(2048 + sizeof(indices) <= 3072, "indices before the counts");
+    buf->Unmap(0, nullptr);
+    D3D12_GPU_VIRTUAL_ADDRESS va = buf->GetGPUVirtualAddress();
+
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = W; td.Height = H; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *rt = nullptr;
+    CHECK_HR(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt)));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    CHECK_HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateRenderTargetView(rt, nullptr, rtv);
+    float clear[4] = { 0, 0, 0, 1 };
+    g.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+    g.list->RSSetViewports(1, &vp);
+    g.list->SetGraphicsRootSignature(rs);
+    g.list->SetPipelineState(pso);
+    g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_INDEX_BUFFER_VIEW ibv = { va + 2048, sizeof(indices), DXGI_FORMAT_R32_UINT };
+    g.list->IASetIndexBuffer(&ibv);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { va + 4096, 6 * 32 * 8, 8 };
+    g.list->IASetVertexBuffers(0, 1, &vbv);
+    D3D12_RECT row0 = { 0, 0, (LONG)W, 1 }, row1 = { 0, 1, (LONG)W, 2 };
+    g.list->RSSetScissorRects(1, &row0);
+    g.list->ExecuteIndirect(sig, MAX, buf, 0, buf, 3072);
+    g.list->RSSetScissorRects(1, &row1);
+    g.list->ExecuteIndirect(sigi, MAX, buf, 1024, buf, 3328);
+
+    ID3D12Resource *rb = create_buffer(256 * H, D3D12_HEAP_TYPE_READBACK);
+    transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, srcl = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+    srcl.pResource = rt;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+    if (!execute_and_wait())
+        return false;
+    const uint32_t *px = nullptr;
+    D3D12_RANGE r = { 0, 256 * H };
+    rb->Map(0, &r, (void **)&px);
+    for (UINT y = 0; y < H; y++)
+        for (UINT x = 0; x < W; x++)
+        {
+            uint32_t want = x < (y ? COUNT1 : COUNT0) ? 0xffffffff : 0xff000000;
+            EXPECT(px[y * 64 + x] == want, "%s draw %u: pixel (%u, %u) 0x%08x, want 0x%08x",
+                   y ? "indexed" : "non-indexed", x, x, y, px[y * 64 + x], want);
+        }
+    rb->Unmap(0, nullptr);
+    rb->Release(); rtv_heap->Release(); rt->Release(); buf->Release(); sigi->Release(); sig->Release(); pso->Release(); rs->Release();
+    return true;
+}
+
 // View instancing (tier 2): two views, mapped to slices 1 and 0 of a render target array, through a vertex shader,
 // a geometry shader, tessellation and a mesh shader. Each pre-rasterization stage adds a multiple of SV_ViewID to
 // red (1x, then 2x and 4x by the next stages), the pixel shader writes its own view to green.
@@ -15386,6 +15773,10 @@ static const Test tests[] = {
     { "wave_ops_compute", test_wave_ops_compute },
     { "inputlayout", test_inputlayout },
     { "executeindirect_buffers", test_executeindirect_buffers },
+    { "executeindirect_count_draws", test_executeindirect_count_draws },
+    { "many_recorded_lists", test_many_recorded_lists },
+    { "metalfx_temporal", test_metalfx_temporal },
+    { "executeindirect_count_dispatches", test_executeindirect_count_dispatches },
     { "executeindirect_template_first", test_executeindirect_template_first },
     { "vs_uav_no_attachments", test_vs_uav_no_attachments },
     { "uav_global_barrier_deferred", test_uav_global_barrier_deferred },
