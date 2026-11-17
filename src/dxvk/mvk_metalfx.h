@@ -30,6 +30,7 @@ extern "C" {
 #define VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK ((VkStructureType)1000999100)
 #define VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK ((VkStructureType)1000999101)
 #define VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK ((VkStructureType)1000999102)
+#define VK_STRUCTURE_TYPE_METALFX_CONTENT_OFFSETS_MVK ((VkStructureType)1000999103)
 
 #define VK_MVK_METALFX_DRIVER_INFO "metalfx"
 #define VK_MVK_METALFX_DENOISED_DRIVER_INFO "metalfx-denoised"
@@ -60,6 +61,9 @@ typedef enum VkMetalFXImageMVK {
 	/* Frame interpolation: color, depth, motion, output and, optionally, the UI (color and alpha) in the denoised
 	 * diffuse albedo's place. Depth and motion are at the render size, the others at the swapchain's. */
 	VK_METALFX_IMAGE_UI_MVK = VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK,
+	/* Temporal: the reactive mask (optional, one channel, 1 favoring the current frame: DLSS's
+	 * Bias.Current.Color.Mask), in the denoised diffuse albedo's place. A MoltenVK before it ignores it. */
+	VK_METALFX_IMAGE_REACTIVE_MVK = VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK,
 } VkMetalFXImageMVK;
 
 typedef enum VkMetalFXScaleFlagBitsMVK {
@@ -68,6 +72,9 @@ typedef enum VkMetalFXScaleFlagBitsMVK {
 	VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK = 0x4,
 	/* The motion vectors are at the output resolution (DLSS without MV_LOWRES): they are brought to the input's. */
 	VK_METALFX_SCALE_MOTION_DISPLAY_RES_BIT_MVK = 0x8,
+	/* Temporal: the motion vectors include the camera jitter (DLSS's MVJittered), which MetalFX takes out with the
+	 * jitter offset where it can (macOS 27). */
+	VK_METALFX_SCALE_JITTERED_MOTION_BIT_MVK = 0x10,
 } VkMetalFXScaleFlagBitsMVK;
 
 /*
@@ -113,6 +120,15 @@ typedef struct VkMetalFXFrameInterpolationInfoMVK {
 	float aspectRatio;
 	uint32_t uiComposited;					/* the UI image's contents are in the color image too */
 } VkMetalFXFrameInterpolationInfoMVK;
+
+/* Temporal: where each image's region starts, in pixels (DLSS's subrect bases), in the pNext chain of its
+ * VkMetalFXScaleInfoMVK; MetalFX reads the regions in place where it can (macOS 27). */
+typedef struct VkMetalFXContentOffsetsMVK {
+	VkStructureType sType;
+	const void* pNext;
+	uint32_t offsetX[VK_METALFX_IMAGE_COUNT_MVK];	/* by VkMetalFXImageMVK: color, depth, motion, output, reactive */
+	uint32_t offsetY[VK_METALFX_IMAGE_COUNT_MVK];
+} VkMetalFXContentOffsetsMVK;
 
 /* MetalFX spatial upscaling at present, to the surface's native size, where that is larger than the images' */
 typedef struct VkSwapchainMetalFXSpatialCreateInfoMVK {
