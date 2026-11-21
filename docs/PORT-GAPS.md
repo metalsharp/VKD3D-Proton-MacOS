@@ -109,6 +109,7 @@ branch's DLLs as its lane, 2026-11-21:
 
 The loader only loads builtins that have a file in the prefix, so `ddraw_.dll` must ship in `lib/wine/<arch>` for
 wineboot to install. Because that file's export name is `ddraw.dll`, the loader also has to keep it away from the
-lane (`is_d7vk_proxy_file()`); without that, d7vk loads itself as its proxy and overflows the stack. Still open: the
-MetalSharp app sends `dxvk_32` to Mullion on the FEX build (`ms_wine_route_pipeline`), and
-`HKCU\Software\Wine\Direct3D\renderer=gdi` with d7vk is untested.
+lane (`is_d7vk_proxy_file()`); without that, d7vk loads itself as its proxy and overflows the stack. On the FEX build the
+MetalSharp app already sends 32-bit DXVK games (`dxvk_32`, through `d3d9`) to `GRAPHICS_BACKEND=dxvk`, which the old
+loader turned back into Mullion for i386 programs; MetalSharp's `feat/d7vk-ddraw` also maps a bare `dxvk_32` to
+`dxvk`. Still open: `HKCU\Software\Wine\Direct3D\renderer=gdi` with d7vk is untested.
