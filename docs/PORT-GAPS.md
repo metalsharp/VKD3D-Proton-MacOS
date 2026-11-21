@@ -92,4 +92,23 @@ presenting to the same window.
 |---|---|
 | ARM64X | **Done**: d7vk's SSE2 vertex processing took ARM64EC for x86 (`ddraw_include.h`); it now uses the scalar path there |
 | d3d9.dll beside ddraw.dll | **Done**: D3D9 is one static library, linked by both; each DLL has its own logger |
-| MetalSharp Wine routing | **Open**: its loader gives DXVK's DLLs to x86_64 programs only, and not `ddraw.dll`. 32-bit games, nearly all of them, need `ddraw.dll` and `ddraw_.dll` deployed or routed |
+| MetalSharp Wine routing | **Done on branches, not released**: with `GRAPHICS_BACKEND=dxvk` alone (no copied DLLs, no overrides), both Wines' loaders give i386 and x86_64 programs the lane's `ddraw.dll`, and `ddraw_.dll` is Wine's own. MetalSharp Wine (arm64): `source/wine` `wine/d7vk-ddraw` (also D3D8/9 for i386 programs) and `feat/d7vk-ddraw` (`stage-dxvk.sh`, `build-dxvk-macos.sh`). MetalSharp Wine x86_64: `source/wine-x86_64` `feat/d7vk-ddraw`. MetalSharp: `feat/d7vk-ddraw` (`build-wine-x86_64-app.sh`) |
+
+`tools/smoke/ddraw_run.sh ... routed`, with each Wine's patched `ntdll.so` in a copy of its installed app and this
+branch's DLLs as its lane, 2026-11-21:
+
+| Wine | Program | `routed` (`GRAPHICS_BACKEND=dxvk`) | `default` |
+|---|---|---|---|
+| MetalSharp Wine (arm64, FEX) | i386 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine (arm64, FEX) | x86_64 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine x86_64 | i386 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine x86_64 | x86_64 | 8/8, d7vk | 8/8, Wine's ddraw |
+
+`GRAPHICS_BACKEND=wine` keeps Wine's ddraw too. On MetalSharp Wine, `d3d9_draw.c` as an i386 program with only
+`GRAPHICS_BACKEND=dxvk` passes 8/8 on this branch's i386 D3D9.
+
+The loader only loads builtins that have a file in the prefix, so `ddraw_.dll` must ship in `lib/wine/<arch>` for
+wineboot to install. Because that file's export name is `ddraw.dll`, the loader also has to keep it away from the
+lane (`is_d7vk_proxy_file()`); without that, d7vk loads itself as its proxy and overflows the stack. Still open: the
+MetalSharp app sends `dxvk_32` to Mullion on the FEX build (`ms_wine_route_pipeline`), and
+`HKCU\Software\Wine\Direct3D\renderer=gdi` with d7vk is untested.
