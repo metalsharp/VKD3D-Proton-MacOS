@@ -523,7 +523,7 @@ namespace dxvk {
       return D3DVECTOR{0.0f, 0.0f, 0.0f};
     }
 
-    const float inv_mag = 1.0f / std::sqrtf(dot);
+    const float inv_mag = 1.0f / std::sqrt(dot);
 
     return D3DVECTOR{v.x * inv_mag, v.y * inv_mag, v.z * inv_mag};
   }
@@ -677,7 +677,7 @@ namespace dxvk {
   inline void ApplyFog(
         float* specularAlpha, D3DFOGMODE vertexMode, float density,
         float start, float end, bool useRange, const D3DVECTOR& position) {
-    const float coord = useRange ? std::sqrtf(D3DVec3Dot(&position, &position)) : fabsf(position.z);
+    const float coord = useRange ? std::sqrt(D3DVec3Dot(&position, &position)) : fabsf(position.z);
 
     switch (vertexMode) {
       // (end - coord) / (end - start)
@@ -1054,7 +1054,7 @@ namespace dxvk {
               hitDirection = D3DVECTOR{light.LightPosition.x - WVPosition.x, light.LightPosition.y - WVPosition.y,
                                        light.LightPosition.z - WVPosition.z};
               Vector4 destination(1.0f, 0.0f, D3DVec3Dot(&hitDirection, &hitDirection), 0.0f);
-              destination.y = std::sqrtf(destination.z);
+              destination.y = std::sqrt(destination.z);
               if (pvData->isLegacy) {
                 destination.y = (light.Range - destination.y) / light.Range;
                 if (destination.y <= 0.0f)
