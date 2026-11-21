@@ -10,7 +10,6 @@
 #include "dxvk_hang.h"
 #include "dxvk_image.h"
 #include "dxvk_instance.h"
-#include "dxvk_latency.h"
 #include "dxvk_memory.h"
 #include "dxvk_meta_clear.h"
 #include "dxvk_objects.h"
@@ -297,6 +296,14 @@ namespace dxvk {
      * \returns \c true if sample locations are supported for any of the given sample counts
      */
     bool canUseSampleLocations(VkSampleCountFlags samples) const;
+
+    /**
+     * \brief Checks whether to use mixed sample counts for the pipeline
+     *
+     * \param [in] shader Fragment shader
+     * \returns \c true if rasterizer and render target sample counts may mismatch
+     */
+    bool canUseMixedSamples(const Rc<DxvkShader>& shader) const;
 
     /**
      * \brief Checks whether pipelines should be tracked
@@ -632,35 +639,23 @@ namespace dxvk {
       const Rc<DxvkShader>&         shader);
 
     /**
-     * \brief Creates latency tracker for a presenter
-     *
-     * The specicfic implementation and parameters used
-     * depend on user configuration.
-     * \param [in] presenter Presenter instance
-     */
-    Rc<DxvkLatencyTracker> createLatencyTracker(
-      const Rc<Presenter>&            presenter);
-
-    /**
      * \brief Presents a swap chain image
      * 
      * Invokes the presenter's \c presentImage method on
      * the submission thread. The status of this operation
      * can be retrieved with \ref waitForSubmission.
      * \param [in] presenter The presenter
-     * \param [in] tracker Latency tracker
      * \param [in] frameId Frame ID
+     * \param [in] latencyFrameId App-provided Reflex frame ID
      * \param [in] rectCount Number of dirty rectangles,
      * \param [in] rects Dirty rectangles
-     * \param [out] status Present status
      */
     void presentImage(
       const Rc<Presenter>&            presenter,
-      const Rc<DxvkLatencyTracker>&   tracker,
             uint64_t                  frameId,
+            uint64_t                  latencyFrameId,
             uint32_t                  rectCount,
-      const VkRectLayerKHR*           rects,
-            DxvkSubmitStatus*         status);
+      const VkRectLayerKHR*           rects);
     
     /**
      * \brief Submits a command list
@@ -668,15 +663,17 @@ namespace dxvk {
      * Submits the given command list to the device using
      * the given set of optional synchronization primitives.
      * \param [in] commandList The command list to submit
-     * \param [in] tracker Latency tracker
-     * \param [in] frameId Frame ID
-     * \param [out] status Submission feedback
+     * \param [in] submissionId Submission timeline
      */
     void submitCommandList(
       const Rc<DxvkCommandList>&      commandList,
-      const Rc<DxvkLatencyTracker>&   tracker,
-            uint64_t                  frameId,
-            DxvkSubmitStatus*         status);
+            uint64_t                  submissionId);
+
+    /**
+     * \brief Sets queue submission timeout
+     * \param [in] timeout Timeout, in nanoseconds
+     */
+    void setSubmissionTimeout(uint64_t timeout);
 
     /**
      * \brief Locks submission queue
@@ -712,12 +709,10 @@ namespace dxvk {
     }
 
     /**
-     * \brief Waits for a given submission
-     * 
-     * \param [in,out] status Submission status
-     * \returns Result of the submission
+     * \brief Waits for a given submission to be sent to the GPU
+     * \param [in] submission Submission timeline to wait for
      */
-    VkResult waitForSubmission(DxvkSubmitStatus* status);
+    void waitForSubmission(uint64_t submissionId);
 
     /**
      * \brief Waits for a fence to become signaled
@@ -772,7 +767,7 @@ namespace dxvk {
     sync::Spinlock              m_statLock;
     DxvkStatCounters            m_statCounters;
 
-    DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
+    DxvkRecycler<DxvkCommandList, MaxNumQueuedCommandBuffers> m_recycledCommandLists;
 
     DxvkSubmissionQueue         m_submissionQueue;
 

@@ -126,6 +126,9 @@ namespace dxvk {
 
       m_condOnAdd.notify_one();
     }
+
+    if (seq >= MaxQueuedCsChunks)
+      synchronize(seq - MaxQueuedCsChunks);
     
     return seq;
   }
@@ -257,7 +260,7 @@ namespace dxvk {
             auto& counter = isHighPrio ? m_seqHighPrio : m_seqOrdered;
             counter.store(entry.seq);
 
-            m_condOnSync.notify_one();
+            m_condOnSync.notify_all();
           }
 
           // Immediately free the chunk to release

@@ -6,7 +6,11 @@
 
 enum class DxvkD3DCompatibility : uint8_t {
   D3D9Ex,
-  D3D8
+  D3D8,
+  D3D7,
+  D3D6,
+  D3D5,
+  D3D3
 };
 
 /**
@@ -29,18 +33,20 @@ IDxvkLegacyD3DDeviceBridge : public IUnknown {
   #endif
 
   /**
-   * \brief Updates a D3D9 surface from a D3D9 buffer
+   * \brief D3D8 CopyRects implementation
    *
-   * \param [in] pDestSurface Destination surface (typically in VRAM)
-   * \param [in] pSrcSurface  Source surface (typically in system memory)
-   * \param [in] pSrcRect     Source rectangle
-   * \param [in] pDestPoint   Destination (top-left) point
+   * \param [in] pSourceSurface Source D3D9 surface
+   * \param [in] pSourceRectsArray Source RECTs array (can be NULL)
+   * \param [in] cRects Number of RECTs
+   * \param [in] pDestinationSurface Destination D3D9 surface
+   * \param [in] pDestPointsArray Destination POINTs array (can be NULL)
    */
-  virtual HRESULT UpdateTextureFromBuffer(
-      IDirect3DSurface9*        pDestSurface,
-      IDirect3DSurface9*        pSrcSurface,
-      const RECT*               pSrcRect,
-      const POINT*              pDestPoint) = 0;
+  virtual HRESULT CopyRects(
+        IDirect3DSurface9*  pSourceSurface,
+  const RECT*               pSourceRectsArray,
+        UINT                cRects,
+        IDirect3DSurface9*  pDestinationSurface,
+  const POINT*              pDestPointsArray) = 0;
 
   /**
    * \brief Checks if a particular surface format is supported by D3D9
@@ -48,6 +54,54 @@ IDxvkLegacyD3DDeviceBridge : public IUnknown {
    * \param [in] Format D3DFORMAT value to be checked
    */
   virtual bool IsSupportedSurfaceFormat(D3DFORMAT Format) = 0;
+
+  /**
+   * \brief Determines the initial amount of texture memory for a device
+   */
+  virtual uint32_t DetermineInitialTextureMemory() = 0;
+
+  /**
+   * \brief Updates the D3D9 presentation interval of the implicit swapchain
+   *
+   * \param [in] presentInterval D3DPRESENT value to be used
+   */
+  virtual void UpdatePresentInterval(uint32_t presentInterval) = 0;
+
+  /**
+   * \brief Updates the D3D9 window size before a DDraw flip
+   */
+  virtual void UpdateFullScreenWindowSize() = 0;
+
+  /**
+   * \brief Updates the color key transparency state in D3D9
+   *
+   * \param [in] stage DWORD texture stage to be used
+   * \param [in] colorKeyState bool value to be used
+   */
+  virtual void SetColorKeyState(DWORD stage, bool colorKeyState) = 0;
+
+  /**
+   * \brief Updates the color key transparency value in D3D9
+   *
+   * \param [in] stage DWORD texture stage to be used
+   * \param [in] colorKeyLow DWORD low color key range boundary
+   * \param [in] colorKeyHigh DWORR high color key range boundary
+   */
+  virtual void SetColorKey(DWORD stage, DWORD colorKeyLow, DWORD colorKeyHigh) = 0;
+
+  /**
+   * \brief Updates the legacy light state in D3D9
+   *
+   * \param [in] legacyLightsState bool value to be used
+   */
+  virtual void SetLegacyLightsState(bool legacyLightsState) = 0;
+
+  /**
+   * \brief Updates the alternate pixel center state in D3D9
+   *
+   * \param [in] alternatePixelCenter bool value to be used
+   */
+  virtual void SetAlternatePixelCenter(bool alternatePixelCenter) = 0;
 };
 
 /**
@@ -63,6 +117,13 @@ IDxvkLegacyD3DInterfaceBridge : public IUnknown {
   virtual void SetD3DCompatibility(DxvkD3DCompatibility d3dCompatibility) const = 0;
 
   /**
+   * \brief Test the current compatibilty level of the D3D9 interface
+   *
+   * \param [in] d3dCompatibility D3D compatibility level to be tested
+   */
+  virtual bool IsD3DCompatible(DxvkD3DCompatibility d3dCompatibility) const = 0;
+
+  /**
    * \brief Retrieves the DXVK configuration
    *
    * \returns The DXVK Config object
@@ -75,6 +136,9 @@ __CRT_UUID_DECL(IDxvkLegacyD3DDeviceBridge,    0xD3D0D3D9, 0x42A9, 0x4C1E, 0xAA,
 __CRT_UUID_DECL(IDxvkLegacyD3DInterfaceBridge, 0xD3D0D3D9, 0xA407, 0x773E, 0x18, 0xE9, 0xCA, 0xFE, 0xBE, 0xEF, 0x30, 0x00);
 #endif
 
+struct VkExtent3D;
+struct VkOffset3D;
+
 namespace dxvk {
 
   using D3DCompatibility = DxvkD3DCompatibility;
@@ -82,6 +146,9 @@ namespace dxvk {
 
   class D3D9DeviceEx;
   class D3D9InterfaceEx;
+  class D3D9CommonTexture;
+
+  struct DxvkFormatInfo;
 
   class DxvkLegacyD3DDeviceBridge : public IDxvkLegacyD3DDeviceBridge {
 
@@ -97,15 +164,50 @@ namespace dxvk {
             REFIID  riid,
             void** ppvObject);
 
-    HRESULT UpdateTextureFromBuffer(
-        IDirect3DSurface9*        pDestSurface,
-        IDirect3DSurface9*        pSrcSurface,
-        const RECT*               pSrcRect,
-        const POINT*              pDestPoint);
-
     bool IsSupportedSurfaceFormat(D3DFORMAT Format);
 
+    HRESULT CopyRects(
+          IDirect3DSurface9*  pSourceSurface,
+    const RECT*               pSourceRectsArray,
+          UINT                cRects,
+          IDirect3DSurface9*  pDestinationSurface,
+    const POINT*              pDestPointsArray);
+
+    uint32_t DetermineInitialTextureMemory();
+
+    void UpdatePresentInterval(uint32_t presentInterval);
+
+    void UpdateFullScreenWindowSize();
+
+    void SetColorKeyState(DWORD stage, bool colorKeyState);
+
+    void SetColorKey(DWORD stage, DWORD colorKeyLow, DWORD colorKeyHigh);
+
+    void SetLegacyLightsState(bool legacyLightsState);
+
+    void SetAlternatePixelCenter(bool alternatePixelCenter);
+
   private:
+
+    void CopyRectImageToImage(
+      const D3D9CommonTexture* srcTex, D3D9CommonTexture* dstTex,
+      uint32_t SrcSubresource, uint32_t DstSubresource,
+      VkOffset3D SrcOffset, VkOffset3D DstOffset, VkExtent3D Extent
+    );
+
+    void CopyRectImageToBuffer(
+      const D3D9CommonTexture* srcTex, D3D9CommonTexture* dstTex,
+      uint32_t SrcSubresource, uint32_t DstSubresource,
+      VkOffset3D SrcOffset, uint32_t DstOffset, uint32_t DstPitch,
+      VkExtent3D Extent, const DxvkFormatInfo* FormatInfo
+    );
+
+    void CopyRectBufferToBuffer(
+      D3D9CommonTexture* srcTex, D3D9CommonTexture* dstTex,
+      uint32_t SrcSubresource, uint32_t DstSubresource,
+      uint32_t SrcOffset, uint32_t DstOffset, uint32_t SrcPitch, uint32_t DstPitch,
+      VkExtent3D BlockCount, const DxvkFormatInfo* FormatInfo
+    );
 
     D3D9DeviceEx* m_device;
 
@@ -126,6 +228,8 @@ namespace dxvk {
             void** ppvObject);
 
     void SetD3DCompatibility(D3DCompatibility d3dCompatibility) const;
+
+    bool IsD3DCompatible(D3DCompatibility d3dCompatibility) const;
 
     const Config* GetConfig() const;
 

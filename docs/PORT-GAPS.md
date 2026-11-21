@@ -64,3 +64,32 @@ VKD3D-Proton's `test_draw_instanced`, `test_clear_render_target_view`, `test_fra
 | App profiles | LEGO and KSP2 from 1.10.3 |
 | Stream-output `S_OK` fallback | 1.10.3 `ce15afaa`. Only for a MoltenVK without transform feedback |
 | Docs | README's `../patches` path (CI uses `../../patches`), its `dxvk.conf` claim, and the state cache mentioned in `PHASE2-REPORT.md` |
+
+## Direct3D 7, 6, 5 and 3 (d7vk `ddraw.dll`)
+
+*2026-11-21. d7vk `devel` at `9fb6a2d50`, merged with upstream master `0f5c295c`. Apple M6, MoltenVK 0.2.2211.*
+
+`tools/smoke/ddraw_draw.c` draws into offscreen DirectDraw 3D surfaces and reads them back: a D3D7 clear, D3D7
+pre-transformed draws, an R5G6B5 render target, a locked 16-bit Z buffer, source color keying, and a D3D6, D3D5
+and D3D3 (execute buffer) draw. Every check passes on Wine's own ddraw and on d7vk's, which loads, uses MoltenVK
+and logs no errors:
+
+| Wine | Program | `ddraw.dll` | Result |
+|---|---|---|---|
+| MetalSharp Wine (arm64, FEX) | i386 | i386 | 8/8 |
+| MetalSharp Wine (arm64, FEX) | x86_64 | ARM64X | 8/8 |
+| MetalSharp Wine x86_64 | i386 | i386 | 8/8 |
+| MetalSharp Wine x86_64 | x86_64 | x86_64 | 8/8 |
+
+`tools/smoke/d3d9_draw.c` passes 8/8 on the same three D3D9 builds, and `d3d11_draw.c` gives the results above
+(`stream_output` still fails).
+
+No MoltenVK change was needed. Still to check in games: rendering to A4R4G4B4 (a swizzled format in MoltenVK),
+D24 depth read back from its D32 fallback, multisampled surface locks, and wined3d (Wine's ddraw) and DXVK
+presenting to the same window.
+
+| Item | Status |
+|---|---|
+| ARM64X | **Done**: d7vk's SSE2 vertex processing took ARM64EC for x86 (`ddraw_include.h`); it now uses the scalar path there |
+| d3d9.dll beside ddraw.dll | **Done**: D3D9 is one static library, linked by both; each DLL has its own logger |
+| MetalSharp Wine routing | **Open**: its loader gives DXVK's DLLs to x86_64 programs only, and not `ddraw.dll`. 32-bit games, nearly all of them, need `ddraw.dll` and `ddraw_.dll` deployed or routed |

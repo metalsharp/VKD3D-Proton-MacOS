@@ -8,17 +8,16 @@
 #include "../util/log/log.h"
 
 #include "../util/util_error.h"
-#include "../util/util_fps_limiter.h"
 #include "../util/util_math.h"
 #include "../util/util_string.h"
 
 #include "../util/sync/sync_signal.h"
+#include "../util/sync/sync_ticketlock.h"
 
 #include "../vulkan/vulkan_loader.h"
 
 #include "dxvk_format.h"
 #include "dxvk_image.h"
-#include "dxvk_latency.h"
 
 namespace dxvk {
 
@@ -53,17 +52,26 @@ namespace dxvk {
   };
 
   /**
+   * \brief Timing info for the last presented frame
+   */
+  struct PresenterTimingFeedback {
+    uint64_t frameId = 0u;
+    uint64_t presentTimeLocal = 0u;
+    uint64_t presentTimeHost = 0u;
+  };
+
+  /**
    * \brief Queued frame
    */
   struct PresenterFrame {
-    uint64_t                frameId       = 0u;
-    Rc<DxvkLatencyTracker>  tracker       = nullptr;
-    VkPresentModeKHR        mode          = VK_PRESENT_MODE_FIFO_KHR;
-    VkResult                result        = VK_NOT_READY;
-    uint64_t                targetTime    = 0u;
-    uint64_t                deadline      = 0u;
-    bool                    isTimed       = false;
-    bool                    doWait        = false;
+    uint64_t                frameId         = 0u;
+    VkPresentModeKHR        mode            = VK_PRESENT_MODE_FIFO_KHR;
+    VkResult                result          = VK_NOT_READY;
+    uint64_t                targetTimeHost  = 0u;
+    VkPresentStageFlagsEXT  targetStage     = 0u;
+    uint64_t                deadlineHost    = 0u;
+    uint64_t                timingDomainId  = 0u;
+    VkPresentStageFlagsEXT  stageQueries    = 0u;
   };
 
   /**
@@ -80,7 +88,6 @@ namespace dxvk {
    *
    * Used for timestamp calibration. Reference times are given in units
    * of nanoseconds, except for QPC which is given in raw QPC ticks.
-   * QPC will be unavailable in dxvk-native environments.
    */
   struct PresenterTimeDomain {
     VkTimeDomainKHR timeDomain = VK_TIME_DOMAIN_MAX_ENUM_KHR;
@@ -124,19 +131,19 @@ namespace dxvk {
     bool absoluteTiming = false;
     uint64_t timeDomainId = 0u;
     uint64_t frameIntervalNs = 0u;
-    uint64_t referenceTime = 0u;
-    uint64_t referenceFrameId = 0u;
-    uint64_t lastFrameTimeLocal = 0u;
-    uint64_t lastFrameTimeQpc = 0u;
-    uint64_t lastFrameId = 0u;
+    PresenterTimingFeedback reference = {};
+    PresenterTimingFeedback lastReport = {};
   };
 
   /**
-   * \brief Timing info for the last presented frame
+   * \brief Latency stats
+   *
+   * Used for informational purposes only.
    */
-  struct PresenterTimingFeedback {
-    uint64_t frameId = 0u;
-    uint64_t presentTime = 0u;
+  struct PresenterLatencyInfo {
+    uint64_t frameLatencyUs = 0u;
+    uint64_t sleepDurationUs = 0u;
+    uint64_t sleepCount = 0u;
   };
 
   /**
@@ -147,8 +154,7 @@ namespace dxvk {
    * window system integration.
    */
   class Presenter : public RcObject {
-    static constexpr size_t FrameQueueSize = 32u;
-    static constexpr size_t MaxFrameQueueSize = 256u;
+    static constexpr size_t FrameQueueSize = 64u;
   public:
 
     Presenter(
@@ -193,14 +199,14 @@ namespace dxvk {
      * 
      * Presents the last successfuly acquired image.
      * \param [in] frameId Frame number.
-     * \param [in] tracker Latency tracker
+     * \param [in] latencyFrameId Reflex frame ID
      * \param [in] rectCount Number of dirty rects
      * \param [in] rects Dirty rectangles
      * \returns Status of the operation
      */
     VkResult presentImage(
             uint64_t                frameId,
-      const Rc<DxvkLatencyTracker>& tracker,
+            uint64_t                latencyFrameId,
             uint32_t                rectCount,
       const VkRectLayerKHR*         rects);
 
@@ -212,11 +218,8 @@ namespace dxvk {
      * called before GPU work prior to the present submission has
      * completed in order to maintain consistency.
      * \param [in] frameId Frame ID
-     * \param [in] tracker Latency tracker
      */
-    void signalFrame(
-            uint64_t                frameId,
-      const Rc<DxvkLatencyTracker>& tracker);
+    void signalFrame(uint64_t frameId);
 
     /**
      * \brief Changes sync interval
@@ -296,7 +299,7 @@ namespace dxvk {
      * Any changes will be applied on the next acquire operation.
      * \param [in] sleepMode Latency mode info
      */
-    void setLatencySleepModeNv(
+    void setLatencySleepMode(
       const VkLatencySleepModeInfoNV& sleepMode);
 
     /**
@@ -306,9 +309,8 @@ namespace dxvk {
      * created with low latency support.
      * \param [in] frameId Frame ID
      * \param [in] marker Marker
-     * \returns CPU timestamp of the marker
      */
-    dxvk::high_resolution_clock::time_point setLatencyMarkerNv(
+    void setLatencyMarker(
             uint64_t                frameId,
             VkLatencyMarkerNV       marker);
 
@@ -317,9 +319,8 @@ namespace dxvk {
      *
      * Ignored if the current swapchain has not been
      * created with low latency support.
-     * \returns Sleep duration
      */
-    dxvk::high_resolution_clock::duration latencySleepNv();
+    void latencySleep();
 
     /**
      * \brief Queries latency timings
@@ -328,7 +329,7 @@ namespace dxvk {
      * \param [out] timings Latency timings
      * \returns Number of frame reports returned
      */
-    uint32_t getLatencyTimingsNv(
+    uint32_t getLatencyTimings(
             uint32_t                timingCount,
             VkLatencyTimingsFrameReportNV* timings);
 
@@ -341,6 +342,12 @@ namespace dxvk {
      * \returns Timing info for the last presented frame
      */
     PresenterTimingFeedback queryPresentTiming();
+
+    /**
+     * \brief Queries latency statistics
+     * \returns Latency statistics
+     */
+    PresenterLatencyInfo queryLatencyStats();
 
   private:
 
@@ -369,6 +376,9 @@ namespace dxvk {
     VkSurfaceFormatKHR          m_preferredFormat = { };
     uint32_t                    m_preferredSyncInterval = 1u;
 
+    bool                        m_calibrationWarned = false;
+    bool                        m_calibrationFailed = false;
+
     bool                        m_dirtySwapchain = false;
     bool                        m_dirtySurface = false;
 
@@ -392,8 +402,9 @@ namespace dxvk {
     std::optional<VkLatencySleepModeInfoNV> m_latencySleepMode;
     VkSemaphore                 m_latencySemaphore = VK_NULL_HANDLE;
     uint64_t                    m_latencySleepCounter = 0u;
+    uint64_t                    m_latencySleepDurationUs = 0u;
 
-    bool                        m_latencySleepModeDirty = false;
+    std::atomic<bool>           m_latencySleepModeDirty = { false };
     bool                        m_latencySleepSupported = false;
 
     alignas(CACHE_LINE_SIZE)
@@ -411,20 +422,20 @@ namespace dxvk {
     uint64_t                    m_lastCompleted = 0u;
 
     alignas(CACHE_LINE_SIZE)
-    dxvk::mutex                             m_timingMutex;
+    sync::TicketLock                        m_timingMutex;
 
     std::optional<PresenterTimeDomainInfo>  m_timingDomains;
     std::optional<PresenterDisplayInfo>     m_timingDisplayInfo;
     PresenterTimingInfo                     m_timingMode = { };
     PresenterTimingFeedback                 m_timingFeedback = {};
-    uint32_t                                m_timingQueueSize = FrameQueueSize;
 
     double                      m_frameRateLimit = 0.0;
 
-    alignas(CACHE_LINE_SIZE)
-    FpsLimiter                  m_fpsLimiter;
+    uint64_t                    m_reportQueueAddId = 0u;
+    uint64_t                    m_reportQueueTakeId = 0u;
 
     bool                        m_hasGamescopeFenceSignalBug = false;
+    bool                        m_hasNvidiaFenceSignalBug = false;
 
     static const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> s_colorSpaceFallbacks;
 
@@ -482,17 +493,24 @@ namespace dxvk {
 
     void updateTimingMode();
 
-    void recalibrateTimeDomains();
+    bool recalibrateTimeDomains();
 
-    bool updatePresentTiming(uint64_t frameId);
+    PresenterTimingFeedback updatePresentTimingFeedback(
+            uint64_t                  frameId,
+            VkPresentStageFlagsEXT    queryStages);
 
-    void commitTimingFeedback(
-      const PresenterTimingFeedback&  feedback);
+    PresenterTimingFeedback commitTimingFeedback(
+      const PresenterTimingFeedback&  feedback,
+            bool                      updateReference);
 
-    void waitUntilFrameTargetTime(
+    PresenterTimingFeedback computeFrameTargetTime(
+            uint64_t                  frameId) const;
+
+    bool waitUntilFrameTargetTime(
       const PresenterFrame&           frame);
 
-    bool hasQpcDomain();
+    bool hasTimeDomain(
+            VkTimeDomainKHR           timeDomain) const;
 
     uint64_t translateTimestamp(
             VkTimeDomainKHR           srcTimeDomain,
@@ -505,6 +523,11 @@ namespace dxvk {
 
     VkResult createLatencySemaphore();
 
+    VkResult getCalibratedTimestamps(
+            uint32_t                  timestampCount,
+      const VkCalibratedTimestampInfoKHR* pTimestampInfos,
+            uint64_t*                 pTimestamps);
+
     void destroySwapchain();
 
     void destroySurface();
@@ -515,6 +538,9 @@ namespace dxvk {
             PresenterSync&            sync);
 
     void pushFrame(const PresenterFrame& frame);
+
+    const PresenterFrame* findFrameEntry(
+            uint64_t                  frameId) const;
 
     void runFrameThread();
 

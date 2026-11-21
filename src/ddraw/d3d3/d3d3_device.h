@@ -1,0 +1,170 @@
+#pragma once
+
+#include "../ddraw_include.h"
+#include "../ddraw_child_object.h"
+#include "../ddraw_options.h"
+
+#include "../d3d_common_device.h"
+
+#include "../../util/sync/sync_scoped.h"
+
+#include "d3d3_interface.h"
+
+#include <vector>
+#include <unordered_map>
+
+namespace dxvk {
+
+  class D3DCommonTexture;
+  class DDrawCommonInterface;
+  class DDrawSurface;
+
+  using D3DMultithread = sync::ScopedDeviceLock;
+  using D3DDeviceLock  = sync::ScopedDeviceGuard;
+
+  class D3D3Device final : public DDrawChildObject<DDrawSurface, IDirect3DDevice> {
+
+  public:
+    D3D3Device(
+          D3DCommonDevice* commonD3DDevice,
+          DDrawSurface* pParent,
+          GUID deviceGUID,
+          d3d9::D3DMULTISAMPLE_TYPE multiSampeType9,
+          Com<d3d9::IDirect3DDevice9>&& pDevice9,
+          DWORD CreationFlags9);
+
+    ~D3D3Device();
+
+    ULONG STDMETHODCALLTYPE AddRef();
+
+    ULONG STDMETHODCALLTYPE Release();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject);
+
+    HRESULT STDMETHODCALLTYPE GetCaps(D3DDEVICEDESC *hal_desc, D3DDEVICEDESC *hel_desc);
+
+    HRESULT STDMETHODCALLTYPE SwapTextureHandles(IDirect3DTexture *tex1, IDirect3DTexture *tex2);
+
+    HRESULT STDMETHODCALLTYPE GetStats(D3DSTATS *stats);
+
+    HRESULT STDMETHODCALLTYPE AddViewport(IDirect3DViewport *viewport);
+
+    HRESULT STDMETHODCALLTYPE DeleteViewport(IDirect3DViewport *viewport);
+
+    HRESULT STDMETHODCALLTYPE NextViewport(IDirect3DViewport *lpDirect3DViewport, IDirect3DViewport **lplpAnotherViewport, DWORD flags);
+
+    HRESULT STDMETHODCALLTYPE EnumTextureFormats(LPD3DENUMTEXTUREFORMATSCALLBACK cb, void *ctx);
+
+    HRESULT STDMETHODCALLTYPE BeginScene();
+
+    HRESULT STDMETHODCALLTYPE EndScene();
+
+    HRESULT STDMETHODCALLTYPE GetDirect3D(IDirect3D **d3d);
+
+    HRESULT STDMETHODCALLTYPE Initialize(IDirect3D *d3d, GUID *lpGUID, D3DDEVICEDESC *desc);
+
+    HRESULT STDMETHODCALLTYPE CreateExecuteBuffer(D3DEXECUTEBUFFERDESC *desc, IDirect3DExecuteBuffer **buffer, IUnknown *pkOuter);
+
+    HRESULT STDMETHODCALLTYPE Execute(IDirect3DExecuteBuffer *buffer, IDirect3DViewport *viewport, DWORD flags);
+
+    HRESULT STDMETHODCALLTYPE Pick(IDirect3DExecuteBuffer *buffer, IDirect3DViewport *viewport, DWORD flags, D3DRECT *rect);
+
+    HRESULT STDMETHODCALLTYPE GetPickRecords(DWORD *count, D3DPICKRECORD *records);
+
+    HRESULT STDMETHODCALLTYPE CreateMatrix(D3DMATRIXHANDLE *matrix);
+
+    HRESULT STDMETHODCALLTYPE SetMatrix(D3DMATRIXHANDLE handle, D3DMATRIX *matrix);
+
+    HRESULT STDMETHODCALLTYPE GetMatrix(D3DMATRIXHANDLE handle, D3DMATRIX *matrix);
+
+    HRESULT STDMETHODCALLTYPE DeleteMatrix(D3DMATRIXHANDLE D3DMatHandle);
+
+    HRESULT InitializeRTAndDS();
+
+    void UpdateSurfaceDirtyTracking(bool dirtyRenderTarget, bool dirtyDepthStencil, bool dirtyPrimarySurface);
+
+    D3DCommonDevice* GetCommonD3DDevice() {
+      return m_commonD3DDevice.ptr();
+    }
+
+    D3DDeviceLock LockDevice() {
+      return m_multithread.acquire();
+    }
+
+    DDrawSurface* GetRenderTarget() const {
+      return m_rt;
+    }
+
+    DDrawSurface* GetDepthStencil() const {
+      return m_ds.ptr();
+    }
+
+  private:
+
+    inline void DDrawDirtySurfaceUpload();
+
+    inline HRESULT SetTextureInternal(D3DCommonTexture* commonTex, DWORD textureHandle);
+
+    inline HRESULT SetRenderStateInternal(D3DRENDERSTATETYPE dwRenderStateType, DWORD dwRenderState);
+
+    inline HRESULT SetLightStateInternal(D3DLIGHTSTATETYPE dwLightStateType, DWORD dwLightState);
+
+    inline void DrawTriangleInternal(D3DTRIANGLE* triangle, uint16_t count, DWORD vertexCount, const D3DTLVERTEX* vertexBuffer);
+
+    inline void DrawLineInternal(D3DLINE* line, uint16_t count, DWORD vertexCount, const D3DTLVERTEX* vertexBuffer);
+
+    inline void DrawPointInternal(D3DPOINT* point, uint16_t count, DWORD vertexCount, const D3DTLVERTEX* vertexBuffer);
+
+    inline void DrawSpanInternal(D3DSPAN* span, uint16_t count, DWORD vertexCount, const D3DTLVERTEX* vertexBuffer);
+
+    inline void TextureLoadInternal(D3DTEXTURELOAD* textureLoad, uint16_t count);
+
+    inline void RefreshLastUsedDevice() {
+      if (unlikely(m_commonD3DDevice != m_commonIntf->GetCommonD3DDevice()))
+        m_commonIntf->SetCommonD3DDevice(m_commonD3DDevice.ptr());
+    }
+
+    inline void UpdateExecuteBufferStatus(D3DSTATUS* dsStatus, const bool doClipping, const bool doExtents) {
+      // We don't perform any clipping
+      if (doClipping && (dsStatus->dwFlags & D3DSETSTATUS_STATUS)) {
+        dsStatus->dwFlags &= ~D3DSETSTATUS_STATUS;
+        dsStatus->dwStatus = 0u;
+      }
+      if (doExtents) {
+        D3DViewport* currentViewport = m_commonD3DDevice->GetCurrentViewportInternal();
+        const d3d9::D3DVIEWPORT9* viewport9 = currentViewport->GetD3D9Viewport();
+
+        dsStatus->dwFlags |= D3DSETSTATUS_EXTENTS;
+        dsStatus->drExtent.x1 = viewport9->X;
+        dsStatus->drExtent.y1 = viewport9->Y;
+        dsStatus->drExtent.x2 = viewport9->X + viewport9->Width;
+        dsStatus->drExtent.y2 = viewport9->Y + viewport9->Height;
+      }
+    }
+
+    Com<D3DCommonDevice>            m_commonD3DDevice;
+
+    DDrawCommonInterface*           m_commonIntf       = nullptr;
+
+    D3DMultithread                  m_multithread;
+
+    // In D3D3, the RT is the parent of the device
+    DDrawSurface*                   m_rt               = nullptr;
+    Com<DDrawSurface, false>        m_ds;
+
+    Com<DDrawSurface, false>        m_texture;
+
+    D3DSTATS                        m_stats            = { };
+
+    D3DMATRIXHANDLE                 m_worldHandle      = 0u;
+    D3DMATRIXHANDLE                 m_viewHandle       = 0u;
+    D3DMATRIXHANDLE                 m_projectionHandle = 0u;
+
+    // Tests have indicated that once created, matrix handles are
+    // shared across all devices, regardless of their relation
+    static std::atomic<D3DMATRIXHANDLE> s_matrixHandle;
+    static inline std::unordered_map<D3DMATRIXHANDLE, D3DMATRIX> s_matrices;
+
+  };
+
+}

@@ -70,7 +70,7 @@ namespace dxvk {
             D3D9DeviceEx*          pDevice,
             D3DPRESENT_PARAMETERS* pPresentParams,
       const D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
-            bool                   EnableLatencyTracking);
+            D3D9Adapter*           pAdapter);
 
     ~D3D9SwapChainEx();
 
@@ -130,6 +130,30 @@ namespace dxvk {
 
     const D3DPRESENT_PARAMETERS* GetPresentParams() const { return &m_presentParams; }
 
+    // DDraw-driven presentation can update the present interval on each present
+    void UpdatePresentInterval(uint32_t presentInterval) {
+      m_presentParams.PresentationInterval = presentInterval;
+    }
+
+    // DDraw can sometimes fail to scale the window properly when in full screen mode
+    void UpdateFullScreenWindowSize() {
+      if (likely(m_window != nullptr)) {
+        UINT width, height;
+        wsi::getWindowSize(m_window, &width, &height);
+
+        if (unlikely(width  != m_presentParams.BackBufferWidth ||
+                     height != m_presentParams.BackBufferHeight)) {
+          wsi::resizeWindow(m_window, &m_windowState,
+                            m_presentParams.BackBufferWidth,
+                            m_presentParams.BackBufferHeight);
+        }
+      }
+    }
+
+    D3D9Adapter* GetAdapter() const { return m_adapter; }
+
+    bool IsGroupSubordinate() const;
+
     void SyncFrameLatency();
 
     void DestroyBackBuffers();
@@ -149,6 +173,8 @@ namespace dxvk {
     Rc<DxvkDevice>            m_device;
     Rc<DxvkSwapchainBlitter>  m_blitter;
 
+    Rc<hud::Hud>              m_hud;
+
     std::unordered_map<
       HWND,
       D3D9WindowContext>      m_presenters;
@@ -167,6 +193,8 @@ namespace dxvk {
     HWND                      m_window   = nullptr;
     HMONITOR                  m_monitor  = nullptr;
 
+    D3D9Adapter*              m_adapter  = nullptr;
+
     wsi::DxvkWindowState      m_windowState;
 
     double                    m_targetFrameRate = 0.0;
@@ -178,11 +206,7 @@ namespace dxvk {
 
     VkColorSpaceKHR           m_colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 
-    bool                      m_latencyTracking = false;
-    Rc<DxvkLatencyTracker>    m_latencyTracker = nullptr;
-
     Rc<hud::HudClientApiItem> m_apiHud;
-    Rc<hud::HudLatencyItem>   m_latencyHud;
 
     std::optional<VkHdrMetadataEXT> m_hdrMetadata;
 
@@ -199,8 +223,6 @@ namespace dxvk {
             DWORD               Flags);
 
     void CreateBlitter();
-
-    void DestroyLatencyTracker();
 
     void InitRamp();
 

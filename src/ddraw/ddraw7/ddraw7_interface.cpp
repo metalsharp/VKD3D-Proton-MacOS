@@ -1,0 +1,895 @@
+#include "ddraw7_interface.h"
+
+#include "../d3d_common_device.h"
+
+#include "ddraw7_surface.h"
+
+#include "../ddraw_clipper.h"
+#include "../ddraw_palette.h"
+
+#include "../ddraw/ddraw_interface.h"
+#include "../ddraw2/ddraw2_interface.h"
+#include "../ddraw4/ddraw4_interface.h"
+
+#include "../d3d7/d3d7_interface.h"
+#include "../d3d7/d3d7_device.h"
+
+namespace dxvk {
+
+  DDraw7Interface::DDraw7Interface(
+        DDrawCommonInterface* commonIntf,
+        Com<IDirectDraw7>&& proxyIntf)
+    : DDrawWrappedObject<IUnknown, IDirectDraw7>(nullptr, std::move(proxyIntf))
+    , m_commonIntf ( commonIntf ) {
+    if (likely(m_commonIntf == nullptr)) {
+      Com<d3d9::IDirect3D9> d3d9IntfInit = d3d9::Direct3DCreate9(D3D_SDK_VERSION);
+      if (unlikely(d3d9IntfInit == nullptr))
+        throw DxvkError("DDraw7Interface: ERROR! Failed to create the D3D9 interface!");
+
+      Com<IDxvkLegacyD3DInterfaceBridge> intfBridge;
+      HRESULT hr = d3d9IntfInit->QueryInterface(__uuidof(IDxvkLegacyD3DInterfaceBridge), reinterpret_cast<void**>(&intfBridge));
+      if (unlikely(FAILED(hr)))
+        throw DxvkError("DDraw7Interface: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
+
+      m_commonIntf = new DDrawCommonInterface(std::move(d3d9IntfInit), intfBridge.ptr());
+    }
+
+    if (m_commonIntf->GetOrigin() == nullptr)
+      m_commonIntf->SetOrigin(this);
+
+    m_commonIntf->SetDD7Interface(this);
+  }
+
+  DDraw7Interface::~DDraw7Interface() {
+    if (m_commonIntf->GetOrigin() == this)
+      m_commonIntf->SetOrigin(nullptr);
+
+    m_commonIntf->SetDD7Interface(nullptr);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::QueryInterface(REFIID riid, void** ppvObject) {
+    if (unlikely(ppvObject == nullptr))
+      return E_POINTER;
+
+    InitReturnPtr(ppvObject);
+
+    // Some games query for legacy ddraw interfaces
+    if (riid == __uuidof(IDirectDraw)) {
+      if (m_commonIntf->GetDDInterface() != nullptr)
+        return m_commonIntf->GetDDInterface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDraw> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      Com<DDrawInterface> ddrawIntf;
+      try {
+        ddrawIntf = new DDrawInterface(m_commonIntf.ptr(), std::move(ppvProxyObject));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+
+      *ppvObject = ddrawIntf.ref();
+
+      return S_OK;
+    }
+    if (unlikely(riid == __uuidof(IDirectDraw2))) {
+      if (m_commonIntf->GetDD2Interface() != nullptr)
+        return m_commonIntf->GetDD2Interface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDraw2> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      Com<DDraw2Interface> ddraw2Intf;
+      try {
+        ddraw2Intf = new DDraw2Interface(m_commonIntf.ptr(), std::move(ppvProxyObject));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+
+      *ppvObject = ddraw2Intf.ref();
+
+      return S_OK;
+    }
+    if (unlikely(riid == __uuidof(IDirectDraw4))) {
+      if (m_commonIntf->GetDD4Interface() != nullptr)
+        return m_commonIntf->GetDD4Interface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDraw4> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      Com<DDraw4Interface> ddraw4Intf;
+      try {
+        ddraw4Intf = new DDraw4Interface(m_commonIntf.ptr(), std::move(ppvProxyObject));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+
+      *ppvObject = ddraw4Intf.ref();
+
+      return S_OK;
+    }
+    // Standard way of retrieving a D3D7 interface
+    if (riid == __uuidof(IDirect3D7)) {
+      // Initialize the IDirect3D7 interlocked object
+      if (unlikely(m_d3d7Intf == nullptr)) {
+        try {
+          m_d3d7Intf = new D3D7Interface(nullptr, m_commonIntf.ptr(), this);
+        } catch (const DxvkError& e) {
+          Logger::err(e.message());
+          return DDERR_GENERIC;
+        }
+      }
+
+      *ppvObject = m_d3d7Intf.ref();
+
+      return S_OK;
+    }
+    // Quite a lot of games query for this IID during intro playback
+    if (unlikely(riid == GUID_IAMMediaStream)) {
+      return m_proxy->QueryInterface(riid, ppvObject);
+    }
+    // Also seen queried by some games, such as V-Rally 2: Expert Edition
+    if (unlikely(riid == GUID_IMediaStream)) {
+      return m_proxy->QueryInterface(riid, ppvObject);
+    }
+
+    if (likely(riid == __uuidof(IUnknown)
+            || riid == __uuidof(IDirectDraw7))) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    Logger::warn("DDraw7Interface::QueryInterface: Unknown interface query");
+    Logger::warn(str::format(riid));
+    return E_NOINTERFACE;
+  }
+
+  // The documentation states: "The IDirectDraw7::Compact method is not currently implemented."
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::Compact() {
+    return DDERR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::CreateClipper(DWORD dwFlags, LPDIRECTDRAWCLIPPER *lplpDDClipper, IUnknown *pUnkOuter) {
+    if (unlikely(lplpDDClipper == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDClipper);
+
+    Com<IDirectDrawClipper> lplpDDClipperProxy;
+    HRESULT hr = m_proxy->CreateClipper(dwFlags, &lplpDDClipperProxy, pUnkOuter);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    *lplpDDClipper = ref(new DDrawClipper(m_commonIntf.ptr(), std::move(lplpDDClipperProxy), this));
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::CreatePalette(DWORD dwFlags, LPPALETTEENTRY lpColorTable, LPDIRECTDRAWPALETTE *lplpDDPalette, IUnknown *pUnkOuter) {
+    if (unlikely(lplpDDPalette == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDPalette);
+
+    Com<IDirectDrawPalette> lplpDDPaletteProxy;
+    HRESULT hr = m_proxy->CreatePalette(dwFlags, lpColorTable, &lplpDDPaletteProxy, pUnkOuter);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    *lplpDDPalette = ref(new DDrawPalette(std::move(lplpDDPaletteProxy), this));
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::CreateSurface(LPDDSURFACEDESC2 lpDDSurfaceDesc, LPDIRECTDRAWSURFACE7 *lplpDDSurface, IUnknown *pUnkOuter) {
+    // The cooperative level is always checked first
+    if (unlikely(!m_commonIntf->IsCooperativeLevelSet()))
+      return DDERR_NOCOOPERATIVELEVELSET;
+
+    if (unlikely(lpDDSurfaceDesc == nullptr || lplpDDSurface == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDSurface);
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    if (likely(lpDDSurfaceDesc->dwFlags & DDSD_CAPS)) {
+      // Disabling support for overlays fixes issues with intro
+      // video playback in games such as NFS: Porsche Unleashed
+      if (unlikely((lpDDSurfaceDesc->ddsCaps.dwCaps & DDSCAPS_OVERLAY)
+                 && !d3dOptions->supportOverlays)) {
+        Logger::info("DDraw7Interface::CreateSurface: Overlay support is disabled, skipping");
+        return DDERR_UNSUPPORTED;
+      }
+
+      // Because we are removing the DDSCAPS_WRITEONLY flag below, we need
+      // to first validate the combinations that would otherwise cause issues
+      HRESULT hr = ValidateSurfaceFlags(lpDDSurfaceDesc);
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      // We need to ensure we can always read from surfaces for upload to
+      // D3D9, so always strip the DDSCAPS_WRITEONLY flag on creation
+      lpDDSurfaceDesc->ddsCaps.dwCaps &= ~DDSCAPS_WRITEONLY;
+      // Similarly strip the DDSCAPS2_OPAQUE flag on texture creation
+      lpDDSurfaceDesc->ddsCaps.dwCaps2 &= ~DDSCAPS2_OPAQUE;
+    }
+
+    if (likely(lpDDSurfaceDesc->dwFlags & DDSD_PIXELFORMAT)) {
+      // WineD3D will fail to create 8-bit texture surfaces at times, for whatever reason...
+      if (unlikely((lpDDSurfaceDesc->ddsCaps.dwCaps & DDSCAPS_TEXTURE)
+               &&  (lpDDSurfaceDesc->ddpfPixelFormat.dwFlags & DDPF_RGB)
+               &&   lpDDSurfaceDesc->ddpfPixelFormat.dwRGBBitCount == 8
+               && !(lpDDSurfaceDesc->ddpfPixelFormat.dwFlags & DDPF_PALETTEINDEXED8))) {
+        static bool s_8bitTextureWarningShown;
+
+        if (!std::exchange(s_8bitTextureWarningShown, true))
+          Logger::warn("DDraw7Interface::CreateSurface: Use of potentially unsupported 8-bit texture surface");
+      }
+
+      // Work around a WineD3D bug/limitation that prevents
+      // read back from L6V5U5 and X8L8V8U8 video memory surfaces
+      //
+      // Note: Doing this for other surfaces/formats is a bad idea,
+      // because some games expect these flags to remain in place, and
+      // may crash in case they find that's not the case
+      if (unlikely((lpDDSurfaceDesc->ddpfPixelFormat.dwFlags == (DDPF_BUMPDUDV | DDPF_BUMPLUMINANCE))
+                && (lpDDSurfaceDesc->ddsCaps.dwCaps & DDSCAPS_VIDEOMEMORY))) {
+        Logger::debug("DDraw7Interface::CreateSurface: Video memory DDPF_BUMPLUMINANCE surface");
+        lpDDSurfaceDesc->ddsCaps.dwCaps &= ~DDSCAPS_VIDEOMEMORY &
+                                           ~DDSCAPS_LOCALVIDMEM &
+                                           ~DDSCAPS_NONLOCALVIDMEM;
+        lpDDSurfaceDesc->ddsCaps.dwCaps |= DDSCAPS_SYSTEMMEMORY;
+      }
+
+      if (unlikely(lpDDSurfaceDesc->ddsCaps.dwCaps & DDSCAPS_ZBUFFER)) {
+        if (unlikely(d3dOptions->useD16forD24X8
+                  && lpDDSurfaceDesc->ddpfPixelFormat.dwZBitMask == 0xFFFFFF
+                  && lpDDSurfaceDesc->ddpfPixelFormat.dwStencilBitMask == 0x0)) {
+          // Games such as Need for Speed: Porsche are broken with 32-bit color
+          // on night tracks with "projected" lights, because they clearly were
+          // designed with 16-bit Z buffers in mind. Fix it up by silently swapping
+          // D16 for D24X8 on depth stencil creation.
+          Logger::debug("DDraw7Interface::CreateSurface: Using D16 instead of D24X8");
+          lpDDSurfaceDesc->ddpfPixelFormat.dwZBufferBitDepth = 16;
+          lpDDSurfaceDesc->ddpfPixelFormat.dwZBitMask = 0xFFFF;
+        } else if (unlikely(lpDDSurfaceDesc->ddpfPixelFormat.dwZBitMask == 0xFFFFFFFF)) {
+          if (d3dOptions->useD24X8forD32) {
+            // In case of up-front unsupported and unadvertised D32 depth stencil use,
+            // replace it with D24X8, as some games, such as Sacrifice, rely on it
+            // to properly enable 32-bit display modes (and revert to 16-bit otherwise)
+            Logger::debug("DDraw7Interface::CreateSurface: Using D24X8 instead of D32");
+            lpDDSurfaceDesc->ddpfPixelFormat.dwZBitMask = 0xFFFFFF;
+          } else {
+            Logger::warn("DDraw7Interface::CreateSurface: Use of unsupported D32");
+          }
+        }
+      }
+    }
+
+    Com<IDirectDrawSurface7> ddraw7SurfaceProxied;
+    HRESULT hr = m_proxy->CreateSurface(lpDDSurfaceDesc, &ddraw7SurfaceProxied, pUnkOuter);
+    // Some games simply try creating surfaces with various formats until something works...
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    try {
+      Com<DDraw7Surface> surface7 = new DDraw7Surface(nullptr, std::move(ddraw7SurfaceProxied), this, nullptr, true);
+
+      DDrawCommonSurface* commonSurf = surface7->GetCommonSurface();
+      if (unlikely(commonSurf->IsPrimarySurface()))
+        m_commonIntf->SetPrimarySurface(commonSurf);
+
+      *lplpDDSurface = surface7.ref();
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return DDERR_GENERIC;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::DuplicateSurface(LPDIRECTDRAWSURFACE7 lpDDSurface, LPDIRECTDRAWSURFACE7 *lplpDupDDSurface) {
+    if (unlikely(lpDDSurface == nullptr || lplpDupDDSurface == nullptr))
+      return DDERR_CANTDUPLICATE;
+
+    InitReturnPtr(lplpDupDDSurface);
+
+    if (unlikely(!DDrawCommonInterface::IsWrappedSurface(lpDDSurface))) {
+      Logger::err("DDraw7Interface::DDraw4Interface: Received an unwrapped surface");
+      return DDERR_CANTDUPLICATE;
+    }
+
+    DDraw7Surface* ddraw7Surface = static_cast<DDraw7Surface*>(lpDDSurface);
+
+    Com<IDirectDrawSurface7> dupSurface7;
+    HRESULT hr = m_proxy->DuplicateSurface(ddraw7Surface->GetProxied(), &dupSurface7);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    try {
+      *lplpDupDDSurface = ref(new DDraw7Surface(nullptr, std::move(dupSurface7), this, nullptr, false));
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return DDERR_GENERIC;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::EnumDisplayModes(DWORD dwFlags, LPDDSURFACEDESC2 lpDDSurfaceDesc, LPVOID lpContext, LPDDENUMMODESCALLBACK2 lpEnumModesCallback) {
+    if (unlikely(lpEnumModesCallback == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(dwFlags & DDEDM_STANDARDVGAMODES)) {
+      static bool s_standardVGAModesWarningShown;
+
+      if (!std::exchange(s_standardVGAModesWarningShown, true))
+        Logger::warn("DDraw7Interface::EnumDisplayModes: Unhandled flag DDEDM_STANDARDVGAMODES");
+    }
+
+    const bool filterDisplayModes = lpDDSurfaceDesc != nullptr;
+
+    HRESULT hr = DDENUMRET_OK;
+
+    for (auto& displayMode : m_commonIntf->GetDisplayModes(dwFlags & DDEDM_REFRESHRATES)) {
+      if (hr != DDENUMRET_OK)
+        break;
+
+      // Filter the available modes if we are required to do so
+      if (unlikely(filterDisplayModes)) {
+        if ((lpDDSurfaceDesc->dwFlags & DDSD_WIDTH) && lpDDSurfaceDesc->dwWidth != displayMode.dwWidth)
+          continue;
+        if ((lpDDSurfaceDesc->dwFlags & DDSD_HEIGHT) && lpDDSurfaceDesc->dwHeight != displayMode.dwHeight)
+          continue;
+        if ((lpDDSurfaceDesc->dwFlags & DDSD_PIXELFORMAT) && lpDDSurfaceDesc->ddpfPixelFormat.dwRGBBitCount !=
+                                                             displayMode.ddpfPixelFormat.dwRGBBitCount)
+          continue;
+        if ((lpDDSurfaceDesc->dwFlags & DDSD_REFRESHRATE) && lpDDSurfaceDesc->dwRefreshRate != displayMode.dwRefreshRate)
+          continue;
+      }
+
+      DDSURFACEDESC2 returnDisplayMode = displayMode;
+      hr = lpEnumModesCallback(&returnDisplayMode, lpContext);
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::EnumSurfaces(DWORD dwFlags, LPDDSURFACEDESC2 lpDDSD, LPVOID lpContext, LPDDENUMSURFACESCALLBACK7 lpEnumSurfacesCallback) {
+    if (unlikely(lpEnumSurfacesCallback == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    std::vector<AttachedSurface7> attachedSurfaces;
+    HRESULT hr = m_proxy->EnumSurfaces(dwFlags, lpDDSD, reinterpret_cast<void*>(&attachedSurfaces), EnumAttachedSurfaces7Callback);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    hr = DDENUMRET_OK;
+
+    for (auto& attachedSurface : attachedSurfaces) {
+      if (likely(hr == DDENUMRET_OK)) {
+        Com<IDirectDrawSurface7> surface7 = attachedSurface.surface7;
+        Com<DDraw7Surface> ddraw7Surface;
+        try {
+          ddraw7Surface = new DDraw7Surface(nullptr, std::move(surface7), this, nullptr, false);
+
+          hr = lpEnumSurfacesCallback(ddraw7Surface.ref(), &attachedSurface.desc, lpContext);
+        } catch (const DxvkError& e) {
+          Logger::warn("DDraw7Interface::EnumSurfaces: Failed to create wrapped surface");
+          Logger::warn(e.message());
+        }
+      }
+
+      if (likely(attachedSurface.surface7 != nullptr)) {
+        // Release the refcount which was added during proxied callback enumeration
+        attachedSurface.surface7->Release();
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::FlipToGDISurface() {
+    DDrawCommonSurface* ps = m_commonIntf->GetPrimarySurface();
+
+    // A primary surface must exist for a GDI flip to be possible
+    if (unlikely(ps == nullptr))
+      return DDERR_NOTFOUND;
+
+    if (unlikely(!ps->IsFlippable()))
+      return DDERR_NOTFLIPPABLE;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetCaps(LPDDCAPS lpDDDriverCaps, LPDDCAPS lpDDHELCaps) {
+    if (unlikely(lpDDDriverCaps == nullptr && lpDDHELCaps == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    // Interstate '76 sends invalid dwSizes part of the structs,
+    // and that explodes in Wine, so validate it before proxying
+    if (unlikely(lpDDDriverCaps != nullptr && !IsValidDDrawCapsSize(lpDDDriverCaps->dwSize)))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(lpDDHELCaps != nullptr && !IsValidDDrawCapsSize(lpDDHELCaps->dwSize)))
+      return DDERR_INVALIDPARAMS;
+
+    HRESULT hr = m_proxy->GetCaps(lpDDDriverCaps, lpDDHELCaps);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    static constexpr DWORD Megabytes = 1024 * 1024;
+    static constexpr DWORD MaxMemory = ddrawCaps::MaxTextureMemory * Megabytes;
+    static constexpr DWORD ReservedMemory = ddrawCaps::ReservedTextureMemory * Megabytes;
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+    // Properly fill in the dwVidMemTotal / dwVidMemFree fields
+    DWORD total9 = 0u;
+    DWORD free9  = 0u;
+
+    D3DCommonDevice* commonD3DDevice = m_commonIntf->GetCommonD3DDevice();
+    if (likely(commonD3DDevice != nullptr)) {
+      d3d9::IDirect3DDevice9* d3d9Device = commonD3DDevice->GetD3D9Device();
+
+      total9 = static_cast<DWORD>(commonD3DDevice->GetTotalTextureMemory());
+      free9  = static_cast<DWORD>(d3d9Device->GetAvailableTextureMem());
+
+      if (likely(total9 >= MaxMemory)) {
+        const DWORD delta = total9 - MaxMemory;
+        total9 = MaxMemory - ReservedMemory;
+        free9 = free9 > delta + ReservedMemory ? free9 - (delta + ReservedMemory) : 0u;
+      }
+
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: Total: ", total9));
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: Free : ", free9));
+    } else {
+      const DWORD total7 = lpDDDriverCaps != nullptr ? lpDDDriverCaps->dwVidMemTotal : 0;
+      const DWORD free7  = lpDDDriverCaps != nullptr ? lpDDDriverCaps->dwVidMemFree  : 0;
+
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: DDraw Total: ", total7));
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: DDraw Free : ", free7));
+
+      if (unlikely(total7 < MaxMemory)) {
+        total9 = total7;
+        free9 = free7;
+      } else {
+        const DWORD delta = total7 - MaxMemory;
+        total9 = MaxMemory - ReservedMemory;
+        free9 = free7 > delta + ReservedMemory ? free7 - (delta + ReservedMemory) : 0u;
+      }
+
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: Total: ", total9));
+      //Logger::debug(str::format("DDraw7Interface::GetCaps: Free : ", free9));
+    }
+
+    if (lpDDDriverCaps != nullptr) {
+      lpDDDriverCaps->dwCaps2 &= ~DDCAPS2_CANCALIBRATEGAMMA;
+      lpDDDriverCaps->dwCaps2 |= DDCAPS2_FLIPINTERVAL | DDCAPS2_FLIPNOVSYNC;
+      lpDDDriverCaps->dwZBufferBitDepths = d3dOptions->supportD16 ? DDBD_16 | DDBD_24 : DDBD_24;
+      lpDDDriverCaps->dwVidMemTotal = total9;
+      lpDDDriverCaps->dwVidMemFree  = d3dOptions->reportFreeTextureMemory ? free9 : 0u;
+      lpDDDriverCaps->dwNumFourCCCodes = ddrawCaps::NumberOfFOURCCCodes;
+    }
+    if (lpDDHELCaps != nullptr) {
+      lpDDHELCaps->dwCaps2 &= ~DDCAPS2_CANCALIBRATEGAMMA;
+      lpDDHELCaps->dwCaps2 |= DDCAPS2_FLIPINTERVAL | DDCAPS2_FLIPNOVSYNC;
+      lpDDHELCaps->dwZBufferBitDepths = d3dOptions->supportD16 ? DDBD_16 | DDBD_24 : DDBD_24;
+      lpDDHELCaps->dwVidMemTotal = total9;
+      lpDDHELCaps->dwVidMemFree  = d3dOptions->reportFreeTextureMemory ? free9 : 0u;
+      lpDDHELCaps->dwNumFourCCCodes = ddrawCaps::NumberOfFOURCCCodes;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetDisplayMode(LPDDSURFACEDESC2 lpDDSurfaceDesc) {
+    if (unlikely(lpDDSurfaceDesc == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    d3d9::IDirect3D9* d3d9Intf = m_commonIntf->GetD3D9Interface();
+
+    d3d9::D3DDISPLAYMODE displayMode9;
+    d3d9Intf->GetAdapterDisplayMode(0, &displayMode9);
+
+    const DWORD currentDisplayModeBitDepth = DDrawCommonInterface::GetDisplayModeBitDepth();
+    const bool shouldMask8BitMode = currentDisplayModeBitDepth == 8u && m_commonIntf->GetOptions()->mask8BitModes;
+    const DWORD displayModeBitDepth = !shouldMask8BitMode ? currentDisplayModeBitDepth : 16u;
+
+    DDSURFACEDESC2 displayMode = { };
+    displayMode.dwSize = sizeof(DDSURFACEDESC2);
+    displayMode.dwFlags = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_REFRESHRATE | DDSD_PIXELFORMAT;
+    displayMode.dwWidth = displayMode9.Width;
+    displayMode.dwHeight = displayMode9.Height;
+    displayMode.dwRefreshRate = displayMode9.RefreshRate;
+    displayMode.ddpfPixelFormat = GetPixelFormatForBitDepth(displayModeBitDepth);
+    displayMode.lPitch = displayMode9.Width * (displayMode.ddpfPixelFormat.dwRGBBitCount / 8u);
+
+    *lpDDSurfaceDesc = displayMode;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetFourCCCodes(LPDWORD lpNumCodes, LPDWORD lpCodes) {
+    if (likely(lpNumCodes != nullptr && lpCodes != nullptr)) {
+      const uint32_t copyNumCodes = std::min<uint32_t>(ddrawCaps::NumberOfFOURCCCodes, *lpNumCodes);
+      for (uint32_t i = 0; i < copyNumCodes; i++) {
+        lpCodes[i] = ddrawCaps::SupportedFourCCs[i];
+      }
+    }
+
+    if (lpNumCodes != nullptr)
+      *lpNumCodes = ddrawCaps::NumberOfFOURCCCodes;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetGDISurface(LPDIRECTDRAWSURFACE7 *lplpGDIDDSurface) {
+    if (unlikely(lplpGDIDDSurface == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpGDIDDSurface);
+
+    Com<IDirectDrawSurface7> gdiSurfaceProxied;
+    HRESULT hr = m_proxy->GetGDISurface(&gdiSurfaceProxied);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    if (unlikely(DDrawCommonInterface::IsWrappedSurface(gdiSurfaceProxied.ptr()))) {
+      *lplpGDIDDSurface = gdiSurfaceProxied.ref();
+    } else {
+      try {
+        Com<DDraw7Surface> gdiSurface = new DDraw7Surface(nullptr, std::move(gdiSurfaceProxied),
+                                                          this, nullptr, false);
+        gdiSurface->GetCommonSurface()->SetIsGDISurface(true);
+
+        *lplpGDIDDSurface = gdiSurface.ref();
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetMonitorFrequency(LPDWORD lpdwFrequency) {
+    if (unlikely(lpdwFrequency == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    d3d9::IDirect3D9* d3d9Intf = m_commonIntf->GetD3D9Interface();
+
+    d3d9::D3DDISPLAYMODE displayMode9;
+    d3d9Intf->GetAdapterDisplayMode(0, &displayMode9);
+
+    *lpdwFrequency = displayMode9.RefreshRate;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetScanLine(LPDWORD lpdwScanLine) {
+    return m_proxy->GetScanLine(lpdwScanLine);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetVerticalBlankStatus(LPBOOL lpbIsInVB) {
+    if (unlikely(lpbIsInVB == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    D3DCommonDevice* commonD3DDevice = m_commonIntf->GetCommonD3DDevice();
+
+    if (commonD3DDevice == nullptr)
+      return m_proxy->GetVerticalBlankStatus(lpbIsInVB);
+
+    static bool isInVB = false;
+    // Use an alternating pattern here, since some games will, for whatever
+    // reason, use this call to wait for a VBlank to happen while others
+    // will wait for a VBlank interval to pass before they continue
+    *lpbIsInVB = std::exchange(isInVB, !isInVB);
+
+    return DD_OK;
+  }
+
+  // Should technically always return DDERR_ALREADYINITIALIZED, unless the
+  // interface is created via IClassFactory, however Requiem: Avenging Angel
+  // expects it to work on a regular interface too, after initially creating
+  // and releasing an interface through IClassFactory (but never initializing it).
+  // On native DDraw the initial interface most likely gets reused. In practice,
+  // applications that don't use IClassFactory won't call this, so keep it simple.
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::Initialize(GUID* lpGUID) {
+    if (unlikely(m_commonIntf->IsInitialized()))
+      return DDERR_ALREADYINITIALIZED;
+
+    m_commonIntf->MarkAsInitialized();
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::RestoreDisplayMode() {
+    HRESULT hr = m_proxy->RestoreDisplayMode();
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    DDrawCommonInterface::RestoreDisplayModeBitDepth();
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::SetCooperativeLevel(HWND hWnd, DWORD dwFlags) {
+    // DDSCL_CREATEDEVICEWINDOW doesn't appear to behave properly in
+    // Wine, so use the cached hWnd to set the device window instead
+    if (unlikely((dwFlags & DDSCL_CREATEDEVICEWINDOW) && hWnd == nullptr
+               && m_commonIntf->GetHWND() != nullptr)) {
+      dwFlags &= ~DDSCL_CREATEDEVICEWINDOW;
+      dwFlags |= DDSCL_SETDEVICEWINDOW;
+      hWnd = m_commonIntf->GetHWND();
+    }
+
+    HRESULT hr = m_proxy->SetCooperativeLevel(hWnd, dwFlags);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonIntf->SetCooperativeLevel(hWnd, dwFlags);
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::SetDisplayMode(DWORD dwWidth, DWORD dwHeight, DWORD dwBPP, DWORD dwRefreshRate, DWORD dwFlags) {
+    Logger::debug(str::format("DDraw7Interface::SetDisplayMode: ", dwWidth, "x", dwHeight, ":", dwBPP, "@", dwRefreshRate));
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    if (likely(!d3dOptions->ignoreDisplayModes)) {
+      HRESULT hr = m_proxy->SetDisplayMode(dwWidth, dwHeight, dwBPP, dwRefreshRate, dwFlags);
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      // Track the display mode bit depth, because Vulkan will only
+      // ever see 32-bit, since we are operating in windowed mode
+      DDrawCommonInterface::SetDisplayModeBitDepth(dwBPP);
+
+      if (unlikely(dwBPP == 8u)) {
+        static bool s_8bitDisplayModeWarningShown;
+
+        if (!std::exchange(s_8bitDisplayModeWarningShown, true))
+          Logger::warn("DDraw7Interface::SetDisplayMode: Use of unsupported 8-bit mode");
+      }
+
+      DDrawCommonSurface* ps = m_commonIntf->GetPrimarySurface();
+
+      if (likely(ps != nullptr))
+        ps->RefreshSurfaceDescripton(true);
+    }
+
+    if (d3dOptions->backBufferResize) {
+      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+
+      // Ignore any mode size dimensions when in windowed present mode
+      if (exclusiveMode) {
+        DDrawModeSize* modeSize = m_commonIntf->GetModeSize();
+        if (modeSize->width != dwWidth || modeSize->height != dwHeight) {
+          modeSize->width  = dwWidth;
+          modeSize->height = dwHeight;
+        }
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::WaitForVerticalBlank(DWORD dwFlags, HANDLE hEvent) {
+    if (unlikely(dwFlags & DDWAITVB_BLOCKBEGINEVENT))
+      return DDERR_UNSUPPORTED;
+
+    D3DCommonDevice* commonD3DDevice = m_commonIntf->GetCommonD3DDevice();
+
+    if (unlikely(commonD3DDevice == nullptr))
+      return m_proxy->WaitForVerticalBlank(dwFlags, hEvent);
+
+    // Switch to a default presentation interval when an application
+    // tries to wait for vertical blank, if we're not already doing so
+    if (unlikely(!m_commonIntf->GetWaitForVBlank())) {
+      Logger::info("DDraw7Interface::WaitForVerticalBlank: Switching to D3DPRESENT_INTERVAL_DEFAULT for presentation");
+      IDxvkLegacyD3DDeviceBridge* deviceBridge = commonD3DDevice->GetD3D9DeviceBridge();
+      deviceBridge->UpdatePresentInterval(D3DPRESENT_INTERVAL_DEFAULT);
+      m_commonIntf->SetWaitForVBlank(true);
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetAvailableVidMem(LPDDSCAPS2 lpDDCaps, LPDWORD lpdwTotal, LPDWORD lpdwFree) {
+    if (unlikely(lpdwTotal == nullptr && lpdwFree == nullptr))
+      return DD_OK;
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    static constexpr DWORD Megabytes = 1024 * 1024;
+    static constexpr DWORD MaxMemory = ddrawCaps::MaxTextureMemory * Megabytes;
+    static constexpr DWORD ReservedMemory = ddrawCaps::ReservedTextureMemory * Megabytes;
+
+    D3DCommonDevice* commonD3DDevice = m_commonIntf->GetCommonD3DDevice();
+    if (likely(commonD3DDevice != nullptr)) {
+      d3d9::IDirect3DDevice9* d3d9Device = commonD3DDevice->GetD3D9Device();
+
+      DWORD total9 = static_cast<DWORD>(commonD3DDevice->GetTotalTextureMemory());
+      DWORD free9  = static_cast<DWORD>(d3d9Device->GetAvailableTextureMem());
+
+      if (likely(total9 >= MaxMemory)) {
+        const DWORD delta = total9 - MaxMemory;
+        total9 = MaxMemory - ReservedMemory;
+        free9 = free9 > delta + ReservedMemory ? free9 - (delta + ReservedMemory) : 0u;
+      }
+
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: Total: ", total9));
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: Free : ", free9));
+
+      if (lpdwTotal != nullptr)
+        *lpdwTotal = total9;
+      if (lpdwFree != nullptr)
+        *lpdwFree  = d3dOptions->reportFreeTextureMemory ? free9 : 0u;
+
+    } else {
+      DWORD total7 = 0u;
+      DWORD free7  = 0u;
+
+      HRESULT hr = m_proxy->GetAvailableVidMem(lpDDCaps, &total7, &free7);
+      if (unlikely(FAILED(hr))) {
+        Logger::err("DDraw7Interface::GetAvailableVidMem: Failed proxied call");
+        if (lpdwTotal != nullptr)
+          *lpdwTotal = 0u;
+        if (lpdwFree != nullptr)
+          *lpdwFree  = 0u;
+        return hr;
+      }
+
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: DDraw Total: ", total7));
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: DDraw Free : ", free7));
+
+      DWORD total9 = 0u;
+      DWORD free9  = 0u;
+
+      if (unlikely(total7 < MaxMemory)) {
+        total9 = total7;
+        free9 = free7;
+      } else {
+        const DWORD delta = total7 - MaxMemory;
+        total9 = MaxMemory - ReservedMemory;
+        free9 = free7 > delta + ReservedMemory ? free7 - (delta + ReservedMemory) : 0u;
+      }
+
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: Total: ", total9));
+      //Logger::debug(str::format("DDraw7Interface::GetAvailableVidMem: Free : ", free9));
+
+      if (lpdwTotal != nullptr)
+        *lpdwTotal = total9;
+      if (lpdwFree != nullptr)
+        *lpdwFree  = d3dOptions->reportFreeTextureMemory ? free9 : 0u;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetSurfaceFromDC(HDC hdc, LPDIRECTDRAWSURFACE7 *pSurf) {
+    if (unlikely(pSurf == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(pSurf);
+
+    Com<IDirectDrawSurface7> surface;
+    HRESULT hr = m_proxy->GetSurfaceFromDC(hdc, &surface);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    try {
+      *pSurf = ref(new DDraw7Surface(nullptr, std::move(surface), this, nullptr, false));
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return DDERR_GENERIC;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::RestoreAllSurfaces() {
+    return m_proxy->RestoreAllSurfaces();
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::TestCooperativeLevel() {
+    // This needs to be forwarded to DDraw in all cases,
+    // because D3D9 won't have visibility over DDraw mode switches
+    return m_proxy->TestCooperativeLevel();
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::GetDeviceIdentifier(LPDDDEVICEIDENTIFIER2 pDDDI, DWORD dwFlags) {
+    if (unlikely(pDDDI == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    // We need to share the device identifier with the underlying
+    // DDraw implementation, as some games validate it in various places
+    DDDEVICEIDENTIFIER2 pDDDIproxy;
+    HRESULT hr = m_proxy->GetDeviceIdentifier(&pDDDIproxy, dwFlags);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    const d3d9::D3DADAPTER_IDENTIFIER9* adapterIdentifier9 = m_commonIntf->GetAdapterIdentifier();
+    // This is the "2D accelerator" device in the system
+    if (unlikely(dwFlags & DDGDI_GETHOSTIDENTIFIER)) {
+      static constexpr uint16_t CompatHostVendorID = static_cast<uint16_t>(DDrawGpuVendor::VGA);
+      static const char* CompatHostDriver = GetDriverDLL(CompatHostVendorID);
+      // The Matrox G400 TechDemo expects the description to be aligned with native
+      static const char* CompatHostDescription = "DirectDraw HAL";
+
+      CopyToStringArray(pDDDI->szDriver, CompatHostDriver);
+      CopyToStringArray(pDDDI->szDescription, CompatHostDescription);
+      pDDDI->liDriverVersion.QuadPart = 0;
+      pDDDI->dwVendorId               = CompatHostVendorID;
+      pDDDI->dwDeviceId               = 0;
+      pDDDI->dwSubSysId               = 0;
+      pDDDI->dwRevision               = 0;
+      pDDDI->guidDeviceIdentifier     = pDDDIproxy.guidDeviceIdentifier;
+      pDDDI->dwWHQLLevel              = 0;
+    } else if (unlikely(m_commonIntf->GetOptions()->glideCompatibilityMode)) {
+      static constexpr uint16_t Compat3dfxVendorID = static_cast<uint16_t>(DDrawGpuVendor::Зdfx);
+      static constexpr uint16_t Compat3dfXDeviceID = 0x0009; // Voodoo 4 4500
+      static const char* Compat3dfxDriver = GetDriverDLL(Compat3dfxVendorID);
+      static const char* Compat3dfxDescription = "3dfx Voodoo Series";
+
+      CopyToStringArray(pDDDI->szDriver, Compat3dfxDriver);
+      CopyToStringArray(pDDDI->szDescription, Compat3dfxDescription);
+      pDDDI->liDriverVersion.QuadPart = 0;
+      pDDDI->dwVendorId               = Compat3dfxVendorID;
+      pDDDI->dwDeviceId               = Compat3dfXDeviceID;
+      pDDDI->dwSubSysId               = adapterIdentifier9->SubSysId;
+      pDDDI->dwRevision               = adapterIdentifier9->Revision;
+      pDDDI->guidDeviceIdentifier     = pDDDIproxy.guidDeviceIdentifier;
+      pDDDI->dwWHQLLevel              = 1;
+    } else {
+      const uint16_t vendorId = GetDriverVendorID(adapterIdentifier9->VendorId);
+      const char* driver = GetDriverDLL(vendorId);
+
+      CopyToStringArray(pDDDI->szDriver, driver);
+      // MAX_DDDEVICEID_STRING is identical to MAX_DEVICE_IDENTIFIER_STRING
+      static_assert(MAX_DDDEVICEID_STRING == MAX_DEVICE_IDENTIFIER_STRING);
+      memcpy(&pDDDI->szDescription, &adapterIdentifier9->Description, sizeof(adapterIdentifier9->Description));
+      // Neither ATI, nor Nvidia (Windows XP) native drivers at the time reported a version
+      pDDDI->liDriverVersion.QuadPart = 0;
+      pDDDI->dwVendorId               = vendorId;
+      pDDDI->dwDeviceId               = adapterIdentifier9->DeviceId;
+      pDDDI->dwSubSysId               = adapterIdentifier9->SubSysId;
+      pDDDI->dwRevision               = adapterIdentifier9->Revision;
+      pDDDI->guidDeviceIdentifier     = pDDDIproxy.guidDeviceIdentifier;
+      pDDDI->dwWHQLLevel              = 1;
+    }
+
+    Logger::info(str::format("DDraw7Interface::GetDeviceIdentifier: Reporting: ", pDDDI->szDescription));
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::StartModeTest(LPSIZE pModes, DWORD dwNumModes, DWORD dwFlags) {
+    Logger::warn("!!! DDraw7Interface::StartModeTest: Stub");
+
+    if (unlikely(!dwNumModes))
+      return DD_OK;
+
+    if (unlikely(pModes == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDraw7Interface::EvaluateMode(DWORD dwFlags, DWORD* pTimeout) {
+    Logger::warn("!!! DDraw7Interface::EvaluateMode: Stub");
+    return DD_OK;
+  }
+
+}

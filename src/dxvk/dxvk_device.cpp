@@ -1,7 +1,5 @@
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
-#include "dxvk_latency_builtin.h"
-#include "dxvk_latency_reflex.h"
 #include "dxvk_shader_cache.h"
 #include "dxvk_shader_ir.h"
 
@@ -130,6 +128,15 @@ namespace dxvk {
   }
 
 
+  bool DxvkDevice::canUseMixedSamples(const Rc<DxvkShader>& shader) const {
+    if (!shader || !(shader->metadata().flags.test(DxvkShaderFlag::UsesSampleMask)))
+      return false;
+
+    return m_features.amdMixedAttachmentSamples
+        || m_features.nvFramebufferMixedSamples;
+  }
+
+
   bool DxvkDevice::mustTrackPipelineLifetime() const {
     switch (m_options.trackPipelineLifetime) {
       case Tristate::True:
@@ -179,12 +186,7 @@ namespace dxvk {
   
   
   Rc<DxvkCommandList> DxvkDevice::createCommandList() {
-    Rc<DxvkCommandList> cmdList = m_recycledCommandLists.retrieveObject();
-    
-    if (cmdList == nullptr)
-      cmdList = new DxvkCommandList(this);
-    
-    return cmdList;
+    return m_recycledCommandLists.retrieveObject(this);
   }
 
 
@@ -584,42 +586,21 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkLatencyTracker> DxvkDevice::createLatencyTracker(
-    const Rc<Presenter>&            presenter) {
-    if (m_options.latencySleep == Tristate::False)
-      return nullptr;
-
-    if (m_options.latencySleep == Tristate::Auto) {
-      if (m_features.nvLowLatency2)
-        return new DxvkReflexLatencyTrackerNv(presenter);
-      else
-        return nullptr;
-    }
-
-    return new DxvkBuiltInLatencyTracker(presenter,
-      m_options.latencyTolerance, m_features.nvLowLatency2);
-  }
-
-
   void DxvkDevice::presentImage(
     const Rc<Presenter>&            presenter,
-    const Rc<DxvkLatencyTracker>&   tracker,
           uint64_t                  frameId,
+          uint64_t                  latencyFrameId,
           uint32_t                  rectCount,
-    const VkRectLayerKHR*           rects,
-          DxvkSubmitStatus*         status) {
+    const VkRectLayerKHR*           rects) {
     DxvkPresentInfo presentInfo = { };
     presentInfo.presenter = presenter;
     presentInfo.frameId = frameId;
+    presentInfo.latencyFrameId = latencyFrameId;
 
     for (uint32_t i = 0u; i < rectCount; i++)
       presentInfo.rects.push_back(rects[i]);
 
-    DxvkLatencyInfo latencyInfo;
-    latencyInfo.tracker = tracker;
-    latencyInfo.frameId = frameId;
-
-    m_submissionQueue.present(presentInfo, latencyInfo, status);
+    m_submissionQueue.present(presentInfo);
     
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
@@ -628,32 +609,24 @@ namespace dxvk {
 
   void DxvkDevice::submitCommandList(
     const Rc<DxvkCommandList>&      commandList,
-    const Rc<DxvkLatencyTracker>&   tracker,
-          uint64_t                  frameId,
-          DxvkSubmitStatus*         status) {
+          uint64_t                  submissionId) {
     DxvkSubmitInfo submitInfo = { };
     submitInfo.cmdList = commandList;
 
-    DxvkLatencyInfo latencyInfo;
-    latencyInfo.tracker = tracker;
-    latencyInfo.frameId = frameId;
-
-    m_submissionQueue.submit(submitInfo, latencyInfo, status);
+    m_submissionQueue.submit(submitInfo, submissionId);
 
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.merge(commandList->statCounters());
   }
-  
-  
-  VkResult DxvkDevice::waitForSubmission(DxvkSubmitStatus* status) {
-    VkResult result = status->result.load();
 
-    if (result == VK_NOT_READY) {
-      m_submissionQueue.synchronizeSubmission(status);
-      result = status->result.load();
-    }
 
-    return result;
+  void DxvkDevice::setSubmissionTimeout(uint64_t timeout) {
+    m_submissionQueue.setSubmissionTimeout(timeout);
+  }
+
+  
+  void DxvkDevice::waitForSubmission(uint64_t submissionId) {
+    m_submissionQueue.synchronizeSubmission(submissionId);
   }
 
 
@@ -779,11 +752,14 @@ namespace dxvk {
     if (!(r32Features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))
       m_shaderOptions.flags.set(DxvkShaderCompileFlag::TypedR32LoadRequiresFormat);
 
-    // Intel's hardware sin/cos is so inaccurate that it causes rendering issues in some games
-    bool lowerSinCos = m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
-                    || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
+    // Up to the Intel Xe2 GPU architecture, the hardware sin/cos precision was low
+    // (but spec compliant) close to zero, which causes rendering issues in some games.
+    // Precision close to 0 is significantly improved with Xe3 (arch 30) and newer.
+    bool lowerSinCos =
+        (m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
+         || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS))
+         && (!m_features.intelDeviceInfo || m_properties.intelDeviceInfo.deviceIpVersionArch < 30u);
     applyTristate(lowerSinCos, m_options.lowerSinCos);
-
 
     if (lowerSinCos)
       m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerSinCos);
@@ -794,6 +770,10 @@ namespace dxvk {
         DxvkShaderCompileFlag::LowerFtoI,
         DxvkShaderCompileFlag::LowerF32toF16);
     }
+
+    // Enable game workarounds
+    if (m_options.zeroShaderScratchMemory)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::ZeroScratchMemory);
 
     // On AMD, push constant BDA will not be worse than going through a descriptor
     if (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)

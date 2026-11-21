@@ -53,6 +53,10 @@ namespace dxvk {
     m_shaderOptions     (GetShaderOptions(m_dxvkDevice, m_d3d11Options)),
     m_maxFeatureLevel   (D3D11DeviceFeatures::GetMaxFeatureLevel(*m_dxvkDevice)),
     m_deviceFeatures    (*m_dxvkDevice, m_d3d11Options, m_featureLevel) {
+    // This option might lead to long-running submissions
+    if (m_d3d11Options.reproducibleCommandStream)
+      m_dxvkDevice->setSubmissionTimeout(-1ull);
+
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     m_d3d10Device = new D3D10Device(this, m_context.ptr());
@@ -1851,7 +1855,7 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE D3D11Device::SetExceptionMode(UINT RaiseFlags) {
     Logger::err("D3D11Device::SetExceptionMode: Not implemented");
-    return E_NOTIMPL;
+    return S_OK;
   }
   
   
@@ -2081,7 +2085,7 @@ namespace dxvk {
     } (shaderInfo.getType());
 
     if (ShaderKey.stage() != shaderStage) {
-      bool mismatch = !ShaderKey.hasXfb() || (
+      bool mismatch = ModuleInfo.xfbEntries.empty() || (
         shaderStage != VK_SHADER_STAGE_VERTEX_BIT &&
         shaderStage != VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
 
@@ -2708,6 +2712,18 @@ namespace dxvk {
   }
 
 
+  void D3D11Device::LockBuffer(
+    const Rc<DxvkBuffer>&           Buffer) {
+    auto chunk = AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    chunk->push([cBuffer = Buffer] (DxvkContext* ctx) {
+      ctx->ensureBufferAddress(cBuffer);
+    });
+
+    m_context->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
+  }
+
+
   bool D3D11Device::LockImage(
     const Rc<DxvkImage>&            Image,
           VkImageUsageFlags         Usage) {
@@ -2767,11 +2783,35 @@ namespace dxvk {
        D3D11_COMMON_TEXTURE_DESC* desc) {
 
     if (size == sizeof(d3dkmt.d3d12) && d3dkmt.d3d12.d3d11.dxgi.size == sizeof(d3dkmt.d3d12.d3d11) && d3dkmt.d3d12.d3d11.dxgi.version == 0) {
-      Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: D3D12 descriptor conversion not implemented"));
-      return false;
-    }
+      const D3D12_RESOURCE_DESC1 *d3d12 = &d3dkmt.d3d12.desc1;
+      Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Found D3D12 desc with dimension: ", d3d12->Dimension));
 
-    if (size >= sizeof(d3dkmt.d3d11) && d3dkmt.dxgi.size == sizeof(d3dkmt.d3d11) && d3dkmt.dxgi.version == 4) {
+      switch (d3d12->Dimension) {
+        case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+          desc->Width = d3d12->Width;
+          desc->Height = d3d12->Height;
+          desc->Depth = 1;
+          desc->MipLevels = d3d12->MipLevels;
+          desc->ArraySize = d3d12->DepthOrArraySize;
+          desc->Format = d3d12->Format;
+          desc->SampleDesc = d3d12->SampleDesc;
+          desc->Usage = D3D11_USAGE_DEFAULT;
+          desc->BindFlags = D3D11_BIND_RENDER_TARGET;
+          if (d3d12->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            desc->BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+          if (d3d12->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            desc->BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+          if (!(d3d12->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+            desc->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+          desc->CPUAccessFlags = 0;
+          desc->MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+          desc->TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+          break;
+        default:
+          Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported dimension: ", d3d12->Dimension));
+          return false;
+      }
+    } else if (size >= sizeof(d3dkmt.d3d11) && d3dkmt.dxgi.size == sizeof(d3dkmt.d3d11) && d3dkmt.dxgi.version == 4) {
       Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Found D3D11 desc with dimension: ", d3dkmt.d3d11.dimension));
 
       switch (d3dkmt.d3d11.dimension) {
@@ -2793,42 +2833,9 @@ namespace dxvk {
           Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported dimension: ", d3dkmt.d3d11.dimension));
           return false;
       }
-
-      Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Translated D3D11 desc:"));
-      Logger::debug(str::format("  Width: ", desc->Width));
-      Logger::debug(str::format("  Height: ", desc->Height));
-      Logger::debug(str::format("  Depth: ", desc->Depth));
-      Logger::debug(str::format("  MipLevels: ", desc->MipLevels));
-      Logger::debug(str::format("  ArraySize: ", desc->ArraySize));
-      Logger::debug(str::format("  Format: ", desc->Format));
-      Logger::debug(str::format("  SampleDesc.Count: ", desc->SampleDesc.Count));
-      Logger::debug(str::format("  SampleDesc.Quality: ", desc->SampleDesc.Quality));
-      Logger::debug(str::format("  Usage: ", desc->Usage));
-      Logger::debug(str::format("  BindFlags: ", desc->BindFlags));
-      Logger::debug(str::format("  CPUAccessFlags: ", desc->CPUAccessFlags));
-      Logger::debug(str::format("  MiscFlags: ", desc->MiscFlags));
-      Logger::debug(str::format("  TextureLayout: ", desc->TextureLayout));
-      return true;
     }
-
-    if (size >= sizeof(d3dkmt.d3d9) && d3dkmt.dxgi.size == sizeof(d3dkmt.d3d9) && d3dkmt.dxgi.version == 1) {
+    else if (size >= sizeof(d3dkmt.d3d9) && d3dkmt.dxgi.size == sizeof(d3dkmt.d3d9) && d3dkmt.dxgi.version == 1) {
       Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Found D3D9 desc: ", d3dkmt.d3d9.type));
-      Logger::debug(str::format("  dxgi.width: ", d3dkmt.d3d9.dxgi.width));
-      Logger::debug(str::format("  dxgi.height: ", d3dkmt.d3d9.dxgi.height));
-      Logger::debug(str::format("  format: ", d3dkmt.d3d9.format));
-      Logger::debug(str::format("  usage: ", d3dkmt.d3d9.usage));
-      if (d3dkmt.d3d9.type == D3DRTYPE_TEXTURE) {
-        Logger::debug(str::format("  texture.width: ", d3dkmt.d3d9.texture.width));
-        Logger::debug(str::format("  texture.height: ", d3dkmt.d3d9.texture.height));
-        Logger::debug(str::format("  texture.depth: ", d3dkmt.d3d9.texture.depth));
-        Logger::debug(str::format("  texture.levels: ", d3dkmt.d3d9.texture.levels));
-      } else if (d3dkmt.d3d9.type == D3DRTYPE_SURFACE) {
-        Logger::debug(str::format("  surface.width: ", d3dkmt.d3d9.surface.width));
-        Logger::debug(str::format("  surface.height: ", d3dkmt.d3d9.surface.height));
-      } else {
-        Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported D3D9 type: ", d3dkmt.d3d9.type));
-        return false;
-      }
 
       desc->Width = d3dkmt.d3d9.dxgi.width;
       desc->Height = d3dkmt.d3d9.dxgi.height;
@@ -2856,29 +2863,30 @@ namespace dxvk {
           desc->Height = d3dkmt.d3d9.surface.height;
           break;
         default:
-          break;
+          Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported D3D9 type: ", d3dkmt.d3d9.type));
+          return false;
       }
-
-      Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Translated D3D9 desc:"));
-      Logger::debug(str::format("  Width: ", desc->Width));
-      Logger::debug(str::format("  Height: ", desc->Height));
-      Logger::debug(str::format("  Depth: ", desc->Depth));
-      Logger::debug(str::format("  MipLevels: ", desc->MipLevels));
-      Logger::debug(str::format("  ArraySize: ", desc->ArraySize));
-      Logger::debug(str::format("  Format: ", desc->Format));
-      Logger::debug(str::format("  SampleDesc.Count: ", desc->SampleDesc.Count));
-      Logger::debug(str::format("  SampleDesc.Quality: ", desc->SampleDesc.Quality));
-      Logger::debug(str::format("  Usage: ", desc->Usage));
-      Logger::debug(str::format("  BindFlags: ", desc->BindFlags));
-      Logger::debug(str::format("  CPUAccessFlags: ", desc->CPUAccessFlags));
-      Logger::debug(str::format("  MiscFlags: ", desc->MiscFlags));
-      Logger::debug(str::format("  TextureLayout: ", desc->TextureLayout));
-      return true;
+    } else {
+      Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported runtime desc size: ",
+                               size, "/", d3dkmt.dxgi.size, " version: ", d3dkmt.dxgi.version));
+      return false;
     }
 
-    Logger::warn(str::format("D3D11Device::ConvertRuntimeDescriptor: Unsupported runtime desc size: ",
-                             size, "/", d3dkmt.dxgi.size, " version: ", d3dkmt.dxgi.version));
-    return false;
+    Logger::debug(str::format("D3D11Device::ConvertRuntimeDescriptor: Translated desc:"));
+    Logger::debug(str::format("  Width: ", desc->Width));
+    Logger::debug(str::format("  Height: ", desc->Height));
+    Logger::debug(str::format("  Depth: ", desc->Depth));
+    Logger::debug(str::format("  MipLevels: ", desc->MipLevels));
+    Logger::debug(str::format("  ArraySize: ", desc->ArraySize));
+    Logger::debug(str::format("  Format: ", desc->Format));
+    Logger::debug(str::format("  SampleDesc.Count: ", desc->SampleDesc.Count));
+    Logger::debug(str::format("  SampleDesc.Quality: ", desc->SampleDesc.Quality));
+    Logger::debug(str::format("  Usage: ", desc->Usage));
+    Logger::debug(str::format("  BindFlags: ", desc->BindFlags));
+    Logger::debug(str::format("  CPUAccessFlags: ", desc->CPUAccessFlags));
+    Logger::debug(str::format("  MiscFlags: ", desc->MiscFlags));
+    Logger::debug(str::format("  TextureLayout: ", desc->TextureLayout));
+    return true;
   }
 
 
@@ -3237,13 +3245,7 @@ namespace dxvk {
     if (!Buffer->canRelocate())
       return;
 
-    auto chunk = m_device->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-
-    chunk->push([cBuffer = Buffer] (DxvkContext* ctx) {
-      ctx->ensureBufferAddress(cBuffer);
-    });
-
-    m_device->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
+    m_device->LockBuffer(Buffer);
   }
 
 
@@ -3493,9 +3495,7 @@ namespace dxvk {
           D3D11Device*            pDevice)
   : m_container(pContainer), m_device(pDevice) {
     auto dxvkDevice = pDevice->GetDXVKDevice();
-
-    m_reflexEnabled = dxvkDevice->features().nvLowLatency2
-                   && dxvkDevice->config().latencySleep == Tristate::Auto;
+    m_reflexEnabled = dxvkDevice->features().nvLowLatency2;
   }
 
 
@@ -3530,17 +3530,17 @@ namespace dxvk {
     if (!m_reflexEnabled)
       return DXGI_ERROR_INVALID_CALL;
 
-    // Don't keep object locked while sleeping
-    Rc<DxvkReflexLatencyTrackerNv> tracker;
+    Com<D3D11SwapChain> swapChain;
 
-    { std::lock_guard lock(m_mutex);
-      tracker = m_tracker;
+    { std::unique_lock lock(m_mutex);
+
+      if (!m_swapChain || !m_swapChain->HasLiveReferences())
+        return S_OK;
+
+      swapChain = m_swapChain;
     }
 
-    if (tracker)
-      tracker->latencySleep();
-
-    return S_OK;
+    return swapChain->LatencySleep();
   }
 
 
@@ -3553,16 +3553,15 @@ namespace dxvk {
 
     std::lock_guard lock(m_mutex);
 
-    if (m_tracker) {
-      m_tracker->setLatencySleepMode(
-        LowLatencyEnable, LowLatencyBoost, MinIntervalUs);
-    }
-
     // Write back in case we have no swapchain yet
-    m_enableLowLatency = LowLatencyEnable;
-    m_enableBoost      = LowLatencyBoost;
-    m_minIntervalUs    = MinIntervalUs;
-    return S_OK;
+    m_sleepMode.lowLatencyMode = LowLatencyEnable;
+    m_sleepMode.lowLatencyBoost = LowLatencyBoost;
+    m_sleepMode.minimumIntervalUs = MinIntervalUs;
+
+    if (!m_swapChain)
+      return S_OK;
+
+    return m_swapChain->SetLatencySleepMode(m_sleepMode);
   }
 
 
@@ -3574,30 +3573,10 @@ namespace dxvk {
 
     std::lock_guard lock(m_mutex);
 
-    if (m_tracker) {
-      auto marker = VkLatencyMarkerNV(MarkerType);
-      m_tracker->setLatencyMarker(FrameId, marker);
+    if (!m_swapChain)
+      return S_OK;
 
-      if (marker == VK_LATENCY_MARKER_RENDERSUBMIT_START_NV) {
-        m_device->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
-          cTracker  = m_tracker,
-          cFrameId  = FrameId
-        ] (DxvkContext* ctx) {
-          uint64_t frameId = cTracker->frameIdFromAppFrameId(cFrameId);
-
-          if (frameId)
-            ctx->beginLatencyTracking(cTracker, frameId);
-        });
-      } else if (marker == VK_LATENCY_MARKER_RENDERSUBMIT_END_NV) {
-        m_device->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
-          cTracker  = m_tracker
-        ] (DxvkContext* ctx) {
-          ctx->endLatencyTracking(cTracker);
-        });
-      }
-    }
-
-    return S_OK;
+    return m_swapChain->SetLatencyMarker(FrameId, VkLatencyMarkerNV(MarkerType));
   }
 
 
@@ -3616,68 +3595,66 @@ namespace dxvk {
 
     std::lock_guard lock(m_mutex);
 
-    if (!m_tracker)
+    if (!m_swapChain)
       return S_OK;
 
-    // Apparently we have to report all 64 frames, or nothing
-    std::array<DxvkReflexFrameReport, FrameCount> reports = { };
-    uint32_t reportCount = m_tracker->getFrameReports(FrameCount, reports.data());
+    std::array<VkLatencyTimingsFrameReportNV, FrameCount> reports = {};
 
-    if (reportCount < FrameCount)
+    for (size_t i = 0u; i < reports.size(); i++)
+      reports[i] = { VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV };
+
+    size_t count = m_swapChain->GetLatencyInfo(reports.size(), reports.data());
+
+    // Apparently we have to report all 64 entries, or nothing.
+    if (count < reports.size())
       return S_OK;
 
-    for (uint32_t i = 0; i < FrameCount; i++) {
-      auto& src = reports[i];
+    for (size_t i = 0u; i < reports.size(); i++) {
+      const auto& src = reports[i];
       auto& dst = pLowLatencyResults->frameReports[i];
 
-      dst.frameID = src.report.presentID;
-      dst.inputSampleTime = src.report.inputSampleTimeUs;
-      dst.simStartTime = src.report.simStartTimeUs;
-      dst.simEndTime = src.report.simEndTimeUs;
-      dst.renderSubmitStartTime = src.report.renderSubmitStartTimeUs;
-      dst.renderSubmitEndTime = src.report.renderSubmitEndTimeUs;
-      dst.presentStartTime = src.report.presentStartTimeUs;
-      dst.presentEndTime = src.report.presentEndTimeUs;
-      dst.driverStartTime = src.report.driverStartTimeUs;
-      dst.driverEndTime = src.report.driverEndTimeUs;
-      dst.osRenderQueueStartTime = src.report.osRenderQueueStartTimeUs;
-      dst.osRenderQueueEndTime = src.report.osRenderQueueEndTimeUs;
-      dst.gpuRenderStartTime = src.report.gpuRenderStartTimeUs;
-      dst.gpuRenderEndTime = src.report.gpuRenderEndTimeUs;
-      dst.gpuActiveRenderTimeUs = src.gpuActiveTimeUs;
-      dst.gpuFrameTimeUs = 0;
-
-      if (i) {
-        dst.gpuFrameTimeUs = reports[i - 0].report.gpuRenderEndTimeUs
-                           - reports[i - 1].report.gpuRenderEndTimeUs;
-      }
+      dst.frameID = src.presentID;
+      dst.inputSampleTime = src.inputSampleTimeUs;
+      dst.simStartTime = src.simStartTimeUs;
+      dst.simEndTime = src.simEndTimeUs;
+      dst.renderSubmitStartTime = src.renderSubmitStartTimeUs;
+      dst.renderSubmitEndTime = src.renderSubmitEndTimeUs;
+      dst.presentStartTime = src.presentStartTimeUs;
+      dst.presentEndTime = src.presentEndTimeUs;
+      dst.driverStartTime = src.driverStartTimeUs;
+      dst.driverEndTime = src.driverEndTimeUs;
+      dst.osRenderQueueStartTime = src.osRenderQueueStartTimeUs;
+      dst.osRenderQueueEndTime = src.osRenderQueueEndTimeUs;
+      dst.gpuRenderStartTime = src.gpuRenderStartTimeUs;
+      dst.gpuRenderEndTime = src.gpuRenderEndTimeUs;
+      // No great way to estimate GPU idle for any given frame
+      dst.gpuActiveRenderTimeUs = src.gpuRenderEndTimeUs - src.gpuRenderStartTimeUs;
+      dst.gpuFrameTimeUs = src.gpuRenderEndTimeUs - src.gpuRenderStartTimeUs;
     }
 
     return S_OK;
   }
 
 
-  void D3D11ReflexDevice::RegisterLatencyTracker(
-          Rc<DxvkLatencyTracker>          Tracker) {
-    std::lock_guard lock(m_mutex);
-
-    if (m_tracker)
+  void D3D11ReflexDevice::RegisterSwapChain(D3D11SwapChain* pSwapChain) {
+    if (!m_reflexEnabled)
       return;
 
-    if ((m_tracker = dynamic_cast<DxvkReflexLatencyTrackerNv*>(Tracker.ptr())))
-      m_tracker->setLatencySleepMode(m_enableLowLatency, m_enableBoost, m_minIntervalUs);
-  }
-
-
-  void D3D11ReflexDevice::UnregisterLatencyTracker(
-          Rc<DxvkLatencyTracker>          Tracker) {
     std::lock_guard lock(m_mutex);
 
-    if (m_tracker == Tracker)
-      m_tracker = nullptr;
+    if (!m_swapChain) {
+      m_swapChain = pSwapChain;
+      m_swapChain->SetLatencySleepMode(m_sleepMode);
+    }
   }
 
 
+  void D3D11ReflexDevice::UnregisterSwapChain(D3D11SwapChain* pSwapChain) {
+    std::lock_guard lock(m_mutex);
+
+    if (m_swapChain == pSwapChain)
+      m_swapChain = nullptr;
+  }
 
 
   DXGIVkSwapChainFactory::DXGIVkSwapChainFactory(

@@ -4,11 +4,13 @@ A maintained macOS/Wine fork of [Gcenx/DXVK-macOS](https://github.com/Gcenx/DXVK
 
 This fork brings Gcenx's MoltenVK compatibility work to DXVK 3.1 and its `dxbc-spirv` shader compiler. It also builds ARM64X DLLs for [MetalSharp Wine](https://github.com/metalsharp/MetalSharp-Wine) (arm64 Wine with FEX).
 
+It also carries [d7vk](https://github.com/WinterSnowfall/d7vk)'s `ddraw.dll`: Direct3D 7, 6, 5 and 3 (immediate mode) on DXVK's D3D9 backend. DirectDraw itself is proxied to Wine's own `ddraw.dll`, which d7vk loads as `ddraw_.dll` (see [Runtime setup](#runtime-setup)).
+
 ## Release contents
 
 A `v*` tag builds a release (`.github/workflows/release.yml`) with four packages, each with its licenses and `SHA256SUMS`:
 
-- `dxvk-macos-<tag>-x86_64`: `d3d8.dll`, `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll` for x86_64 Windows programs (`x86_64-windows`)
+- `dxvk-macos-<tag>-x86_64`: `ddraw.dll`, `d3d8.dll`, `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll` for x86_64 Windows programs (`x86_64-windows`)
 - `dxvk-macos-<tag>-i386`: the same for 32-bit Windows programs (`i386-windows`)
 - `dxvk-macos-<tag>-arm64x`: the same as ARM64X for an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine). x86_64 programs load them as ARM64EC from `x86_64-windows`, so DXVK itself runs natively.
 - `moltenvk-<tag>-universal`: the universal (arm64 + x86_64), ad-hoc signed `libMoltenVK.dylib` and `MoltenVK_icd.json`. It is built by [metalsharp/VKD3D-Proton-MacOS](https://github.com/metalsharp/VKD3D-Proton-MacOS)'s `scripts/fetch-sources.sh moltenvk` and `scripts/build-moltenvk.sh --externals` at the commit the workflow pins (`VKD3D_PROTON_MACOS_REV`). That is the same MoltenVK, with the same MoltenVK and SPIRV-Cross fixes, that VKD3D-Proton-MacOS ships and MetalSharp Wine runs. DXVK 3.1 needs those fixes on Metal:
@@ -134,9 +136,25 @@ export WINEDLLOVERRIDES='d3d8,d3d9,d3d10core,d3d11,dxgi=n,b'
 
 Copy the DLLs into the prefix's `system32` (64-bit, or ARM64X on MetalSharp Wine) and `syswow64` (i386) folders, or into the game's folder.
 
+### Direct3D 7, 6, 5 and 3 (`ddraw.dll`)
+
+`ddraw.dll` implements only Direct3D and passes DirectDraw itself to a real DirectDraw. It loads `ddraw_.dll` from the
+game's folder first, then from the system folder. Copy Wine's own `ddraw.dll` of the same architecture
+(`lib/wine/i386-windows/ddraw.dll` for 32-bit games, which nearly all of them are) next to it as `ddraw_.dll`, and set
+`ddraw=n,b`:
+
+```bash
+export WINEDLLOVERRIDES='ddraw=n,b'
+```
+
+Some games (GTA 2, StarLancer, Midtown Madness 2) only load DirectDraw from the system folder; install both files in
+`syswow64` for them. D3D9's `d3d9.*` options apply to these games too, and `ddraw.*` options are listed in `dxvk.conf`.
+The log is `<game>_ddraw.log`. `tools/smoke/ddraw_run.sh` runs the D3D7/6/5/3 checks in `tools/smoke/ddraw_draw.c`.
+
 ## Provenance
 
-- Upstream DXVK: `v3.1.1` (`1e0f92318d6ec7b7286e050d9e24fd01a2d09c92`), merged up to master `40e01640396d03f9fddeb697f5ee00ae893ecb75`
+- Upstream DXVK: `v3.1.1` (`1e0f92318d6ec7b7286e050d9e24fd01a2d09c92`), merged up to master `0f5c295c66770895a68542ea9cee2c77ac7dfd9f` through d7vk
+- d7vk (`src/ddraw` and its D3D9 changes): `devel` at `9fb6a2d50`
 - Upstream `dxbc-spirv`: the submodule's pinned commit (`git ls-tree HEAD subprojects/dxbc-spirv`)
 - MoltenVK and SPIRV-Cross: [metalsharp/VKD3D-Proton-MacOS](https://github.com/metalsharp/VKD3D-Proton-MacOS) (`patches/moltenvk`, `patches/spirv-cross`)
 - Gcenx DXVK-macOS heritage: `1.10.x` branch and release history

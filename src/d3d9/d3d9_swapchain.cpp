@@ -19,11 +19,11 @@ namespace dxvk {
           D3D9DeviceEx*          pDevice,
           D3DPRESENT_PARAMETERS* pPresentParams,
     const D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
-          bool                   EnableLatencyTracking)
+          D3D9Adapter*           pAdapter)
     : D3D9SwapChainExBase(pDevice)
     , m_device           (pDevice->GetDXVKDevice())
     , m_frameLatencyCap  (pDevice->GetOptions()->maxFrameLatency)
-    , m_latencyTracking  (EnableLatencyTracking)
+    , m_adapter          (pAdapter)
     , m_swapchainExt     (this) {
     this->NormalizePresentParameters(pPresentParams);
     m_presentParams = *pPresentParams;
@@ -65,7 +65,9 @@ namespace dxvk {
     DestroyBackBuffers();
 
     ResetWindowProc(m_window);
-    RestoreDisplayMode(m_monitor);
+    // In D3D7 and earlier we rely on DDraw to handle display modes
+    if (!m_parent->IsD3DCompatibile(D3DCompatibility::D3D7))
+      RestoreDisplayMode(m_monitor);
 
     for (auto& p : m_presenters) {
       if (p.second.presenter) {
@@ -207,7 +209,10 @@ namespace dxvk {
   #define DCX_USESTYLE 0x00010000
 
   HRESULT D3D9SwapChainEx::PresentImageGDI(HWND Window) {
-    m_parent->EndFrame(nullptr);
+    m_parent->EmitCs([] (DxvkContext* ctx) {
+      ctx->endFrame();
+    });
+
     m_parent->Flush();
 
     if (!std::exchange(m_warnedAboutGDIFallback, true))
@@ -283,7 +288,7 @@ namespace dxvk {
                        || dstTexExtent.width > srcTexExtent.width
                        || dstTexExtent.height > srcTexExtent.height;
 
-    dstTexInfo->CreateBuffer(clearDst, dstTexInfo->GetTotalSize());
+    dstTexInfo->EnsureBufferExists(clearDst);
     DxvkBufferSlice dstBufferSlice = dstTexInfo->GetBufferSlice(dst->GetSubresource());
     Rc<DxvkImage>   srcImage       = srcTexInfo->GetImage();
 
@@ -607,7 +612,7 @@ namespace dxvk {
 
       wsi::WsiMode devMode = { };
 
-      if (!wsi::getCurrentDisplayMode(wsi::getDefaultMonitor(), &devMode)) {
+      if (!wsi::getCurrentDisplayMode(m_adapter->GetMonitor(), &devMode)) {
         Logger::err("D3D9SwapChainEx::GetDisplayModeEx: Failed to enum display settings");
         return D3DERR_INVALIDCALL;
       }
@@ -631,6 +636,12 @@ namespace dxvk {
     bool changeFullscreen = m_presentParams.Windowed != pPresentParams->Windowed;
 
     if (m_window != pPresentParams->hDeviceWindow) {
+      if (!m_presentParams.Windowed) {
+        this->LeaveFullscreenMode();
+        if (!pPresentParams->Windowed)
+          changeFullscreen = true;
+      }
+
       m_window = pPresentParams->hDeviceWindow;
       m_displayRefreshRateDirty = true;
     }
@@ -640,7 +651,9 @@ namespace dxvk {
         this->LeaveFullscreenMode();
     }
     else {
-      m_parent->NotifyFullscreen(m_window, true);
+      // Device loss on focus loss only tracks head 0's window.
+      if (!IsGroupSubordinate())
+        m_parent->NotifyFullscreen(m_window, true);
 
       if (changeFullscreen) {
         hr = this->EnterFullscreenMode(pPresentParams, pFullscreenDisplayMode);
@@ -736,7 +749,8 @@ namespace dxvk {
                  && cp[i].b == identity;
     }
 
-    if (!isIdentity && !m_presentParams.Windowed)
+    // For D3D7 and earlier we always fake windowed mode because of DDraw interop
+    if (!isIdentity && (!m_presentParams.Windowed || m_parent->IsD3DCompatibile(D3DCompatibility::D3D7)))
       m_blitter->setGammaRamp(NumControlPoints, cp.data());
     else
       m_blitter->setGammaRamp(0, nullptr);
@@ -761,9 +775,6 @@ namespace dxvk {
       if (entry->second.presenter) {
         entry->second.presenter->destroyResources();
         entry->second.presenter = nullptr;
-
-        if (m_presentParams.hDeviceWindow == hWindow)
-          DestroyLatencyTracker();
       }
 
       if (m_wctx == &entry->second)
@@ -829,7 +840,7 @@ namespace dxvk {
         pPresentParams->BackBufferHeight ? nullptr : &pPresentParams->BackBufferHeight);
     }
     else {
-      wsi::getMonitorClientSize(wsi::getDefaultMonitor(),
+      wsi::getMonitorClientSize(m_adapter->GetMonitor(),
         pPresentParams->BackBufferWidth  ? nullptr : &pPresentParams->BackBufferWidth,
         pPresentParams->BackBufferHeight ? nullptr : &pPresentParams->BackBufferHeight);
     }
@@ -843,11 +854,7 @@ namespace dxvk {
 
 
   void D3D9SwapChainEx::PresentImage(UINT SyncInterval) {
-    m_parent->EndFrame(m_latencyTracker);
     m_parent->Flush();
-
-    if (m_latencyTracker)
-      m_latencyTracker->notifyCpuPresentBegin(m_wctx->frameId + 1u);
 
     // Retrieve the image and image view to present
     VkResult status = VK_SUCCESS;
@@ -889,15 +896,18 @@ namespace dxvk {
         cDevice         = m_device,
         cPresenter      = m_wctx->presenter,
         cBlitter        = m_blitter,
+        cHud            = m_hud,
         cColorSpace     = m_colorspace,
         cSrcView        = swapImageView,
         cSrcRect        = srcRect,
         cDstView        = backBuffer->createView(viewInfo),
         cDstRect        = dstRect,
         cSync           = sync,
-        cFrameId        = m_wctx->frameId,
-        cLatency        = m_latencyTracker
+        cFrameId        = m_wctx->frameId
       ] (DxvkContext* ctx) {
+        if (cHud)
+          cHud->update(*cPresenter);
+
         // Update back buffer color space as necessary
         if (cSrcView->image()->info().colorSpace != cColorSpace) {
           DxvkImageUsageInfo usage = { };
@@ -909,39 +919,21 @@ namespace dxvk {
         // Blit back buffer onto Vulkan swap chain
         auto contextObjects = ctx->beginExternalRendering();
 
-        cBlitter->present(contextObjects, VkClearColorValue(),
+        cBlitter->present(contextObjects, cHud, VkClearColorValue(),
           cDstView, cDstRect, cSrcView, cSrcRect);
 
         // Submit command list and present
+        ctx->endFrame();
         ctx->synchronizeWsi(cSync);
-        ctx->flushCommandList(nullptr, nullptr);
+        ctx->flushCommandList(nullptr, 0u);
 
-        cDevice->presentImage(cPresenter, cLatency, cFrameId, 0, nullptr, nullptr);
+        cDevice->presentImage(cPresenter, cFrameId, 0, 0, nullptr);
       });
 
       m_parent->FlushCsChunk();
     }
 
-    if (m_latencyTracker) {
-      if (status == VK_SUCCESS)
-        m_latencyTracker->notifyCpuPresentEnd(m_wctx->frameId);
-      else
-        m_latencyTracker->discardTimings();
-    }
-
     SyncFrameLatency();
-
-    DxvkLatencyStats latencyStats = { };
-
-    if (m_latencyTracker && status == VK_SUCCESS) {
-      latencyStats = m_latencyTracker->getStatistics(m_wctx->frameId);
-      m_latencyTracker->sleepAndBeginFrame(m_wctx->frameId + 1, std::abs(m_targetFrameRate));
-
-      m_parent->BeginFrame(m_latencyTracker, m_wctx->frameId + 1u);
-    }
-
-    if (m_latencyHud)
-      m_latencyHud->accumulateStats(latencyStats);
 
     // Rotate swap chain buffers so that the back
     // buffer at index 0 becomes the front buffer.
@@ -1010,9 +1002,6 @@ namespace dxvk {
 
       entry->second.frameLatencySignal = new sync::Fence(entry->second.frameId);
       entry->second.presenter = CreatePresenter(m_window, entry->second.frameLatencySignal);
-
-      if (m_presentParams.hDeviceWindow == m_window && m_latencyTracking)
-        m_latencyTracker = m_device->createLatencyTracker(entry->second.presenter);
     }
 
     m_wctx = &entry->second;
@@ -1086,22 +1075,18 @@ namespace dxvk {
 
 
   void D3D9SwapChainEx::CreateBlitter() {
-    Rc<hud::Hud> hud = hud::Hud::createHud(m_device);
+    m_hud = hud::Hud::createHud(m_device);
 
-    if (hud) {
-      m_apiHud = hud->addItem<hud::HudClientApiItem>("api", 1, GetApiName());
-
-      if (m_latencyTracking)
-        m_latencyHud = hud->addItem<hud::HudLatencyItem>("latency", 4);
-
-      hud->addItem<hud::HudSWVPState>("swvp", -1, m_parent);
+    if (m_hud) {
+      m_apiHud = m_hud->addItem<hud::HudClientApiItem>("api", 1, GetApiName());
+      m_hud->addItem<hud::HudSWVPState>("swvp", -1, m_parent);
 
 #ifdef DXVK_USE_UNMAPPABLE_MEMORY
-      hud->addItem<hud::HudTextureMemory>("memory", -1, m_parent);
+      m_hud->addItem<hud::HudTextureMemory>("memory", -1, m_parent);
 #endif
     }
 
-    m_blitter = new DxvkSwapchainBlitter(m_device, std::move(hud));
+    m_blitter = new DxvkSwapchainBlitter(m_device);
 
     // D3D9 and D3D8 have no feature levels: the Metal HUD shows the API (D3D9, D3D9Ex, D3D8, ...On12)
     reportMetalHud(GetApiName());
@@ -1119,29 +1104,20 @@ namespace dxvk {
   }
 
 
-  void D3D9SwapChainEx::DestroyLatencyTracker() {
-    if (!m_latencyTracker)
-      return;
-
-    m_parent->InjectCs([
-      cTracker = std::move(m_latencyTracker)
-    ] (DxvkContext* ctx) {
-      ctx->endLatencyTracking(cTracker);
-    });
-  }
-
-
   void D3D9SwapChainEx::UpdateTargetFrameRate(uint32_t SyncInterval) {
     double frameRate = double(m_parent->GetOptions()->maxFrameRate);
 
     if (frameRate != -1.0) {
       if (frameRate == 0.0 && SyncInterval) {
-        bool engageLimiter = SyncInterval > 1u || m_monitor ||
-          m_device->config().latencySleep == Tristate::True;
+        bool engageLimiter = SyncInterval > 1u || m_monitor;
 
         if (engageLimiter)
           frameRate = -m_displayRefreshRate / double(SyncInterval);
       }
+
+      // Head 0 paces presentation for the whole adapter group.
+      if (IsGroupSubordinate())
+        frameRate = 0.0;
 
       m_wctx->presenter->setFrameRateLimit(frameRate, GetActualFrameLatency());
       m_targetFrameRate = frameRate;
@@ -1250,7 +1226,7 @@ namespace dxvk {
 
     D3D9WindowMessageFilter filter(m_window);
     
-    m_monitor = wsi::getDefaultMonitor();
+    m_monitor = m_adapter->GetMonitor();
 
     wsi::saveWindowState(m_window, &m_windowState, true);
 
@@ -1259,7 +1235,8 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
     }
     
-    m_parent->NotifyFullscreen(m_window, true);
+    if (!IsGroupSubordinate())
+      m_parent->NotifyFullscreen(m_window, true);
     
     return D3D_OK;
   }
@@ -1282,7 +1259,8 @@ namespace dxvk {
     }
     wsi::restoreWindowState(m_window, &m_windowState, false);
 
-    m_parent->NotifyFullscreen(m_window, false);
+    if (!IsGroupSubordinate())
+      m_parent->NotifyFullscreen(m_window, false);
     
     return D3D_OK;
   }
@@ -1306,10 +1284,21 @@ namespace dxvk {
 
     wsi::WsiMode wsiMode = ConvertDisplayMode(mode);
     
-    HMONITOR monitor = wsi::getDefaultMonitor();
+    HMONITOR monitor = m_adapter->GetMonitor();
 
-    if (!wsi::setWindowMode(monitor, m_window, &m_windowState, wsiMode))
+    // Only head 0 changes and restores display modes,
+    // subordinate heads are scaled to the desktop mode.
+    if (IsGroupSubordinate()) {
+      wsi::WsiMode currentMode = { };
+
+      if (wsi::getCurrentDisplayMode(monitor, &currentMode)
+       && (currentMode.width != wsiMode.width || currentMode.height != wsiMode.height)) {
+        Logger::warn(str::format("D3D9SwapChainEx::ChangeDisplayMode: Keeping desktop mode ",
+          currentMode.width, "x", currentMode.height, " for adapter group head"));
+      }
+    } else if (!wsi::setWindowMode(monitor, m_window, &m_windowState, wsiMode)) {
       return D3DERR_NOTAVAILABLE;
+    }
 
     m_displayRefreshRate = 0.0;
 
@@ -1326,12 +1315,20 @@ namespace dxvk {
   HRESULT D3D9SwapChainEx::RestoreDisplayMode(HMONITOR hMonitor) {
     if (hMonitor == nullptr)
       return D3DERR_INVALIDCALL;
+
+    // Head 0 restores every display.
+    if (IsGroupSubordinate())
+      return D3D_OK;
     
     if (!wsi::restoreDisplayMode())
       return D3DERR_NOTAVAILABLE;
 
     m_displayRefreshRateDirty = true;
     return D3D_OK;
+  }
+
+  bool D3D9SwapChainEx::IsGroupSubordinate() const {
+    return m_adapter != m_parent->GetAdapter();
   }
 
   void D3D9SwapChainEx::UpdatePresentRegion(const RECT* pSourceRect, const RECT* pDestRect) {
@@ -1362,11 +1359,15 @@ namespace dxvk {
       dstRect = *pDestRect;
     }
 
-    m_partialCopy =
-       dstRect.left != 0
-    || dstRect.top != 0
-    || dstRect.right  - dstRect.left != LONG(width)
-    || dstRect.bottom - dstRect.top  != LONG(height);
+    // We always want a full copy on Present() in D3D7 and earlier,
+    // since that is potentially needed for aspect ratio correction
+    if (!m_parent->IsD3DCompatibile(D3DCompatibility::D3D7)) {
+      m_partialCopy =
+        dstRect.left != 0
+      || dstRect.top != 0
+      || dstRect.right  - dstRect.left != LONG(width)
+      || dstRect.bottom - dstRect.top  != LONG(height);
+    }
 
     m_swapchainExtent = { width, height };
     m_dstRect = dstRect;
@@ -1388,7 +1389,11 @@ namespace dxvk {
     if (m_parent->Is9On12Device())
       return m_parent->IsD3DCompatibile(D3DCompatibility::D3D9Ex) ? "D3D9ExOn12" : "D3D9On12";
 
-    return m_parent->IsD3DCompatibile(D3DCompatibility::D3D8) ? "D3D8" :
+    return m_parent->IsD3DCompatibile(D3DCompatibility::D3D3) ? "D3D3" :
+           m_parent->IsD3DCompatibile(D3DCompatibility::D3D5) ? "D3D5" :
+           m_parent->IsD3DCompatibile(D3DCompatibility::D3D6) ? "D3D6" :
+           m_parent->IsD3DCompatibile(D3DCompatibility::D3D7) ? "D3D7" :
+           m_parent->IsD3DCompatibile(D3DCompatibility::D3D8) ? "D3D8" :
            m_parent->IsD3DCompatibile(D3DCompatibility::D3D9Ex) ? "D3D9Ex" : "D3D9";
   }
 

@@ -926,9 +926,6 @@ namespace dxvk {
     void Flush();
     void FlushAndSync9On12();
 
-    void BeginFrame(Rc<DxvkLatencyTracker> LatencyTracker, uint64_t FrameId);
-    void EndFrame(Rc<DxvkLatencyTracker> LatencyTracker);
-
     template <uint32_t Index>
     void UpdateAnyColorWrites();
 
@@ -1115,6 +1112,10 @@ namespace dxvk {
     HRESULT ResetSwapChain(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode);
 
     HRESULT InitialReset(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode);
+
+    D3D9SwapChainEx* GetHeadSwapChain(UINT iSwapChain) const;
+
+    uint32_t GetHeadCount() const;
 
     /**
      * \brief Returns the allocator used for unmappable system memory texture data
@@ -1448,6 +1449,53 @@ namespace dxvk {
         : GetHelper(m_state.psConsts);
     }
 
+    // DDraw-driven presentation can update the present interval on each present
+    void UpdatePresentInterval(uint32_t presentInterval);
+
+    void UpdateFullScreenWindowSize();
+
+    // To simplify the implementation, disregard all but stage 0. The only known
+    // use of multi-stage color keying is in Arx Fatalis, but it, thankfully,
+    // relies on pure black color key transparency for all texture stages.
+    void SetColorKeyState(DWORD stage, bool colorKeyState) {
+      if (likely(stage == 0)) {
+        if (m_specData.setColorKeyEnable(colorKeyState))
+          m_dirty.set(D3D9DeviceDirtyFlag::SpecializationEntries);
+      } else if (unlikely(colorKeyState)) {
+        static bool s_textureStageColorKeyWarningShown;
+
+        if (!std::exchange(s_textureStageColorKeyWarningShown, true))
+          Logger::warn("D3D9Device:SetColorKeyState: Unsupported use of non-stage 0 color keying");
+      }
+    }
+
+    void SetLegacyLightsState(bool legacyLightState) {
+      if (m_specData.setLegacyLights(legacyLightState))
+        m_dirty.set(D3D9DeviceDirtyFlag::SpecializationEntries);
+    }
+
+    void SetAlternatePixelCenter(bool alternatePixelCenter) {
+      if (m_specData.setAlternatePixelCenter(alternatePixelCenter))
+        m_dirty.set(D3D9DeviceDirtyFlag::SpecializationEntries);
+    }
+
+    // To simplify the implementation, disregard all but stage 0. The only known
+    // use of multi-stage color keying is in Arx Fatalis, but it, thankfully,
+    // relies on pure black color key transparency for all texture stages.
+    void SetColorKey(DWORD stage, DWORD colorKeyLow, DWORD colorKeyHigh) {
+      if (likely(stage == 0)) {
+        if (m_pushData.ffps.colorKeyLow != colorKeyLow) {
+          m_pushData.ffps.colorKeyLow = colorKeyLow;
+          m_dirty.set(D3D9DeviceDirtyFlag::PushDataFfps);
+        }
+
+        if (m_pushData.ffps.colorKeyHigh != colorKeyHigh) {
+          m_pushData.ffps.colorKeyHigh = colorKeyHigh;
+          m_dirty.set(D3D9DeviceDirtyFlag::PushDataFfps);
+        }
+      }
+    }
+
     void UpdateFixedFunctionVS();
 
     void UpdateFixedFunctionPS();
@@ -1619,6 +1667,7 @@ namespace dxvk {
     Com<D3D9Surface, false>         m_autoDepthStencil;
 
     Com<D3D9SwapChainEx, false>     m_implicitSwapchain;
+    std::vector<Com<D3D9SwapChainEx, false>> m_groupHeads;
 
     D3D9ShaderOptions               m_shaderOptions;
     DxvkShaderOptions               m_dxvkShaderOptions;
@@ -1697,7 +1746,6 @@ namespace dxvk {
 
     Rc<sync::Fence>                 m_submissionFence;
     uint64_t                        m_submissionId = 0ull;
-    DxvkSubmitStatus                m_submitStatus;
 
     uint64_t                        m_flushSeqNum = 0ull;
     GpuFlushTracker                 m_flushTracker;

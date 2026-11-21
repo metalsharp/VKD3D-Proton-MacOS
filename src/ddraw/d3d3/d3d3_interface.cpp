@@ -1,0 +1,360 @@
+#include "d3d3_interface.h"
+
+#include "d3d3_material.h"
+
+#include "../d3d_light.h"
+#include "../d3d_viewport.h"
+
+#include "../d3d5/d3d5_interface.h"
+#include "../d3d6/d3d6_interface.h"
+
+#include "../ddraw/ddraw_interface.h"
+
+namespace dxvk {
+
+  D3D3Interface::D3D3Interface(
+        D3DCommonInterface* commonD3DIntf,
+        DDrawCommonInterface* commonIntf,
+        IUnknown* pParent)
+    : DDrawChildObject<IUnknown, IDirect3D>(pParent)
+    , m_commonD3DIntf ( commonD3DIntf )
+    , m_commonIntf ( commonIntf ) {
+    if (m_commonD3DIntf == nullptr) {
+      Com<d3d9::IDirect3D9> d3d9Intf = d3d9::Direct3DCreate9(D3D_SDK_VERSION);
+      if (unlikely(d3d9Intf == nullptr))
+        throw DxvkError("D3D3Interface: ERROR! Failed to create the D3D9 interface!");
+
+      // Get the bridge interface to D3D9
+      Com<IDxvkLegacyD3DInterfaceBridge> intfBridgeInst;
+      HRESULT hr = d3d9Intf->QueryInterface(__uuidof(IDxvkLegacyD3DInterfaceBridge), reinterpret_cast<void**>(&intfBridgeInst));
+      if (unlikely(FAILED(hr)))
+        throw DxvkError("D3D3Interface: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
+
+      m_commonD3DIntf = new D3DCommonInterface(std::move(d3d9Intf), std::move(intfBridgeInst));
+    }
+
+    m_commonD3DIntf->SetD3D3Interface(this);
+
+    // Don't enable D3D3 compatibility mode when coming from a higher interface
+    if (likely(m_commonD3DIntf->GetD3D5Interface() == nullptr
+            && m_commonD3DIntf->GetD3D6Interface() == nullptr)) {
+      IDxvkLegacyD3DInterfaceBridge* intfBridge = m_commonD3DIntf->GetD3D9InterfaceBridge();
+
+      intfBridge->SetD3DCompatibility(D3DCompatibility::D3D3);
+    }
+  }
+
+  D3D3Interface::~D3D3Interface() {
+    if (m_commonD3DIntf->GetD3D3Interface() == this)
+      m_commonD3DIntf->SetD3D3Interface(nullptr);
+
+    // Needed for D3D3 device creation from an IDirectDrawSurface object
+    if (m_commonIntf->GetD3D3Interface() == this)
+      m_commonIntf->SetD3D3Interface(nullptr);
+  }
+
+  // Interlocked refcount with the parent IDirectDraw
+  ULONG STDMETHODCALLTYPE D3D3Interface::AddRef() {
+    if (likely(m_parent != nullptr)) {
+      IUnknown* origin = m_commonIntf->GetOrigin();
+      if (likely(origin != nullptr))
+        return origin->AddRef();
+      else
+        return m_parent->AddRef();
+    } else {
+      return ComObjectClamp::AddRef();
+    }
+  }
+
+  // Interlocked refcount with the parent IDirectDraw
+  ULONG STDMETHODCALLTYPE D3D3Interface::Release() {
+    if (likely(m_parent != nullptr)) {
+      IUnknown* origin = m_commonIntf->GetOrigin();
+      if (likely(origin != nullptr))
+        return origin->Release();
+      else
+        return m_parent->Release();
+    } else {
+      return ComObjectClamp::Release();
+    }
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::QueryInterface(REFIID riid, void** ppvObject) {
+    if (unlikely(ppvObject == nullptr))
+      return E_POINTER;
+
+    InitReturnPtr(ppvObject);
+
+    if (riid == __uuidof(IDirectDraw)) {
+      return m_parent->QueryInterface(riid, ppvObject);
+    }
+    // Deathtrap Dungeon queries for IDirect3D2...
+    if (unlikely(riid == __uuidof(IDirect3D2))) {
+      if (likely(m_commonD3DIntf->GetD3D5Interface() != nullptr))
+        return m_commonD3DIntf->GetD3D5Interface()->QueryInterface(riid, ppvObject);
+
+      try {
+        m_d3d5Intf = new D3D5Interface(m_commonD3DIntf.ptr(), m_commonIntf, m_parent);
+        *ppvObject = m_d3d5Intf.ref();
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+
+      return S_OK;
+    }
+    // ... and Final Fantasy VIII queries for IDirect3D3, because why not...
+    if (unlikely(riid == __uuidof(IDirect3D3))) {
+      if (likely(m_commonD3DIntf->GetD3D6Interface() != nullptr))
+        return m_commonD3DIntf->GetD3D6Interface()->QueryInterface(riid, ppvObject);
+
+      try {
+        m_d3d6Intf = new D3D6Interface(m_commonD3DIntf.ptr(), m_commonIntf, m_parent);
+        *ppvObject = m_d3d6Intf.ref();
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return DDERR_GENERIC;
+      }
+
+      return S_OK;
+    }
+
+    if (likely(riid == __uuidof(IUnknown)
+            || riid == __uuidof(IDirect3D))) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    Logger::warn("D3D3Interface::QueryInterface: Unknown interface query");
+    Logger::warn(str::format(riid));
+    return E_NOINTERFACE;
+  }
+
+  // Docs state: "This method is provided for compliance with the COM protocol.
+  // Returns DDERR_ALREADYINITIALIZED because the Direct3D object is initialized when it is created."
+  HRESULT STDMETHODCALLTYPE D3D3Interface::Initialize(REFIID riid) {
+    return DDERR_ALREADYINITIALIZED;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::EnumDevices(LPD3DENUMDEVICESCALLBACK lpEnumDevicesCallback, LPVOID lpUserArg) {
+    if (unlikely(lpEnumDevicesCallback == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    // D3D3 reports both HAL and HEL caps for any type of device,
+    // with minor differences between the two. Note that the
+    // device listing order matters, so list RAMP first, RGB second,
+    // and HAL last. A RAMP device also needs to be advertised in D3D3,
+    // since some games like Resident Evil expect it to be present.
+
+    HRESULT hr;
+
+    // Tests have shown all returned variables and structs are expected
+    // to remain valid even after the enumeration completes. Moreover,
+    // some applications may choose to overwrite various elements in place,
+    // such as the device name/description, and reuse those strings.
+
+    // RAMP device (monochrome), this is expected to be exposed
+    static GUID deviceGuidRAMP;
+    static char deviceDescRAMP[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static char deviceNameRAMP[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static D3DDEVICEDESC descDeviceRAMP_HAL;
+    static D3DDEVICEDESC descDeviceRAMP_HEL;
+
+    D3DDEVICEDESC3 desc3RAMP_HAL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3RAMP_HAL, IID_IDirect3DRampDevice, true);
+    D3DDEVICEDESC3 desc3RAMP_HEL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3RAMP_HEL, IID_IDirect3DRampDevice, false);
+
+    deviceGuidRAMP = IID_IDirect3DRampDevice;
+    if (likely(!d3dOptions->legacyDeviceNames)) {
+      CopyToStringArrayAndPad(deviceDescRAMP, "D3VK Ramp");
+      CopyToStringArrayAndPad(deviceNameRAMP, "D3VK Ramp");
+
+    } else {
+      CopyToStringArrayAndPad(deviceDescRAMP, "Ramp Emulation");
+      CopyToStringArrayAndPad(deviceNameRAMP, "Ramp Emulation");
+    }
+    memset(&descDeviceRAMP_HAL, 0, sizeof(D3DDEVICEDESC));
+    memset(&descDeviceRAMP_HEL, 0, sizeof(D3DDEVICEDESC));
+    memcpy(&descDeviceRAMP_HAL, &desc3RAMP_HAL, sizeof(D3DDEVICEDESC3));
+    memcpy(&descDeviceRAMP_HEL, &desc3RAMP_HEL, sizeof(D3DDEVICEDESC3));
+
+    hr = lpEnumDevicesCallback(&deviceGuidRAMP, &deviceDescRAMP[0], &deviceNameRAMP[0],
+                               &descDeviceRAMP_HAL, &descDeviceRAMP_HEL, lpUserArg);
+    if (hr != D3DENUMRET_OK)
+      return D3D_OK;
+
+    // Software emulation, this is expected to be exposed
+    static GUID deviceGuidRGB;
+    static char deviceDescRGB[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static char deviceNameRGB[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static D3DDEVICEDESC descDeviceRGB_HAL;
+    static D3DDEVICEDESC descDeviceRGB_HEL;
+
+    D3DDEVICEDESC3 desc3RGB_HAL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3RGB_HAL, IID_IDirect3DRGBDevice, true);
+    D3DDEVICEDESC3 desc3RGB_HEL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3RGB_HEL, IID_IDirect3DRGBDevice, false);
+
+    deviceGuidRGB = IID_IDirect3DRGBDevice;
+    if (likely(!d3dOptions->legacyDeviceNames)) {
+      CopyToStringArrayAndPad(deviceDescRGB, "D3VK RGB");
+      CopyToStringArrayAndPad(deviceNameRGB, "D3VK RGB");
+    } else {
+      CopyToStringArrayAndPad(deviceDescRGB, "RGB Emulation");
+      CopyToStringArrayAndPad(deviceNameRGB, "RGB Emulation");
+    }
+    memset(&descDeviceRGB_HAL, 0, sizeof(D3DDEVICEDESC));
+    memset(&descDeviceRGB_HEL, 0, sizeof(D3DDEVICEDESC));
+    memcpy(&descDeviceRGB_HAL, &desc3RGB_HAL, sizeof(D3DDEVICEDESC3));
+    memcpy(&descDeviceRGB_HEL, &desc3RGB_HEL, sizeof(D3DDEVICEDESC3));
+
+    hr = lpEnumDevicesCallback(&deviceGuidRGB, &deviceDescRGB[0], &deviceNameRGB[0],
+                               &descDeviceRGB_HAL, &descDeviceRGB_HEL, lpUserArg);
+    if (hr != D3DENUMRET_OK)
+      return D3D_OK;
+
+    // Hardware acceleration
+    static GUID deviceGuidHAL;
+    static char deviceDescHAL[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static char deviceNameHAL[MAX_ENUM_DEVICES_IDENTIFIER_STRING];
+    static D3DDEVICEDESC descDeviceHAL_HAL;
+    static D3DDEVICEDESC descDeviceHAL_HEL;
+
+    D3DDEVICEDESC3 desc3HAL_HAL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3HAL_HAL, IID_IDirect3DHALDevice, true);
+    D3DDEVICEDESC3 desc3HAL_HEL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&desc3HAL_HEL, IID_IDirect3DHALDevice, false);
+
+    deviceGuidHAL = IID_IDirect3DHALDevice;
+    if (likely(!d3dOptions->legacyDeviceNames)) {
+      CopyToStringArrayAndPad(deviceDescHAL, "D3VK HAL");
+      CopyToStringArrayAndPad(deviceNameHAL, "D3VK HAL");
+    } else {
+      CopyToStringArrayAndPad(deviceDescHAL, "Direct3D HAL");
+      CopyToStringArrayAndPad(deviceDescHAL, "Direct3D HAL");
+    }
+    memset(&descDeviceHAL_HAL, 0, sizeof(D3DDEVICEDESC));
+    memset(&descDeviceHAL_HEL, 0, sizeof(D3DDEVICEDESC));
+    memcpy(&descDeviceHAL_HAL, &desc3HAL_HAL, sizeof(D3DDEVICEDESC3));
+    memcpy(&descDeviceHAL_HEL, &desc3HAL_HEL, sizeof(D3DDEVICEDESC3));
+
+    hr = lpEnumDevicesCallback(&deviceGuidHAL, &deviceDescHAL[0], &deviceNameHAL[0],
+                               &descDeviceHAL_HAL, &descDeviceHAL_HEL, lpUserArg);
+    if (hr != D3DENUMRET_OK)
+      return D3D_OK;
+
+    return D3D_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::CreateLight(LPDIRECT3DLIGHT *lplpDirect3DLight, IUnknown *pUnkOuter) {
+    if (unlikely(lplpDirect3DLight == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDirect3DLight);
+
+    *lplpDirect3DLight = ref(new D3DLight(this));
+
+    return D3D_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::CreateMaterial(LPDIRECT3DMATERIAL *lplpDirect3DMaterial, IUnknown *pUnkOuter) {
+    if (unlikely(lplpDirect3DMaterial == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDirect3DMaterial);
+
+    *lplpDirect3DMaterial = ref(new D3D3Material(nullptr, this));
+
+    return D3D_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::CreateViewport(LPDIRECT3DVIEWPORT *lplpD3DViewport, IUnknown *pUnkOuter) {
+    InitReturnPtr(lplpD3DViewport);
+
+    *lplpD3DViewport = ref(new D3DViewport(this));
+
+    return D3D_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D3Interface::FindDevice(D3DFINDDEVICESEARCH *lpD3DFDS, D3DFINDDEVICERESULT *lpD3DFDR) {
+    if (unlikely(lpD3DFDS == nullptr || lpD3DFDR == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(lpD3DFDS->dwSize != sizeof(D3DFINDDEVICESEARCH)))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(!IsValidFindDeviceResultSize(lpD3DFDR->dwSize)))
+      return DDERR_INVALIDPARAMS;
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    // Software emulation, this is expected to be exposed
+    D3DDEVICEDESC3 descRGB_HAL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&descRGB_HAL, IID_IDirect3DRGBDevice, true);
+    D3DDEVICEDESC3 descRGB_HEL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&descRGB_HEL, IID_IDirect3DRGBDevice, false);
+
+    // Hardware acceleration
+    D3DDEVICEDESC3 descHAL_HAL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&descHAL_HAL, IID_IDirect3DHALDevice, true);
+    D3DDEVICEDESC3 descHAL_HEL = GetD3D3BaseCaps(d3dOptions);
+    ApplyD3D3DeviceCaps(&descHAL_HEL, IID_IDirect3DHALDevice, false);
+
+    D3DFINDDEVICERESULT3 lpD3DFRD3 = { };
+    lpD3DFRD3.dwSize = sizeof(D3DFINDDEVICERESULT3);
+
+    if (lpD3DFDS->dwFlags & D3DFDS_GUID) {
+      // IID_IDirect3DMMXDevice returns DDERR_NOTFOUND in D3D3
+      if (lpD3DFDS->guid == IID_IDirect3DRGBDevice ||
+          lpD3DFDS->guid == IID_IDirect3DRampDevice) {
+        lpD3DFRD3.guid = IID_IDirect3DRGBDevice;
+        lpD3DFRD3.ddHwDesc = descRGB_HAL;
+        lpD3DFRD3.ddSwDesc = descRGB_HEL;
+      } else if (lpD3DFDS->guid == IID_IDirect3DHALDevice) {
+        lpD3DFRD3.guid = IID_IDirect3DHALDevice;
+        lpD3DFRD3.ddHwDesc = descHAL_HAL;
+        lpD3DFRD3.ddSwDesc = descHAL_HEL;
+      } else if (lpD3DFDS->guid == IID_IDirect3DMMXDevice) {
+        return DDERR_NOTFOUND;
+      } else {
+        Logger::warn(str::format("D3D3Interface::FindDevice: Unknown device type: ", lpD3DFDS->guid));
+        return DDERR_NOTFOUND;
+      }
+
+      memcpy(lpD3DFDR, &lpD3DFRD3, sizeof(D3DFINDDEVICERESULT3));
+    } else if (lpD3DFDS->dwFlags & D3DFDS_HARDWARE) {
+      if (likely(lpD3DFDS->bHardware == TRUE)) {
+        lpD3DFRD3.guid = IID_IDirect3DHALDevice;
+        lpD3DFRD3.ddHwDesc = descHAL_HAL;
+        lpD3DFRD3.ddSwDesc = descHAL_HEL;
+      } else {
+        lpD3DFRD3.guid = IID_IDirect3DRGBDevice;
+        lpD3DFRD3.ddHwDesc = descRGB_HAL;
+        lpD3DFRD3.ddSwDesc = descRGB_HEL;
+      }
+
+      memcpy(lpD3DFDR, &lpD3DFRD3, sizeof(D3DFINDDEVICERESULT3));
+    } else if (lpD3DFDS->dwFlags & D3DFDS_COLORMODEL) {
+      lpD3DFRD3.guid = IID_IDirect3DHALDevice;
+      lpD3DFRD3.ddHwDesc = descHAL_HAL;
+      lpD3DFRD3.ddSwDesc = descHAL_HEL;
+
+      memcpy(lpD3DFDR, &lpD3DFRD3, sizeof(D3DFINDDEVICERESULT3));
+    } else if (lpD3DFDS->dwFlags == 0u) {
+      lpD3DFRD3.guid = IID_IDirect3DHALDevice;
+      lpD3DFRD3.ddHwDesc = descHAL_HAL;
+      lpD3DFRD3.ddSwDesc = descHAL_HEL;
+
+      memcpy(lpD3DFDR, &lpD3DFRD3, sizeof(D3DFINDDEVICERESULT3));
+    } else {
+      Logger::err("D3D3Interface::FindDevice: Unhandled matching type");
+      return DDERR_NOTFOUND;
+    }
+
+    return D3D_OK;
+  }
+
+}

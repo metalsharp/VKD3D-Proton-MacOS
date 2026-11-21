@@ -57,19 +57,22 @@ namespace dxvk {
       return DXGI_ERROR_INVALID_CALL;
 
     LARGE_INTEGER timeout = { };
+    timeout.QuadPart = int64_t(milliseconds) * -10000;
+
     D3DKMT_ACQUIREKEYEDMUTEX acquire = { };
     acquire.hKeyedMutex = m_kmtLocal;
     acquire.Key = key;
-    acquire.pTimeout = &timeout;
-    timeout.QuadPart = milliseconds * -10000;
+    acquire.pTimeout = milliseconds == INFINITE ? nullptr : &timeout;
 
     NTSTATUS status = D3DKMTAcquireKeyedMutex(&acquire);
+
     if (status == STATUS_TIMEOUT)
       return WAIT_TIMEOUT;
     if (status)
       return DXGI_ERROR_INVALID_CALL;
 
     VkSemaphore semaphore = m_fence->handle();
+
     VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
     info.semaphoreCount = 1;
     info.pSemaphores = &semaphore;
@@ -334,7 +337,9 @@ namespace dxvk {
     allocationInfo.resourceCookie = cookie();
     allocationInfo.properties = m_properties;
     allocationInfo.mode = mode;
-    allocationInfo.handleType = m_info.sharing.type;
+
+    if (m_shared)
+      allocationInfo.handleType = m_info.sharing.type;
 
     if (m_info.transient)
       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
@@ -358,10 +363,16 @@ namespace dxvk {
     // Self-assignment is possible here if we
     // just update the image properties
     bool invalidateViews = false;
-    m_storage = std::move(resource);
 
-    if (m_storage != old) {
+    m_storage = std::move(resource);
+    m_storage->assignResource(cookie());
+
+    if (likely(m_storage != old)) {
       m_imageInfo = m_storage->getImageInfo();
+      m_storage->assignResource(cookie());
+
+      if (likely(old))
+        old->assignResource(0u);
 
       if (unlikely(m_info.debugName))
         updateDebugName();
