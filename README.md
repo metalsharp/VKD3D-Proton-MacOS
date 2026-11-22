@@ -4,7 +4,22 @@ A maintained macOS/Wine fork of [Gcenx/DXVK-macOS](https://github.com/Gcenx/DXVK
 
 This fork brings Gcenx's MoltenVK compatibility work to DXVK 3.1 and its `dxbc-spirv` shader compiler. It also builds ARM64X DLLs for [MetalSharp Wine](https://github.com/metalsharp/MetalSharp-Wine) (arm64 Wine with FEX).
 
-It also carries [d7vk](https://github.com/WinterSnowfall/d7vk)'s `ddraw.dll`: Direct3D 7, 6, 5 and 3 (immediate mode) on DXVK's D3D9 backend. DirectDraw itself is proxied to Wine's own `ddraw.dll`, which d7vk loads as `ddraw_.dll` (see [Runtime setup](#runtime-setup)).
+## What's included
+
+| DLL | APIs | Source |
+|---|---|---|
+| `ddraw.dll` | Direct3D 7, 6, 5 and 3 (immediate mode) | [d7vk](https://github.com/WinterSnowfall/d7vk), built for macOS |
+| `d3d8.dll` | Direct3D 8 | DXVK |
+| `d3d9.dll` | Direct3D 9 | DXVK |
+| `d3d10core.dll`, `d3d11.dll`, `dxgi.dll` | Direct3D 10 and 11, DXGI | DXVK |
+
+Every DLL is built for x86_64, i386 and ARM64X and runs on MoltenVK.
+
+### d7vk for macOS
+
+This fork includes [d7vk](https://github.com/WinterSnowfall/d7vk) by WinterSnowfall, built for macOS. d7vk is a DXVK fork that runs Direct3D 7, 6, 5 and 3 games on DXVK's D3D9 backend. Here its `ddraw.dll` is built with this fork's MoltenVK fixes, in the same x86_64, i386 and ARM64X lanes as the rest of DXVK, and it is tested on both MetalSharp Wines.
+
+d7vk implements only Direct3D. DirectDraw itself goes to Wine's own `ddraw.dll`, which d7vk loads as `ddraw_.dll` (see [Runtime setup](#runtime-setup)).
 
 ## Release contents
 
