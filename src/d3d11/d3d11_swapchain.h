@@ -4,7 +4,6 @@
 
 #include "../dxvk/hud/dxvk_hud.h"
 
-#include "../dxvk/dxvk_latency.h"
 #include "../dxvk/dxvk_swapchain_blitter.h"
 
 #include "../util/sync/sync_signal.h"
@@ -96,6 +95,19 @@ namespace dxvk {
     HRESULT STDMETHODCALLTYPE SetRotation(
             DXGI_MODE_ROTATION        Rotation);
 
+    HRESULT LatencySleep();
+
+    HRESULT SetLatencySleepMode(
+      const VkLatencySleepModeInfoNV& pSleepMode);
+
+    HRESULT SetLatencyMarker(
+            uint64_t                  FrameId,
+            VkLatencyMarkerNV         Marker);
+
+    size_t GetLatencyInfo(
+            uint32_t                  ReportCount,
+            VkLatencyTimingsFrameReportNV* pFrameReports);
+
   private:
 
     using DirtyRectList = small_vector<VkRectLayerKHR, 4>;
@@ -122,8 +134,9 @@ namespace dxvk {
     Rc<DxvkDevice>            m_device;
     Rc<Presenter>             m_presenter;
 
+    Rc<hud::Hud>              m_hud;
+
     Rc<DxvkSwapchainBlitter>  m_blitter;
-    Rc<DxvkLatencyTracker>    m_latency;
 
     small_vector<Com<D3D11Texture2D, false>, 4> m_backBuffers;
 
@@ -139,13 +152,12 @@ namespace dxvk {
     HANDLE                    m_frameLatencyEvent = nullptr;
     Rc<sync::CallbackFence>   m_frameLatencySignal;
 
+    std::atomic<uint64_t>     m_nextLatencyFrameId = 0;
+
     VkColorSpaceKHR           m_colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkClearColorValue         m_clearColor = {};
 
     double                    m_targetFrameRate = 0.0;
-
-    bool                      m_hasHud = false;
-    Rc<hud::HudLatencyItem>   m_latencyHud;
 
     Rc<DxvkImageView> GetBackBufferView();
 
@@ -164,8 +176,6 @@ namespace dxvk {
     void CreateBlitter();
 
     void DestroyFrameLatencyEvent();
-
-    void DestroyLatencyTracker();
 
     void SyncFrameLatency();
 

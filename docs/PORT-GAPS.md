@@ -64,3 +64,52 @@ VKD3D-Proton's `test_draw_instanced`, `test_clear_render_target_view`, `test_fra
 | App profiles | LEGO and KSP2 from 1.10.3 |
 | Stream-output `S_OK` fallback | 1.10.3 `ce15afaa`. Only for a MoltenVK without transform feedback |
 | Docs | README's `../patches` path (CI uses `../../patches`), its `dxvk.conf` claim, and the state cache mentioned in `PHASE2-REPORT.md` |
+
+## Direct3D 7, 6, 5 and 3 (d7vk `ddraw.dll`)
+
+*2026-11-21. d7vk `devel` at `9fb6a2d50`, merged with upstream master `0f5c295c`. Apple M6, MoltenVK 0.2.2211.*
+
+`tools/smoke/ddraw_draw.c` draws into offscreen DirectDraw 3D surfaces and reads them back: a D3D7 clear, D3D7
+pre-transformed draws, an R5G6B5 render target, a locked 16-bit Z buffer, source color keying, and a D3D6, D3D5
+and D3D3 (execute buffer) draw. Every check passes on Wine's own ddraw and on d7vk's, which loads, uses MoltenVK
+and logs no errors:
+
+| Wine | Program | `ddraw.dll` | Result |
+|---|---|---|---|
+| MetalSharp Wine (arm64, FEX) | i386 | i386 | 8/8 |
+| MetalSharp Wine (arm64, FEX) | x86_64 | ARM64X | 8/8 |
+| MetalSharp Wine x86_64 | i386 | i386 | 8/8 |
+| MetalSharp Wine x86_64 | x86_64 | x86_64 | 8/8 |
+
+`tools/smoke/d3d9_draw.c` passes 8/8 on the same three D3D9 builds, and `d3d11_draw.c` gives the results above
+(`stream_output` still fails).
+
+No MoltenVK change was needed. Still to check in games: rendering to A4R4G4B4 (a swizzled format in MoltenVK),
+D24 depth read back from its D32 fallback, multisampled surface locks, and wined3d (Wine's ddraw) and DXVK
+presenting to the same window.
+
+| Item | Status |
+|---|---|
+| ARM64X | **Done**: d7vk's SSE2 vertex processing took ARM64EC for x86 (`ddraw_include.h`); it now uses the scalar path there |
+| d3d9.dll beside ddraw.dll | **Done**: D3D9 is one static library, linked by both; each DLL has its own logger |
+| MetalSharp Wine routing | **Done on branches, not released**: with `GRAPHICS_BACKEND=dxvk` alone (no copied DLLs, no overrides), both Wines' loaders give i386 and x86_64 programs the lane's `ddraw.dll`, and `ddraw_.dll` is Wine's own. MetalSharp Wine (arm64): `source/wine` `wine/d7vk-ddraw` (also D3D8/9 for i386 programs) and `feat/d7vk-ddraw` (`stage-dxvk.sh`, `build-dxvk-macos.sh`). MetalSharp Wine x86_64: `source/wine-x86_64` `feat/d7vk-ddraw`. MetalSharp: `feat/d7vk-ddraw` (`build-wine-x86_64-app.sh`) |
+
+`tools/smoke/ddraw_run.sh ... routed`, with each Wine's patched `ntdll.so` in a copy of its installed app and this
+branch's DLLs as its lane, 2026-11-21:
+
+| Wine | Program | `routed` (`GRAPHICS_BACKEND=dxvk`) | `default` |
+|---|---|---|---|
+| MetalSharp Wine (arm64, FEX) | i386 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine (arm64, FEX) | x86_64 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine x86_64 | i386 | 8/8, d7vk | 8/8, Wine's ddraw |
+| MetalSharp Wine x86_64 | x86_64 | 8/8, d7vk | 8/8, Wine's ddraw |
+
+`GRAPHICS_BACKEND=wine` keeps Wine's ddraw too. On MetalSharp Wine, `d3d9_draw.c` as an i386 program with only
+`GRAPHICS_BACKEND=dxvk` passes 8/8 on this branch's i386 D3D9.
+
+The loader only loads builtins that have a file in the prefix, so `ddraw_.dll` must ship in `lib/wine/<arch>` for
+wineboot to install. Because that file's export name is `ddraw.dll`, the loader also has to keep it away from the
+lane (`is_d7vk_proxy_file()`); without that, d7vk loads itself as its proxy and overflows the stack. On the FEX build the
+MetalSharp app already sends 32-bit DXVK games (`dxvk_32`, through `d3d9`) to `GRAPHICS_BACKEND=dxvk`, which the old
+loader turned back into Mullion for i386 programs; MetalSharp's `feat/d7vk-ddraw` also maps a bare `dxvk_32` to
+`dxvk`. Still open: `HKCU\Software\Wine\Direct3D\renderer=gdi` with d7vk is untested.

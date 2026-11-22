@@ -296,9 +296,12 @@ namespace dxvk {
     VkMemoryHeapFlags heapFlagMask = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
     VkMemoryHeapFlags heapFlags    = 0;
 
-    if (MemorySegmentGroup == DXGI_MEMORY_SEGMENT_GROUP_LOCAL)
+    // Apparently, Unreal Engine decided that not having a non-local heap equates
+    // running on a 15-year old Intel IGP and disables a bunch of effects as a
+    // result. Simply report the VRAM budgets as a workaround.
+    if (MemorySegmentGroup == DXGI_MEMORY_SEGMENT_GROUP_LOCAL || m_adapter->isUnifiedMemoryArchitecture())
       heapFlags |= VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
-    
+
     pVideoMemoryInfo->Budget = 0;
     pVideoMemoryInfo->CurrentUsage = 0;
     pVideoMemoryInfo->AvailableForReservation = 0;
@@ -430,10 +433,11 @@ namespace dxvk {
 
       bool hideNvidiaGpu = adapterInfo.driverId == VK_DRIVER_ID_NVIDIA_PROPRIETARY
         ? options->hideNvidiaGpu : options->hideNvkGpu;
+      bool hideIntelGpu = options->shouldHideIntelGpu();
 
       bool hideGpu = (adapterInfo.vendorId == uint16_t(DxvkGpuVendor::Nvidia) && hideNvidiaGpu)
                   || (adapterInfo.vendorId == uint16_t(DxvkGpuVendor::Amd) && options->hideAmdGpu)
-                  || (adapterInfo.vendorId == uint16_t(DxvkGpuVendor::Intel) && options->hideIntelGpu);
+                  || (adapterInfo.vendorId == uint16_t(DxvkGpuVendor::Intel) && hideIntelGpu);
 
       if (hideGpu) {
         adapterInfo.vendorId = fallbackVendor;

@@ -41,7 +41,6 @@ namespace dxvk {
     HANDLE_EXT(extSampleLocations);                \
     HANDLE_EXT(extShaderModuleIdentifier);         \
     HANDLE_EXT(extShaderStencilExport);            \
-    HANDLE_EXT(extSwapchainColorSpace);            \
     HANDLE_EXT(extSwapchainMaintenance1);          \
     HANDLE_EXT(extTransformFeedback);              \
     HANDLE_EXT(extVertexAttributeDivisor);         \
@@ -73,11 +72,14 @@ namespace dxvk {
     HANDLE_EXT(khrUnifiedImageLayouts);            \
     HANDLE_EXT(khrWin32KeyedMutex);                \
     HANDLE_EXT(amdBufferMarker);                   \
+    HANDLE_EXT(amdMixedAttachmentSamples);         \
     HANDLE_EXT(nvDeviceDiagnosticCheckpoints);     \
+    HANDLE_EXT(nvFramebufferMixedSamples);         \
     HANDLE_EXT(nvLowLatency2);                     \
     HANDLE_EXT(nvRawAccessChains);                 \
     HANDLE_EXT(nvxBinaryImport);                   \
-    HANDLE_EXT(nvxImageViewHandle);
+    HANDLE_EXT(nvxImageViewHandle);                \
+    HANDLE_EXT(intelDeviceInfo);
 
   #define EXTENSIONS_WITH_PROPERTIES               \
     HANDLE_EXT(extConservativeRasterization);      \
@@ -97,7 +99,8 @@ namespace dxvk {
     HANDLE_EXT(khrMaintenance6);                   \
     HANDLE_EXT(khrMaintenance7);                   \
     HANDLE_EXT(khrMaintenance9);                   \
-    HANDLE_EXT(khrMaintenance10);
+    HANDLE_EXT(khrMaintenance10);                  \
+    HANDLE_EXT(intelDeviceInfo);
 
 
   DxvkDeviceCapabilities::DxvkDeviceCapabilities(
@@ -554,7 +557,10 @@ namespace dxvk {
     }
 
     // Reflex is broken on 32-bit
-    if (env::is32BitHostPlatform())
+    bool enableReflex = !env::is32BitHostPlatform();
+    applyTristate(enableReflex, instance.options().enableNvLowLatency2);
+
+    if (!enableReflex)
       m_featuresSupported.nvLowLatency2 = VK_FALSE;
 
     // EXT_multi_draw is broken on proprietary qcom on some devices
@@ -601,6 +607,12 @@ namespace dxvk {
     // Apply raw access chain option
     if (!instance.options().enableNvRawAccessChains)
       m_featuresSupported.nvRawAccessChains.shaderRawAccessChains = VK_FALSE;
+
+    // If a device magically supports both the AMD and Nvidia extensions for
+    // mixed attachment samples, prefer the Nvidia one since that matches the
+    // desired behaviour. The AMD extension is more of a crutch here.
+    if (m_featuresSupported.nvFramebufferMixedSamples)
+      m_featuresSupported.amdMixedAttachmentSamples = VK_FALSE;
 
     // Disable somewhat broken present_id2 on older Nvidia drivers.
     if (m_properties.vk12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY
@@ -1024,9 +1036,6 @@ namespace dxvk {
       /* Stencil export, used both internally and in client APIs */
       ENABLE_EXT(extShaderStencilExport, false),
 
-      /* HDR color space support */
-      ENABLE_EXT(extSwapchainColorSpace, false),
-
       /* Swapchain maintenance, used to implement proper synchronization
        * and dynamic present modes to avoid swapchain recreation */
       ENABLE_EXT_FEATURE(extSwapchainMaintenance1, swapchainMaintenance1, false),
@@ -1106,8 +1115,14 @@ namespace dxvk {
       /* Hang debugging on AMD */
       ENABLE_EXT(amdBufferMarker, false),
 
+      /* Not-so-great target-independent raster on AMD */
+      ENABLE_EXT(amdMixedAttachmentSamples, false),
+
       /* Hang debugging on Nvidia */
       ENABLE_EXT(nvDeviceDiagnosticCheckpoints, false),
+
+      /* Target-independent raster on Nvidia */
+      ENABLE_EXT(nvFramebufferMixedSamples, false),
 
       /* Reflex support */
       ENABLE_EXT(nvLowLatency2, false),
@@ -1118,6 +1133,9 @@ namespace dxvk {
       /* CUDA interop extensions */
       ENABLE_EXT(nvxBinaryImport, false),
       ENABLE_EXT(nvxImageViewHandle, false),
+
+      /* Intel device info, used to detect the GPU architecture generation */
+      ENABLE_EXT(intelDeviceInfo, false),
     }};
 
     #undef ENABLE_FEATURE

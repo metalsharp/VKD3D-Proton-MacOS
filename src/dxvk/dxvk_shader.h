@@ -114,6 +114,8 @@ namespace dxvk {
     SupportsResourceIndexing    = 20u,
     /// Whether descriptor heap is used as the binding model.
     SupportsDescriptorHeap      = 21u,
+    /// Whether scratch memory should be zeroed.
+    ZeroScratchMemory           = 22u,
   };
 
   using DxvkShaderSpirvFlags = Flags<DxvkShaderSpirvFlag>;
@@ -160,6 +162,7 @@ namespace dxvk {
     ExportsViewport,
     ExportsStencilRef,
     ExportsSampleMask,
+    UsesSampleMask,
     UsesFragmentCoverage,
     UsesSparseResidency,
     TessellationPoints,
@@ -406,24 +409,24 @@ namespace dxvk {
     /**
      * \brief Adds a shader stage with specialization info
      *
-     * \param [in] stage Shader stage
+     * \param [in] metadata Shader metadata
      * \param [in] code SPIR-V code
      * \param [in] specinfo Specialization info
      */
     void addStage(
-            VkShaderStageFlagBits   stage,
+      const DxvkShaderMetadata&     metadata,
             SpirvCodeBuffer&&       code,
       const VkSpecializationInfo*   specInfo);
 
     /**
      * \brief Adds stage using a module identifier
      *
-     * \param [in] stage Shader stage
+     * \param [in] metadata Shader metadata
      * \param [in] identifier Shader module identifier
      * \param [in] specinfo Specialization info
      */
     void addStage(
-            VkShaderStageFlagBits   stage,
+      const DxvkShaderMetadata&     metadata,
       const VkShaderModuleIdentifierEXT& identifier,
       const VkSpecializationInfo*   specInfo);
 
@@ -661,6 +664,9 @@ namespace dxvk {
             VkPipelineCreateFlags2        flags);
 
     SpirvCodeBuffer getShaderCode(
+            VkShaderStageFlagBits         stage) const;
+
+    DxvkShaderMetadata getShaderMetadata(
             VkShaderStageFlagBits         stage) const;
 
     void generateModuleIdentifierLocked(

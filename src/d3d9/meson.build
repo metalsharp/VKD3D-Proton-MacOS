@@ -2,6 +2,7 @@ d3d9_res = wrc_generator.process('version.rc')
 
 d3d9_shaders = files([
   'shaders/d3d9_convert_yuy2_uyvy.comp',
+  'shaders/d3d9_convert_r3g3b2.comp',
   'shaders/d3d9_convert_l6v5u5.comp',
   'shaders/d3d9_convert_x8l8v8u8.comp',
   'shaders/d3d9_convert_a2w10v10u10.comp',
@@ -60,9 +61,17 @@ if platform != 'windows'
   d3d9_link_depends += files('d3d9.sym')
 endif
 
-d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
+# D3D9 is built once as a static library. d3d9.dll links all of it; ddraw.dll
+# (D3D7/6/5/3, from d7vk) links it too, with its own logger.
+d3d9_static = static_library(dxvk_name_prefix+'d3d9_static', d3d9_src, glsl_generator.process(d3d9_shaders),
   dependencies        : [ dxbc_spirv_dep, dxvk_dep ],
   include_directories : dxvk_include_path,
+)
+
+d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', 'd3d9_logger.cpp', d3d9_res,
+  dependencies        : [ dxbc_spirv_dep, dxvk_dep ],
+  include_directories : dxvk_include_path,
+  link_whole          : [ d3d9_static ],
   install             : true,
   vs_module_defs      : 'd3d9'+def_spec_ext,
   link_args           : d3d9_ld_args,

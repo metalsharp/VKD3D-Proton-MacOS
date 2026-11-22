@@ -104,6 +104,9 @@ namespace dxvk {
     m_trackingId += 1u;
 
     this->beginCurrentCommands();
+
+    if (m_frameCount >= m_framesToCapture.first && m_frameCount < m_framesToCapture.second)
+      beginFrameCapture();
   }
   
   
@@ -129,41 +132,15 @@ namespace dxvk {
     this->endRenderPass(true);
 
     m_renderPassIndex = 0u;
-
-    if (m_frameCount >= m_framesToCapture.first && m_frameCount < m_framesToCapture.second)
-      endFrameCapture();
-
     m_frameCount += 1u;
 
-    if (m_frameCount >= m_framesToCapture.first && m_frameCount < m_framesToCapture.second)
-      beginFrameCapture();
-  }
-
-
-  void DxvkContext::beginLatencyTracking(
-    const Rc<DxvkLatencyTracker>&     tracker,
-          uint64_t                    frameId) {
-    if (tracker && (!m_latencyTracker || m_latencyTracker == tracker)) {
-      tracker->notifyCsRenderBegin(frameId);
-
-      m_latencyTracker = tracker;
-      m_latencyFrameId = frameId;
-
-      m_endLatencyTracking = false;
-    }
-  }
-
-
-  void DxvkContext::endLatencyTracking(
-    const Rc<DxvkLatencyTracker>&     tracker) {
-    if (tracker && tracker == m_latencyTracker)
-      m_endLatencyTracking = true;
+    endFrameCapture();
   }
 
 
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
-          DxvkSubmitStatus*           status) {
+          uint64_t                    submissionId) {
     // If necessary, block any async queue on previous command completion
     if (m_submitWaitId)
       m_cmd->waitFence(m_trackingFence, std::exchange(m_submitWaitId, 0ull));
@@ -178,23 +155,7 @@ namespace dxvk {
                        DxvkContextFeature::DescriptorBuffer))
       m_cmd->setDescriptorSyncHandle(m_descriptorWorker.getSyncHandle());
 
-    // Need to call this before submitting so that the last GPU
-    // submission does not happen before the render end signal.
-    if (m_endLatencyTracking && m_latencyTracker)
-      m_latencyTracker->notifyCsRenderEnd(m_latencyFrameId);
-
-    m_device->submitCommandList(this->endRecording(reason),
-      m_latencyTracker, m_latencyFrameId, status);
-
-    // Ensure that subsequent submissions do not see the tracker.
-    // It is important to hide certain internal submissions in
-    // case the application is CPU-bound.
-    if (m_endLatencyTracking) {
-      m_latencyTracker = nullptr;
-      m_latencyFrameId = 0u;
-
-      m_endLatencyTracking = false;
-    }
+    m_device->submitCommandList(this->endRecording(reason), submissionId);
 
     // If we have a zero buffer, see if we can get rid of it
     freeZeroBuffer();
@@ -2459,18 +2420,20 @@ namespace dxvk {
                                           | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT
                                           | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
-      bool needsNewBackingStorage = (dstImage->info().stages & graphicsStages)
-        && dstImage->isTracked(m_trackingId, DxvkAccess::Write);
+      bool needsNewBackingStorage = false;
 
-      // We never make MSAA passes unsynchronized, so this should be fine
-      if (needsNewBackingStorage && dstImage->hasGfxStores()) {
-        needsNewBackingStorage = resourceHasAccess(*dstImage, dstSubresource, DxvkAccess::Read, DxvkAccessOp::None)
-                              || resourceHasAccess(*dstImage, dstSubresource, DxvkAccess::Write, DxvkAccessOp::None);
+      if (dstImage->info().stages & graphicsStages) {
+        // We never make MSAA passes unsynchronized, so this should be fine
+        if (dstImage->hasGfxStores()) {
+          needsNewBackingStorage = resourceHasAccess(*dstImage, dstSubresource, DxvkAccess::Read, DxvkAccessOp::None)
+                                || resourceHasAccess(*dstImage, dstSubresource, DxvkAccess::Write, DxvkAccessOp::None);
+        } else {
+          dstImage->trackGfxStores();
+
+          needsNewBackingStorage = dstImage->isTracked(
+            m_trackingId, DxvkAccess::Write);
+        }
       }
-
-      // Enable tracking so that we don't unnecessarily hit slow paths in the future
-      if (dstImage->info().stages & graphicsStages)
-        needsNewBackingStorage |= !dstImage->trackGfxStores();
 
       if (needsNewBackingStorage) {
         auto imageSubresource = dstImage->getAvailableSubresources();
@@ -2947,10 +2910,8 @@ namespace dxvk {
     }
 
     if (unlikely(rs.sampleCount() != m_state.gp.state.rs.sampleCount())) {
-      m_flags.set(DxvkContextFlag::GpDirtySampleLocations);
-
-      if (!m_state.gp.state.ms.sampleCount())
-        m_flags.set(DxvkContextFlag::GpDirtyMultisampleState);
+      m_flags.set(DxvkContextFlag::GpDirtySampleLocations,
+                  DxvkContextFlag::GpDirtyMultisampleState);
 
       if (!m_features.test(DxvkContextFeature::VariableMultisampleRate))
         m_flags.set(DxvkContextFlag::GpRenderPassNeedsFlush);
@@ -5082,7 +5043,7 @@ namespace dxvk {
 
       m_cmd->bindResources(DxvkCmdBuffer::ExecBuffer, pipeline.layout,
         0u, nullptr, sizeof(copyArgs), &copyArgs);
-      m_cmd->cmdDraw(3u, srcSubresource.layerCount, 0u, 1u);
+      m_cmd->cmdDraw(3u, 1u, 0u, 1u);
     }
 
     // Issue by-region barrier after the copy and before subsequent rendering
@@ -5469,12 +5430,12 @@ namespace dxvk {
 
     uint32_t basePass = 0u;
 
+    DxvkMetaMipGenPushConstants pushData = { };
+    pushData.atomicCounterVa = counterMemory.gpuAddress;
+    pushData.samplerIndex = sampler->getDescriptor().samplerIndex;
+
     while (basePass < mipGenerator.getPassCount()) {
       small_vector<DxvkResourceAccess, MaxDescriptorCount> accessBatch;
-
-      DxvkMetaMipGenPushConstants pushData = { };
-      pushData.atomicCounterVa = counterMemory.gpuAddress;
-      pushData.samplerIndex = sampler->getDescriptor().samplerIndex;
 
       if (requiresPrepass && !basePass) {
         // It is beneficial to run this on the maximum mip count here because
@@ -5951,7 +5912,7 @@ namespace dxvk {
 
     // Create an image view that we can use to perform the clear
     DxvkImageViewKey key = { };
-    key.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    key.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     key.usage = usageBit;
     key.format = format;
     key.aspects = region.dstSubresource.aspectMask;
@@ -7749,7 +7710,7 @@ namespace dxvk {
       auto& entry = m_deferredClears[srcIndex];
 
       if ((entry.imageView->image() == &image)
-       && ((entry.clearAspects | entry.discardAspects) | subresources.aspectMask)
+       && ((entry.clearAspects | entry.discardAspects) & subresources.aspectMask)
        && (vk::checkSubresourceRangeOverlap(entry.imageView->imageSubresources(), subresources))) {
         clearBatch.add(batchClear(entry.imageView, -1, entry.discardAspects, entry.clearAspects, entry.clearValue));
         srcIndex += 1u;
@@ -8054,16 +8015,9 @@ namespace dxvk {
 
       // Infer actual sample count from both the multisample state
       // and rasterizer state, just like during pipeline creation
-      VkSampleCountFlagBits sampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
-
-      if (!sampleCount) {
-        sampleCount = m_state.gp.state.rs.sampleCount()
-          ? VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount())
-          : VK_SAMPLE_COUNT_1_BIT;
-      }
-
-      VkSampleMask sampleMask = m_state.gp.state.ms.sampleMask() & ((1u << sampleCount) - 1u);
-      m_cmd->cmdSetMultisampleState(sampleCount, sampleMask);
+      auto sampleCount = m_state.gp.state.determineRasterSamples(m_device->canUseMixedSamples(m_state.gp.shaders.fs));
+      auto sampleMask = m_state.gp.state.ms.sampleMask() & ((1u << uint32_t(sampleCount)) - 1u);
+      m_cmd->cmdSetMultisampleState(sampleCount, VkSampleMask(sampleMask));
 
       if (m_device->features().extExtendedDynamicState3.extendedDynamicState3AlphaToCoverageEnable
        && !m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport))
@@ -8082,21 +8036,17 @@ namespace dxvk {
       // render most of its content with regular sample positions and only draw a small portion
       // with centered positions, so we would want the default interpretation to use default
       // sample positions anyway, e.g. for the purpose of copies or resolves.
-      VkSampleCountFlagBits msSampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
-      VkSampleCountFlagBits rsSampleCount = VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount());
-
-      if (!msSampleCount)
-        msSampleCount = rsSampleCount ? rsSampleCount : VK_SAMPLE_COUNT_1_BIT;
+      auto sampleCount = m_state.gp.state.determineRasterSamples(m_device->canUseMixedSamples(m_state.gp.shaders.fs));
 
       bool center = m_state.gp.state.useSampleLocations();
-      bool enable = m_device->canUseSampleLocations(msSampleCount);
+      bool enable = m_device->canUseSampleLocations(sampleCount);
 
       if (enable && m_state.om.renderTargets.depth.view) {
         auto flags = m_state.om.renderTargets.depth.view->image()->info().flags;
         enable = bool(flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
       }
 
-      VkSampleLocationsInfoEXT locations = util::setupSampleLocations(msSampleCount, center);
+      VkSampleLocationsInfoEXT locations = util::setupSampleLocations(sampleCount, center);
       m_cmd->cmdSetSampleLocations(enable && center, &locations);
     }
 
@@ -8816,29 +8766,6 @@ namespace dxvk {
   }
 
 
-  bool DxvkContext::tryInvalidateDeviceLocalBuffer(
-      const Rc<DxvkBuffer>&           buffer,
-            VkDeviceSize              copySize) {
-    // We can only discard if the full buffer gets written, and we will only discard
-    // small buffers in order to not waste significant amounts of memory.
-    if (copySize != buffer->info().size || copySize > 0x40000)
-      return false;
-
-    // Check if the buffer is safe to move at all
-    if (!buffer->canRelocate())
-      return false;
-
-    // Suspend the current render pass if transform feedback is active prior to
-    // invalidating the buffer, since otherwise we may invalidate a bound buffer.
-    if ((buffer->info().usage & VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT)
-     && (m_flags.test(DxvkContextFlag::GpXfbActive)))
-      this->endCurrentPass(true);
-
-    this->invalidateBuffer(buffer, buffer->allocateStorage());
-    return true;
-  }
-
-
   Rc<DxvkImageView> DxvkContext::ensureImageViewCompatibility(
     const Rc<DxvkImageView>&        view,
           VkImageUsageFlagBits      usage) {
@@ -9080,15 +9007,15 @@ namespace dxvk {
         planeCount = vk::getPlaneCount(formatInfo->aspectMask);
 
       for (uint32_t p = 0; p < planeCount; p++) {
-        for (uint32_t m = 0; m < info.image->info().mipLevels; m++) {
+        for (uint32_t m = 0; m < availableSubresources.levelCount; m++) {
           VkImageSubresourceRange subresourceRange = availableSubresources;
           subresourceRange.baseMipLevel = m;
           subresourceRange.levelCount = 1u;
 
           uint32_t layerStep = info.image->isInitialized(subresourceRange)
-            ? subresourceRange.layerCount : 1u;
+            ? availableSubresources.layerCount : 1u;
 
-          for (uint32_t l = 0; l < subresourceRange.layerCount; l += layerStep) {
+          for (uint32_t l = 0; l < availableSubresources.layerCount; l += layerStep) {
             subresourceRange.baseArrayLayer = l;
             subresourceRange.layerCount = layerStep;
 
@@ -9186,8 +9113,10 @@ namespace dxvk {
     for (const auto& e : resourceList) {
       auto storage = e.resource->relocateStorage(e.mode);
 
-      if (!storage)
+      if (!storage) {
+        e.resource->revertResidency();
         continue;
+      }
 
       Rc<DxvkImage> image = dynamic_cast<DxvkImage*>(e.resource.ptr());
       Rc<DxvkBuffer> buffer = dynamic_cast<DxvkBuffer*>(e.resource.ptr());
@@ -9754,15 +9683,18 @@ namespace dxvk {
 
 
   void DxvkContext::prepareSharedImages() {
-    // Only flush clears for shared images, and restore layouts
-    bool hasSharedClear = false;
+    small_vector<Rc<DxvkImage>, 8u> imagesToClear;
 
-    for (const auto& image : m_nonDefaultLayoutImages) {
-      if (image->info().shared)
-        hasSharedClear = flushDeferredClear(*image, image->getAvailableSubresources());
+    // Only flush clears for shared images, and restore layouts
+    for (const auto& clear : m_deferredClears) {
+      if (clear.imageView->image()->info().shared)
+        imagesToClear.push_back(clear.imageView->image());
     }
 
-    if (hasSharedClear)
+    for (const auto& image : imagesToClear)
+      flushDeferredClear(*image, image->getAvailableSubresources());
+
+    if (!imagesToClear.empty())
       flushBarriers();
 
     restoreImageLayouts([] (DxvkImage& image) {
@@ -10807,17 +10739,19 @@ namespace dxvk {
 
 
   void DxvkContext::beginFrameCapture() {
-    if (m_features.test(DxvkContextFeature::DebugUtils)) {
+    if (m_features.test(DxvkContextFeature::DebugUtils) && !m_frameCaptureActive) {
       m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::SdmaBarriers,
         vk::makeLabel(0, "capture-marker,begin_capture"));
+      m_frameCaptureActive = true;
     }
   }
 
 
   void DxvkContext::endFrameCapture() {
-    if (m_features.test(DxvkContextFeature::DebugUtils)) {
+    if (m_features.test(DxvkContextFeature::DebugUtils) && m_frameCaptureActive) {
       m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer,
         vk::makeLabel(0, "capture-marker,end_capture"));
+      m_frameCaptureActive = false;
     }
   }
 
@@ -11006,7 +10940,7 @@ namespace dxvk {
     if (unlikely(!m_scratchBuffer || m_scratchBuffer->info().size < size)) {
       // We probably won't need a lot of scratch memory, so keep it small
       DxvkBufferCreateInfo info = { };
-      info.size = DxvkPageAllocator::PageSize;
+      info.size = std::max(DxvkPageAllocator::PageSize, align(size, alignment));
       info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -11025,13 +10959,14 @@ namespace dxvk {
     // Suballocate slice from buffer
     VkDeviceSize offset = align(m_scratchOffset, alignment);
 
-    if (offset + size < m_scratchBuffer->info().size) {
+    if (offset + size > m_scratchBuffer->info().size) {
       invalidateBuffer(m_scratchBuffer, m_scratchBuffer->allocateStorage());
       m_scratchOffset = 0u;
+      offset = 0;
     }
 
-    DxvkResourceBufferInfo slice = m_scratchBuffer->getSliceInfo(m_scratchOffset, size);
-    m_scratchOffset += align(size, alignment);
+    DxvkResourceBufferInfo slice = m_scratchBuffer->getSliceInfo(offset, size);
+    m_scratchOffset = offset + align(size, alignment);
 
     // Unconditionally track for writing to not bother the caller with it.
     m_cmd->track(m_scratchBuffer, DxvkAccess::Write);

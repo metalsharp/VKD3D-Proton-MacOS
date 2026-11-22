@@ -55,8 +55,6 @@ dxvk_src = [
   'dxvk_implicit_resolve.cpp',
   'dxvk_instance.cpp',
   'dxvk_metal_hud.cpp',
-  'dxvk_latency_builtin.cpp',
-  'dxvk_latency_reflex.cpp',
   'dxvk_memory.cpp',
   'dxvk_meta_blit.cpp',
   'dxvk_meta_clear.cpp',

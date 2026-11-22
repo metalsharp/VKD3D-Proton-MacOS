@@ -187,6 +187,9 @@ namespace dxvk {
     for (const auto& p : m_imageCopyPipelines)
       vk->vkDestroyPipeline(vk->device(), p.second.pipeline, nullptr);
 
+    for (const auto& p : m_inputAttachmentImageCopyPipelines)
+      vk->vkDestroyPipeline(vk->device(), p.second.pipeline, nullptr);
+
     for (const auto& p : m_bufferImageCopyPipelines)
       vk->vkDestroyPipeline(vk->device(), p.second.pipeline, nullptr);
 
@@ -810,7 +813,7 @@ namespace dxvk {
           uint32_t bitShift = bitIndex;
 
           if (isBgr && i < 3u)
-            bitShift = (hasAlpha ? 10u : 11u) - bitShift;
+            bitShift = 16u - bitIndex - bitCount;
 
           ir::SsaDef scale = builder.makeConstant(float((1u << bitCount) - 1u));
           channel = builder.add(ir::Op::FMul(ir::ScalarType::eF32, channel, scale));

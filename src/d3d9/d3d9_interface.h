@@ -131,6 +131,11 @@ namespace dxvk {
     HRESULT ValidatePresentationParameters(
         const D3DPRESENT_PARAMETERS* pPresentationParameters);
 
+    HRESULT ValidateAdapterGroupParameters(
+              HWND                   hFocusWindow,
+        const D3DPRESENT_PARAMETERS* pPresentationParameters,
+              UINT                   HeadCount);
+
     const D3D9Options& GetOptions() const { return m_d3d9Options; }
 
     D3D9Adapter* GetAdapter(UINT Ordinal) {
@@ -153,6 +158,34 @@ namespace dxvk {
       switch (d3dCompatibility) {
         case D3DCompatibility::D3D8:
           Logger::info("The D3D9 interface is now operating in D3D8 compatibility mode.");
+          break;
+        case D3DCompatibility::D3D7:
+          m_d3dCompatibility.set(D3DCompatibility::D3D8);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D6);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D5);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D3);
+          Logger::info("The D3D9 interface is now operating in D3D7 compatibility mode.");
+          break;
+        case D3DCompatibility::D3D6:
+          m_d3dCompatibility.set(D3DCompatibility::D3D8);
+          m_d3dCompatibility.set(D3DCompatibility::D3D7);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D5);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D3);
+          Logger::info("The D3D9 interface is now operating in D3D6 compatibility mode.");
+          break;
+        case D3DCompatibility::D3D5:
+          m_d3dCompatibility.set(D3DCompatibility::D3D8);
+          m_d3dCompatibility.set(D3DCompatibility::D3D7);
+          m_d3dCompatibility.set(D3DCompatibility::D3D6);
+          m_d3dCompatibility.clr(D3DCompatibility::D3D3);
+          Logger::info("The D3D9 interface is now operating in D3D5 compatibility mode.");
+          break;
+        case D3DCompatibility::D3D3:
+          m_d3dCompatibility.set(D3DCompatibility::D3D8);
+          m_d3dCompatibility.set(D3DCompatibility::D3D7);
+          m_d3dCompatibility.set(D3DCompatibility::D3D6);
+          m_d3dCompatibility.set(D3DCompatibility::D3D5);
+          Logger::info("The D3D9 interface is now operating in D3D3 compatibility mode.");
           break;
         default:
           break;

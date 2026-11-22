@@ -296,10 +296,10 @@ vec4 sampleTexture(uint stage, vec4 texcoord, vec4 previousStageTextureVal) {
             texcoord = calculateBumpmapCoords(stage, texcoord, previousStageTextureVal);
     }
 
-    // We can encounter null textures in certain scenarios where only alpha
-    // samples the texture, or the color op itself implicitly samples. For
-    // some reason this appears to return a null vector on native.
-    vec4 texVal = vec4(0.0f);
+    // The only time we should ever be able to observe a null texture is with
+    // D3DTOP_PREMODULATE. It's not 100% clear what's supposed to happen in
+    // that case, but make it so that the multiplication has no effect for now.
+    vec4 texVal = vec4(1.0f);
 
     switch (state.type) {
         case TEXTURE_TYPE_2D:
@@ -307,6 +307,40 @@ vec4 sampleTexture(uint stage, vec4 texcoord, vec4 previousStageTextureVal) {
                 texcoord.z = adjustDref(texcoord.z, state);
                 texVal = texture(sampler2DShadow(t2d[stage], sampler_heap[loadSamplerHeapIndex(stage)]), texcoord.xyz).xxxx;
             } else {
+                if (isColorKeyEnabled()) {
+                    const uint wrapModeU = bitfieldExtract(ffps.packedAddressUV, 0, 16);
+                    const uint wrapModeV = bitfieldExtract(ffps.packedAddressUV, 16, 16);
+                    const ivec2 texSize = textureSize(sampler2D(t2d[stage], sampler_heap[loadSamplerHeapIndex(stage)]), 0);
+
+                    ivec2 pixelCoord = ivec2(texcoord.xy * vec2(texSize));
+                    if (wrapModeU == WRAPMODE_CLAMP) {
+                        pixelCoord.x = clamp(pixelCoord.x, 0, texSize.x - 1);
+                    } else if (wrapModeU == WRAPMODE_MIRROR) {
+                        int period = texSize.x * 2;
+                        pixelCoord.x = (pixelCoord.x % period + period) % period;
+                        pixelCoord.x = min(pixelCoord.x, period - pixelCoord.x - 1);
+                    } else {
+                        pixelCoord.x = (pixelCoord.x % texSize.x + texSize.x) % texSize.x;
+                    }
+                    if (wrapModeV == WRAPMODE_CLAMP) {
+                        pixelCoord.y = clamp(pixelCoord.y, 0, texSize.y - 1);
+                    } else if (wrapModeV == WRAPMODE_MIRROR) {
+                        int period = texSize.y * 2;
+                        pixelCoord.y = (pixelCoord.y % period + period) % period;
+                        pixelCoord.y = min(pixelCoord.y, period - pixelCoord.y - 1);
+                    } else {
+                        pixelCoord.y = (pixelCoord.y % texSize.y + texSize.y) % texSize.y;
+                    }
+
+                    texVal = texelFetch(sampler2D(t2d[stage], sampler_heap[loadSamplerHeapIndex(stage)]), pixelCoord, 0);
+                    const ivec4 ckl = decodeColorKey(ffps.colorKeyLow);
+                    const ivec4 ckh = decodeColorKey(ffps.colorKeyHigh);
+                    const ivec4 src = ivec4(texVal.rgba * 255.0);
+                    if (all(greaterThanEqual(src, ckl)) && all(lessThanEqual(src, ckh))) {
+                        discard;
+                    }
+                }
+
                 texVal = texture(sampler2D(t2d[stage], sampler_heap[loadSamplerHeapIndex(stage)]), texcoord.xy);
             }
             break;
