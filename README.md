@@ -3,7 +3,7 @@
 <h1>MetalVulkan</h1>
 
 <p>
-  Direct3D 12 down to Direct3D 3 on Metal, for Wine on Apple Silicon.
+  A Vulkan 1.4 implementation for macOS, and Direct3D 12 down to 3 on top of it.
 </p>
 
 <p>
@@ -12,20 +12,30 @@
   <a href="https://github.com/metalsharp/MetalVulkan/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/metalsharp/MetalVulkan/build.yml?branch=main&style=for-the-badge&label=Build" alt="Build"></a>
 </p>
 
-<pre>Direct3D 12        → VKD3D-Proton ┐
-Direct3D 11 to 3   → DXVK         ┴→ Vulkan → MetalSharp's MoltenVK → Metal</pre>
+<pre>Vulkan programs                    ┐
+Direct3D 12        → VKD3D-Proton  ├→ MetalVulkan's Vulkan 1.4 (MoltenVK) → Metal
+Direct3D 11 to 3   → DXVK          ┘</pre>
 
 </div>
 
 ___
 
-VKD3D-Proton and DXVK, built and patched for macOS, on a MoltenVK made to run them: Metal Shader Converter for most
-shaders, MetalFX for upscaling and DLSS, and Metal 4 where the system has it. DXVK (with d7vk's ddraw) lives in
-[`dxvk/`](dxvk), with its history; VKD3D-Proton and MoltenVK are upstream with this repository's patches. One DXVK
-serves DXGI for VKD3D-Proton's swap chains and Direct3D 11 down to 3, so a program gets one lane whatever API it uses.
+**Vulkan.** At its core is MetalSharp's MoltenVK, a Vulkan 1.4 driver for Metal with 178 extensions: ray tracing
+pipelines, ray queries and acceleration structures; mesh shaders; transform feedback; dynamic rendering, extended
+dynamic state 3 and pipeline libraries; descriptor indexing, push descriptors and timeline semaphores; host image
+copy, fragment shader interlock and barycentrics; present timing and waits; and Metal interop (`VK_EXT_metal_objects`,
+`VK_EXT_external_memory_metal`). It loads like any Vulkan driver: native macOS programs through the Vulkan loader, and
+Windows programs through Wine's `winevulkan`. SPIR-V shaders go to Metal through SPIRV-Cross, and Direct3D 12's DXIL
+and DXBC ones straight through Apple's Metal Shader Converter. MetalFX does upscaling and frame generation, and
+Metal 4 is used where the system has it.
 
-Each [release](https://github.com/metalsharp/MetalVulkan/releases/latest) has packages for x86_64 Wine, 32-bit
-programs, and arm64 Wine with FEX (ARM64X, with NEON on the hot CPU paths), and the universal MoltenVK they share.
+**Direct3D.** On top of it, VKD3D-Proton runs Direct3D 12, and DXVK ([`dxvk/`](dxvk), with d7vk's ddraw) runs
+DXGI and Direct3D 11 down to 3. It is one DXVK for VKD3D-Proton's swap chains and every older API, so a Windows game
+gets one lane whatever API it uses, with DLSS on MetalFX.
+
+Each [release](https://github.com/metalsharp/MetalVulkan/releases/latest) has the universal Vulkan driver (MoltenVK),
+and the Direct3D DLLs for x86_64 Wine, 32-bit programs, and arm64 Wine with FEX (ARM64X, with NEON on the hot CPU
+paths).
 
 ## Capabilities
 
@@ -33,6 +43,7 @@ Measured on an Apple M6 (macOS 27.2):
 
 | | |
 | --- | --- |
+| Vulkan | **1.4**, 178 device and instance extensions, a portability driver |
 | Shader Model | **6.8** |
 | Feature levels | **12_1** by default; **12_2** with `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1` |
 | Ray tracing | DXR **1.1** with that setting |
@@ -46,6 +57,20 @@ The full matrix is in [docs/features.md](docs/features.md), and the regression g
 
 ## Install
 
+### As a Vulkan driver
+
+The `moltenvk-<tag>-universal` package is a Vulkan ICD (arm64 and x86_64). Point the Vulkan loader at it:
+
+```bash
+tar -xf moltenvk-<tag>-universal.tar.zst
+export VK_DRIVER_FILES="$PWD/moltenvk-<tag>-universal/MoltenVK_icd.json"
+vulkaninfo --summary
+```
+
+It is a portability driver, so applications enable `VK_KHR_portability_enumeration` to see it, as with any MoltenVK.
+
+### Direct3D in a Wine prefix
+
 Download a VKD3D-Proton package and the MoltenVK package from the latest release, extract them side by side, and run
 the installer on your Wine prefix:
 
@@ -56,7 +81,8 @@ tar -xf moltenvk-<tag>-universal.tar.zst
 ~/my-prefix/vkd3d-proton-macos/wine game.exe
 ```
 
-[docs/install.md](docs/install.md) covers both packages, the options, running programs and uninstalling.
+The DXVK packages (`dxvk-<tag>-x86_64`, `-i386`, `-arm64x`) add Direct3D 9 to 3 and 32-bit programs.
+[docs/install.md](docs/install.md) covers the packages, the options, running programs and uninstalling.
 [docs/runtime.md](docs/runtime.md) covers MetalFX, DLSS, and the switches for pipeline compilation, Metal Shader
 Converter, ExecuteIndirect and presentation.
 
