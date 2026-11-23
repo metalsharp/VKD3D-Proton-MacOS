@@ -12,6 +12,7 @@
 #include "../d3d10/d3d10_multithread.h"
 
 #include "../util/util_flush.h"
+#include "../util/util_hotpatch.h"
 
 #include "d3d11_annotation.h"
 #include "d3d11_buffer.h"
@@ -183,7 +184,9 @@ namespace dxvk {
     void STDMETHODCALLTYPE GenerateMips(
             ID3D11ShaderResourceView*         pShaderResourceView);
 
-    void STDMETHODCALLTYPE ResolveSubresource(
+    // Assetto Corsa's Custom Shaders Patch detours ResolveSubresource with an x86 jump for its MSAA resolve. In an
+    // x86_64 process on ARM64EC that would land on ARM64 code; a hybrid patchable function gives it an x64 entry.
+    DXVK_HOTPATCHABLE void STDMETHODCALLTYPE ResolveSubresource(
             ID3D11Resource*                   pDstResource,
             UINT                              DstSubresource,
             ID3D11Resource*                   pSrcResource,
