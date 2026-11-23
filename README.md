@@ -1,50 +1,53 @@
 <div align="center">
 
-<h1>VKD3D-Proton macOS</h1>
+<h1>MetalVulkan</h1>
 
 <p>
-  Reproducible D3D12-on-Metal runtime for Apple Silicon.
+  Direct3D 12 down to Direct3D 3 on Metal, for Wine on Apple Silicon.
 </p>
 
 <p>
-  <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/latest"><img src="https://img.shields.io/github/v/release/metalsharp/vkd3d-proton-macos?style=for-the-badge" alt="Release"></a>
+  <a href="https://github.com/metalsharp/MetalVulkan/releases/latest"><img src="https://img.shields.io/github/v/release/metalsharp/MetalVulkan?style=for-the-badge" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg?style=for-the-badge" alt="AGPL-3.0 License"></a>
-  <a href="https://github.com/metalsharp/vkd3d-proton-macos/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/metalsharp/vkd3d-proton-macos/build.yml?branch=main&style=for-the-badge&label=Build" alt="Build"></a>
+  <a href="https://github.com/metalsharp/MetalVulkan/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/metalsharp/MetalVulkan/build.yml?branch=main&style=for-the-badge&label=Build" alt="Build"></a>
 </p>
 
-<pre>D3D12 application → vkd3d-proton → Vulkan → custom MoltenVK → Metal</pre>
-
-<p>
-  Each <a href="https://github.com/metalsharp/vkd3d-proton-macos/releases/latest">release</a> has a package for
-  x86_64 Wine, one for arm64 Wine with FEX, and the universal MoltenVK, with install scripts for both kinds of Wine.
-</p>
+<pre>Direct3D 12        → VKD3D-Proton ┐
+Direct3D 11 to 3   → DXVK         ┴→ Vulkan → MetalSharp's MoltenVK → Metal</pre>
 
 </div>
 
-
 ___
+
+VKD3D-Proton and DXVK, built and patched for macOS, on a MoltenVK made to run them: Metal Shader Converter for most
+shaders, MetalFX for upscaling and DLSS, and Metal 4 where the system has it. DXVK (with d7vk's ddraw) lives in
+[`dxvk/`](dxvk), with its history; VKD3D-Proton and MoltenVK are upstream with this repository's patches. One DXVK
+serves DXGI for VKD3D-Proton's swap chains and Direct3D 11 down to 3, so a program gets one lane whatever API it uses.
+
+Each [release](https://github.com/metalsharp/MetalVulkan/releases/latest) has packages for x86_64 Wine, 32-bit
+programs, and arm64 Wine with FEX (ARM64X, with NEON on the hot CPU paths), and the universal MoltenVK they share.
 
 ## Capabilities
 
-Measured on an Apple M6 (macOS 27.2) through VKD3D-Proton and this MoltenVK:
+Measured on an Apple M6 (macOS 27.2):
 
-- Shader Model **6.8**
-- D3D12 feature levels **12_1, 12_0, 11_1, 11_0** by default, and **12_2** with
-  `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1`, which turns on MoltenVK's ray tracing pipelines
-- DXR **1.1** (ray tracing tier 1.1) with that setting; none without it
-- Variable-rate shading tier 2 (16-pixel shading-rate tiles)
-- Mesh shader tier 1, sampler feedback tier 0.9
-- Tiled resources tier 4, conservative rasterization tier 3, resource binding tier 3
-- ROVs, depth bounds, barycentrics, fully typed format casting, copy-queue timestamps, and output-merger logic
-  operations
+| | |
+| --- | --- |
+| Shader Model | **6.8** |
+| Feature levels | **12_1** by default; **12_2** with `MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1` |
+| Ray tracing | DXR **1.1** with that setting |
+| Variable-rate shading | Tier 2 (16-pixel tiles) |
+| Mesh shaders, sampler feedback | Tier 1, tier 0.9 |
+| Tiled resources, conservative rasterization, resource binding | Tier 4, tier 3, tier 3 |
+| Also | ROVs, depth bounds, barycentrics, fully typed format casting, copy-queue timestamps, logic operations |
 
-[docs/features.md](docs/features.md) has the full matrix and [docs/validation.md](docs/validation.md) the regression
-gate.
+The full matrix is in [docs/features.md](docs/features.md), and the regression gate in
+[docs/validation.md](docs/validation.md).
 
 ## Install
 
 Download a VKD3D-Proton package and the MoltenVK package from the latest release, extract them side by side, and run
-the package's installer on your Wine prefix:
+the installer on your Wine prefix:
 
 ```bash
 tar -xf vkd3d-proton-<tag>-x86_64.tar.zst      # or -arm64 for an arm64 Wine with FEX
@@ -54,177 +57,66 @@ tar -xf moltenvk-<tag>-universal.tar.zst
 ```
 
 [docs/install.md](docs/install.md) covers both packages, the options, running programs and uninstalling.
-
-### MetalFX and DLSS settings
-
-The arm64 package ships `vkd3d.conf` and `dxvk.conf`, which the installer copies into
-`<prefix>/vkd3d-proton-macos/` (a reinstall keeps your edits) and points `VKD3D_CONFIG_FILE` and `DXVK_CONFIG_FILE` at
-from `env.sh`. MetalSharp writes its own; other Wines use these:
-
-- **MetalFX spatial upscaling** of the swap chain to the display, where a game renders smaller than its window: on in
-  `vkd3d.conf` (`d3d12.metalSpatialUpscale`) and `dxvk.conf` (`d3d11.metalSpatialUpscale`). `VKD3D_METALFX_SPATIAL=1`
-  or `0` overrides the file for D3D12.
-- **DLSS** (Super Resolution, Ray Reconstruction and Frame Generation on MetalFX): the package's NGX core (`nvngx.dll`,
-  signed with the Mullion NGX key, whose certificate the lane's DXGI trusts in the prefix) and NVAPI answer only games
-  that DXGI shows an NVIDIA GPU. Uncomment the `dxgi.customVendorId = 10de` lines in `dxvk.conf` under the game's
-  `[Game.exe]` section. Ray Reconstruction and Frame Generation need the game to ship `nvngx_dlssd.dll` and
-  `nvngx_dlssg.dll`, as on Windows; Frame Generation needs macOS 27.
-
-A path in either variable may be a Unix path or a Windows one (`Z:/...`).
-
-Creating a pipeline returns once its shaders are converted: Metal compiles it meanwhile, started from the creating
-thread and finished by its completion handler, so no thread waits for it, and the first draw or dispatch that uses
-the pipeline waits if it isn't done. `MVK_CONFIG_DEFERRED_PIPELINES=0` compiles in the creating call instead.
-`MVK_CONFIG_PARALLEL_STAGE_COMPILE=1` compiles a pipeline's fragment shader alongside its vertex shader; it is off by
-default, as its compiles wait on Metal from GCD worker threads. Metal compiles with as many threads as the machine has
-(`MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=0` turns that off).
-
-Shaders the Metal Shader Converter converts are kept on disk beside MoltenVK's pipeline cache (`<cache>.msc/`, one
-file each), so a relaunch converts none of them again (`MVK_CONFIG_MSC_DISK_CACHE=0` turns that off). The converter
-targets the GPU's Apple family and the running macOS (`MVK_CONFIG_MSC_TARGET_DEVICE=0` keeps its oldest targets).
-
-ExecuteIndirect of 25 or more draws whose signature has only root constants runs from one Metal indirect command buffer
-(`MVK_CONFIG_DGC_RENDER_ICB_MIN_SEQUENCES` sets the threshold; `0` turns it off). ExecuteIndirect that sets root
-constants or root descriptors writes them into a converted pipeline's top-level argument buffer, so the pipeline stays
-the converter's instead of switching to a SPIR-V one compiled for it. An indirect draw with a count buffer of 25 or more
-draws (ExecuteIndirect of draws alone) runs only the counted draws, from an indirect command buffer encoded before the
-render pass (`MVK_CONFIG_INDIRECT_COUNT_ICB_MIN_DRAWS` sets the threshold; `0` turns it off). ExecuteIndirect of
-dispatches alone with a count buffer runs only the counted dispatches. ExecuteIndirect inside a render pass doesn't
-end it: its kernels run before the pass begins (`MVK_CONFIG_DGC_HOIST=0` runs them in place). Command lists encode
-into Metal when their recording ends, on the thread that recorded them, not all at once on the submitting thread
-(`MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=0` encodes at submission). MetalFX's temporal scaler is made
-without stopping the queue (`MVK_CONFIG_METALFX_SYNCHRONOUS_INIT=1` waits for it); `MVK_CONFIG_METALFX_OUTPUT_MOTION=1`
-lets it take motion vectors at the output resolution itself, on macOS 27, instead of a downscale pass.
-
-`Present` with a SyncInterval of 2 to 4 holds each frame for that many refreshes (through relative present targets),
-so a game capped at half or a third of the refresh rate stays capped. Two options leave out features that run slowly
-here, for games that pick a faster path without them: `MVK_CONFIG_RAY_TRACING_MIN_APPLE_FAMILY=9` reports no ray
-tracing on GPUs before Apple family 9, which trace rays in compute, and `MVK_CONFIG_CONSERVATIVE_RASTERIZATION=0`
-reports no conservative rasterization, which is emulated (D3D12 feature level 12_1 needs it, so 12_0 is reported).
-
-Apple's Metal Shader Converter turns DXIL and DXBC shaders straight into Metal libraries for most pipelines
-(compute; vertex, mesh, amplification and pixel), skipping SPIR-V and Metal source. Tessellation pipelines of DXIL
-shaders run in the converter's emulation, a mesh pipeline whose object stage runs the vertex and hull shaders and whose
-mesh stage runs the tessellator and the domain shader, so a tessellated draw no longer ends the render pass for compute
-passes (`VKD3D_MSC_TESSELLATION=0` keeps them on SPIR-V; isolines, DXBC tessellation and ExecuteIndirect with such a
-PSO use SPIR-V). Pipelines with geometry shaders, tessellation with a geometry shader, stream output, logic operations, conservative rasterization, the depth bounds test, view
-instancing, ray queries, 64-bit atomics, barycentrics, residency feedback, min/max sampler filtering or a
-three-component 32-bit typed buffer stay on SPIR-V. `METALSHARP_MSC=0` keeps every pipeline on SPIR-V,
-`METALSHARP_MSC=compute` keeps graphics ones there, and `METALSHARP_MSC_DXBC=0` keeps DXBC (SM 4.x and 5.x)
-shaders there. `METALSHARP_METAL_VERSION=3` has MoltenVK run as it does on macOS 14 and 15 (no MSL 4.0, Metal 4
-family features, sampler reduction or sparse resources), to test the Metal 3 paths on a newer system.
+[docs/runtime.md](docs/runtime.md) covers MetalFX, DLSS, and the switches for pipeline compilation, Metal Shader
+Converter, ExecuteIndirect and presentation.
 
 ## Build from source
 
 ```bash
-git clone https://github.com/metalsharp/vkd3d-proton-macos.git
+git clone https://github.com/metalsharp/MetalVulkan.git
 cd vkd3d-proton-macos
-make help
-make docs-check
+scripts/fetch-sources.sh   # VKD3D-Proton, MoltenVK, NVAPI and DXC with their patches; DXVK's submodules
+make tools                 # check the host and the toolchain (docs/requirements.md)
+make vkd3d                 # d3d12.dll and d3d12core.dll
+make moltenvk              # the universal libMoltenVK.dylib
+scripts/build-dxvk.sh arm64x   # DXVK (also x86_64, i386)
 ```
 
-For a complete local build, fetch the sources with `scripts/fetch-sources.sh`,
-install the toolchain described in [the requirements guide](docs/requirements.md),
-then run:
-
-```bash
-make tools       # verify the host and external tools
-make vkd3d      # build d3d12.dll + d3d12core.dll
-make moltenvk   # build the universal libMoltenVK.dylib
-make flprobe    # build the D3D12 feature-level probe
-```
-
-The full target map is documented in [docs/Development.md](docs/Development.md). Do not
-mix `d3d12.dll` and `d3d12core.dll` from different builds.
-
-## Repository layout
+`make help` lists every target, and [docs/Development.md](docs/Development.md) explains them. Don't mix `d3d12.dll`
+and `d3d12core.dll` from different builds.
 
 ```text
-.
-├── Makefile                         # build, probe, package, and doc targets
-├── docs/                            # current guides plus dated evidence
-├── install/                         # install scripts for x86_64 and arm64 Wine prefixes
-├── patches/                         # this project's changes to VKD3D-Proton, MoltenVK, SPIRV-Cross, DXVK
-├── scripts/                         # environment, build, probe, and recovery tools
-├── sources/                         # local source clones (intentionally ignored)
-├── toolchain/                       # local llvm-mingw/toolchain assets
-└── artifacts/                       # local builds, staging, and evidence
+Makefile        build, probe, package and documentation targets
+dxvk/           DXVK 3.1 on MoltenVK, with d7vk's ddraw (formerly metalsharp/DXVK-MacOS)
+docs/           guides, and dated evidence
+install/        installers for x86_64 and arm64 Wine prefixes
+patches/        this project's changes to VKD3D-Proton, dxil-spirv, MoltenVK, SPIRV-Cross and DXC
+scripts/        build, probe and packaging tools
+sources/        source clones (ignored)
+toolchain/      llvm-mingw and other local tools (ignored)
+artifacts/      builds, staging and evidence
 ```
 
 ## Documentation
 
-Start at [docs/README.md](docs/README.md), then see:
+[docs/README.md](docs/README.md) is the index. The guides:
+[install](docs/install.md) ·
+[runtime](docs/runtime.md) ·
+[requirements](docs/requirements.md) ·
+[development](docs/Development.md) ·
+[features](docs/features.md) ·
+[validation](docs/validation.md) ·
+[tracing](docs/tracing.md) ·
+[release](docs/release.md) ·
+[final state](docs/Final.md)
 
-- [Installing into a Wine prefix](docs/install.md)
-- [Requirements](docs/requirements.md)
-- [Development and Make targets](docs/Development.md)
-- [Feature-level matrix](docs/features.md)
-- [Validation and regression](docs/validation.md)
-- [Tracing a problem with `METALSHARP_TRACE`](docs/tracing.md)
-- [Release and packaging](docs/release.md)
-- [Final state](docs/Final.md)
-
-## Project policies
-
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Code of Conduct](CODE_OF_CONDUCT.md)
+[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## License
 
 This repository's own code, scripts and documentation are licensed under the
-[GNU Affero General Public License v3.0](LICENSE).
+[GNU Affero General Public License v3.0](LICENSE). The projects it builds keep their own licenses, and so do this
+repository's changes to them: in `patches/`, and `dxvk/`, which is DXVK's zlib license ([dxvk/LICENSE](dxvk/LICENSE)). Each release package carries the licenses of what it contains:
 
-The projects it builds keep their own licenses, and so do this repository's changes to them in `patches/`:
-VKD3D-Proton is LGPL-2.1, DXVK is zlib, MoltenVK and SPIRV-Cross are Apache-2.0, and DirectXShaderCompiler (whose
-DXBC to DXIL converter the MoltenVK package carries) is the University of Illinois/NCSA license. Each release package carries
-the licenses of what it contains. [Third-party licenses](#third-party-licenses) lists them, with the terms Apple's
-Metal Shader Converter library ships under.
-
-## Third-party licenses
-
-| Component | In the release | License | License file in the package |
+| Component | In the release | License | License file |
 | --- | --- | --- | --- |
 | [VKD3D-Proton](https://github.com/HansKristian-Work/vkd3d-proton) | `d3d12.dll`, `d3d12core.dll` | LGPL-2.1 | `LICENSE.vkd3d-proton` |
-| [DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS) (DXVK on MoltenVK) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll` | zlib (dxbc-spirv: MIT) | `LICENSE.dxvk`, `LICENSE.dxbc-spirv` |
-| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
-| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |
-| Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license, see below | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |
-| [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)'s dxilconv | `libdxbcconverter.dylib` (DXBC to DXIL, for Metal Shader Converter) | University of Illinois/NCSA | `LICENSE.dxc.txt` |
-| Metal Shader Converter headers | built into `libMoltenVK.dylib` | Apache-2.0 | `sources/MoltenVK/MoltenVK/MoltenVK/MetalShaderConverter/metal_irconverter/LICENSE.txt` in MoltenVK's source |
+| [DXVK](https://github.com/doitsujin/dxvk) and [d7vk](https://github.com/WinterSnowfall/d7vk) (`dxvk/`) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll`, `d3d9.dll`, `d3d8.dll`, `ddraw.dll` | zlib (dxbc-spirv: MIT) | `LICENSE.dxvk` or `LICENSE`, `LICENSE.dxbc-spirv` |
+| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) and [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
+| Metal Shader Converter headers | built into `libMoltenVK.dylib` | Apache-2.0 | `metal_irconverter/LICENSE.txt` in MoltenVK's source |
+| [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)'s dxilconv | `libdxbcconverter.dylib` (DXBC to DXIL) | University of Illinois/NCSA | `LICENSE.dxc.txt` |
+| Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |
 
-### Apple Metal Shader Converter
-
-**What it is.** `libmetalirconverter.dylib` is Apple's Metal Shader Converter library, © Apple Inc. It is
-proprietary, not open source, and is licensed under Apple's *Software License Agreement for Metal Shader Converter*.
-The `moltenvk-vX.Y-universal` package ships that agreement and Apple's acknowledgements file next to the library.
-The library is the only part of the Metal Shader Converter that this repository distributes: not its command-line
-tool and not its documentation.
-
-**What it is used for.** MoltenVK loads the library at runtime and calls its public C API, declared in the
-Apache-2.0 headers above, to convert the DXIL shaders VKD3D-Proton hands it into Metal libraries. It converts
-compute shaders, and the vertex and pixel shaders of graphics pipelines. Without it, every shader goes
-DXIL → SPIR-V → MSL text, and Metal compiles that text at run time: 0.4–1.7 s per large shader, against 1–4 ms
-for the converter. Shader conversion is all the library does here. `METALSHARP_MSC=0` turns it off. If the library
-is missing or a conversion fails, VKD3D-Proton builds that pipeline from SPIR-V as before.
-
-**Why we may use and ship it this way.** Our reading of Apple's agreement:
-
-- **Section 2B** licenses the Dynamic Libraries (the converter's `.dylib` files) to be installed, used, tested and
-  distributed "for the sole purpose of shader conversion". Converting D3D12 shaders for Metal is that purpose, and
-  the library ships only for it.
-- **Section 2E** forbids modifying, decompiling, disassembling or reverse engineering the software. The library
-  ships byte for byte as Apple publishes it and keeps Apple's code signature: our scripts never re-sign it.
-  `scripts/fetch-metal-shaderconverter.sh` checks its SHA-256 and Apple's signature. MoltenVK uses only the public
-  API and the documented reflection the converter returns.
-- **Sections 2C and 2D** limit the software to Apple-branded hardware and require copyright and proprietary notices
-  to be kept. The library ships only in the macOS MoltenVK package, which runs only on Macs, with Apple's agreement
-  and acknowledgements unmodified beside it. The library is not sold, rented or offered as a hosted service.
-- **Section 7B** (and the agreement's opening note) asks that the software only be used with material you are
-  permitted to use. It converts the shaders of the games you run, on your own Mac.
-- Apple's own download requires an Apple ID, so this repository hosts the unmodified library, agreement and
-  acknowledgements as the `deps-metal-shaderconverter-4.0b3` release, which section 2B's distribution grant allows
-  ([docs/release.md](docs/release.md)).
-
-Apple's agreement governs. If you redistribute the MoltenVK package, keep the library unmodified, with its agreement
-and acknowledgements, and use it only for shader conversion on Apple-branded systems.
+Apple's Metal Shader Converter library is proprietary. It ships unmodified, with Apple's signature, agreement and
+acknowledgements, and only for shader conversion on Macs. [docs/metal-shader-converter.md](docs/metal-shader-converter.md)
+explains what it does here and how Apple's agreement allows that.

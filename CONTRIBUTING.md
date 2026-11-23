@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve VKD3D-Proton macOS. Contributions are welcome in
+Thanks for helping improve MetalVulkan. Contributions are welcome in
 the workspace code, build interface, documentation, probes, and reproducible
 validation tooling.
 
@@ -18,8 +18,8 @@ to a pull request.
 ## Local setup
 
 ```bash
-git clone https://github.com/metalsharp/vkd3d-proton-macos.git
-cd vkd3d-proton-macos
+git clone https://github.com/metalsharp/MetalVulkan.git
+cd MetalVulkan
 make docs-check
 ```
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Export sources/vkd3d-proton, sources/MoltenVK and its External/SPIRV-Cross work into patches/ (see fetch-sources.sh).
-# sources/dxvk is DXVK-MacOS at the revision fetch-sources.sh pins: its changes go to metalsharp/DXVK-MacOS.
+# DXVK is dxvk/ in this repository: its changes are commits here, and upstream DXVK comes in by subtree merge.
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 # VKD3D-Proton: the commit series on the upstream revision fetch-sources.sh pins, applied there with git am

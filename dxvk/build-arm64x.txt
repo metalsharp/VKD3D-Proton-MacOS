@@ -1,0 +1,25 @@
+# ARM64X PE modules for MetalSharp Wine (arm64 Wine with FEX): one DLL with ARM64 code for native arm64
+# programs and ARM64EC code for x86_64 programs, which FEX runs, so DXVK itself is never emulated.
+# Needs llvm-mingw with the arm64ec-w64-mingw32 target.
+#   meson setup build-arm64x --cross-file build-arm64x.txt --buildtype release
+[binaries]
+c = 'arm64ec-w64-mingw32-clang'
+cpp = 'arm64ec-w64-mingw32-clang++'
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+windres = 'arm64ec-w64-mingw32-windres'
+
+[built-in options]
+c_args = ['-marm64x']
+cpp_args = ['-marm64x']
+c_link_args = ['-marm64x']
+cpp_link_args = ['-marm64x']
+
+[properties]
+needs_exe_wrapper = true
+
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'

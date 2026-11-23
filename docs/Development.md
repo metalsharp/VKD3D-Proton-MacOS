@@ -1,4 +1,4 @@
-# Build VKD3D-Proton macOS
+# Build MetalVulkan
 
 The [Build workflow](../.github/workflows/build.yml) is the best reference
 for the portable repository checks. The root `Makefile` is the source of
@@ -83,7 +83,33 @@ artifacts/build/vkd3d-proton/x86_64-windows/d3d12core.dll
 Both files must be PE32+ x86-64 and must come from the same build. Never mix
 DLLs from different lanes or build timestamps.
 
-## Build DXVK macOS DXGI
+## Build DXVK
+
+DXVK is `dxvk/` in this repository: DXVK 3.1 on MoltenVK, with d7vk's ddraw, kept with its full history (it was
+metalsharp/DXVK-MacOS). `scripts/build-dxvk.sh` checks out its submodules, applies its dxbc-spirv patch once, and
+builds one lane:
+
+```bash
+LLVM_MINGW=toolchain/llvm-mingw bash scripts/build-dxvk.sh arm64x   # artifacts/build/dxvk-arm64x/x86_64-windows
+LLVM_MINGW=toolchain/llvm-mingw bash scripts/build-dxvk.sh x86_64   # artifacts/build/dxvk/x86_64-windows
+LLVM_MINGW=toolchain/llvm-mingw bash scripts/build-dxvk.sh i386     # artifacts/build/dxvk-i386/i386-windows
+```
+
+Each holds `ddraw.dll`, `d3d8.dll`, `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll`. DXVK's own probes and
+smoke tests are in `dxvk/tools`, its notes in `dxvk/docs`.
+
+Changes to DXVK are commits here, like any other. Upstream DXVK and d7vk come in with a subtree merge, which keeps
+their history and maps their root onto `dxvk/`:
+
+```bash
+git fetch https://github.com/doitsujin/dxvk master
+git merge -X subtree=dxvk FETCH_HEAD
+```
+
+When a merge moves one of DXVK's submodules, update its pin in the top-level `.gitmodules` paths too (Git reads only
+that file; `dxvk/.gitmodules` is DXVK's own).
+
+## Build DXVK macOS DXGI (DXGI-1 to 5 validation)
 
 stage DXGI-1 uses the pinned DXVK macOS source at commit
 `8f1e28deed3ad30802f7e1bdff428ec14e6e7817`:

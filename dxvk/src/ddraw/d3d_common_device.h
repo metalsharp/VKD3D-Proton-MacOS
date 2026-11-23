@@ -1,0 +1,293 @@
+#pragma once
+
+#include "ddraw_include.h"
+
+#include "d3d_viewport.h"
+
+#include "../d3d9/d3d9_bridge.h"
+
+#include <vector>
+
+namespace dxvk {
+
+  class DDrawCommonSurface;
+  class DDrawCommonInterface;
+
+  class D3DCommonInterface;
+
+  class DDraw7Surface;
+  class DDraw4Surface;
+  class DDrawSurface;
+
+  class D3D7Device;
+  class D3D6Device;
+  class D3D5Device;
+  class D3D3Device;
+
+  class D3DCommonDevice : public ComObjectClamp<IUnknown> {
+
+  public:
+
+    D3DCommonDevice(
+          DDrawCommonInterface* commonIntf,
+          Com<d3d9::IDirect3DDevice9>&& device9,
+          Com<IDxvkLegacyD3DDeviceBridge>&& deviceBridge,
+          GUID deviceGUID,
+          d3d9::D3DMULTISAMPLE_TYPE multiSampeType9,
+          DWORD creationFlags9);
+
+    ~D3DCommonDevice();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject);
+
+    D3DCommonInterface* GetCommonD3DInterface() const;
+
+    DDrawSurface* GetCurrentRenderTarget() const;
+
+    DDraw4Surface* GetCurrentRenderTarget4() const;
+
+    DDraw7Surface* GetCurrentRenderTarget7() const;
+
+    DDrawCommonSurface* GetCommonRenderTarget() const;
+
+    DDrawCommonSurface* GetCommonDepthStencil() const;
+
+    bool IsCurrentRenderTarget(DDrawCommonSurface* commonSurface) const;
+
+    void UpdateSurfaceDirtyTracking(bool dirtyRenderTarget, bool dirtyDepthStencil, bool dirtyPrimarySurface);
+
+    HRESULT GetClipStatusCommon(D3DCLIPSTATUS* clip_status);
+
+    HRESULT AddViewportCommon(D3DViewport* viewport);
+
+    HRESULT DeleteViewportCommon(D3DViewport* viewport);
+
+    HRESULT NextViewportCommon(D3DViewport* viewport, D3DViewport** nextViewport, DWORD flags);
+
+    void SetDepthWriteEnabled(bool isDepthWriteEnabled) {
+      m_isDepthWriteEnabled = isDepthWriteEnabled;
+    }
+
+    bool IsDepthWriteEnabled() const {
+      return m_isDepthWriteEnabled;
+    }
+
+    void SetInScene(bool inScene) {
+      m_inScene = inScene;
+    }
+
+    bool IsInScene() const {
+      return m_inScene;
+    }
+
+    GUID GetDeviceGUID() const {
+      return m_deviceGUID;
+    }
+
+    bool IsHALOrTNLHALDevice() const {
+      return m_deviceGUID == IID_IDirect3DHALDevice ||
+             m_deviceGUID == IID_IDirect3DTnLHalDevice;
+    }
+
+    DDrawCommonInterface* GetCommonInterface() const {
+      return m_commonIntf;
+    }
+
+    void SetTotalTextureMemory(uint32_t totalMemory) {
+      m_totalMemory = totalMemory;
+    }
+
+    uint32_t GetTotalTextureMemory() const {
+      return m_totalMemory;
+    }
+
+    void SetPresentRect(RECT* presentRect) {
+      if (likely(presentRect != nullptr))
+        m_presentRect = *presentRect;
+
+      if (likely(m_presentRect.left != 0 || m_presentRect.top != 0 ||
+                 m_presentRect.right != 0 || m_presentRect.bottom != 0)) {
+        m_aspectRatioCorrection = true;
+      } else {
+        m_aspectRatioCorrection = false;
+      }
+    }
+
+    const RECT* GetPresentRect() const {
+      if (!m_aspectRatioCorrection)
+        return nullptr;
+
+      return &m_presentRect;
+    }
+
+    D3DMATERIALHANDLE GetCurrentMaterialHandle() const {
+      return m_materialHandle;
+    }
+
+    void SetCurrentMaterialHandle(D3DMATERIALHANDLE materialHandle) {
+      m_materialHandle = materialHandle;
+    }
+
+    D3DTEXTUREHANDLE GetCurrentTextureHandle() const {
+      return m_textureHandle;
+    }
+
+    void SetCurrentTextureHandle(D3DTEXTUREHANDLE textureHandle) {
+      m_textureHandle = textureHandle;
+    }
+
+    DWORD GetColorKeyEnable() const {
+      return m_colorKeyEnable;
+    }
+
+    void SetColorKeyEnable(DWORD colorKeyEnable) {
+      m_colorKeyEnable = colorKeyEnable;
+    }
+
+    DWORD GetColorKeyBlendEnable() const {
+      return m_colorKeyBlendEnable;
+    }
+
+    void SetColorKeyBlendEnable(DWORD colorKeyBlendEnable) {
+      m_colorKeyBlendEnable = colorKeyBlendEnable;
+    }
+
+    DWORD GetAntialias() const {
+      return m_antialias;
+    }
+
+    void SetAntialias(DWORD antialias) {
+      m_antialias = antialias;
+    }
+
+    D3DLINEPATTERN GetLinePattern() const {
+      return m_linePattern;
+    }
+
+    void SetLinePattern(D3DLINEPATTERN linePattern) {
+      m_linePattern = linePattern;
+    }
+
+    DWORD GetTextureMapBlend() const {
+      return m_textureMapBlend;
+    }
+
+    void SetTextureMapBlend(DWORD textureMapBlend) {
+      m_textureMapBlend = textureMapBlend;
+    }
+
+    void SetCurrentViewportInternal(D3DViewport* currentViewport) {
+      m_currentViewport = currentViewport;
+    }
+
+    D3DViewport* GetCurrentViewportInternal() const {
+      return m_currentViewport.ptr();
+    }
+
+    d3d9::D3DMULTISAMPLE_TYPE GetD3D9MultiSampleType() const {
+      return m_multiSampeType9;
+    }
+
+    DWORD GetD3D9CreationFlags() const {
+      return m_creationFlags9;
+    }
+
+    d3d9::IDirect3DDevice9* GetD3D9Device() const {
+      return m_device9.ptr();
+    }
+
+    IDxvkLegacyD3DDeviceBridge* GetD3D9DeviceBridge() const {
+      return m_bridge.ptr();
+    }
+
+    void SetD3D7Device(D3D7Device* device7) {
+      m_device7 = device7;
+    }
+
+    D3D7Device* GetD3D7Device() const {
+      return m_device7;
+    }
+
+    void SetD3D6Device(D3D6Device* device6) {
+      m_device6 = device6;
+    }
+
+    D3D6Device* GetD3D6Device() const {
+      return m_device6;
+    }
+
+    void SetD3D5Device(D3D5Device* device5) {
+      m_device5 = device5;
+    }
+
+    D3D5Device* GetD3D5Device() const {
+      return m_device5;
+    }
+
+    void SetD3D3Device(D3D3Device* device3) {
+      m_device3 = device3;
+    }
+
+    D3D3Device* GetD3D3Device() const {
+      return m_device3;
+    }
+
+    void SetOrigin(IUnknown* origin) {
+      m_origin = origin;
+    }
+
+    IUnknown* GetOrigin() const {
+      return m_origin;
+    }
+
+  private:
+
+    bool                            m_inScene               = false;
+    // D3DRENDERSTATE_ZWRITEENABLE, defaults to TRUE.
+    // Used only for D3D9 depth stencil surface dirtying.
+    bool                            m_isDepthWriteEnabled   = true;
+    bool                            m_aspectRatioCorrection = false;
+
+    DDrawCommonInterface*           m_commonIntf            = nullptr;
+
+    GUID                            m_deviceGUID;
+    uint32_t                        m_totalMemory           = 0u;
+
+    // Used for aspect ratio correction on back buffer resize
+    RECT                            m_presentRect           = { };
+
+    D3DMATERIALHANDLE               m_materialHandle        = 0u;
+    D3DTEXTUREHANDLE                m_textureHandle         = 0u;
+
+    // D3DRENDERSTATE_COLORKEYENABLE
+    DWORD                           m_colorKeyEnable        = FALSE;
+    // D3DRENDERSTATE_COLORKEYBLENDENABLE
+    DWORD                           m_colorKeyBlendEnable   = FALSE;
+    // D3DRENDERSTATE_ANTIALIAS
+    DWORD                           m_antialias             = D3DANTIALIAS_NONE;
+    // D3DRENDERSTATE_LINEPATTERN
+    D3DLINEPATTERN                  m_linePattern           = { };
+    // D3DRENDERSTATE_TEXTUREMAPBLEND
+    DWORD                           m_textureMapBlend       = D3DTBLEND_MODULATE;
+
+    d3d9::D3DMULTISAMPLE_TYPE       m_multiSampeType9       = d3d9::D3DMULTISAMPLE_NONE;
+    DWORD                           m_creationFlags9        = 0u;
+
+    Com<D3DViewport>                m_currentViewport;
+    std::vector<Com<D3DViewport>>   m_viewports;
+
+    Com<d3d9::IDirect3DDevice9>     m_device9;
+    Com<IDxvkLegacyD3DDeviceBridge> m_bridge;
+
+    D3D7Device*                     m_device7               = nullptr;
+    D3D6Device*                     m_device6               = nullptr;
+    D3D5Device*                     m_device5               = nullptr;
+    D3D3Device*                     m_device3               = nullptr;
+
+    // Track the origin device, as in the device
+    // that gets created through a CreateDevice call
+    IUnknown*                       m_origin                = nullptr;
+
+  };
+
+}

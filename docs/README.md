@@ -14,6 +14,8 @@ final-state record for the shipped runtime.
 | [validation.md](validation.md) | Probe staging, runtime environment, and regression gate |
 | [tracing.md](tracing.md) | `METALSHARP_TRACE`: one flag for shader, present, memory, sync, GPU and CPU logs |
 | [install.md](install.md) | Installing a release into an x86_64 or arm64 Wine prefix |
+| [runtime.md](runtime.md) | MetalFX, DLSS, and the switches for pipeline compilation, Metal Shader Converter, ExecuteIndirect and presentation |
+| [metal-shader-converter.md](metal-shader-converter.md) | Apple's Metal Shader Converter library: what it does here, and its license |
 | [release.md](release.md) | Release packages, how CI builds them, and publishing |
 
 ## Project policies

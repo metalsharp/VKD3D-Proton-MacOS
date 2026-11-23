@@ -5,8 +5,7 @@
 #   sources/MoltenVK      upstream MoltenVK + patches/moltenvk/metalsharp-vkmt.diff
 #                         (dttdrv's ray tracing, mesh shader and fix branches, then MetalSharp's work),
 #                         with External/SPIRV-Cross at the dttdrv revision + patches/spirv-cross/metalsharp.diff
-#   sources/dxvk          DXVK-MacOS (metalsharp/DXVK-MacOS, DXVK 3.1 on MoltenVK), with its dxbc-spirv patch: the
-#                         DXGI and D3D10/11 of the VKD3D lane (D3D11On12 too), the same DXVK as MetalSharp's DXVK lane
+#   dxvk/                 (in this repository) its submodules checked out and its dxbc-spirv patch applied
 #   sources/DirectXShaderCompiler  DXC + patches/dxc/metalsharp-dxilconv.diff: the DXBC to DXIL converter MoltenVK
 #                         loads for Metal Shader Converter (scripts/build-dxbcconverter.sh)
 #   scripts/fetch-sources.sh [vkd3d-proton] [moltenvk] [dxvk] [nvapi] [dxc]   (default: all five)
@@ -14,7 +13,6 @@ set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 VKD3D_REV=ef9a02e873715c9e2da0d6db8a236aca8380b303
 MOLTENVK_REV=5189f8de
-DXVK_REV=e4ab674217f4b841654eee7da7925e896ac8acc1
 DXC_TAG=v1.9.2609
 mkdir -p "$WS/sources"
 WANT=" ${*:-vkd3d-proton moltenvk dxvk nvapi dxc} "
@@ -43,12 +41,14 @@ if want moltenvk && [ ! -d "$WS/sources/MoltenVK/.git" ]; then
     git -C "$WS/sources/MoltenVK/External/SPIRV-Cross" -c user.name=MetalSharp -c user.email=metalsharp@users.noreply.github.com \
         commit -q -m "MetalSharp SPIRV-Cross (patches/spirv-cross/metalsharp.diff)"
 fi
-if want dxvk && [ ! -d "$WS/sources/dxvk/.git" ]; then
-    git clone https://github.com/metalsharp/DXVK-MacOS.git "$WS/sources/dxvk"
-    git -C "$WS/sources/dxvk" checkout -b metalsharp-dxvk "$DXVK_REV"
-    git -C "$WS/sources/dxvk" submodule update --init --recursive
-    # DXVK-MacOS's own change to dxbc-spirv (MoltenVK), applied as its CI applies it
-    git -C "$WS/sources/dxvk/subprojects/dxbc-spirv" apply ../../patches/dxbc-spirv-moltenvk.patch
+if want dxvk; then
+    git -C "$WS" submodule update --init --recursive dxvk/include/native/directx dxvk/include/vulkan \
+        dxvk/include/spirv dxvk/subprojects/libdisplay-info dxvk/subprojects/dxbc-spirv
+    # DXVK's change to dxbc-spirv for MoltenVK, applied as its CI applies it (once: a checkout keeps it)
+    DXBC="$WS/dxvk/subprojects/dxbc-spirv"
+    if ! git -C "$DXBC" apply -R --check "$WS/dxvk/patches/dxbc-spirv-moltenvk.patch" 2>/dev/null; then
+        git -C "$DXBC" apply "$WS/dxvk/patches/dxbc-spirv-moltenvk.patch"
+    fi
 fi
 # NVIDIA's NVAPI headers (MIT), for the NGX core and NVAPI in ngx/
 if want nvapi && [ ! -d "$WS/sources/nvapi/.git" ]; then
@@ -63,4 +63,4 @@ if want dxc && [ ! -d "$WS/sources/DirectXShaderCompiler/.git" ]; then
         external/DirectX-Headers external/SPIRV-Headers external/SPIRV-Tools
     git -C "$WS/sources/DirectXShaderCompiler" apply "$WS/patches/dxc/metalsharp-dxilconv.diff"
 fi
-echo "sources ready; build MoltenVK with scripts/build-moltenvk.sh, the DXBC converter with scripts/build-dxbcconverter.sh, DXVK with scripts/build-dxvk.sh, the NGX core and NVAPI with scripts/build-ngx-arm64x.sh"
+echo "sources ready; build MoltenVK with scripts/build-moltenvk.sh, the DXBC converter with scripts/build-dxbcconverter.sh, DXVK with scripts/build-dxvk.sh [x86_64|i386|arm64x], the NGX core and NVAPI with scripts/build-ngx-arm64x.sh"

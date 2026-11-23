@@ -1,0 +1,45 @@
+name: Capability Probe (macOS)
+
+on:
+  push:
+    paths: ["tools/probe/**", "docs/gap-policy.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # GitHub's macOS runners are virtual machines with a paravirtual GPU that lacks Metal features MoltenVK needs
+  # (it stops in vkCreateInstance on newArgumentEncoderWithLayout:), so the probe fails there. It is not run on
+  # pull requests; on real Apple silicon run tools/probe/bin/probe and compare with docs/baselines.
+  probe:
+    name: Vulkan capability probe (macos-14, arm64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MoltenVK (runtime ICD)
+        run: brew install molten-vk
+
+      - name: Build probe
+        run: |
+          cd tools/probe
+          ./build.sh
+
+      - name: Run probe
+        run: |
+          cd tools/probe
+          MOLTENVK_LIB="$(brew --prefix)/lib/libMoltenVK.dylib" ./bin/probe > probe-report.json
+          python3 -m json.tool probe-report.json
+          python3 probe_to_policy.py probe-report.json > gap-policy-seeded.md
+          cat gap-policy-seeded.md
+
+      - name: Upload probe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: capability-probe-${{ github.sha }}
+          path: |
+            tools/probe/probe-report.json
+            tools/probe/gap-policy-seeded.md
+          if-no-files-found: error

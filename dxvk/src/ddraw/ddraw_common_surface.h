@@ -1,0 +1,615 @@
+#pragma once
+
+#include "ddraw_include.h"
+#include "ddraw_format.h"
+
+#include "ddraw_common_interface.h"
+
+#include "d3d_common_device.h"
+
+#include "ddraw_clipper.h"
+#include "ddraw_palette.h"
+
+namespace dxvk {
+
+  enum class D3D9SurfaceType : uint8_t {
+    None,
+    BackBuffer,
+    CubeTexture,
+    Texture,
+    DepthStencil,
+    OffscreenPlainSurface,
+    RenderTarget
+  };
+
+  class DDraw7Surface;
+  class DDraw4Surface;
+  class DDraw3Surface;
+  class DDraw2Surface;
+  class DDrawSurface;
+
+  class DDrawCommonSurface : public ComObjectClamp<IUnknown> {
+
+  public:
+
+    DDrawCommonSurface(DDrawCommonInterface* commonIntf);
+
+    ~DDrawCommonSurface();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject);
+
+    void RefreshSurfaceDescripton(const bool refreshFormat);
+
+    void RefreshD3DDevice();
+
+    d3d9::IDirect3DDevice9* GetRefreshedD3D9Device();
+
+    HRESULT InitializeD3D9(const bool initRenderTarget);
+
+    HRESULT InitializeOrUploadD3D9();
+
+    bool IsInitialized() const {
+      return m_surface9 != nullptr;
+    }
+
+    D3DCommonDevice* GetCommonD3DDevice() const {
+      return m_commonD3DDevice;
+    }
+
+    DDrawCommonInterface* GetCommonInterface() const {
+      return m_commonIntf.ptr();
+    }
+
+    void SetCommonShadowSurface(DDrawCommonSurface* commonShadowSurf) {
+      m_commonShadowSurf = commonShadowSurf;
+    }
+
+    DDrawCommonSurface* GetCommonShadowSurface() const {
+      return m_commonShadowSurf;
+    }
+
+    void SetD3D9Surface(Com<d3d9::IDirect3DSurface9>&& surface9) {
+      m_surface9 = surface9;
+    }
+
+    d3d9::IDirect3DSurface9* GetD3D9Surface() const {
+      return m_surface9.ptr();
+    }
+
+    void SetD3D9Texture(Com<d3d9::IDirect3DTexture9>&& texture9) {
+      m_texture9 = texture9;
+    }
+
+    d3d9::IDirect3DTexture9* GetD3D9Texture() const {
+      return m_texture9.ptr();
+    }
+
+    void SetD3D9CubeTexture(Com<d3d9::IDirect3DCubeTexture9>&& cubeTex9) {
+      m_cubeTex9 = cubeTex9;
+    }
+
+    d3d9::IDirect3DCubeTexture9* GetD3D9CubeTexture() const {
+      return m_cubeTex9.ptr();
+    }
+
+    void ResetD3D9Objects() {
+      m_cubeTex9 = nullptr;
+      m_texture9 = nullptr;
+      m_surface9 = nullptr;
+      // Also reset all D3D9 related tracking flags
+      m_surfaceType9 = D3D9SurfaceType::None;
+      m_dirtyD3D9 = false;
+    }
+
+    D3D9SurfaceType GetD3D9SurfaceType() const {
+      return m_surfaceType9;
+    }
+
+    d3d9::D3DFORMAT GetD3D9Format() const {
+      return m_format9;
+    }
+
+    void SetDesc(const DDSURFACEDESC& desc) {
+      // DDSURFACEDESC is aligned with DDSURFACEDESC2
+      memcpy(&m_desc, &desc, sizeof(DDSURFACEDESC));
+      // Update the struct size to DDSURFACEDESC2
+      m_desc.dwSize = sizeof(DDSURFACEDESC2);
+      RefreshStaticDescData(true);
+    }
+
+    void SetDesc(const DDSURFACEDESC2& desc) {
+      m_desc = desc;
+      RefreshStaticDescData(true);
+    }
+
+    const DDSURFACEDESC2* GetDesc() const {
+      return &m_desc;
+    }
+
+    uint8_t GetColorBitCount() const {
+      return m_desc.dwFlags & DDSD_PIXELFORMAT ? m_desc.ddpfPixelFormat.dwRGBBitCount : 0u;
+    }
+
+    bool IsAlphaFormat() const {
+      return (m_desc.dwFlags & DDSD_PIXELFORMAT) && (m_desc.ddpfPixelFormat.dwFlags & DDPF_ALPHAPIXELS);
+    }
+
+    bool HasValidColorKey() const {
+      return m_desc.dwFlags & DDSD_CKSRCBLT;
+    }
+
+    const DDCOLORKEY* GetColorKeyNormalized() const {
+      return &m_ckNormalized;
+    }
+
+    bool IsFullSurfaceLock(const RECT* lockRect, const RECT* fullSurfaceRect) const {
+      if (lockRect == nullptr) {
+        if (fullSurfaceRect == nullptr)
+          return true;
+
+        lockRect = fullSurfaceRect;
+      }
+
+      return (m_rect.right  == lockRect->right  - lockRect->left) &&
+             (m_rect.bottom == lockRect->bottom - lockRect->top);
+    }
+
+    const RECT* GetFullSurfaceRect() const {
+      return &m_rect;
+    }
+
+    float GetNormalizedFloatDepth(DWORD input) const {
+      DWORD max = m_format9 != d3d9::D3DFMT_D16 ? std::numeric_limits<uint32_t>::max()
+                                                : std::numeric_limits<uint16_t>::max();
+      return static_cast<float>(input) / static_cast<float>(max);
+    }
+
+    uint32_t GetMipCount() const {
+      return m_mipCount;
+    }
+
+    uint32_t GetBackBufferIndex() const {
+      return m_backBufferIndex;
+    }
+
+    void IncrementBackBufferIndex(uint32_t index) {
+      m_backBufferIndex = index + 1;
+    }
+
+    void SetLOD(DWORD lod) {
+      m_lod = lod;
+    }
+
+    DWORD GetLOD() const {
+      return m_lod;
+    }
+
+    void SetPriority(DWORD priority) {
+      m_priority = priority;
+    }
+
+    DWORD GetPriority() const {
+      return m_priority;
+    }
+
+    bool IsDDrawSurfaceDirty() const {
+      return m_dirtyDDraw;
+    }
+
+    void DirtyDDrawSurface() {
+      m_dirtyDDraw = true;
+    }
+
+    void UnDirtyDDrawSurface() {
+      m_dirtyDDraw = false;
+    }
+
+    bool IsD3D9SurfaceDirty() const {
+      return m_dirtyD3D9;
+    }
+
+    void DirtyD3D9Surface() {
+      m_dirtyD3D9 = true;
+    }
+
+    void UnDirtyD3D9Surface() {
+      m_dirtyD3D9 = false;
+    }
+
+    void SetIsAttached(bool isAttached) {
+      m_isAttached = isAttached;
+    }
+
+    bool IsAttached() const {
+      return m_isAttached;
+    }
+
+    void SetIsGDISurface(bool isGDISurface) {
+      m_isGDISurface = isGDISurface;
+    }
+
+    bool IsGDISurface() const {
+      return m_isGDISurface;
+    }
+
+    void MarkWithTextureHandle() {
+      m_hasTextureHandle = true;
+    }
+
+    void SetClipper(DDrawClipper* clipper) {
+      if (likely(m_clipper != clipper)) {
+        if (unlikely(m_clipper != nullptr))
+          m_clipper->SetCommonSurface(nullptr);
+
+        m_clipper = clipper;
+
+        if (likely(m_clipper != nullptr))
+          m_clipper->SetCommonSurface(this);
+      }
+    }
+
+    DDrawClipper* GetClipper() const {
+      return m_clipper.ptr();
+    }
+
+    void SetPalette(DDrawPalette* palette) {
+      if (likely(m_palette != palette)) {
+        if (unlikely(m_palette != nullptr))
+          m_palette->SetCommonSurface(nullptr);
+
+        m_palette = palette;
+
+        if (likely(m_palette != nullptr))
+          m_palette->SetCommonSurface(this);
+      }
+    }
+
+    DDrawPalette* GetPalette() const {
+      return m_palette.ptr();
+    }
+
+    void SetDD7Surface(DDraw7Surface* surf7) {
+      m_surf7 = surf7;
+    }
+
+    DDraw7Surface* GetDD7Surface() const {
+      return m_surf7;
+    }
+
+    void SetDD4Surface(DDraw4Surface* surf4) {
+      m_surf4 = surf4;
+    }
+
+    DDraw4Surface* GetDD4Surface() const {
+      return m_surf4;
+    }
+
+    void SetDD3Surface(DDraw3Surface* surf3) {
+      m_surf3 = surf3;
+    }
+
+    DDraw3Surface* GetDD3Surface() const {
+      return m_surf3;
+    }
+
+    void SetDD2Surface(DDraw2Surface* surf2) {
+      m_surf2 = surf2;
+    }
+
+    DDraw2Surface* GetDD2Surface() const {
+      return m_surf2;
+    }
+
+    void SetDDSurface(DDrawSurface* surf) {
+      m_surf = surf;
+    }
+
+    DDrawSurface* GetDDSurface() const {
+      return m_surf;
+    }
+
+    void SetOrigin(IUnknown* origin) {
+      m_origin = origin;
+    }
+
+    IUnknown* GetOrigin() const {
+      return m_origin;
+    }
+
+    bool IsComplex() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_COMPLEX;
+    }
+
+    bool IsPrimarySurface() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE;
+    }
+
+    bool IsFrontBuffer() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_FRONTBUFFER;
+    }
+
+    bool IsBackBuffer() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_BACKBUFFER;
+    }
+
+    bool IsFlippable() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_FLIP;
+    }
+
+    bool IsDepthStencil() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER;
+    }
+
+    bool IsOffScreenPlainSurface() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_OFFSCREENPLAIN;
+    }
+
+    bool IsTexture() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_TEXTURE;
+    }
+
+    // Only called during surface intialization, when we always have a valid device
+    bool IsBindableAsTexture() const {
+      // Surfaces which aren't explicitly marked as textures are only bindable on software devices
+      const bool isBindableSurface = !m_commonD3DDevice->IsHALOrTNLHALDevice() && m_hasTextureHandle;
+
+      return m_desc.ddsCaps.dwCaps  & DDSCAPS_TEXTURE
+          || m_desc.ddsCaps.dwCaps2 & DDSCAPS2_CUBEMAP
+          || isBindableSurface;
+    }
+
+    bool IsTextureMip() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_MIPMAP;
+    }
+
+    bool IsMipSublevel() const {
+      return m_desc.ddsCaps.dwCaps2 & DDSCAPS2_MIPMAPSUBLEVEL;
+    }
+
+    bool IsCubeTexture() const {
+      return m_desc.ddsCaps.dwCaps2 & DDSCAPS2_CUBEMAP;
+    }
+
+    bool IsOverlay() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_OVERLAY;
+    }
+
+    bool Is3DSurface() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_3DDEVICE;
+    }
+
+    bool IsManaged() const {
+      return m_desc.ddsCaps.dwCaps2 & DDSCAPS2_TEXTUREMANAGE
+          || m_desc.ddsCaps.dwCaps2 & DDSCAPS2_D3DTEXTUREMANAGE;
+    }
+
+    bool IsInVideoMemory() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_VIDEOMEMORY;
+    }
+
+    bool IsInSystemMemory() const {
+      return m_desc.ddsCaps.dwCaps & DDSCAPS_SYSTEMMEMORY;
+    }
+
+    bool IsRenderTarget() const {
+      return m_isRenderTarget;
+    }
+
+    bool IsBackBufferOrFlippable() const {
+      return m_isBackBufferOrFlippable;
+    }
+
+    bool IsDXTFormat() const {
+      switch (m_format9) {
+        case d3d9::D3DFMT_DXT1:
+        case d3d9::D3DFMT_DXT2:
+        case d3d9::D3DFMT_DXT3:
+        case d3d9::D3DFMT_DXT4:
+        case d3d9::D3DFMT_DXT5:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    bool IsPalettedFormat() const {
+      return m_format9 == d3d9::D3DFMT_P8;
+    }
+
+    // D3D7 is a bit more sane here, as always, so handle it separately
+    HRESULT ValidateRTUsage7(bool isHALOrTNLHALDevice, bool isDeviceCreation) const {
+      // Render targets require the DDSCAPS_3DDEVICE flag
+      if (unlikely(!Is3DSurface())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Missing DDSCAPS_3DDEVICE");
+        return DDERR_INVALIDCAPS;
+      }
+      // Depth stencil surfaces can't be set as render targets
+      if (unlikely(IsDepthStencil())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid DDSCAPS_ZBUFFER");
+        return isDeviceCreation ? DDERR_INVALIDCAPS : DDERR_INVALIDPIXELFORMAT;
+      }
+      // DXVK doesn't support P8 render targets, so pretend these are always invalid
+      if (unlikely(IsPalettedFormat())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid P8 render target");
+        return isDeviceCreation ? DDERR_NOPALETTEATTACHED : DDERR_INVALIDPARAMS;
+      }
+      // Render targets can't be created in system memory on HAL/HAL T&L devices
+      if (unlikely(IsInSystemMemory() && isHALOrTNLHALDevice)) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid DDSCAPS_SYSTEMMEMORY");
+        return isDeviceCreation ? D3DERR_SURFACENOTINVIDMEM : DDERR_INVALIDPARAMS;
+      }
+
+      return DD_OK;
+    }
+
+    // D3D6 and earlier RT usage validations
+    HRESULT ValidateRTUsage(bool isHALDevice, bool isDeviceCreation, bool isLegacySurface) const {
+      // Render targets typically require the DDSCAPS_3DDEVICE flag,
+      // however it appears D3D3/D3D5 RTs are exempt from this validation,
+      // or rather the flag isn't strictly required on an IDirectDrawSurface object
+      if (unlikely(!isLegacySurface && !Is3DSurface())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Missing DDSCAPS_3DDEVICE");
+        return DDERR_INVALIDCAPS;
+      }
+      // Depth stencil surfaces can't be set as render targets
+      if (unlikely(IsDepthStencil())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid DDSCAPS_ZBUFFER");
+        return isDeviceCreation ? DDERR_INVALIDCAPS : DDERR_INVALIDPIXELFORMAT;
+      }
+      // DXVK doesn't support P8 render targets, so pretend these are always invalid
+      if (unlikely(IsPalettedFormat())) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid P8 render target");
+        return isDeviceCreation ? DDERR_NOPALETTEATTACHED : DDERR_INVALIDPARAMS;
+      }
+      // Render targets can't be created in system memory on HAL devices,
+      // however system memory surfaces can later be set as render targets... yeah...
+      if (unlikely(isDeviceCreation && IsInSystemMemory() && isHALDevice)) {
+        Logger::err("DDrawCommonSurface::ValidateRTUsage: Invalid DDSCAPS_SYSTEMMEMORY");
+        return D3DERR_SURFACENOTINVIDMEM;
+      }
+
+      return DD_OK;
+    }
+
+    void ListSurfaceDetails() const {
+      const char* type = "generic surface";
+
+      if (IsPrimarySurface())             type = "primary surface";
+      else if (IsFrontBuffer())           type = "front buffer";
+      else if (IsBackBufferOrFlippable()) type = "back buffer";
+      else if (IsCubeTexture())           type = "cube texture";
+      else if (IsTextureMip())            type = "texture mipmap";
+      else if (IsTexture())               type = "texture";
+      else if (IsDepthStencil())          type = "depth stencil";
+      else if (IsOverlay())               type = "overlay";
+      else if (IsOffScreenPlainSurface()) type = "offscreen plain surface";
+      else if (Is3DSurface())             type = "render target";
+
+      const DWORD mipMapCount    = m_desc.dwFlags & DDSD_MIPMAPCOUNT ? m_desc.dwMipMapCount : 0u;
+      const DWORD backBuferCount = m_desc.dwFlags & DDSD_BACKBUFFERCOUNT ? m_desc.dwBackBufferCount : 0u;
+
+      Logger::debug(str::format("   Type:        ", type,
+                              "\n   Dimensions:  ", m_rect.right, "x", m_rect.bottom,
+                              "\n   Format:      ", GetD3D9Format(),
+                              "\n   IsComplex:   ", IsComplex() ? "yes" : "no",
+                              "\n   IsAttached:  ", IsAttached() ? "yes" : "no"));
+      if (mipMapCount)
+        Logger::debug(str::format("   MipMaps:     ", mipMapCount));
+      if (backBuferCount)
+        Logger::debug(str::format("   BackBuffers: ", backBuferCount));
+    }
+
+  private:
+
+    // Note: The flag check order IS important here, as some flags take
+    // priority over others when considering D3D9 surface type mappings
+    inline D3D9SurfaceType DetermineD3D9SurfaceType(const bool initRenderTarget) {
+      // Primary surface / front buffer / back buffer or flippable
+      if (IsPrimarySurface() || IsFrontBuffer() || IsBackBufferOrFlippable())
+        return D3D9SurfaceType::BackBuffer;
+      // Cube texture
+      if (IsCubeTexture())
+        return D3D9SurfaceType::CubeTexture;
+      // Texture
+      if (IsBindableAsTexture())
+        return D3D9SurfaceType::Texture;
+      // Depth stencil
+      if (IsDepthStencil())
+        return D3D9SurfaceType::DepthStencil;
+      // Overlay
+      if (unlikely(IsOverlay()))
+        return D3D9SurfaceType::OffscreenPlainSurface;
+      // Offscreen plain surface
+      if (IsOffScreenPlainSurface()) {
+        if (unlikely(initRenderTarget))
+          return D3D9SurfaceType::BackBuffer;
+
+        return D3D9SurfaceType::OffscreenPlainSurface;
+      // Generic render target
+      }
+      if (Is3DSurface())
+        return D3D9SurfaceType::RenderTarget;
+
+      // We sometimes get generic surfaces, with only dimensions, format and placement info
+      return D3D9SurfaceType::OffscreenPlainSurface;
+    }
+
+    inline void RefreshStaticDescData(const bool refreshFormat) {
+      // determine and cache various frequently used flag combinations
+      m_isRenderTarget          = IsFrontBuffer() || IsBackBuffer() || IsFlippable() || Is3DSurface();
+      m_isBackBufferOrFlippable = !IsPrimarySurface() && !IsFrontBuffer() && (IsBackBuffer() || IsFlippable());
+      // refresh static values such as the full surface rect and format
+      m_rect.right  = (m_desc.dwFlags & DDSD_WIDTH)  ? m_desc.dwWidth  : 0;
+      m_rect.bottom = (m_desc.dwFlags & DDSD_HEIGHT) ? m_desc.dwHeight : 0;
+      if (refreshFormat) {
+        const d3d9::D3DFORMAT format9 = ConvertFormat(m_desc.ddpfPixelFormat);
+        // warn if a format change is detected on an already initialized surface
+        if (unlikely(m_surface9 != nullptr && m_format9 != format9))
+          Logger::warn("DDrawCommonSurface::RefreshStaticDescData: Surface format has changed post initialization");
+        m_format9 = format9;
+      }
+      // refresh normalized color key range (if present)
+      static constexpr DDCOLORKEY DefaultColorKey = { 0u, 0u };
+      // ignore normalized color key calculations on P8 surfaces
+      m_ckNormalized = !IsPalettedFormat() && HasValidColorKey() ? UpdateColorKeyNormalized() : DefaultColorKey;
+    }
+
+    inline DDCOLORKEY UpdateColorKeyNormalized() const {
+      const DDPIXELFORMAT* pixelFormat = m_desc.dwFlags & DDSD_PIXELFORMAT ? &m_desc.ddpfPixelFormat : nullptr;
+      const DDCOLORKEY*    colorKey    = m_desc.dwFlags & DDSD_CKSRCBLT ? &m_desc.ddckCKSrcBlt : nullptr;
+
+      // Empire of the Ants relies on us using the "Low" color space DWORD
+      return ColorKeyToARGB(pixelFormat, colorKey != nullptr ? colorKey->dwColorSpaceLowValue : 0u);
+    }
+
+    bool                             m_dirtyDDraw       = false;
+    bool                             m_dirtyD3D9        = false;
+
+    bool                             m_hasTextureHandle = false;
+
+    bool                             m_isAttached       = false;
+    bool                             m_isGDISurface     = false;
+    bool                             m_isRenderTarget   = false;
+    bool                             m_isBackBufferOrFlippable = false;
+
+    Com<DDrawCommonInterface>        m_commonIntf;
+
+    D3DCommonDevice*                 m_commonD3DDevice  = nullptr;
+
+    DDrawCommonSurface*              m_commonShadowSurf = nullptr;
+
+    uint32_t                         m_mipCount         = 1u;
+    uint32_t                         m_backBufferIndex  = 0u;
+
+    DWORD                            m_lod              = 0u;
+    DWORD                            m_priority         = 0u;
+
+    // Common surface desc, even for IDirectDrawSurface/2/3 objects
+    DDSURFACEDESC2                   m_desc             = { };
+    RECT                             m_rect             = { };
+
+    DDCOLORKEY                       m_ckNormalized     = { };
+
+    D3D9SurfaceType                  m_surfaceType9     = D3D9SurfaceType::None;
+    d3d9::D3DFORMAT                  m_format9          = d3d9::D3DFMT_UNKNOWN;
+
+    Com<DDrawClipper>                m_clipper;
+    Com<DDrawPalette>                m_palette;
+
+    Com<d3d9::IDirect3DSurface9>     m_surface9;
+    Com<d3d9::IDirect3DTexture9>     m_texture9;
+    Com<d3d9::IDirect3DCubeTexture9> m_cubeTex9;
+
+    DDraw7Surface*                   m_surf7            = nullptr;
+    DDraw4Surface*                   m_surf4            = nullptr;
+    DDraw3Surface*                   m_surf3            = nullptr;
+    DDraw2Surface*                   m_surf2            = nullptr;
+    DDrawSurface*                    m_surf             = nullptr;
+
+    // Track the origin surface, as in the DDraw surface
+    // that gets created through a CreateSurface call
+    IUnknown*                        m_origin           = nullptr;
+
+  };
+
+}
