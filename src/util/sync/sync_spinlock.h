@@ -24,7 +24,8 @@ namespace dxvk::sync {
         #if defined(DXVK_ARCH_X86)
         _mm_pause();
         #elif defined(DXVK_ARCH_ARM64)
-        __asm__ __volatile__ ("yield");
+        // ISB holds the core for a short while; YIELD is a no-op on Apple cores
+        __asm__ __volatile__ ("isb" ::: "memory");
         #else
         /* Do nothing (busy-loop). Please add more #elif above here if
          * your CPU architecture has a suitable pause/yield instruction */

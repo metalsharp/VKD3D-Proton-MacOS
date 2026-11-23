@@ -149,6 +149,23 @@ public:
     uint32_t bits1 = _mm_movemask_epi8(eq1);
 
     return bit::tzcnt(bits0 | (bits1 << 16u));
+    #elif defined(DXVK_ARCH_ARM64_NEON)
+    // The entries only, not the count byte after them: the scalar loop's result
+    uint8x16_t compareMask = vdupq_n_u8(packed);
+
+    uint8x16_t eq0 = vceqq_u8(compareMask, vld1q_u8(&m_entries[ 0u]));
+    uint8x16_t eq1 = vceqq_u8(compareMask, vld1q_u8(&m_entries[16u]));
+
+    // Four bits a byte
+    uint64_t bits0 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4u)), 0u);
+    uint64_t bits1 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq1), 4u)), 0u);
+    bits1 &= ~(uint64_t(0xfu) << (4u * (SizeIndex - 16u)));
+
+    if (bits0)
+      return bit::tzcnt(bits0) / 4u;
+    if (bits1)
+      return 16u + bit::tzcnt(bits1) / 4u;
+    return m_entries.size();
     #else
     for (uint32_t i = 0u; i < SizeIndex; i++) {
       if (m_entries[i] == packed)

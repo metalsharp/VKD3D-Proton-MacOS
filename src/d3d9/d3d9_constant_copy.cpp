@@ -348,6 +348,14 @@ namespace dxvk {
 
     for (uint32_t i = 0u; i < range.count; i++)
       _mm_stream_si128(dstPtr + i, _mm_loadu_si128(srcPtr + i));
+    #elif defined(DXVK_ARCH_ARM64_NEON)
+    // Inline 16-byte copies in place of a CRT memcpy call for a few vectors. Plain
+    // stores: STNP is no faster than them on Apple cores, even into a streamed buffer.
+    auto dstPtr = reinterpret_cast<      int32_t*>(reinterpret_cast<Vector4i*>(args.intBuffer) + range.dstIndex);
+    auto srcPtr = reinterpret_cast<const int32_t*>(args.constIntApi + range.srcIndex);
+
+    for (uint32_t i = 0u; i < range.count; i++)
+      vst1q_s32(dstPtr + 4u * i, vld1q_s32(srcPtr + 4u * i));
     #else
     std::memcpy(reinterpret_cast<Vector4i*>(args.intBuffer) + range.dstIndex,
       args.constIntApi + range.srcIndex, range.count * sizeof(Vector4i));
@@ -374,6 +382,18 @@ namespace dxvk {
       auto data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(srcPtr + i));
       _mm_stream_si128(reinterpret_cast<__m128i*>(dstPtr + i), data);
     }
+    #elif defined(DXVK_ARCH_ARM64_NEON)
+    // Exactly range.count values (the SSE path rounds up to a multiple of four),
+    // inline in place of a CRT memcpy call
+    auto dstPtr = reinterpret_cast<      uint32_t*>(args.boolBuffer) + range.dstIndex;
+    auto srcPtr = reinterpret_cast<const uint32_t*>(args.constBoolApi) + range.srcIndex;
+    uint32_t i = 0u;
+
+    for (; i + 4u <= range.count; i += 4u)
+      vst1q_u32(dstPtr + i, vld1q_u32(srcPtr + i));
+
+    for (; i < range.count; i++)
+      dstPtr[i] = srcPtr[i];
     #else
     std::memcpy(reinterpret_cast<uint32_t*>(args.boolBuffer) + range.dstIndex,
       args.constBoolApi + range.srcIndex, range.count * sizeof(uint32_t));

@@ -8,6 +8,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef DXVK_SWVP_NEON
+#include <arm_neon.h>
+#endif
+
 namespace dxvk {
 
   struct ProcessVerticesData {
@@ -374,6 +378,275 @@ namespace dxvk {
     __m128 r = _mm_mul_ps(va, vb);
 
     _mm_storeu_ps(&a.r, r);
+
+    if (legacy)
+      a.a = 0.0f;
+    else
+      a.a = b.a;
+  }
+#elif defined(DXVK_SWVP_NEON)
+  // The SSE2 paths above with NEON, operation for operation, so that they give
+  // the same results: separate multiplies and adds, SSE's MINPS/MAXPS operand
+  // order for NaNs, and the same order of horizontal adds.
+  struct alignas(16) SIMDRow {
+    float32x4_t lo; // Elements 0, 1, 2, 3
+    float32x4_t hi; // Elements 4, 5, 6, 7
+  };
+
+  inline void SwapRowsNEON(SIMDRow& a, SIMDRow& b) {
+    std::swap(a.lo, b.lo);
+    std::swap(a.hi, b.hi);
+  }
+
+  inline float32x4_t SetR(float a, float b, float c, float d) {
+    const float f[4] = { a, b, c, d };
+    return vld1q_f32(f);
+  }
+
+  inline void InvertMatrix(D3DMATRIX *out, const D3DMATRIX *m) {
+    SIMDRow r[4];
+
+    auto get_val = [](const SIMDRow& row, int col) -> float {
+      float f[4];
+      vst1q_f32(f, col < 4 ? row.lo : row.hi);
+      return f[col & 3];
+    };
+
+    r[0].lo = vld1q_f32(&m->_11);
+    r[0].hi = SetR(1.0f, 0.0f, 0.0f, 0.0f);
+    r[1].lo = vld1q_f32(&m->_21);
+    r[1].hi = SetR(0.0f, 1.0f, 0.0f, 0.0f);
+    r[2].lo = vld1q_f32(&m->_31);
+    r[2].hi = SetR(0.0f, 0.0f, 1.0f, 0.0f);
+    r[3].lo = vld1q_f32(&m->_41);
+    r[3].hi = SetR(0.0f, 0.0f, 0.0f, 1.0f);
+
+    if (std::fabs(get_val(r[3], 0)) > std::fabs(get_val(r[2], 0)))
+      SwapRowsNEON(r[3], r[2]);
+    if (std::fabs(get_val(r[2], 0)) > std::fabs(get_val(r[1], 0)))
+      SwapRowsNEON(r[2], r[1]);
+    if (std::fabs(get_val(r[1], 0)) > std::fabs(get_val(r[0], 0)))
+      SwapRowsNEON(r[1], r[0]);
+
+    const float pivot0 = get_val(r[0], 0);
+    if (pivot0 == 0.0f)
+      return;
+
+    auto eliminate_row = [&](SIMDRow& target, const SIMDRow& source, float factor) {
+      float32x4_t v_factor = vdupq_n_f32(factor);
+      target.lo = vsubq_f32(target.lo, vmulq_f32(v_factor, source.lo));
+      target.hi = vsubq_f32(target.hi, vmulq_f32(v_factor, source.hi));
+    };
+
+    auto scale_row = [&](SIMDRow& target, float factor) {
+      float32x4_t v_factor = vdupq_n_f32(factor);
+      target.lo = vmulq_f32(target.lo, v_factor);
+      target.hi = vmulq_f32(target.hi, v_factor);
+    };
+
+    eliminate_row(r[1], r[0], get_val(r[1], 0) / pivot0);
+    eliminate_row(r[2], r[0], get_val(r[2], 0) / pivot0);
+    eliminate_row(r[3], r[0], get_val(r[3], 0) / pivot0);
+
+    if (std::fabs(get_val(r[3], 1)) > std::fabs(get_val(r[2], 1)))
+      SwapRowsNEON(r[3], r[2]);
+    if (std::fabs(get_val(r[2], 1)) > std::fabs(get_val(r[1], 1)))
+      SwapRowsNEON(r[2], r[1]);
+
+    const float pivot1 = get_val(r[1], 1);
+    if (pivot1 == 0.0f)
+      return;
+
+    eliminate_row(r[2], r[1], get_val(r[2], 1) / pivot1);
+    eliminate_row(r[3], r[1], get_val(r[3], 1) / pivot1);
+
+    if (std::fabs(get_val(r[3], 2)) > std::fabs(get_val(r[2], 2)))
+      SwapRowsNEON(r[3], r[2]);
+    const float pivot2 = get_val(r[2], 2);
+    if (pivot2 == 0.0f)
+      return;
+
+    eliminate_row(r[3], r[2], get_val(r[3], 2) / pivot2);
+
+    const float pivot3 = get_val(r[3], 3);
+    if (pivot3 == 0.0f)
+      return;
+
+    scale_row(r[3], 1.0f / pivot3);
+
+    eliminate_row(r[2], r[3], get_val(r[2], 3));
+    scale_row(r[2], 1.0f / get_val(r[2], 2));
+
+    const float m1_3 = get_val(r[1], 3);
+    const float m1_2 = get_val(r[1], 2);
+    eliminate_row(r[1], r[3], m1_3);
+    eliminate_row(r[1], r[2], m1_2);
+    scale_row(r[1], 1.0f / get_val(r[1], 1));
+
+    const float m0_3 = get_val(r[0], 3);
+    const float m0_2 = get_val(r[0], 2);
+    const float m0_1 = get_val(r[0], 1);
+    eliminate_row(r[0], r[3], m0_3);
+    eliminate_row(r[0], r[2], m0_2);
+    eliminate_row(r[0], r[1], m0_1);
+    scale_row(r[0], 1.0f / get_val(r[0], 0));
+
+    vst1q_f32(&out->_11, r[0].hi);
+    vst1q_f32(&out->_21, r[1].hi);
+    vst1q_f32(&out->_31, r[2].hi);
+    vst1q_f32(&out->_41, r[3].hi);
+  }
+
+  inline float32x4_t CrossProduct(float32x4_t a, float32x4_t b) {
+    float32x4_t a_yzx = __builtin_shufflevector(a, a, 1, 2, 0, 3);
+    float32x4_t b_zxy = __builtin_shufflevector(b, b, 2, 0, 1, 3);
+    float32x4_t a_zxy = __builtin_shufflevector(a, a, 2, 0, 1, 3);
+    float32x4_t b_yzx = __builtin_shufflevector(b, b, 1, 2, 0, 3);
+
+    return vsubq_f32(vmulq_f32(a_yzx, b_zxy), vmulq_f32(a_zxy, b_yzx));
+  }
+
+  inline void InvertMatrixLegacy(D3DMATRIX *out, const D3DMATRIX *in) {
+    float32x4_t r1 = vld1q_f32(&in->_11);
+    float32x4_t r2 = vld1q_f32(&in->_21);
+    float32x4_t r3 = vld1q_f32(&in->_31);
+
+    float32x4_t v_a = CrossProduct(r2, r3);
+    float32x4_t v_b = CrossProduct(r3, r1);
+    float32x4_t v_c = CrossProduct(r1, r2);
+
+    float temp_det[4];
+    vst1q_f32(temp_det, vmulq_f32(r1, v_a));
+    const float det = temp_det[0] + temp_det[1] + temp_det[2];
+
+    if (std::fabs(det) <= std::numeric_limits<float>::min() * 10.0f)
+      return;
+
+    const float inv_det = 1.0f / det;
+
+    float va[4], vb[4], vc[4];
+    vst1q_f32(va, vmulq_n_f32(v_a, inv_det));
+    vst1q_f32(vb, vmulq_n_f32(v_b, inv_det));
+    vst1q_f32(vc, vmulq_n_f32(v_c, inv_det));
+
+    out->_11 = va[0]; out->_12 = vb[0]; out->_13 = vc[0];
+    out->_21 = va[1]; out->_22 = vb[1]; out->_23 = vc[1];
+    out->_31 = va[2]; out->_32 = vb[2]; out->_33 = vc[2];
+  }
+
+  // r0 * v0 + r1 * v1 + r2 * v2 + r3 * v3, added in that order
+  inline float32x4_t LinearCombination4(float32x4_t r0, float32x4_t r1, float32x4_t r2, float32x4_t r3,
+                                        float v0, float v1, float v2, float v3) {
+    float32x4_t r = vmulq_n_f32(r0, v0);
+    r = vaddq_f32(r, vmulq_n_f32(r1, v1));
+    r = vaddq_f32(r, vmulq_n_f32(r2, v2));
+    r = vaddq_f32(r, vmulq_n_f32(r3, v3));
+    return r;
+  }
+
+  inline D3DMATRIX D3DMatrixMultiply4x4(const D3DMATRIX& a, const D3DMATRIX& b) {
+    D3DMATRIX result;
+
+    const float32x4_t b0 = vld1q_f32(&b._11);
+    const float32x4_t b1 = vld1q_f32(&b._21);
+    const float32x4_t b2 = vld1q_f32(&b._31);
+    const float32x4_t b3 = vld1q_f32(&b._41);
+
+    vst1q_f32(&result._11, LinearCombination4(b0, b1, b2, b3, a._11, a._12, a._13, a._14));
+    vst1q_f32(&result._21, LinearCombination4(b0, b1, b2, b3, a._21, a._22, a._23, a._24));
+    vst1q_f32(&result._31, LinearCombination4(b0, b1, b2, b3, a._31, a._32, a._33, a._34));
+    vst1q_f32(&result._41, LinearCombination4(b0, b1, b2, b3, a._41, a._42, a._43, a._44));
+
+    return result;
+  }
+
+  inline D3DVECTOR4 D3DVec4Transform(const D3DMATRIX& m, const D3DVECTOR4& v) {
+    D3DVECTOR4 result;
+
+    vst1q_f32(&result.x, LinearCombination4(vld1q_f32(&m._11), vld1q_f32(&m._21),
+      vld1q_f32(&m._31), vld1q_f32(&m._41), v.x, v.y, v.z, v.w));
+
+    return result;
+  }
+
+  inline D3DVECTOR D3DVec3Transform(const D3DMATRIX& m, const D3DVECTOR& v) {
+    // The fourth lane, which SSE2 zeroes, is not returned
+    float32x4_t r = vmulq_n_f32(vld1q_f32(&m._11), v.x);
+    r = vaddq_f32(r, vmulq_n_f32(vld1q_f32(&m._21), v.y));
+    r = vaddq_f32(r, vmulq_n_f32(vld1q_f32(&m._31), v.z));
+
+    D3DVECTOR4 tmp;
+    vst1q_f32(&tmp.x, r);
+
+    return D3DVECTOR{tmp.x, tmp.y, tmp.z};
+  }
+
+  inline D3DVECTOR D3DVec4to3Transform(const D3DMATRIX& m, const D3DVECTOR4& v) {
+    D3DVECTOR4 tmp;
+
+    vst1q_f32(&tmp.x, LinearCombination4(vld1q_f32(&m._11), vld1q_f32(&m._21),
+      vld1q_f32(&m._31), vld1q_f32(&m._41), v.x, v.y, v.z, v.w));
+
+    return D3DVECTOR{tmp.x, tmp.y, tmp.z};
+  }
+
+  inline float D3DVec3Dot(const D3DVECTOR* a, const D3DVECTOR* b) {
+    if (a == nullptr || b == nullptr)
+      return 0.0f;
+
+    float32x4_t x = SetR(a->x, a->y, a->z, 0.0f);
+    float32x4_t y = SetR(b->x, b->y, b->z, 0.0f);
+    float32x4_t m = vmulq_f32(x, y);
+    // (m0 + m2) + (m1 + m3), as SSE2's shuffles add them
+    float32x4_t t = vaddq_f32(m, vextq_f32(m, m, 2));
+
+    return vgetq_lane_f32(t, 0) + vgetq_lane_f32(t, 1);
+  }
+
+  // SSE2's RSQRTSS estimate differs between CPUs, so this is the scalar path's
+  inline D3DVECTOR D3DVec3Normalize(const D3DVECTOR& v) {
+    const float dot = v.x * v.x + v.y * v.y + v.z * v.z;
+
+    if (dot <= 0.0f) {
+      return D3DVECTOR{0.0f, 0.0f, 0.0f};
+    }
+
+    const float inv_mag = 1.0f / std::sqrt(dot);
+
+    return D3DVECTOR{v.x * inv_mag, v.y * inv_mag, v.z * inv_mag};
+  }
+
+  inline void D3DColorClamp(D3DCOLORVALUE& color) {
+    float32x4_t c = vld1q_f32(&color.r);
+    float32x4_t one = vdupq_n_f32(1.0f);
+    float32x4_t zero = vdupq_n_f32(0.0f);
+
+    // MINPS and MAXPS: the second operand unless the first compares less (greater)
+    c = vbslq_f32(vcltq_f32(c, one), c, one);
+    c = vbslq_f32(vcgtq_f32(c, zero), c, zero);
+
+    vst1q_f32(&color.r, c);
+  }
+
+  inline void ColorVMultiplyAdd(D3DCOLORVALUE& out, const D3DCOLORVALUE& color, float value) {
+    float32x4_t r = vaddq_f32(vmulq_n_f32(vld1q_f32(&color.r), value), vld1q_f32(&out.r));
+
+    float alpha = out.a;
+    vst1q_f32(&out.r, r);
+    out.a = alpha;
+  }
+
+  inline float D3DMad2AddScalar(float a1, float a2, float b1, float b2, float c) {
+    // Not fused, as with SSE2's MULSS and ADDSS
+    float32x2_t r = vmul_f32(vdup_n_f32(a1), vdup_n_f32(a2));
+    r = vadd_f32(r, vmul_f32(vdup_n_f32(b1), vdup_n_f32(b2)));
+    r = vadd_f32(r, vdup_n_f32(c));
+
+    return vget_lane_f32(r, 0);
+  }
+
+  inline void D3DColorMulRGBSetAlpha(D3DCOLORVALUE& a, const D3DCOLORVALUE& b, bool legacy) {
+    vst1q_f32(&a.r, vmulq_f32(vld1q_f32(&a.r), vld1q_f32(&b.r)));
 
     if (legacy)
       a.a = 0.0f;

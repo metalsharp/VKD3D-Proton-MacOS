@@ -296,6 +296,22 @@ namespace dxvk {
 
       if (e.dwordCount & 1u)
         std::memcpy(copyDst + dwordIndex, copySrc + dwordIndex, sizeof(uint32_t));
+      #elif defined(DXVK_ARCH_ARM64_NEON)
+      // Small copies (typically up to 32 bytes) of dword-aligned blocks, as with SSE
+      uint32_t dwordIndex = 0u;
+
+      while (dwordIndex + 4u <= e.dwordCount) {
+        vst1q_u32(copyDst + dwordIndex, vld1q_u32(copySrc + dwordIndex));
+        dwordIndex += 4u;
+      }
+
+      if (e.dwordCount & 2u) {
+        vst1_u32(copyDst + dwordIndex, vld1_u32(copySrc + dwordIndex));
+        dwordIndex += 2u;
+      }
+
+      if (e.dwordCount & 1u)
+        copyDst[dwordIndex] = copySrc[dwordIndex];
       #else
       std::memcpy(copyDst, copySrc, e.dwordCount * sizeof(uint32_t));
       #endif

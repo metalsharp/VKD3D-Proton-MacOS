@@ -711,6 +711,47 @@ namespace dxvk {
 
       return true;
       // If any mask bit is 0, a constant has changed
+      #elif defined(DXVK_ARCH_ARM64_NEON)
+      auto* dstPtr = reinterpret_cast<      uint32_t*>(dstData);
+      auto* srcPtr = reinterpret_cast<const uint32_t*>(pConstantData);
+
+      // As with SSE: find the first constant that changed and copy from there,
+      // telling the caller whether any did
+      bool dirty = false;
+
+      uint32_t index = 0u;
+
+      while (index < Count) {
+        uint32x4_t srcData = vld1q_u32(srcPtr + 4u * index);
+        uint32x4_t dstData = vld1q_u32(dstPtr + 4u * index);
+
+        // Any lane not equal
+        dirty = vminvq_u32(vceqq_u32(srcData, dstData)) == 0u;
+        index += 1u;
+
+        if (dirty) {
+          vst1q_u32(dstPtr + 4u * (index - 1u), srcData);
+          break;
+        }
+      }
+
+      if (unlikely(!dirty))
+        return false;
+
+      while (index + 2u <= Count) {
+        uint32x4_t src0 = vld1q_u32(srcPtr + 4u * index);
+        uint32x4_t src1 = vld1q_u32(srcPtr + 4u * index + 4u);
+
+        vst1q_u32(dstPtr + 4u * index, src0);
+        vst1q_u32(dstPtr + 4u * index + 4u, src1);
+
+        index += 2u;
+      }
+
+      if (index < Count)
+        vst1q_u32(dstPtr + 4u * index, vld1q_u32(srcPtr + 4u * index));
+
+      return true;
       #else
       size_t dataSize = Count * sizeof(*dstData);
 

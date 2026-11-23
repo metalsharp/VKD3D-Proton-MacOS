@@ -161,6 +161,10 @@ __CRT_UUID_DECL(d3d9::IDirect3DDevice9Ex,          0xB18B10CE, 0x2649, 0x405A, 0
 #if (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)) \
     && !defined(__arm64ec__) && !defined(_M_ARM64EC)
   #define DXVK_SWVP_SSE2
+#elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(__clang__)
+  // AArch64 and ARM64EC: the same vector paths with NEON, which give the
+  // SSE2 paths' results (multiplies and adds are not fused)
+  #define DXVK_SWVP_NEON
 #endif
 
 

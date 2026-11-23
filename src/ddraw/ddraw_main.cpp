@@ -74,6 +74,12 @@ namespace dxvk {
     if (!std::exchange(s_sse2InfoShown, true))
       Logger::info("D7VK: Using SSE2 optimizations for SWVP");
 #endif
+#ifdef DXVK_SWVP_NEON
+    static bool s_neonInfoShown;
+
+    if (!std::exchange(s_neonInfoShown, true))
+      Logger::info("D7VK: Using NEON optimizations for SWVP");
+#endif
 
     return hDDraw;
   }
