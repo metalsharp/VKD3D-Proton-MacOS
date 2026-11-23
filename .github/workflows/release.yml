@@ -1,12 +1,13 @@
 name: Release
 
-# Builds the runtime's three parts from the pinned sources and this repository's patches:
-#   x86_64    VKD3D-Proton's d3d12.dll + d3d12core.dll, and DXVK's dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows),
-#             with the lane's own NGX core and NVAPI as x86_64 Wine builtins (MetalSharp's x86_64 Wine, under Rosetta)
-#   arm64     VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows), which x86_64 programs load as
-#             ARM64EC under FEX, with DXVK's x86_64 dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows), as
-#             MetalSharp Wine's VKD3D-Proton lane runs them
-#   moltenvk  the universal libMoltenVK.dylib and its ICD file, with Apple's Metal Shader Converter library
+# Builds MetalVulkan's parts from this repository (dxvk/), the pinned sources and this repository's patches:
+#   x86_64     VKD3D-Proton's d3d12.dll + d3d12core.dll, and DXVK's dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows),
+#              with the lane's own NGX core and NVAPI as x86_64 Wine builtins (MetalSharp's x86_64 Wine, under Rosetta)
+#   arm64      VKD3D-Proton's d3d12.dll + d3d12core.dll as ARM64X (aarch64-windows), which x86_64 programs load as
+#              ARM64EC under FEX, with DXVK's ARM64X dxgi.dll, d3d11.dll, d3d10core.dll (x86_64-windows), as
+#              MetalSharp Wine's VKD3D-Proton lane runs them
+#   dxvk       DXVK (dxvk/): ddraw (d7vk), d3d8, d3d9, d3d10core, d3d11 and dxgi for x86_64, i386 and ARM64X
+#   moltenvk   the universal libMoltenVK.dylib and its ICD file, with Apple's Metal Shader Converter library
 # A pushed tag vX.Y publishes them as one release, vX.Y, with each part a package of its own.
 # main and pull requests that change the build only build them (the archives are the run's artifacts).
 
@@ -20,6 +21,8 @@ on:
       - '.github/workflows/release.yml'
       - 'scripts/**'
       - 'patches/**'
+      - 'dxvk/**'
+      - '.gitmodules'
   workflow_dispatch:
 
 permissions:
@@ -79,9 +82,9 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP/ngx-key.pem"
           if [ "${{ matrix.lane }}" = x86_64 ]; then
-            bash scripts/build-dxvk.sh
+            bash scripts/build-dxvk.sh x86_64
           else
-            bash scripts/build-dxvk-arm64x.sh
+            bash scripts/build-dxvk.sh arm64x
           fi
 
       - name: Package
@@ -112,8 +115,8 @@ jobs:
             # the lane's settings (MetalFX upscaling, DLSS's GPU identity), which the installer points the prefix at
             cp install/vkd3d.conf install/dxvk.conf "$ROOT/"
           fi
-          cp sources/dxvk/LICENSE "$ROOT/LICENSE.dxvk"
-          cp sources/dxvk/subprojects/dxbc-spirv/LICENSE "$ROOT/LICENSE.dxbc-spirv"
+          cp dxvk/LICENSE "$ROOT/LICENSE.dxvk"
+          cp dxvk/subprojects/dxbc-spirv/LICENSE "$ROOT/LICENSE.dxbc-spirv"
           cp sources/vkd3d-proton/LICENSE "$ROOT/LICENSE.vkd3d-proton"
           cp LICENSE "$ROOT/LICENSE"
           # the lane's installer, run from the extracted package next to the extracted MoltenVK package
@@ -127,6 +130,97 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.lane }}
+          path: dist/*.tar.zst
+          if-no-files-found: error
+
+  dxvk:
+    name: DXVK ${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: x86_64
+            cross: build-win64.txt
+            dir: x86_64-windows
+          - lane: i386
+            cross: build-win32.txt
+            dir: i386-windows
+          - lane: arm64x
+            cross: build-arm64x.txt
+            dir: x86_64-windows
+    defaults:
+      run:
+        working-directory: dxvk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y glslang-tools meson ninja-build python3 zstd
+          if [ "${{ matrix.lane }}" = arm64x ]; then
+            curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+              "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64.tar.xz"
+            tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+            echo "$RUNNER_TEMP/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+          else
+            sudo apt-get install --no-install-recommends -y \
+              g++-mingw-w64-x86-64 g++-mingw-w64-i686 gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+          fi
+
+      - name: MoltenVK shader compiler patch
+        run: |
+          git -C subprojects/dxbc-spirv apply ../../patches/dxbc-spirv-moltenvk.patch
+          git -C subprojects/dxbc-spirv diff --check
+
+      - name: Build
+        run: |
+          meson setup build \
+            --cross-file "${{ matrix.cross }}" \
+            --buildtype release \
+            --strip \
+            --wrap-mode nodownload \
+            --prefix "$PWD/stage" \
+            --bindir "${{ matrix.dir }}" \
+            --libdir "${{ matrix.dir }}" \
+            -Db_ndebug=if-release
+          meson compile -C build
+          meson install -C build
+
+      - name: Check architecture
+        run: |
+          set -euo pipefail
+          file stage/${{ matrix.dir }}/*.dll
+          case "${{ matrix.lane }}" in
+            arm64x) python3 tools/ci/check-arm64x.py stage/${{ matrix.dir }}/*.dll ;;
+            x86_64) ! file stage/${{ matrix.dir }}/*.dll | grep -E 'ARM|80386' ;;
+            i386)   ! file stage/${{ matrix.dir }}/*.dll | grep -E 'ARM|x86-64' ;;
+          esac
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || VERSION="$(git rev-parse --short HEAD)"
+          NAME="dxvk-$VERSION-${{ matrix.lane }}"
+          ROOT="$RUNNER_TEMP/$NAME"
+          mkdir -p "$ROOT/${{ matrix.dir }}"
+          cp stage/${{ matrix.dir }}/*.dll "$ROOT/${{ matrix.dir }}/"
+          cp LICENSE "$ROOT/LICENSE"
+          cp subprojects/dxbc-spirv/LICENSE "$ROOT/LICENSE.dxbc-spirv"
+          cp dxvk.conf "$ROOT/dxvk.conf"
+          (cd "$ROOT" && find . -type f | LC_ALL=C sort | xargs sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+          mkdir -p ../dist
+          tar -C "$RUNNER_TEMP" -cf - "$NAME" | zstd -19 -q -o "../dist/$NAME.tar.zst"
+          ls -la ../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-${{ matrix.lane }}
           path: dist/*.tar.zst
           if-no-files-found: error
 
@@ -209,7 +303,7 @@ jobs:
   release:
     name: Releases
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [dlls, moltenvk]
+    needs: [dlls, dxvk, moltenvk]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -229,7 +323,8 @@ jobs:
 
           - **vkd3d-proton-$TAG-x86_64**: VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\`, with DXVK's \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\`, for x86_64 Windows programs (\`x86_64-windows\`), and the lane's own NGX core and NVAPI (\`nvngx.dll\`, \`nvapi64.dll\`) as x86_64 Wine builtins, which run DLSS Super Resolution and Ray Reconstruction on MetalFX in an x86_64 Wine (MetalSharp's, under Rosetta). Stage them together.
           - **vkd3d-proton-$TAG-arm64**: for an arm64 Wine that runs x86_64 programs with FEX (MetalSharp Wine): VKD3D-Proton's \`d3d12.dll\` and \`d3d12core.dll\` as ARM64X (\`aarch64-windows\`, loaded by x86_64 programs as ARM64EC), with DXVK's x86_64 \`dxgi.dll\`, \`d3d11.dll\` and \`d3d10core.dll\` (\`x86_64-windows\`), and the lane's own NGX core and NVAPI (\`nvngx.dll\`, \`nvapi64.dll\`, ARM64X), which run DLSS Super Resolution and Ray Reconstruction on MetalFX.
+          - **dxvk-$TAG-x86_64**, **dxvk-$TAG-i386**, **dxvk-$TAG-arm64x**: DXVK (\`dxvk/\`, DXVK 3.1 on MoltenVK): \`ddraw.dll\` (d7vk: Direct3D 7, 6, 5 and 3), \`d3d8.dll\`, \`d3d9.dll\`, \`d3d10core.dll\`, \`d3d11.dll\` and \`dxgi.dll\` for x86_64 programs, 32-bit programs, and as ARM64X for an arm64 Wine with FEX (MetalSharp Wine, \`x86_64-windows\`). With the VKD3D-Proton packages, Direct3D 12 to 3 on one DXVK.
           - **moltenvk-$TAG-universal**: the universal (arm64 + x86_64), ad-hoc signed \`libMoltenVK.dylib\` and \`MoltenVK_icd.json\` both lanes run on, with Apple's Metal Shader Converter library (\`libmetalirconverter.dylib\`, unmodified, Apple-signed), which MoltenVK uses to convert DXIL compute, vertex, mesh, amplification and pixel shaders for VKD3D-Proton (\`METALSHARP_MSC=0\` turns it off), and DirectXShaderCompiler's DXBC to DXIL converter (\`libdxbcconverter.dylib\`, NCSA), which hands it DXBC shaders too (\`METALSHARP_MSC_DXBC=0\` keeps them on SPIR-V). It runs MetalFX's scalers for VKD3D-Proton's and DXVK's DLSS and swap chain upscaling (\`mvk_metalfx.h\`).
           EOF
-          gh release create "$TAG" dist/x86_64/*.tar.zst dist/arm64/*.tar.zst dist/moltenvk/*.tar.zst \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --title "VKD3D-Proton MacOS $TAG" --notes-file notes.md
+          gh release create "$TAG" dist/x86_64/*.tar.zst dist/arm64/*.tar.zst dist/dxvk-*/*.tar.zst dist/moltenvk/*.tar.zst \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "MetalVulkan $TAG" --notes-file notes.md

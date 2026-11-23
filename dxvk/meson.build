@@ -216,7 +216,9 @@ glsl_generator = generator(
 )
 
 dxvk_version = vcs_tag(
-  command: ['git', 'describe', '--dirty=+'],
+  # MetalVulkan: DXVK's release (RELEASE) and the MetalVulkan revision it is built from; this tree's tags are
+  # MetalVulkan's, not DXVK's
+  command: ['sh', '-c', 'printf "v%s (MetalVulkan %s)" "$(cat RELEASE)" "$(git describe --tags --always --dirty=+ --first-parent)"'],
   input:  'version.h.in',
   output: 'version.h',
 )
