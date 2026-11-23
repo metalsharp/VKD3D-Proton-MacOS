@@ -1,6 +1,6 @@
 #!/bin/bash
-# Export sources/vkd3d-proton, sources/MoltenVK and its External/SPIRV-Cross work, and sources/dxvk's, into patches/
-# (see fetch-sources.sh).
+# Export sources/vkd3d-proton, sources/MoltenVK and its External/SPIRV-Cross work into patches/ (see fetch-sources.sh).
+# sources/dxvk is DXVK-MacOS at the revision fetch-sources.sh pins: its changes go to metalsharp/DXVK-MacOS.
 set -e
 WS="$(cd "$(dirname "$0")/.." && pwd)"
 # VKD3D-Proton: the commit series on the upstream revision fetch-sources.sh pins, applied there with git am
@@ -21,11 +21,6 @@ rm -f "$WS"/patches/spirv-cross/*.patch
 git diff c1af5739..HEAD > "$WS/patches/spirv-cross/metalsharp.diff"
 git log --format='%h %s' c1af5739..HEAD > "$WS/patches/spirv-cross/metalsharp.log"
 ls "$WS/patches/spirv-cross"
-cd "$WS/sources/dxvk"
-mkdir -p "$WS/patches/dxvk"
-rm -f "$WS"/patches/dxvk/*.patch
-git format-patch -q v2.7.1..HEAD -o "$WS/patches/dxvk"
-ls "$WS/patches/dxvk"
 # DXC: the working tree's changes on the tag fetch-sources.sh pins (new files marked intent-to-add), as one diff
 if [ -d "$WS/sources/DirectXShaderCompiler/.git" ]; then
     cd "$WS/sources/DirectXShaderCompiler"

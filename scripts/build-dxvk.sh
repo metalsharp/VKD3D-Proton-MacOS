@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build DXVK 2.7.1 (sources/dxvk, see fetch-sources.sh) for the VKD3D lane: its dxgi.dll presents VKD3D-Proton's
+# Build DXVK-MacOS (sources/dxvk, see fetch-sources.sh) for the VKD3D lane: its dxgi.dll presents VKD3D-Proton's
 # swap chains, and its d3d11.dll provides D3D11On12CreateDevice on VKD3D-Proton devices.
 #   LLVM_MINGW=<llvm-mingw> scripts/build-dxvk.sh [out-dir]
 set -euo pipefail
