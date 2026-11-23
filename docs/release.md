@@ -1,6 +1,6 @@
 # Releases
 
-A release is one GitHub release, `vX.Y`, with three packages. Each package carries the licenses of what it contains
+A release is one GitHub release, `vX.Y`, with six packages. Each package carries the licenses of what it contains
 and a `SHA256SUMS` file.
 
 ```text
@@ -15,7 +15,14 @@ vkd3d-proton-vX.Y-arm64/             for an arm64 Wine that runs x86_64 programs
 ├── install-arm64-wine.sh, install-common.sh
 └── LICENSE, LICENSE.vkd3d-proton, LICENSE.dxvk, LICENSE.dxbc-spirv, SHA256SUMS
 
-moltenvk-vX.Y-universal/             for both
+dxvk-vX.Y-x86_64/, dxvk-vX.Y-i386/   DXVK (dxvk/) for x86_64 and 32-bit programs
+├── x86_64-windows/ or i386-windows/ ddraw.dll (d7vk) d3d8.dll d3d9.dll d3d10core.dll d3d11.dll dxgi.dll
+└── dxvk.conf, LICENSE (zlib), LICENSE.dxbc-spirv, SHA256SUMS
+
+dxvk-vX.Y-arm64x/                    the same as ARM64X, for an arm64 Wine that runs x86_64 programs with FEX
+└── x86_64-windows/                  ...
+
+moltenvk-vX.Y-universal/             for all of them
 ├── libMoltenVK.dylib                arm64 + x86_64, ad-hoc signed
 ├── MoltenVK_icd.json
 ├── libmetalirconverter.dylib        Apple's Metal Shader Converter, arm64 + x86_64, unmodified and Apple-signed
@@ -27,14 +34,15 @@ moltenvk-vX.Y-universal/             for both
 
 ## How CI builds them
 
-`.github/workflows/release.yml` builds the three packages on `macos-26` runners from the pinned sources and this
-repository's patches:
+`.github/workflows/release.yml` builds the VKD3D-Proton and MoltenVK packages on `macos-26` runners from the pinned
+sources and this repository's patches, and the DXVK packages from `dxvk/` on Ubuntu runners (MinGW GCC for x86_64
+and i386, llvm-mingw for ARM64X), as DXVK-MacOS built them:
 
 - **Sources:** `scripts/fetch-sources.sh`.
 - **Toolchain:** llvm-mingw, plus meson, ninja and glslang from Homebrew.
 - **Build scripts:**
   - `scripts/build-vkd3d-proton.sh` for x86_64, `scripts/build-vkd3d-proton-arm64x.sh` for ARM64X;
-  - `scripts/build-dxvk.sh` for DXGI and D3D10/11 on x86_64, `scripts/build-dxvk-arm64x.sh` for ARM64X;
+  - `scripts/build-dxvk.sh x86_64` and `arm64x` for the VKD3D-Proton packages' DXGI and D3D10/11;
   - `scripts/build-moltenvk.sh --externals` for MoltenVK, with the newest Xcode on the runner. It needs the macOS 26
     SDK or later.
 - **Metal Shader Converter:** `scripts/fetch-metal-shaderconverter.sh` downloads Apple's `libmetalirconverter.dylib`,

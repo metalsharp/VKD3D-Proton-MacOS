@@ -59,7 +59,7 @@ Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported privately through the repository's GitHub contact and security
 channels:
 
-<https://github.com/metalsharp/vkd3d-proton-macos/security/advisories/new>
+<https://github.com/metalsharp/MetalVulkan/security/advisories/new>
 
 Reports will be reviewed and investigated. Maintainers will respect the
 reporter's privacy and will not publicly identify a reporter without consent,

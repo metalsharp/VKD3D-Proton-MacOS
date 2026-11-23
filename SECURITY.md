@@ -14,7 +14,7 @@ should also be reported to the appropriate upstream project when applicable.
 Please do **not** report security vulnerabilities in a public issue or pull
 request. Use GitHub's private vulnerability reporting for this repository:
 
-<https://github.com/metalsharp/vkd3d-proton-macos/security/advisories/new>
+<https://github.com/metalsharp/MetalVulkan/security/advisories/new>
 
 If private reporting is unavailable, contact the maintainers through the
 project profile at <https://github.com/metalsharp> and do not include exploit
