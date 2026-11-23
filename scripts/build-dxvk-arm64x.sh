@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build DXVK 2.7.1 (sources/dxvk, see fetch-sources.sh) for the arm64 lane as ARM64X, like build-vkd3d-proton-arm64x.sh
+# Build DXVK-MacOS (sources/dxvk, see fetch-sources.sh) for the arm64 lane as ARM64X, like build-vkd3d-proton-arm64x.sh
 # builds VKD3D-Proton: one DLL with ARM64 and ARM64EC code, so x86_64 programs (ARM64EC under FEX) and native ARM64
 # programs both load it without emulation. dxgi.dll presents VKD3D-Proton's swap chains; d3d11.dll and d3d10core.dll
 # provide D3D11On12CreateDevice on VKD3D-Proton devices. The same source and patches as build-dxvk.sh's x86_64 build.

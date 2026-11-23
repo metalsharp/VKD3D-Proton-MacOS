@@ -186,7 +186,7 @@ Metal Shader Converter library ships under.
 | Component | In the release | License | License file in the package |
 | --- | --- | --- | --- |
 | [VKD3D-Proton](https://github.com/HansKristian-Work/vkd3d-proton) | `d3d12.dll`, `d3d12core.dll` | LGPL-2.1 | `LICENSE.vkd3d-proton` |
-| [DXVK](https://github.com/doitsujin/dxvk) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll` | zlib | `LICENSE.dxvk` |
+| [DXVK-MacOS](https://github.com/metalsharp/DXVK-MacOS) (DXVK on MoltenVK) | `dxgi.dll`, `d3d11.dll`, `d3d10core.dll` | zlib (dxbc-spirv: MIT) | `LICENSE.dxvk`, `LICENSE.dxbc-spirv` |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | built into `libMoltenVK.dylib` | Apache-2.0 | `LICENSE.MoltenVK` (the same license) |
 | Apple Metal Shader Converter 4.0 beta 3 | `libmetalirconverter.dylib` | Apple's license, see below | `LICENSE.metal-shaderconverter.rtf`, `ACKNOWLEDGEMENTS.metal-shaderconverter.rtf` |
