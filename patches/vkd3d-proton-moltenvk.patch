@@ -14050,3 +14050,708 @@ index 87a12439..19cac7f3 100644
 -- 
 2.54.0 (Apple Git-157)
 
+From 89311f2c526a56add9e7c0b9beddb2da72d8469f Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Sun, 22 Nov 2026 20:03:17 -0700
+Subject: [PATCH 76/77] MetalSharp: NEON for descriptor copies, spin waits and
+ the bridge's root argument pushes
+
+An ARM64X build has neither half on SSE2 (AArch64, and ARM64EC, which defines __arm64ec__ and not __aarch64__), so
+copy_utils.h's unrolled copies were memcpy calls into the CRT, non-temporal stores were plain ones, and
+vkd3d_pause() was nothing.
+
+- copy_utils.h: the 16/32/64-byte and multiple-of-16 copies are NEON loads and stores (LD1/ST1 of 1, 2 and 4
+  registers); the non-temporal ones store Q register pairs with STNP, ordered by DMB ISHST where SSE2 has SFENCE.
+- vkd3d_pause(): ISB, which holds the core for a short while (YIELD is a no-op on Apple cores), in the spin locks and
+  every spin wait.
+- vkd3d_memcmp_first_diff_u32() / vkd3d_memcmp_last_diff_u32(): the first and last differing 32-bit word of two
+  buffers, four words a step with NEON. The Metal Shader Converter bridge finds the bytes of a draw's root arguments
+  that changed since its last push with them, word by word from each end before; 2.6 to 3.8 times faster for
+  64 to 1024 bytes (an M-series core, the same result on 2 million random cases).
+---
+ include/private/copy_utils.h     | 123 +++++++++++++++++++++++++++++++
+ include/private/vkd3d_spinlock.h |   4 +
+ libs/vkd3d/command.c             |   6 +-
+ subprojects/dxil-spirv           |   2 +-
+ 4 files changed, 130 insertions(+), 5 deletions(-)
+
+diff --git a/include/private/copy_utils.h b/include/private/copy_utils.h
+index e1992589..303404d4 100644
+--- a/include/private/copy_utils.h
++++ b/include/private/copy_utils.h
+@@ -21,6 +21,10 @@
+ 
+ #ifdef __SSE2__
+ #include <emmintrin.h>
++#elif defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64ec__))
++/* AArch64, and ARM64EC (__arm64ec__, without __aarch64__), the two halves of an ARM64X build: neither has SSE2 */
++#include <arm_neon.h>
++#define VKD3D_COPY_UTILS_NEON 1
+ #endif
+ #include <stdint.h>
+ #include <memory.h>
+@@ -100,6 +104,69 @@ static inline void vkd3d_memcpy_aligned_cached(void *dst_, const void *src_, siz
+ }
+ 
+ #define vkd3d_memcpy_non_temporal_barrier() _mm_sfence()
++#elif defined(VKD3D_COPY_UTILS_NEON)
++
++/* The same unrolled copies with NEON. Non-temporal stores are STNP, of Q register pairs; NEON has no intrinsic for
++ * them, and __builtin_nontemporal_store splits a 16-byte vector into D register halves. A lone 16 bytes has no pair,
++ * so it is stored normally. Loads and stores need no alignment, but the callers' 16-byte alignment keeps them in one
++ * cache line. */
++static inline void vkd3d_neon_store_pair_non_temporal(void *dst, uint8x16_t a, uint8x16_t b)
++{
++    __asm__ ("stnp %q1, %q2, [%3]" : "=m"(*(uint8_t (*)[32])dst) : "w"(a), "w"(b), "r"(dst));
++}
++
++#define vkd3d_memcpy_aligned_64_non_temporal(dst, src) do { \
++    uint8x16x4_t v_ = vld1q_u8_x4((const uint8_t *)(src)); \
++    vkd3d_neon_store_pair_non_temporal((uint8_t *)(dst), v_.val[0], v_.val[1]); \
++    vkd3d_neon_store_pair_non_temporal((uint8_t *)(dst) + 32, v_.val[2], v_.val[3]); \
++} while(0)
++
++#define vkd3d_memcpy_aligned_32_non_temporal(dst, src) do { \
++    uint8x16x2_t v_ = vld1q_u8_x2((const uint8_t *)(src)); \
++    vkd3d_neon_store_pair_non_temporal((uint8_t *)(dst), v_.val[0], v_.val[1]); \
++} while(0)
++
++#define vkd3d_memcpy_aligned_16_non_temporal(dst, src) \
++    vst1q_u8((uint8_t *)(dst), vld1q_u8((const uint8_t *)(src)))
++
++#define vkd3d_memcpy_aligned_64_cached(dst, src) \
++    vst1q_u8_x4((uint8_t *)(dst), vld1q_u8_x4((const uint8_t *)(src)))
++
++#define vkd3d_memcpy_aligned_32_cached(dst, src) \
++    vst1q_u8_x2((uint8_t *)(dst), vld1q_u8_x2((const uint8_t *)(src)))
++
++#define vkd3d_memcpy_aligned_16_cached(dst, src) \
++    vst1q_u8((uint8_t *)(dst), vld1q_u8((const uint8_t *)(src)))
++
++/* size is a multiple of 16, as for SSE2: 64 bytes at a time, then the rest 16 at a time */
++static inline void vkd3d_memcpy_aligned_non_temporal(void *dst_, const void *src_, size_t size)
++{
++    const uint8_t *src = src_;
++    uint8_t *dst = dst_;
++    size_t i = 0;
++
++    for (; i + 64 <= size; i += 64)
++        vkd3d_memcpy_aligned_64_non_temporal(dst + i, src + i);
++    for (; i + 32 <= size; i += 32)
++        vkd3d_memcpy_aligned_32_non_temporal(dst + i, src + i);
++    for (; i < size; i += 16)
++        vkd3d_memcpy_aligned_16_non_temporal(dst + i, src + i);
++}
++
++static inline void vkd3d_memcpy_aligned_cached(void *dst_, const void *src_, size_t size)
++{
++    const uint8_t *src = src_;
++    uint8_t *dst = dst_;
++    size_t i = 0;
++
++    for (; i + 64 <= size; i += 64)
++        vkd3d_memcpy_aligned_64_cached(dst + i, src + i);
++    for (; i < size; i += 16)
++        vkd3d_memcpy_aligned_16_cached(dst + i, src + i);
++}
++
++/* SFENCE's part: the non-temporal stores are ordered before the stores after this one */
++#define vkd3d_memcpy_non_temporal_barrier() __asm__ __volatile__("dmb ishst" ::: "memory")
+ #else
+ #define vkd3d_memcpy_aligned_64_non_temporal(dst, src) memcpy((uint8_t *)(dst), (const uint8_t *)(src), 64)
+ #define vkd3d_memcpy_aligned_32_non_temporal(dst, src) memcpy((uint8_t *)(dst), (const uint8_t *)(src), 32)
+@@ -112,4 +179,60 @@ static inline void vkd3d_memcpy_aligned_cached(void *dst_, const void *src_, siz
+ #define vkd3d_memcpy_non_temporal_barrier() ((void)0)
+ #endif
+ 
++/* The byte offset of the first 32-bit word in [begin, end) where a and b differ, or end; begin and end are multiples
++ * of 4. With NEON, four words a step. */
++static inline uint32_t vkd3d_memcmp_first_diff_u32(const void *a_, const void *b_, uint32_t begin, uint32_t end)
++{
++    const uint8_t *a = a_, *b = b_;
++    uint32_t wa, wb;
++
++#ifdef VKD3D_COPY_UTILS_NEON
++    for (; begin + 16 <= end; begin += 16)
++    {
++        uint32x4_t ne = vmvnq_u32(vceqq_u32(vld1q_u32((const uint32_t *)(a + begin)),
++                vld1q_u32((const uint32_t *)(b + begin))));
++        /* one 16-bit lane of the narrowed mask a word */
++        uint64_t mask = vget_lane_u64(vreinterpret_u64_u16(vmovn_u32(ne)), 0);
++
++        if (mask)
++            return begin + (__builtin_ctzll(mask) / 16) * 4;
++    }
++#endif
++    for (; begin < end; begin += 4)
++    {
++        memcpy(&wa, a + begin, sizeof(wa));
++        memcpy(&wb, b + begin, sizeof(wb));
++        if (wa != wb)
++            break;
++    }
++    return begin;
++}
++
++/* The byte offset just past the last 32-bit word in [begin, end) where a and b differ, or begin. */
++static inline uint32_t vkd3d_memcmp_last_diff_u32(const void *a_, const void *b_, uint32_t begin, uint32_t end)
++{
++    const uint8_t *a = a_, *b = b_;
++    uint32_t wa, wb;
++
++#ifdef VKD3D_COPY_UTILS_NEON
++    for (; end >= begin + 16; end -= 16)
++    {
++        uint32x4_t ne = vmvnq_u32(vceqq_u32(vld1q_u32((const uint32_t *)(a + end - 16)),
++                vld1q_u32((const uint32_t *)(b + end - 16))));
++        uint64_t mask = vget_lane_u64(vreinterpret_u64_u16(vmovn_u32(ne)), 0);
++
++        if (mask)
++            return end - 16 + (3 - __builtin_clzll(mask) / 16) * 4 + 4;
++    }
++#endif
++    for (; end > begin; end -= 4)
++    {
++        memcpy(&wa, a + end - 4, sizeof(wa));
++        memcpy(&wb, b + end - 4, sizeof(wb));
++        if (wa != wb)
++            break;
++    }
++    return end;
++}
++
+ #endif
+diff --git a/include/private/vkd3d_spinlock.h b/include/private/vkd3d_spinlock.h
+index 4adeb7d1..f167c14f 100644
+--- a/include/private/vkd3d_spinlock.h
++++ b/include/private/vkd3d_spinlock.h
+@@ -32,6 +32,10 @@ static inline void vkd3d_pause(void)
+ {
+ #ifdef __SSE2__
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm64ec__)
++    /* PAUSE's part on AArch64 and ARM64EC: ISB holds the core for a short while, where YIELD is a no-op on Apple
++     * cores, and the spinning thread backs off its lock's cache line as with PAUSE */
++    __asm__ __volatile__("isb" ::: "memory");
+ #endif
+ }
+ 
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index f10e277d..ccbfb2b2 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8884,12 +8884,10 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+     if (list->msc.last_push_valid && list->msc.last_push_layout == layout &&
+             list->msc.last_push_size == root_signature->msc.push_size)
+     {
+-        while (first < end && !memcmp(list->msc.last_push + first, data + first, sizeof(uint32_t)))
+-            first += sizeof(uint32_t);
++        first = vkd3d_memcmp_first_diff_u32(list->msc.last_push, data, first, end);
+         if (first == end)
+             return;
+-        while (!memcmp(list->msc.last_push + end - sizeof(uint32_t), data + end - sizeof(uint32_t), sizeof(uint32_t)))
+-            end -= sizeof(uint32_t);
++        end = vkd3d_memcmp_last_diff_u32(list->msc.last_push, data, first, end);
+     }
+ 
+     if (graphics)
+diff --git a/subprojects/dxil-spirv b/subprojects/dxil-spirv
+index 8434b063..3776fe69 160000
+--- a/subprojects/dxil-spirv
++++ b/subprojects/dxil-spirv
+@@ -1 +1 @@
+-Subproject commit 8434b0639fb2a48ce13aac08a420ecce5d23df0e
++Subproject commit 3776fe69f57d7210ee8e3a093754281a38e32c50
+-- 
+2.54.0 (Apple Git-157)
+
+
+From ea13a4e9ee8b290b3fb52a7b44b1ab2917f17690 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@aol.com>
+Date: Sun, 22 Nov 2026 20:10:34 -0700
+Subject: [PATCH 77/77] MetalSharp: CopyDescriptors finds each set's runs with
+ bit scans, and copies its metadata inline
+
+On MoltenVK, d3d12_desc_copy_range() is CopyDescriptors' and CopyDescriptorsSimple's path for more than one
+descriptor, which games take per draw for their tables.
+
+- The descriptors' set masks are gathered 16 at a time with NEON (the byte at offset 4 of each 8-byte entry), and
+  a range's descriptors are taken 64 at a time: for each set a bitmask of the descriptors in it, whose runs are found
+  with bit scans. Each descriptor was tested for each set before. The runs are the same (400 000 random ranges);
+  3.6 to 4.6 times faster for 32 to 1024 descriptors, the same for 8 (an M-series core).
+- Its five copies of per-descriptor metadata (16, 8, 24, 8 and 16 bytes a descriptor) and the bridge's zeroing of a
+  draw's root arguments are inline NEON copies and stores, vkd3d_memcpy_inline() and vkd3d_memzero_inline(), not CRT
+  calls: Wine's CRT under Wine. Any size and alignment, the same bytes as memcpy and memset.
+- The bridge's shadow heap views are tested four slots at a time, where both heaps' are NULL (nearly all are), in
+  copies and when a heap is freed.
+- A command list's reset clears its bridge state but the 4 KiB copy of the last push, which is read only while
+  last_push_valid is set, and the reset clears that.
+---
+ include/private/copy_utils.h |  91 +++++++++++++++
+ libs/vkd3d/command.c         |   5 +-
+ libs/vkd3d/msc_bridge.c      |  37 +++++-
+ libs/vkd3d/resource.c        | 217 +++++++++++++++++++++++++++--------
+ 4 files changed, 296 insertions(+), 54 deletions(-)
+
+diff --git a/include/private/copy_utils.h b/include/private/copy_utils.h
+index 303404d4..64314b88 100644
+--- a/include/private/copy_utils.h
++++ b/include/private/copy_utils.h
+@@ -235,4 +235,95 @@ static inline uint32_t vkd3d_memcmp_last_diff_u32(const void *a_, const void *b_
+     return end;
+ }
+ 
++/* memcpy and memset to zero, inline: the descriptor paths copy and clear from a few bytes to a few KiB at a time,
++ * which is a call into the CRT otherwise (Wine's, under Wine, not the system's). The buffers do not overlap; any size,
++ * any alignment. Without NEON they are memcpy and memset. */
++static inline void vkd3d_memcpy_inline(void *dst_, const void *src_, size_t size)
++{
++#ifdef VKD3D_COPY_UTILS_NEON
++    const uint8_t *src = src_;
++    uint8_t *dst = dst_;
++    size_t i = 0;
++
++    if (size >= 16)
++    {
++        for (; i + 64 <= size; i += 64)
++            vst1q_u8_x4(dst + i, vld1q_u8_x4(src + i));
++        for (; i + 16 <= size; i += 16)
++            vst1q_u8(dst + i, vld1q_u8(src + i));
++        /* the last 16 bytes again, overlapping what was copied, for a tail of 1 to 15 */
++        if (i < size)
++            vst1q_u8(dst + size - 16, vld1q_u8(src + size - 16));
++    }
++    else if (size >= 8)
++    {
++        uint64_t a, b;
++        memcpy(&a, src, 8);
++        memcpy(&b, src + size - 8, 8);
++        memcpy(dst, &a, 8);
++        memcpy(dst + size - 8, &b, 8);
++    }
++    else if (size >= 4)
++    {
++        uint32_t a, b;
++        memcpy(&a, src, 4);
++        memcpy(&b, src + size - 4, 4);
++        memcpy(dst, &a, 4);
++        memcpy(dst + size - 4, &b, 4);
++    }
++    else if (size)
++    {
++        /* 1 to 3 bytes; a loop would become a memcpy call again */
++        dst[0] = src[0];
++        dst[size / 2] = src[size / 2];
++        dst[size - 1] = src[size - 1];
++    }
++#else
++    memcpy(dst_, src_, size);
++#endif
++}
++
++static inline void vkd3d_memzero_inline(void *dst_, size_t size)
++{
++#ifdef VKD3D_COPY_UTILS_NEON
++    const uint8x16_t zero = vdupq_n_u8(0);
++    uint8_t *dst = dst_;
++    size_t i = 0;
++
++    if (size >= 16)
++    {
++        for (; i + 64 <= size; i += 64)
++        {
++            vst1q_u8(dst + i, zero);
++            vst1q_u8(dst + i + 16, zero);
++            vst1q_u8(dst + i + 32, zero);
++            vst1q_u8(dst + i + 48, zero);
++        }
++        for (; i + 16 <= size; i += 16)
++            vst1q_u8(dst + i, zero);
++        if (i < size)
++            vst1q_u8(dst + size - 16, zero);
++    }
++    else if (size >= 8)
++    {
++        vst1_u8(dst, vget_low_u8(zero));
++        vst1_u8(dst + size - 8, vget_low_u8(zero));
++    }
++    else if (size >= 4)
++    {
++        const uint32_t z = 0;
++        memcpy(dst, &z, 4);
++        memcpy(dst + size - 4, &z, 4);
++    }
++    else if (size)
++    {
++        dst[0] = 0;
++        dst[size / 2] = 0;
++        dst[size - 1] = 0;
++    }
++#else
++    memset(dst_, 0, size);
++#endif
++}
++
+ #endif
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ccbfb2b2..c9c10af9 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7480,7 +7480,8 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(&list->graphics_bindings, 0, sizeof(list->graphics_bindings));
+     memset(&list->compute_bindings, 0, sizeof(list->compute_bindings));
+     memset(&list->descriptor_heap, 0, sizeof(list->descriptor_heap));
+-    memset(&list->msc, 0, sizeof(list->msc));
++    /* Not last_push, 4 KiB: it is read only while last_push_valid, which this clears */
++    memset(&list->msc, 0, (size_t)((const char *)list->msc.last_push - (const char *)&list->msc));
+ 
+     if (vkd3d_descriptor_debug_active_instruction_qa_checks())
+     {
+@@ -8832,7 +8833,7 @@ static void d3d12_command_list_push_msc_arguments(struct d3d12_command_list *lis
+     if (VKD3D_MS_TRACE_ON(GPU))
+         d3d12_command_list_check_msc_arguments(list, graphics, bindings, root_descriptor_vas);
+ 
+-    memset(data, 0, root_signature->msc.push_size);
++    vkd3d_memzero_inline(data, root_signature->msc.push_size);
+ 
+     for (i = 0; i < root_signature->msc.parameter_count; i++)
+     {
+diff --git a/libs/vkd3d/msc_bridge.c b/libs/vkd3d/msc_bridge.c
+index 443523e4..ab6efcc8 100644
+--- a/libs/vkd3d/msc_bridge.c
++++ b/libs/vkd3d/msc_bridge.c
+@@ -303,17 +303,42 @@ void d3d12_desc_msc_release_view(const struct d3d12_desc_split *d)
+         vkd3d_view_decref(view, d->heap->device);
+ }
+ 
++/* Whether four view slots are all NULL (b may be NULL: a heap without views). Most are: only typed buffer views the
++ * bridge made itself are owned here. */
++static inline bool vkd3d_msc_views_null4(struct vkd3d_view *const *a, struct vkd3d_view *const *b)
++{
++#ifdef VKD3D_COPY_UTILS_NEON
++    uint64x2_t v = vorrq_u64(vld1q_u64((const uint64_t *)a), vld1q_u64((const uint64_t *)a + 2));
++
++    if (b)
++        v = vorrq_u64(v, vorrq_u64(vld1q_u64((const uint64_t *)b), vld1q_u64((const uint64_t *)b + 2)));
++    return !(vgetq_lane_u64(v, 0) | vgetq_lane_u64(v, 1));
++#else
++    return !(a[0] || a[1] || a[2] || a[3] || (b && (b[0] || b[1] || b[2] || b[3])));
++#endif
++}
++
+ void d3d12_desc_msc_copy_views(struct d3d12_descriptor_heap *dst_heap, uint32_t dst_offset,
+         struct d3d12_descriptor_heap *src_heap, uint32_t src_offset, uint32_t count)
+ {
++    struct vkd3d_view *const *src_views;
+     struct vkd3d_view *old;
+     uint32_t i;
+ 
+     if (!dst_heap->msc.views)
+         return;
++    src_views = src_heap->msc.views ? src_heap->msc.views + src_offset : NULL;
+     for (i = 0; i < count; i++)
+     {
+-        struct vkd3d_view *view = src_heap->msc.views ? src_heap->msc.views[src_offset + i] : NULL;
++        struct vkd3d_view *view;
++
++        while (i + 4 <= count && vkd3d_msc_views_null4(dst_heap->msc.views + dst_offset + i,
++                src_views ? src_views + i : NULL))
++            i += 4;
++        if (i >= count)
++            break;
++
++        view = src_views ? src_views[i] : NULL;
+ 
+         if (view)
+             vkd3d_view_incref(view);
+@@ -332,9 +357,15 @@ void d3d12_descriptor_heap_cleanup_msc(struct d3d12_descriptor_heap *descriptor_
+ 
+     if (descriptor_heap->msc.views)
+     {
+-        for (i = 0; i < max(1u, descriptor_heap->desc.NumDescriptors); i++)
+-            if (descriptor_heap->msc.views[i])
++        unsigned int count = max(1u, descriptor_heap->desc.NumDescriptors);
++
++        for (i = 0; i < count; i++)
++        {
++            while (i + 4 <= count && vkd3d_msc_views_null4(descriptor_heap->msc.views + i, NULL))
++                i += 4;
++            if (i < count && descriptor_heap->msc.views[i])
+                 vkd3d_view_decref(descriptor_heap->msc.views[i], device);
++        }
+         vkd3d_free(descriptor_heap->msc.views);
+     }
+ 
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 26db9ce4..6fc33acf 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -5211,83 +5211,202 @@ static VkCopyDescriptorSet *d3d12_desc_copy_batch_add(struct d3d12_desc_copy_bat
+     return &batch->vk_copies[batch->copy_count++];
+ }
+ 
++/* MetalSharp: d3d12_desc_copy_range() works on its descriptors 64 at a time: their set masks gathered into bytes
++ * (NEON: 16 descriptors a step), then the descriptors of each bindless set as a bitmask, whose runs are found with
++ * bit scans instead of a test of each descriptor for each set. */
++#define VKD3D_DESC_COPY_CHUNK 64
++STATIC_ASSERT(offsetof(struct vkd3d_descriptor_metadata_types, set_info_mask) == 4);
++
++static inline void d3d12_desc_gather_set_masks(const struct vkd3d_descriptor_metadata_types *types,
++        unsigned int count, uint8_t *masks)
++{
++    unsigned int i = 0;
++
++#ifdef VKD3D_COPY_UTILS_NEON
++    for (; i + 16 <= count; i += 16)
++    {
++        /* set_info_mask is the low byte of each 8-byte entry's second word */
++        const uint32_t *w = (const uint32_t *)(types + i);
++        uint16x8_t lo = vcombine_u16(vmovn_u32(vld2q_u32(w).val[1]), vmovn_u32(vld2q_u32(w + 8).val[1]));
++        uint16x8_t hi = vcombine_u16(vmovn_u32(vld2q_u32(w + 16).val[1]), vmovn_u32(vld2q_u32(w + 24).val[1]));
++
++        vst1q_u8(masks + i, vcombine_u8(vmovn_u16(lo), vmovn_u16(hi)));
++    }
++#endif
++    for (; i < count; i++)
++        masks[i] = types[i].set_info_mask;
++}
++
++static inline uint32_t d3d12_desc_or_set_masks(const uint8_t *masks, unsigned int count)
++{
++    uint32_t mask = 0;
++    unsigned int i = 0;
++
++#ifdef VKD3D_COPY_UTILS_NEON
++    if (count >= 16)
++    {
++        uint8x16_t acc = vdupq_n_u8(0);
++        uint64_t m;
++
++        for (; i + 16 <= count; i += 16)
++            acc = vorrq_u8(acc, vld1q_u8(masks + i));
++        m = vgetq_lane_u64(vreinterpretq_u64_u8(acc), 0) | vgetq_lane_u64(vreinterpretq_u64_u8(acc), 1);
++        m |= m >> 32;
++        m |= m >> 16;
++        m |= m >> 8;
++        mask = (uint8_t)m;
++    }
++#endif
++    for (; i < count; i++)
++        mask |= masks[i];
++    return mask;
++}
++
++/* Bit i is set where descriptor i uses the set of bit (count <= 64) */
++static inline uint64_t d3d12_desc_set_bits(const uint8_t *masks, unsigned int count, uint8_t bit)
++{
++    uint64_t bits = 0;
++    unsigned int i = 0;
++
++#ifdef VKD3D_COPY_UTILS_NEON
++    static const uint8_t lane_bits[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
++    const uint8x16_t weights = vld1q_u8(lane_bits), set = vdupq_n_u8(bit);
++
++    for (; i + 16 <= count; i += 16)
++    {
++        uint8x16_t t = vandq_u8(vtstq_u8(vld1q_u8(masks + i), set), weights);
++
++        bits |= (uint64_t)(vaddv_u8(vget_low_u8(t)) | ((uint32_t)vaddv_u8(vget_high_u8(t)) << 8)) << i;
++    }
++#endif
++    for (; i < count; i++)
++        if (masks[i] & bit)
++            bits |= 1ull << i;
++    return bits;
++}
++
++static void d3d12_desc_copy_range_run(struct d3d12_device *device, struct d3d12_desc_copy_batch **batch,
++        struct d3d12_desc_copy_batch *local_batch, const struct d3d12_desc_split *dst,
++        const struct d3d12_desc_split *src, uint32_t set_info_index, unsigned int first, unsigned int count)
++{
++    struct vkd3d_descriptor_binding binding;
++    VkCopyDescriptorSet *vk_copy;
++
++    if (!*batch)
++    {
++        local_batch->copy_count = 0;
++        *batch = local_batch;
++    }
++
++    binding = vkd3d_bindless_state_binding_from_info_index(&device->bindless_state, set_info_index);
++    vk_copy = d3d12_desc_copy_batch_add(*batch, device);
++    vk_copy->sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
++    vk_copy->pNext = NULL;
++    vk_copy->srcSet = src->heap->sets[binding.set].vk_descriptor_set;
++    vk_copy->srcBinding = binding.binding;
++    vk_copy->srcArrayElement = src->offset + first;
++    vk_copy->dstSet = dst->heap->sets[binding.set].vk_descriptor_set;
++    vk_copy->dstBinding = binding.binding;
++    vk_copy->dstArrayElement = dst->offset + first;
++    vk_copy->descriptorCount = count;
++}
++
+ void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t src_va,
+         unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device,
+         struct d3d12_desc_copy_batch *batch)
+ {
++    unsigned int run_start[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
++    uint32_t set_info_mask = 0, chunk_mask, open_mask = 0, mask;
+     const struct vkd3d_bindless_set_info *set_info;
++    unsigned int base, n, i, first, run, set_bit;
+     struct d3d12_desc_copy_batch local_batch;
+-    struct vkd3d_descriptor_binding binding;
++    uint8_t masks[VKD3D_DESC_COPY_CHUNK];
+     struct d3d12_desc_split src, dst;
+-    VkCopyDescriptorSet *vk_copy;
+-    uint32_t set_info_mask = 0;
+     uint32_t set_info_index;
+-    unsigned int i, run;
++    uint64_t bits;
+ 
+     src = d3d12_desc_decode_va(src_va);
+     dst = d3d12_desc_decode_va(dst_va);
+ 
+-    for (i = 0; i < count; i++)
+-        set_info_mask |= src.types[i].set_info_mask;
+-
+-    memcpy(dst.view, src.view, sizeof(*dst.view) * count);
+-    memcpy(dst.types, src.types, sizeof(*dst.types) * count);
++    vkd3d_memcpy_inline(dst.view, src.view, sizeof(*dst.view) * count);
++    vkd3d_memcpy_inline(dst.types, src.types, sizeof(*dst.types) * count);
+ 
+     if (dst.heap->msc.entries && src.heap->msc.entries)
+     {
+-        memcpy(dst.heap->msc.entries + dst.offset, src.heap->msc.entries + src.offset,
++        vkd3d_memcpy_inline(dst.heap->msc.entries + dst.offset, src.heap->msc.entries + src.offset,
+                 sizeof(*dst.heap->msc.entries) * count);
+         d3d12_desc_msc_copy_views(dst.heap, dst.offset, src.heap, src.offset, count);
+     }
+ 
+-    while (set_info_mask)
++    /* Copy only the descriptors that use each set, as runs. Copying the whole range into every set any of its
++     * descriptors uses multiplies the work for mixed ranges (CBV, SRV and UAV tables), and vkUpdateDescriptorSets
++     * copies are per descriptor on MoltenVK. Slots of a set that the new descriptor type doesn't use are never
++     * read. A run open at the end of a chunk goes on into the next. */
++    for (base = 0; base < count; base += n)
+     {
+-        set_info_index = vkd3d_bitmask_iter32(&set_info_mask);
+-        set_info = &device->bindless_state.legacy.set_info[set_info_index];
++        n = min(count - base, VKD3D_DESC_COPY_CHUNK);
++        d3d12_desc_gather_set_masks(src.types + base, n, masks);
++        chunk_mask = d3d12_desc_or_set_masks(masks, n);
++        set_info_mask |= chunk_mask;
+ 
+-        if (set_info->host_copy_template)
+-        {
+-            set_info->host_copy_template(
+-                    dst.heap->sets[set_info->set_index].mapped_set,
+-                    src.heap->sets[set_info->set_index].mapped_set,
+-                    dst.offset, src.offset, count);
+-        }
+-        else
++        mask = chunk_mask | open_mask;
++        while (mask)
+         {
+-            if (!batch)
++            set_info_index = vkd3d_bitmask_iter32(&mask);
++            if (device->bindless_state.legacy.set_info[set_info_index].host_copy_template)
++                continue;
++
++            set_bit = 1u << set_info_index;
++            bits = (chunk_mask & set_bit) ? d3d12_desc_set_bits(masks, n, set_bit) : 0;
++            i = 0;
++
++            if (open_mask & set_bit)
+             {
+-                local_batch.copy_count = 0;
+-                batch = &local_batch;
++                run = vkd3d_bitmask_tzcnt64(~bits);
++                if (run >= n)
++                    continue;
++                d3d12_desc_copy_range_run(device, &batch, &local_batch, &dst, &src, set_info_index,
++                        run_start[set_info_index], base + run - run_start[set_info_index]);
++                open_mask &= ~set_bit;
++                i = run;
+             }
+ 
+-            binding = vkd3d_bindless_state_binding_from_info_index(&device->bindless_state, set_info_index);
+-
+-            /* Copy only the descriptors that use this set, as runs. Copying the whole range into
+-             * every set any of its descriptors uses multiplies the work for mixed ranges (CBV, SRV
+-             * and UAV tables), and vkUpdateDescriptorSets copies are per descriptor on MoltenVK.
+-             * Slots of a set that the new descriptor type doesn't use are never read. */
+-            for (i = 0; i < count; i += run)
++            while (i < n && (bits >> i))
+             {
+-                if (!(src.types[i].set_info_mask & (1u << set_info_index)))
++                first = i + vkd3d_bitmask_tzcnt64(bits >> i);
++                run = vkd3d_bitmask_tzcnt64(~(bits >> first));
++                if (first + run >= n)
+                 {
+-                    run = 1;
+-                    continue;
++                    run_start[set_info_index] = base + first;
++                    open_mask |= set_bit;
++                    break;
+                 }
++                d3d12_desc_copy_range_run(device, &batch, &local_batch, &dst, &src, set_info_index,
++                        base + first, run);
++                i = first + run;
++            }
++        }
++    }
+ 
+-                for (run = 1; i + run < count && (src.types[i + run].set_info_mask & (1u << set_info_index)); run++)
+-                    ;
++    while (open_mask)
++    {
++        set_info_index = vkd3d_bitmask_iter32(&open_mask);
++        d3d12_desc_copy_range_run(device, &batch, &local_batch, &dst, &src, set_info_index,
++                run_start[set_info_index], count - run_start[set_info_index]);
++    }
+ 
+-                vk_copy = d3d12_desc_copy_batch_add(batch, device);
+-                vk_copy->sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+-                vk_copy->pNext = NULL;
+-                vk_copy->srcSet = src.heap->sets[binding.set].vk_descriptor_set;
+-                vk_copy->srcBinding = binding.binding;
+-                vk_copy->srcArrayElement = src.offset + i;
+-                vk_copy->dstSet = dst.heap->sets[binding.set].vk_descriptor_set;
+-                vk_copy->dstBinding = binding.binding;
+-                vk_copy->dstArrayElement = dst.offset + i;
+-                vk_copy->descriptorCount = run;
+-            }
++    mask = set_info_mask;
++    while (mask)
++    {
++        set_info_index = vkd3d_bitmask_iter32(&mask);
++        set_info = &device->bindless_state.legacy.set_info[set_info_index];
++
++        if (set_info->host_copy_template)
++        {
++            set_info->host_copy_template(
++                    dst.heap->sets[set_info->set_index].mapped_set,
++                    src.heap->sets[set_info->set_index].mapped_set,
++                    dst.offset, src.offset, count);
+         }
+     }
+ 
+@@ -5295,13 +5414,13 @@ void d3d12_desc_copy_range(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descripto
+     {
+         const VkDeviceAddress *src_vas = src.heap->raw_va_aux_buffer.host_ptr;
+         VkDeviceAddress *dst_vas = dst.heap->raw_va_aux_buffer.host_ptr;
+-        memcpy(dst_vas + dst.offset, src_vas + src.offset, sizeof(*dst_vas) * count);
++        vkd3d_memcpy_inline(dst_vas + dst.offset, src_vas + src.offset, sizeof(*dst_vas) * count);
+ 
+         if (device->bindless_state.flags & (VKD3D_TYPED_OFFSET_BUFFER | VKD3D_SSBO_OFFSET_BUFFER))
+         {
+             const struct vkd3d_bound_buffer_range *src_ranges = src.heap->buffer_ranges.host_ptr;
+             struct vkd3d_bound_buffer_range *dst_ranges = dst.heap->buffer_ranges.host_ptr;
+-            memcpy(dst_ranges + dst.offset, src_ranges + src.offset, sizeof(*dst_ranges) * count);
++            vkd3d_memcpy_inline(dst_ranges + dst.offset, src_ranges + src.offset, sizeof(*dst_ranges) * count);
+         }
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
