@@ -1,0 +1,36 @@
+diff --git a/sm3/sm3_converter.h b/sm3/sm3_converter.h
+index 19f8a7e..cdbfe84 100644
+--- a/sm3/sm3_converter.h
++++ b/sm3/sm3_converter.h
+@@ -46,6 +46,8 @@ public:
+      *  texture type rather than the shader declaration in Shader Model 2
+      *  and 3 content. Must only be enabled for pixel shaders. */
+     bool forceDynamicTextureType = false;
++    /** Use separate image bindings for each legacy texture type. */
++    bool deAliasedSamplers = false;
+   };
+ 
+   Converter(util::ByteReader code, const Options& options);
+diff --git a/sm3/sm3_resources.cpp b/sm3/sm3_resources.cpp
+index af1c591..cd9a7dd 100644
+--- a/sm3/sm3_resources.cpp
++++ b/sm3/sm3_resources.cpp
+@@ -406,8 +406,17 @@ ir::SsaDef ResourceMap::dclSampler(ir::Builder& builder, uint32_t samplerIndex)
+ 
+ 
+ ir::SsaDef ResourceMap::dclTexture(ir::Builder& builder, SamplerStateType textureType, uint32_t samplerIndex) {
++  uint32_t binding = samplerIndex;
++  if (m_converter.getOptions().deAliasedSamplers) {
++    // Keep the binding order stable with the D3D9 fixed-function shader:
++    // 2D, cube, 3D.
++    uint32_t variant = textureType == SamplerStateType::eTextureCube ? 1u
++      : textureType == SamplerStateType::eTexture3D ? 2u : 0u;
++    binding = samplerIndex * uint32_t(SamplerStateType::eCount) + variant;
++  }
++
+   auto textureDef = builder.add(ir::Op::DclSrv(ir::ScalarType::eF32, m_converter.getEntryPoint(), TextureBindingsRegSpace,
+-    samplerIndex, 1u, resourceKindFromTextureType(textureTypeFromSamplerStateType(textureType))));
++    binding, 1u, resourceKindFromTextureType(textureTypeFromSamplerStateType(textureType))));
+ 
+   if (m_converter.m_options.includeDebugNames) {
+     const ConstantInfo* ctabEntry = nullptr;

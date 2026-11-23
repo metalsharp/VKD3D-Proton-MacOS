@@ -1,0 +1,123 @@
+name: Build DXVK-MacOS cross targets
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_MINGW_VERSION: '20261020'
+
+jobs:
+  build-cross:
+    name: Build MinGW x86_64 and i386
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++-mingw-w64-x86-64 \
+            g++-mingw-w64-i686 \
+            gcc-mingw-w64-x86-64 \
+            gcc-mingw-w64-i686 \
+            glslang-tools \
+            meson \
+            ninja-build \
+            python3
+
+      - name: Apply MoltenVK shader compiler patch
+        run: |
+          git -C subprojects/dxbc-spirv apply ../../patches/dxbc-spirv-moltenvk.patch
+          git -C subprojects/dxbc-spirv diff --check
+
+      - name: Build x86_64 Windows lane
+        run: |
+          meson setup build.x86_64 \
+            --cross-file build-win64.txt \
+            --buildtype release \
+            --wrap-mode nodownload \
+            --prefix "$PWD/stage/x86_64"
+          meson compile -C build.x86_64
+          meson install -C build.x86_64
+
+      - name: Build i386 Windows lane
+        run: |
+          meson setup build.i386 \
+            --cross-file build-win32.txt \
+            --buildtype release \
+            --wrap-mode nodownload \
+            --prefix "$PWD/stage/i386"
+          meson compile -C build.i386
+          meson install -C build.i386
+
+      - name: Verify PE architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          file stage/x86_64/x86_64-windows/*.dll
+          file stage/i386/i386-windows/*.dll
+          ! file stage/x86_64/x86_64-windows/*.dll | grep -E 'ARM|80386'
+          ! file stage/i386/i386-windows/*.dll | grep -E 'ARM|x86-64'
+
+      - name: Upload cross-build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-macos-cross-${{ github.sha }}
+          path: stage/
+          if-no-files-found: error
+
+  build-arm64x:
+    name: Build ARM64X (MetalSharp Wine)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y glslang-tools meson ninja-build python3
+          curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Apply MoltenVK shader compiler patch
+        run: |
+          git -C subprojects/dxbc-spirv apply ../../patches/dxbc-spirv-moltenvk.patch
+          git -C subprojects/dxbc-spirv diff --check
+
+      - name: Build ARM64X lane
+        run: |
+          meson setup build.arm64x \
+            --cross-file build-arm64x.txt \
+            --buildtype release \
+            --wrap-mode nodownload \
+            --prefix "$PWD/stage/arm64x"
+          meson compile -C build.arm64x
+          meson install -C build.arm64x
+
+      - name: Verify ARM64X
+        run: python3 tools/ci/check-arm64x.py stage/arm64x/*/*.dll
+
+      - name: Upload ARM64X artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-macos-arm64x-${{ github.sha }}
+          path: stage/arm64x/
+          if-no-files-found: error

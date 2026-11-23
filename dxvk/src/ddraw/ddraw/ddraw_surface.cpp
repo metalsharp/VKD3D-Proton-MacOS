@@ -1,0 +1,1361 @@
+#include "ddraw_surface.h"
+
+#include "../d3d_common_device.h"
+
+#include "../ddraw_gamma.h"
+#include "../ddraw2/ddraw2_surface.h"
+#include "../ddraw2/ddraw3_surface.h"
+#include "../ddraw4/ddraw4_surface.h"
+#include "../ddraw7/ddraw7_surface.h"
+
+#include "../d3d3/d3d3_device.h"
+#include "../d3d3/d3d3_interface.h"
+
+namespace dxvk {
+
+  DDrawSurface::DDrawSurface(
+        DDrawCommonSurface* commonSurf,
+        Com<IDirectDrawSurface>&& surfProxy,
+        DDrawInterface* pParent,
+        DDrawSurface* pParentSurf,
+        bool isChildObject)
+    : DDrawWrappedObject<DDrawInterface, IDirectDrawSurface>(pParent, std::move(surfProxy))
+    , m_isChildObject ( isChildObject )
+    , m_commonSurf ( commonSurf )
+    , m_parentSurf ( pParentSurf ) {
+    if (m_parent != nullptr) {
+      m_commonIntf = m_parent->GetCommonInterface();
+    } else if (m_parentSurf != nullptr) {
+      m_commonIntf = m_parentSurf->GetCommonInterface();
+    } else if (m_commonSurf != nullptr) {
+      m_commonIntf = m_commonSurf->GetCommonInterface();
+    } else {
+      throw DxvkError("DDrawSurface: ERROR! Failed to retrieve the common interface!");
+    }
+
+    if (m_commonSurf == nullptr) {
+      m_commonSurf = new DDrawCommonSurface(m_commonIntf);
+
+      // Retrieve and cache the proxy surface desc
+      DDSURFACEDESC desc;
+      desc.dwSize = sizeof(DDSURFACEDESC);
+      m_proxy->GetSurfaceDesc(&desc);
+
+      m_commonSurf->SetDesc(desc);
+    }
+
+    // Retrieve and cache the next surface in a flippable chain
+    if (unlikely(m_commonSurf->IsFlippable() && !m_commonSurf->IsBackBuffer())) {
+      IDirectDrawSurface* nextFlippable = nullptr;
+      EnumAttachedSurfaces(&nextFlippable, ListBackBufferSurfacesCallback);
+      m_nextFlippable = reinterpret_cast<DDrawSurface*>(nextFlippable);
+      if (likely(m_nextFlippable != nullptr)) {
+        // The call to EnumAttachedSurfaces has incremented the public ref
+        m_nextFlippable->Release();
+        //Logger::debug("DDrawSurface: Retrieved the next swapchain surface");
+      }
+    }
+
+    DDrawInterface* ddrawIntf = m_commonIntf->GetDDInterface();
+    // Create an offscreen plain shadow surface in system memory, if needed
+    if (unlikely(m_commonSurf->IsPrimarySurface() &&
+                 m_commonIntf->GetOptions()->forceLegacyPresent &&
+                 ddrawIntf != nullptr &&
+                !m_commonSurf->IsPalettedFormat())) {
+      const DDSURFACEDESC2* surfaceDesc = m_commonSurf->GetDesc();
+
+      DDSURFACEDESC shadowDesc = { };
+      shadowDesc.dwSize = sizeof(DDSURFACEDESC);
+      shadowDesc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+      shadowDesc.dwWidth = surfaceDesc->dwWidth;
+      shadowDesc.dwHeight = surfaceDesc->dwHeight;
+      shadowDesc.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_3DDEVICE;
+
+      // Creating the shadow surface in system memory speeds up our own uploads/downloads,
+      // however it might cause stuttering or regress performance if WineD3D performs
+      // optimized GPU-to-GPU blitting on the primary surface, e.g. Star Trek: Armada
+      if (likely(m_commonIntf->GetOptions()->systemMemoryShadow))
+        shadowDesc.ddsCaps.dwCaps |= DDSCAPS_SYSTEMMEMORY;
+
+      Com<IDirectDrawSurface> ddrawSurfaceShadow;
+      HRESULT hr = ddrawIntf->GetProxied()->CreateSurface(&shadowDesc, &ddrawSurfaceShadow, NULL);
+      if (unlikely(FAILED(hr))) {
+        Logger::warn("DDrawSurface: Failed to create shadow surface");
+      } else {
+        DDrawCommonSurface* commonShadowSurf = m_commonSurf->GetCommonShadowSurface();
+        m_shadowSurf = new DDrawSurface(commonShadowSurf, std::move(ddrawSurfaceShadow),
+                                        ddrawIntf, nullptr, false);
+        if (commonShadowSurf == nullptr)
+          m_commonSurf->SetCommonShadowSurface(m_shadowSurf->GetCommonSurface());
+      }
+    }
+
+    DDrawCommonInterface::AddWrappedSurface(this);
+
+    m_commonSurf->SetDDSurface(this);
+
+    if (m_parentSurf != nullptr
+     && m_parentSurf->GetCommonSurface()->IsBackBufferOrFlippable()) {
+      const uint32_t index = m_parentSurf->GetCommonSurface()->GetBackBufferIndex();
+      m_commonSurf->IncrementBackBufferIndex(index);
+    }
+
+    if (m_parent != nullptr && m_isChildObject)
+      m_parent->AddRef();
+
+    //Logger::debug(str::format("DDrawSurface: Created a new surface nr. [[1-", std::hex, this, "]]"));
+
+    if (m_commonSurf->GetOrigin() == nullptr) {
+      m_commonSurf->SetOrigin(this);
+      m_commonSurf->SetIsAttached(m_parentSurf != nullptr);
+      //m_commonSurf->ListSurfaceDetails();
+    }
+  }
+
+  DDrawSurface::~DDrawSurface() {
+    if (m_commonSurf->GetOrigin() == this)
+      m_commonSurf->SetOrigin(nullptr);
+
+    // Clear the cached depth stencil on the parent if matched
+    if (unlikely(m_parentSurf != nullptr && m_commonSurf->IsDepthStencil()
+      && m_parentSurf->GetAttachedDepthStencil() == this)) {
+      m_parentSurf->SetAttachedDepthStencil(nullptr);
+    }
+
+    DDrawCommonInterface::RemoveWrappedSurface(this);
+
+    if (m_depthStencil != nullptr)
+      m_depthStencil->SetParentSurface(nullptr);
+
+    // Release all public references on all attached surfaces
+    for (auto& attachedSurface : m_attachedSurfaces) {
+      attachedSurface.second->SetParentSurface(nullptr);
+      uint32_t attachedRef = 0u;
+      do {
+        attachedRef = attachedSurface.second->Release();
+      } while (attachedRef > 0);
+    }
+
+    if (m_parent != nullptr && m_isChildObject)
+      m_parent->Release();
+
+    m_commonSurf->SetDDSurface(nullptr);
+
+    //Logger::debug(str::format("DDrawSurface: Surface nr. [[1-", std::hex, this, "]] bites the dust"));
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::QueryInterface(REFIID riid, void** ppvObject) {
+    if (unlikely(ppvObject == nullptr))
+      return E_POINTER;
+
+    InitReturnPtr(ppvObject);
+
+    if (riid == __uuidof(IDirect3DTexture)) {
+      if (unlikely(m_texture3 == nullptr)) {
+        Com<IDirect3DTexture> ppvProxyObject;
+        HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+        if (unlikely(FAILED(hr)))
+          return hr;
+
+        m_texture3 = new D3D3Texture(m_texture5 != nullptr ? m_texture5->GetCommonTexture() : nullptr,
+                                     m_commonSurf.ptr(), std::move(ppvProxyObject), this);
+      }
+
+      *ppvObject = m_texture3.ref();
+
+      return S_OK;
+    }
+    if (riid == __uuidof(IDirect3DTexture2)) {
+      if (unlikely(m_texture5 == nullptr)) {
+        Com<IDirect3DTexture2> ppvProxyObject;
+        HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+        if (unlikely(FAILED(hr)))
+          return hr;
+
+        // If any games query for IDirect3DTexture2 from IDirectDrawSurface, they will need
+        // a valid IDirectDrawSurface4 object in order to use IDirect3DTexture2 with a D3D6
+        // device, or when calling IDirect3DTexture2::Load, which is a known use in D3D5/3.
+        // Query for one and cache it, to keep it alive as long as needed.
+        //
+        // Note: Doing only this for The Sims won't be enough as, for some reason,
+        // it goes out of its way to release the originating IDirectDrawSurface4
+        // object AFTER it queries for IDirect3DTexture2 from IDirectDrawSurface...
+        if (unlikely(m_commonSurf->GetDD4Surface() == nullptr)) {
+          Com<IDirectDrawSurface4> surface4ProxyObject;
+          HRESULT hr = m_proxy->QueryInterface(__uuidof(IDirectDrawSurface4),
+                                               reinterpret_cast<void**>(&surface4ProxyObject));
+          if (unlikely(FAILED(hr)))
+            return hr;
+
+          try {
+            m_surface4 = new DDraw4Surface(m_commonSurf.ptr(), std::move(surface4ProxyObject),
+                                           m_commonIntf->GetDD4Interface(), nullptr, false);
+          } catch (const DxvkError& e) {
+            Logger::err(e.message());
+            return E_NOINTERFACE;
+          }
+        }
+
+        m_texture5 = new D3D5Texture(m_texture3 != nullptr ? m_texture3->GetCommonTexture() : nullptr,
+                                     m_commonSurf.ptr(), std::move(ppvProxyObject), this);
+      }
+
+      *ppvObject = m_texture5.ref();
+
+      return S_OK;
+    }
+    // Wrap IDirectDrawGammaControl, to potentially ignore application set gamma ramps
+    if (riid == __uuidof(IDirectDrawGammaControl)) {
+      void* gammaControlProxiedVoid = nullptr;
+      // This can never reasonably fail
+      m_proxy->QueryInterface(__uuidof(IDirectDrawGammaControl), &gammaControlProxiedVoid);
+      Com<IDirectDrawGammaControl> gammaControlProxied = static_cast<IDirectDrawGammaControl*>(gammaControlProxiedVoid);
+      *ppvObject = ref(new DDrawGammaControl(m_commonSurf.ptr(), std::move(gammaControlProxied), this));
+      return S_OK;
+    }
+    if (unlikely(riid == __uuidof(IDirectDrawColorControl))) {
+      return E_NOINTERFACE;
+    }
+    // The standard way of creating a new D3D3 device. Outside of RAMP, MMX, RGB and HAL,
+    // some applications (e.g. Dark Rift) query for Wine's advertised custom device IID.
+    if (riid == IID_IDirect3DHALDevice  || riid == IID_IDirect3DRGBDevice  ||
+        riid == IID_IDirect3DRampDevice || riid == IID_WineD3DDevice) {
+      // Surfaces which have been queried from an IDirectDrawSurface7
+      // object are unable to create a D3D3 device on this legacy path
+      if (unlikely(m_commonSurf->GetDD7Surface() == m_commonSurf->GetOrigin()))
+        return E_NOINTERFACE;
+
+      // Tests show that a surface can't be used to create more than a device
+      // at a time, and esentially that the surface IS the device in such cases...
+      if (m_device3 == nullptr) {
+        HRESULT hr = CreateDeviceInternal(riid, ppvObject);
+        if (unlikely(FAILED(hr)))
+          return E_NOINTERFACE;
+      // TODO: What happens when a device with a different riid than the existing one
+      // is requested on the same surface? Is the old one released and a new one created?
+      // We could potentially handle such corner cases transparently, by recreating only
+      // the D3D9 device as per the new request and binding it to the same object, though
+      // I don't actually expect this to be much of a problem in practice.
+      } else if (unlikely(m_device3->GetCommonD3DDevice()->GetDeviceGUID() != riid)) {
+        Logger::warn("DDrawSurface::QueryInterface: Query with mismatched device GUID");
+      }
+
+      *ppvObject = m_device3.ref();
+
+      return S_OK;
+    }
+    if (riid == __uuidof(IDirectDrawSurface2)) {
+      if (m_commonSurf->GetDD2Surface() != nullptr)
+        return m_commonSurf->GetDD2Surface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDrawSurface2> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      try {
+        *ppvObject = ref(new DDraw2Surface(m_commonSurf.ptr(), std::move(ppvProxyObject),
+                                           this, nullptr));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return E_NOINTERFACE;
+      }
+
+      return S_OK;
+    }
+    if (riid == __uuidof(IDirectDrawSurface3)) {
+      if (m_commonSurf->GetDD3Surface() != nullptr)
+        return m_commonSurf->GetDD3Surface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDrawSurface3> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      try {
+        *ppvObject = ref(new DDraw3Surface(m_commonSurf.ptr(), std::move(ppvProxyObject),
+                                           this, nullptr));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return E_NOINTERFACE;
+      }
+
+      return S_OK;
+    }
+    // Some applications check the supported API level by querying the various newer surface GUIDs...
+    if (unlikely(riid == __uuidof(IDirectDrawSurface4))) {
+      if (m_commonSurf->GetDD4Surface() != nullptr)
+        return m_commonSurf->GetDD4Surface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDrawSurface4> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      Com<DDraw4Surface> surface4;
+      try {
+        surface4 = new DDraw4Surface(m_commonSurf.ptr(), std::move(ppvProxyObject),
+                                     m_commonIntf->GetDD4Interface(), nullptr, false);
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return E_NOINTERFACE;
+      }
+
+      // Dungeon Keeper 2 creates and attaches a IDirectDrawSurface4 depth stencil,
+      // but then keeps using clears from the IDirectDrawSurface object...
+      if (m_depthStencil != nullptr) {
+        Com<IDirectDrawSurface4> dsProxyObject;
+        hr = m_depthStencil->GetProxied()->QueryInterface(riid, reinterpret_cast<void**>(&dsProxyObject));
+        if (unlikely(FAILED(hr)))
+          return hr;
+
+        Com<DDraw4Surface> depthStencil4;
+        try {
+          depthStencil4 = new DDraw4Surface(m_depthStencil->GetCommonSurface(), std::move(dsProxyObject),
+                                            m_commonIntf->GetDD4Interface(), nullptr, false);
+        } catch (const DxvkError& e) {
+          Logger::err(e.message());
+          return E_NOINTERFACE;
+        }
+
+        surface4->SetAttachedDepthStencil(std::move(depthStencil4));
+      }
+
+      *ppvObject = surface4.ref();
+
+      return S_OK;
+    }
+    if (unlikely(riid == __uuidof(IDirectDrawSurface7))) {
+      if (m_commonSurf->GetDD7Surface() != nullptr)
+        return m_commonSurf->GetDD7Surface()->QueryInterface(riid, ppvObject);
+
+      Com<IDirectDrawSurface7> ppvProxyObject;
+      HRESULT hr = m_proxy->QueryInterface(riid, reinterpret_cast<void**>(&ppvProxyObject));
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      try {
+        *ppvObject = ref(new DDraw7Surface(m_commonSurf.ptr(), std::move(ppvProxyObject),
+                                           m_commonIntf->GetDD7Interface(), nullptr, false));
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        return E_NOINTERFACE;
+      }
+
+      return S_OK;
+    }
+    // Some games are known to query the clipper from the surface,
+    // though that won't work and GetClipper exists anyway...
+    if (unlikely(riid == __uuidof(IDirectDrawClipper))) {
+      return E_NOINTERFACE;
+    }
+
+    if (likely(riid == __uuidof(IUnknown)
+            || riid == __uuidof(IDirectDrawSurface))) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    Logger::warn("DDrawSurface::QueryInterface: Unknown interface query");
+    Logger::warn(str::format(riid));
+    return E_NOINTERFACE;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::AddAttachedSurface(LPDIRECTDRAWSURFACE lpDDSAttachedSurface) {
+    if (unlikely(lpDDSAttachedSurface == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(!DDrawCommonInterface::IsWrappedSurface(lpDDSAttachedSurface))) {
+      Logger::err("DDrawSurface::AddAttachedSurface: Received an unwrapped surface");
+      return DDERR_CANNOTATTACHSURFACE;
+    }
+
+    DDrawSurface* attachedSurf = static_cast<DDrawSurface*>(lpDDSAttachedSurface);
+
+    HRESULT hr = m_proxy->AddAttachedSurface(attachedSurf->GetProxied());
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    attachedSurf->SetParentSurface(this);
+    attachedSurf->GetCommonSurface()->RefreshSurfaceDescripton(false);
+
+    if (likely(attachedSurf->GetCommonSurface()->IsDepthStencil())) {
+      m_depthStencil = attachedSurf;
+    // If a flippable surface is attached, mark it as the next flippable surface
+    } else if (unlikely(attachedSurf->GetCommonSurface()->IsBackBufferOrFlippable())) {
+      m_nextFlippable = attachedSurf;
+    }
+
+    m_commonSurf->RefreshSurfaceDescripton(false);
+
+    return DD_OK;
+  }
+
+  // Docs: "This method is used for the software implementation.
+  // It is not needed if the overlay support is provided by the hardware."
+  HRESULT STDMETHODCALLTYPE DDrawSurface::AddOverlayDirtyRect(LPRECT lpRect) {
+    return DDERR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwFlags, LPDDBLTFX lpDDBltFx) {
+    if (unlikely(lpDDSrcSurface != nullptr
+             && !DDrawCommonInterface::IsWrappedSurface(lpDDSrcSurface))) {
+      Logger::err("DDrawSurface::Blt: Received an unwrapped source surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    DDrawSurface* sourceSurface = static_cast<DDrawSurface*>(lpDDSrcSurface);
+
+    // Write back any dirty surface data from bound D3D9 back buffers or
+    // depth stencils, for both the source surface and the current surface
+    if (likely(sourceSurface != nullptr)) {
+      sourceSurface->DownloadSurfaceData();
+    }
+    // No point in downloading the destination surface if it's going to be overwritten
+    if ((lpDDBltFx == nullptr || (dwFlags & DDBLT_COLORFILL) || (dwFlags & DDBLT_DEPTHFILL)) &&
+         m_commonSurf->IsFullSurfaceLock(lpDestRect, nullptr)) {
+      m_commonSurf->UnDirtyD3D9Surface();
+    } else {
+      DownloadSurfaceData();
+    }
+
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    if (likely(d3d9Device != nullptr)) {
+      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+
+      // Windowed mode presentation path
+      if (!exclusiveMode && sourceSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+        // TODO: Handle this properly, not by uploading the RT again
+        DDrawSurface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget();
+
+        if (sourceSurface == renderTarget) {
+          renderTarget->InitializeOrUploadD3D9();
+          d3d9Device->Present(NULL, NULL, NULL, NULL);
+          return DD_OK;
+        }
+      }
+    }
+
+    HRESULT hr = GetProxiedOrShadow()->Blt(lpDestRect,
+                                           sourceSurface != nullptr ? sourceSurface->GetProxiedOrShadow() : nullptr,
+                                           lpSrcRect, dwFlags, lpDDBltFx);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->DirtyDDrawSurface();
+
+    if (m_shadowSurf != nullptr && d3d9Device != nullptr) {
+      const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+      const bool shouldPresent = d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Auto ?
+                                !m_commonSurf->GetCommonD3DDevice()->IsInScene() :
+                                 d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Strict ?
+                                 false : true;
+      if (shouldPresent) {
+        InitializeOrUploadD3D9();
+        const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
+        d3d9Device->Present(NULL, presentRect, NULL, NULL);
+      }
+    }
+
+    return DD_OK;
+  }
+
+  // Docs: "The IDirectDrawSurface::BltBatch method is not currently implemented."
+  HRESULT STDMETHODCALLTYPE DDrawSurface::BltBatch(LPDDBLTBATCH lpDDBltBatch, DWORD dwCount, DWORD dwFlags) {
+    return DDERR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::BltFast(DWORD dwX, DWORD dwY, LPDIRECTDRAWSURFACE lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwTrans) {
+    if (unlikely(lpDDSrcSurface != nullptr
+             && !DDrawCommonInterface::IsWrappedSurface(lpDDSrcSurface))) {
+      Logger::err("DDrawSurface::BltFast: Received an unwrapped source surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    DDrawSurface* sourceSurface = static_cast<DDrawSurface*>(lpDDSrcSurface);
+
+    const RECT* sourceFullSurfaceRect = nullptr;
+    // Write back any dirty surface data from bound D3D9 back buffers or
+    // depth stencils, for both the source surface and the current surface
+    if (likely(sourceSurface != nullptr)) {
+      sourceSurface->DownloadSurfaceData();
+      sourceFullSurfaceRect = sourceSurface->GetCommonSurface()->GetFullSurfaceRect();
+    }
+    // No point in downloading the destination surface if it's going to be overwritten
+    if (dwX == 0 && dwY == 0 && (dwTrans & DDBLTFAST_NOCOLORKEY) &&
+        m_commonSurf->IsFullSurfaceLock(lpSrcRect, sourceFullSurfaceRect)) {
+      m_commonSurf->UnDirtyD3D9Surface();
+    } else {
+      DownloadSurfaceData();
+    }
+
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    if (likely(d3d9Device != nullptr)) {
+      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+
+      // Windowed mode presentation path
+      if (!exclusiveMode && sourceSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+        // TODO: Handle this properly, not by uploading the RT again
+        DDrawSurface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget();
+
+        if (sourceSurface == renderTarget) {
+          renderTarget->InitializeOrUploadD3D9();
+          d3d9Device->Present(NULL, NULL, NULL, NULL);
+          return DD_OK;
+        }
+      }
+    }
+
+    HRESULT hr = GetProxiedOrShadow()->BltFast(dwX, dwY,
+                                               sourceSurface != nullptr ? sourceSurface->GetProxiedOrShadow() : nullptr,
+                                               lpSrcRect, dwTrans);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->DirtyDDrawSurface();
+
+    if (m_shadowSurf != nullptr && d3d9Device != nullptr) {
+      const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+      const bool shouldPresent = d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Auto ?
+                                !m_commonSurf->GetCommonD3DDevice()->IsInScene() :
+                                 d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Strict ?
+                                 false : true;
+      if (shouldPresent) {
+        InitializeOrUploadD3D9();
+        const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
+        d3d9Device->Present(NULL, presentRect, NULL, NULL);
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::DeleteAttachedSurface(DWORD dwFlags, LPDIRECTDRAWSURFACE lpDDSAttachedSurface) {
+    if (unlikely(lpDDSAttachedSurface != nullptr
+             && !DDrawCommonInterface::IsWrappedSurface(lpDDSAttachedSurface))) {
+      Logger::err("DDrawSurface::DeleteAttachedSurface: Received an unwrapped surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    DDrawSurface* attachedSurf = static_cast<DDrawSurface*>(lpDDSAttachedSurface);
+
+    // If lpDDSAttachedSurface is NULL, then all surfaces are detached
+    if (attachedSurf == nullptr) {
+      HRESULT hr = m_proxy->DeleteAttachedSurface(dwFlags, nullptr);
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      // By alterning the elements of the swapchain, the flags associated with the attached surface may change
+      if (m_nextFlippable != nullptr)
+        m_nextFlippable->GetCommonSurface()->RefreshSurfaceDescripton(false);
+
+      m_depthStencil  = nullptr;
+      m_nextFlippable = nullptr;
+
+      // By alterning the elements of the swapchain, the flags associated with this surface may change
+      m_commonSurf->RefreshSurfaceDescripton(false);
+
+      return DD_OK;
+    }
+
+    HRESULT hr = m_proxy->DeleteAttachedSurface(dwFlags, attachedSurf->GetProxied());
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    attachedSurf->SetParentSurface(nullptr);
+    // By alterning the elements of the swapchain, the flags associated with the attached surface may change
+    attachedSurf->GetCommonSurface()->RefreshSurfaceDescripton(false);
+
+    if (likely(m_depthStencil == attachedSurf)) {
+      m_depthStencil = nullptr;
+    // Clear the next flippable surface or flippable surface detachment
+    } else if (unlikely(m_nextFlippable == attachedSurf)) {
+      m_nextFlippable = nullptr;
+    }
+
+    // By alterning the elements of the swapchain, the flags associated with this surface may change
+    m_commonSurf->RefreshSurfaceDescripton(false);
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::EnumAttachedSurfaces(LPVOID lpContext, LPDDENUMSURFACESCALLBACK lpEnumSurfacesCallback) {
+    if (unlikely(lpEnumSurfacesCallback == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    std::vector<AttachedSurface> attachedSurfaces;
+    // Enumerate all attached surfaces from the underlying DDraw implementation
+    HRESULT hr = m_proxy->EnumAttachedSurfaces(reinterpret_cast<void*>(&attachedSurfaces), EnumAttachedSurfacesCallback);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    hr = DDENUMRET_OK;
+
+    // Wrap surfaces as needed and perform the actual callback the application is requesting
+    for (auto& attachedSurface : attachedSurfaces) {
+      if (likely(hr == DDENUMRET_OK)) {
+        try {
+          auto attachedSurfaceIter = m_attachedSurfaces.find(attachedSurface.surface);
+          if (unlikely(attachedSurfaceIter == m_attachedSurfaces.end())) {
+            // Return the already attached depth surface if it exists
+            if (unlikely(m_depthStencil != nullptr && attachedSurface.surface == m_depthStencil->GetProxied())) {
+              hr = lpEnumSurfacesCallback(m_depthStencil.ref(), &attachedSurface.desc, lpContext);
+            } else {
+              Com<IDirectDrawSurface> surface = attachedSurface.surface;
+              Com<DDrawSurface> ddrawSurface = new DDrawSurface(nullptr, std::move(surface),
+                                                                m_commonIntf->GetDDInterface(), this, false);
+              m_attachedSurfaces.emplace(std::piecewise_construct,
+                                         std::forward_as_tuple(ddrawSurface->GetProxied()),
+                                         std::forward_as_tuple(ddrawSurface.ref()));
+              hr = lpEnumSurfacesCallback(ddrawSurface.ref(), &attachedSurface.desc, lpContext);
+            }
+          } else {
+            hr = lpEnumSurfacesCallback(attachedSurfaceIter->second.ref(), &attachedSurface.desc, lpContext);
+          }
+        } catch (const DxvkError& e) {
+          Logger::err(e.message());
+          return DDERR_GENERIC;
+        }
+      }
+
+      if (likely(attachedSurface.surface != nullptr)) {
+        // Release the refcount which was added during proxied callback enumeration
+        attachedSurface.surface->Release();
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::EnumOverlayZOrders(DWORD dwFlags, LPVOID lpContext, LPDDENUMSURFACESCALLBACK lpfnCallback) {
+    return m_proxy->EnumOverlayZOrders(dwFlags, lpContext, lpfnCallback);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Flip(LPDIRECTDRAWSURFACE lpDDSurfaceTargetOverride, DWORD dwFlags) {
+    if (unlikely(lpDDSurfaceTargetOverride != nullptr
+             && !DDrawCommonInterface::IsWrappedSurface(lpDDSurfaceTargetOverride))) {
+      Logger::err("DDrawSurface::Flip: Received an unwrapped override surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    DDrawSurface* overrideSurf = static_cast<DDrawSurface*>(lpDDSurfaceTargetOverride);
+
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    // Overlays can have odd video formats which DXVK doesn't support for RT
+    // use, so let DDraw present in case the flipped surface is an overlay
+    if (likely(d3d9Device != nullptr && !m_commonSurf->IsOverlay())) {
+      // Lost surfaces are not flippable
+      HRESULT hr = m_proxy->IsLost();
+      if (unlikely(FAILED(hr)))
+        return hr;
+
+      if (unlikely(!(m_commonSurf->IsFrontBuffer() || m_commonSurf->IsBackBufferOrFlippable())))
+        return DDERR_NOTFLIPPABLE;
+
+      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+
+      // Non-exclusive mode validations
+      if (unlikely(m_commonSurf->IsPrimarySurface() && !exclusiveMode))
+        return DDERR_NOEXCLUSIVEMODE;
+
+      // Exclusive mode validations
+      if (unlikely(m_commonSurf->IsBackBufferOrFlippable() && exclusiveMode))
+        return DDERR_NOTFLIPPABLE;
+
+      if (unlikely(overrideSurf != nullptr && !overrideSurf->GetCommonSurface()->IsBackBufferOrFlippable()))
+        return DDERR_NOTFLIPPABLE;
+
+      D3DCommonDevice* commonD3DDevice = m_commonSurf->GetCommonD3DDevice();
+
+      if (unlikely(!m_commonIntf->GetWaitForVBlank())) {
+        Logger::info("DDrawSurface::Flip: Switching to D3DPRESENT_INTERVAL_DEFAULT for presentation");
+        IDxvkLegacyD3DDeviceBridge* deviceBridge = commonD3DDevice->GetD3D9DeviceBridge();
+        deviceBridge->UpdatePresentInterval(D3DPRESENT_INTERVAL_DEFAULT);
+        m_commonIntf->SetWaitForVBlank(true);
+      }
+
+      const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+      // Workaround for The Sims/other games flipping a different
+      // swapchain than the one set on the current D3D device
+      if (unlikely(d3dOptions->forceRTFlip && m_commonSurf->IsPrimarySurface())) {
+        m_nextFlippable = commonD3DDevice->GetCurrentRenderTarget();
+      }
+
+      if (likely(m_nextFlippable != nullptr)) {
+        if (d3dOptions->emulateFrontBuffer) {
+          InitializeOrUploadD3D9();
+          // Workaround for primary surface image retention issues
+          if (m_shadowSurf != nullptr && m_nextFlippable->GetCommonSurface()->IsDDrawSurfaceDirty())
+            GetProxiedOrShadow()->BltFast(0, 0, m_nextFlippable->GetProxiedOrShadow(), nullptr, DDBLTFAST_NOCOLORKEY);
+        }
+        m_nextFlippable->InitializeOrUploadD3D9();
+      } else {
+        InitializeOrUploadD3D9();
+      }
+
+      if (unlikely(exclusiveMode && d3dOptions->forceWindowResize))
+        commonD3DDevice->GetD3D9DeviceBridge()->UpdateFullScreenWindowSize();
+
+      const RECT* presentRect = commonD3DDevice->GetPresentRect();
+      d3d9Device->Present(NULL, presentRect, NULL, NULL);
+
+    } else {
+      HRESULT hr = m_proxy->Flip(overrideSurf != nullptr ? overrideSurf->GetProxied() : nullptr, dwFlags);
+      if (unlikely(FAILED(hr)))
+        return hr;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetAttachedSurface(LPDDSCAPS lpDDSCaps, LPDIRECTDRAWSURFACE *lplpDDAttachedSurface) {
+    if (unlikely(lpDDSCaps == nullptr || lplpDDAttachedSurface == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDAttachedSurface);
+
+    Com<IDirectDrawSurface> surface;
+    HRESULT hr = m_proxy->GetAttachedSurface(lpDDSCaps, &surface);
+    // These are rather common, as some games query expecting to get nothing in return, for
+    // example it's a common use case to query the mip attach chain until nothing is returned
+    if (FAILED(hr))
+      return hr;
+
+    try {
+      auto attachedSurfaceIter = m_attachedSurfaces.find(surface.ptr());
+      if (unlikely(attachedSurfaceIter == m_attachedSurfaces.end())) {
+        // Return the already attached depth surface if it exists
+        if (unlikely(m_depthStencil != nullptr && surface.ptr() == m_depthStencil->GetProxied())) {
+          *lplpDDAttachedSurface = m_depthStencil.ref();
+        } else {
+          Com<DDrawSurface> ddrawSurface = new DDrawSurface(nullptr, std::move(surface),
+                                                            m_commonIntf->GetDDInterface(), this, false);
+          m_attachedSurfaces.emplace(std::piecewise_construct,
+                                     std::forward_as_tuple(ddrawSurface->GetProxied()),
+                                     std::forward_as_tuple(ddrawSurface.ref()));
+          *lplpDDAttachedSurface = ddrawSurface.ref();
+        }
+      } else {
+        *lplpDDAttachedSurface = attachedSurfaceIter->second.ref();
+      }
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return DDERR_GENERIC;
+    }
+
+    return DD_OK;
+  }
+
+  // Blitting can be done at any time and completes within its call frame
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetBltStatus(DWORD dwFlags) {
+    if (likely(dwFlags == DDGBS_CANBLT || dwFlags == DDGBS_ISBLTDONE))
+      return DD_OK;
+
+    return DDERR_INVALIDPARAMS;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetCaps(LPDDSCAPS lpDDSCaps) {
+    if (unlikely(lpDDSCaps == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    const DDSURFACEDESC2* surfaceDesc = m_commonSurf->GetDesc();
+    memcpy(lpDDSCaps, &surfaceDesc->ddsCaps, sizeof(DDSCAPS));
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetClipper(LPDIRECTDRAWCLIPPER *lplpDDClipper) {
+    if (unlikely(lplpDDClipper == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDClipper);
+
+    DDrawClipper* clipper = m_commonSurf->GetClipper();
+
+    if (unlikely(clipper == nullptr))
+      return DDERR_NOCLIPPERATTACHED;
+
+    *lplpDDClipper = ref(clipper);
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetColorKey(DWORD dwFlags, LPDDCOLORKEY lpDDColorKey) {
+    return m_proxy->GetColorKey(dwFlags, lpDDColorKey);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetDC(HDC *lphDC) {
+    // Direct D3D9 path which can sometimes be faster (and other times slower)
+    if (unlikely(m_commonIntf->GetOptions()->forceDCForwarding && m_commonSurf->IsInitialized())) {
+      InitializeOrUploadD3D9();
+
+      HRESULT hr = m_commonSurf->GetD3D9Surface()->GetDC(lphDC);
+      if (unlikely(FAILED(hr)))
+        return DDERR_INVALIDPARAMS;
+
+      return DD_OK;
+    }
+
+    // Write back any dirty surface data from bound D3D9 back buffers or depth stencils
+    DownloadSurfaceData();
+
+    return GetProxiedOrShadow()->GetDC(lphDC);
+  }
+
+  // Flipping can be done at any time and completes within its call frame
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetFlipStatus(DWORD dwFlags) {
+    if (likely(dwFlags == DDGFS_CANFLIP || dwFlags == DDGFS_ISFLIPDONE))
+      return DD_OK;
+
+    return DDERR_INVALIDPARAMS;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetOverlayPosition(LPLONG lplX, LPLONG lplY) {
+    return m_proxy->GetOverlayPosition(lplX, lplY);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetPalette(LPDIRECTDRAWPALETTE *lplpDDPalette) {
+    if (unlikely(lplpDDPalette == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    InitReturnPtr(lplpDDPalette);
+
+    DDrawPalette* palette = m_commonSurf->GetPalette();
+
+    if (unlikely(palette == nullptr))
+      return DDERR_NOPALETTEATTACHED;
+
+    *lplpDDPalette = ref(palette);
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetPixelFormat(LPDDPIXELFORMAT lpDDPixelFormat) {
+    if (unlikely(lpDDPixelFormat == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    *lpDDPixelFormat = m_commonSurf->GetDesc()->ddpfPixelFormat;
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::GetSurfaceDesc(LPDDSURFACEDESC lpDDSurfaceDesc) {
+    if (unlikely(lpDDSurfaceDesc == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(lpDDSurfaceDesc->dwSize != sizeof(DDSURFACEDESC)))
+      return DDERR_INVALIDPARAMS;
+
+    const DDSURFACEDESC2* surfaceDesc = m_commonSurf->GetDesc();
+    // DDSURFACEDESC is aligned with DDSURFACEDESC2
+    memcpy(lpDDSurfaceDesc, surfaceDesc, sizeof(DDSURFACEDESC));
+    // Update the struct size to DDSURFACEDESC
+    lpDDSurfaceDesc->dwSize = sizeof(DDSURFACEDESC);
+
+    return DD_OK;
+  }
+
+  // According to the docs: "Because the DirectDrawSurface object is initialized
+  // when it's created, this method always returns DDERR_ALREADYINITIALIZED."
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Initialize(LPDIRECTDRAW lpDD, LPDDSURFACEDESC lpDDSurfaceDesc) {
+    return DDERR_ALREADYINITIALIZED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::IsLost() {
+    return m_proxy->IsLost();
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Lock(LPRECT lpDestRect, LPDDSURFACEDESC lpDDSurfaceDesc, DWORD dwFlags, HANDLE hEvent) {
+    // Write back any dirty surface data from bound D3D9 back buffers or depth stencils
+    DownloadSurfaceData();
+
+    HRESULT hr = GetProxiedOrShadow()->Lock(lpDestRect, lpDDSurfaceDesc, dwFlags, hEvent);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    // For single surface locks, track the READONLY flag in order to skip dirtying
+    // on Unlock(). Reset flag tracking in case of multiple simultaneous locks,
+    // which are technically possible but extremely rare in practice.
+    if (likely(!m_readOnlyLock)) {
+      m_readOnlyLock = (dwFlags & DDLOCK_READONLY) && !(dwFlags & DDLOCK_WRITEONLY);
+    } else {
+      m_readOnlyLock = false;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::ReleaseDC(HDC hDC) {
+    // Direct D3D9 path which can sometimes be faster (and other times slower)
+    if (unlikely(m_commonIntf->GetOptions()->forceDCForwarding && m_commonSurf->IsInitialized())) {
+      HRESULT hr = m_commonSurf->GetD3D9Surface()->ReleaseDC(hDC);
+      if (unlikely(FAILED(hr)))
+        return DDERR_INVALIDPARAMS;
+
+      m_commonSurf->DirtyD3D9Surface();
+
+      return DD_OK;
+    }
+
+    HRESULT hr = GetProxiedOrShadow()->ReleaseDC(hDC);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->DirtyDDrawSurface();
+
+    if (m_shadowSurf != nullptr) {
+      d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+      if (likely(d3d9Device != nullptr)) {
+        const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+        const bool shouldPresent = d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Auto ?
+                                  !m_commonSurf->GetCommonD3DDevice()->IsInScene() :
+                                   d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Strict ?
+                                   false : true;
+        if (shouldPresent) {
+          InitializeOrUploadD3D9();
+          const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
+          d3d9Device->Present(NULL, presentRect, NULL, NULL);
+        }
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Restore() {
+    return m_proxy->Restore();
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::SetClipper(LPDIRECTDRAWCLIPPER lpDDClipper) {
+    DDrawClipper* ddrawClipper = static_cast<DDrawClipper*>(lpDDClipper);
+
+    // A nullptr lpDDClipper gets the current clipper detached
+    HRESULT hr = m_proxy->SetClipper(ddrawClipper != nullptr ? ddrawClipper->GetProxied() : nullptr);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->SetClipper(ddrawClipper);
+
+    if (ddrawClipper != nullptr) {
+      // Retrieve a hWnd, if needed, during clipper attachment
+      HWND hWnd = nullptr;
+      ddrawClipper->GetProxied()->GetHWnd(&hWnd);
+      if (hWnd != nullptr)
+        m_commonIntf->SetHWND(hWnd);
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::SetColorKey(DWORD dwFlags, LPDDCOLORKEY lpDDColorKey) {
+    // The Combat Mission series of games set a color key which is
+    // outside the color range of the surface they are setting it on...
+    // clamp it to the surface color depth in that case. This doesn't
+    // appear to work well universally, however, so only apply when needed.
+    if (unlikely(m_commonIntf->GetOptions()->colorKeyMasking && lpDDColorKey != nullptr)) {
+      const uint8_t colorBitCount = m_commonSurf->GetColorBitCount();
+      if (likely(colorBitCount < 32u)) {
+        lpDDColorKey->dwColorSpaceLowValue  &= (1 << colorBitCount) - 1;
+        lpDDColorKey->dwColorSpaceHighValue &= (1 << colorBitCount) - 1;
+      }
+    }
+
+    HRESULT hr = m_proxy->SetColorKey(dwFlags, lpDDColorKey);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->RefreshSurfaceDescripton(false);
+
+    // Color keys are used during blits, so make sure the shadow surface is in sync
+    if (unlikely(m_shadowSurf != nullptr)) {
+      hr = m_shadowSurf->GetProxied()->SetColorKey(dwFlags, lpDDColorKey);
+      if (unlikely(FAILED(hr))) {
+        Logger::warn("DDrawSurface::SetColorKey: Failed to set shadow surface color key");
+      } else {
+        m_shadowSurf->GetCommonSurface()->RefreshSurfaceDescripton(false);
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::SetOverlayPosition(LONG lX, LONG lY) {
+    return m_proxy->SetOverlayPosition(lX, lY);
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::SetPalette(LPDIRECTDRAWPALETTE lpDDPalette) {
+    DownloadSurfaceData();
+
+    DDrawPalette* ddrawPalette = static_cast<DDrawPalette*>(lpDDPalette);
+
+    // A nullptr lpDDPalette gets the current palette detached
+    HRESULT hr = GetProxiedOrShadow()->SetPalette(ddrawPalette != nullptr ? ddrawPalette->GetProxied() : nullptr);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    m_commonSurf->SetPalette(ddrawPalette);
+    m_commonSurf->DirtyDDrawSurface();
+
+    // We don't currently support P8 primary surfaces
+    if (unlikely(m_shadowSurf != nullptr)) {
+      d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+      if (likely(d3d9Device != nullptr)) {
+        const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+        const bool shouldPresent = d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Auto ?
+                                  !m_commonSurf->GetCommonD3DDevice()->IsInScene() :
+                                   d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Strict ?
+                                   false : true;
+        if (shouldPresent) {
+          InitializeOrUploadD3D9();
+          const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
+          d3d9Device->Present(NULL, presentRect, NULL, NULL);
+        }
+      }
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::Unlock(LPVOID lpSurfaceData) {
+    HRESULT hr = GetProxiedOrShadow()->Unlock(lpSurfaceData);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    if (!m_readOnlyLock) {
+      m_commonSurf->DirtyDDrawSurface();
+
+      if (m_shadowSurf != nullptr) {
+        d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+        if (likely(d3d9Device != nullptr)) {
+          const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+          const bool shouldPresent = d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Auto ?
+                                    !m_commonSurf->GetCommonD3DDevice()->IsInScene() :
+                                     d3dOptions->legacyPresentGuard == D3DLegacyPresentGuard::Strict ?
+                                     false : true;
+          if (shouldPresent) {
+            InitializeOrUploadD3D9();
+            const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
+            d3d9Device->Present(NULL, presentRect, NULL, NULL);
+          }
+        }
+      }
+    } else {
+      m_readOnlyLock = false;
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::UpdateOverlay(LPRECT lpSrcRect, LPDIRECTDRAWSURFACE lpDDDestSurface, LPRECT lpDestRect, DWORD dwFlags, LPDDOVERLAYFX lpDDOverlayFx) {
+    if (unlikely(lpDDDestSurface == nullptr))
+      return DDERR_INVALIDPARAMS;
+
+    if (unlikely(!DDrawCommonInterface::IsWrappedSurface(lpDDDestSurface))) {
+      Logger::err("DDrawSurface::UpdateOverlay: Received an unwrapped surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    DDrawSurface* ddrawSurface = static_cast<DDrawSurface*>(lpDDDestSurface);
+    return m_proxy->UpdateOverlay(lpSrcRect, ddrawSurface->GetProxied(), lpDestRect, dwFlags, lpDDOverlayFx);
+  }
+
+  // Docs: "This method is for software emulation only; it does nothing if the hardware supports overlays."
+  HRESULT STDMETHODCALLTYPE DDrawSurface::UpdateOverlayDisplay(DWORD dwFlags) {
+    return DDERR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DDrawSurface::UpdateOverlayZOrder(DWORD dwFlags, LPDIRECTDRAWSURFACE lpDDSReference) {
+    if (unlikely(lpDDSReference != nullptr
+              && !DDrawCommonInterface::IsWrappedSurface(lpDDSReference))) {
+      Logger::err("DDrawSurface::UpdateOverlayZOrder: Received an unwrapped surface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    if (lpDDSReference == nullptr) {
+      return m_proxy->UpdateOverlayZOrder(dwFlags, lpDDSReference);
+    } else {
+      DDrawSurface* ddrawSurface = static_cast<DDrawSurface*>(lpDDSReference);
+      return m_proxy->UpdateOverlayZOrder(dwFlags, ddrawSurface->GetProxied());
+    }
+  }
+
+  HRESULT DDrawSurface::InitializeD3D9RenderTarget() {
+    if (unlikely(m_commonSurf->IsPalettedFormat()))
+      return DD_OK;
+
+    m_commonSurf->RefreshD3DDevice();
+
+    if (unlikely(!m_commonSurf->IsInitialized())) {
+      HRESULT hr = m_commonSurf->InitializeD3D9(true);
+      if (unlikely(FAILED(hr))) {
+        Logger::err(str::format("DDrawSurface::InitializeD3D9RenderTarget: Failed to initialize surface nr. [[1-", std::hex, this, "]]"));
+        return hr;
+      }
+
+      return UploadSurfaceData();
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT DDrawSurface::InitializeD3D9DepthStencil() {
+    m_commonSurf->RefreshD3DDevice();
+
+    if (unlikely(!m_commonSurf->IsInitialized())) {
+      HRESULT hr = m_commonSurf->InitializeD3D9(false);
+      if (unlikely(FAILED(hr))) {
+        Logger::err(str::format("DDrawSurface::InitializeD3D9DepthStencil: Failed to initialize surface nr. [[1-", std::hex, this, "]]"));
+        return hr;
+      }
+
+      return UploadSurfaceData();
+    }
+
+    return DD_OK;
+  }
+
+  HRESULT DDrawSurface::InitializeOrUploadD3D9() {
+    if (unlikely(m_commonSurf->IsPalettedFormat()))
+      return DD_OK;
+
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+
+    // Fast skip
+    if (unlikely(d3d9Device == nullptr))
+      return DD_OK;
+
+    if (unlikely(!m_commonSurf->IsInitialized())) {
+      const bool initRenderTarget = m_commonSurf->GetCommonD3DDevice()->IsCurrentRenderTarget(m_commonSurf.ptr());
+
+      HRESULT hr = m_commonSurf->InitializeD3D9(initRenderTarget);
+      if (unlikely(FAILED(hr))) {
+        Logger::err(str::format("DDrawSurface::InitializeOrUploadD3D9: Failed to initialize surface nr. [[1-", std::hex, this, "]]"));
+        return hr;
+      }
+    }
+
+    return UploadSurfaceData();
+  }
+
+  void DDrawSurface::DownloadSurfaceData() {
+    // Some games, like The Settlers IV, use multiple devices for rendering, one to handle
+    // terrain and the overall 3D scene, and one to create textures/sprites to overlay on
+    // top of it. Since DXVK's D3D9 backend does not restrict cross-device surface/texture
+    // use, simply skip changing assigned surface devices during downloads. This is essentially
+    // a hack, which by some miracle works well enough in some cases, though may explode in others.
+    if (likely(!m_commonIntf->GetOptions()->deviceResourceSharing))
+      m_commonSurf->RefreshD3DDevice();
+
+    // TODO: We are technically ignoring mip maps as is, though that will probably never be an issue
+    if (m_commonSurf->IsD3D9SurfaceDirty() && m_commonSurf->IsInitialized()) {
+      //Logger::debug(str::format("DDrawSurface::DownloadSurfaceData: Downloading nr. [[1-", std::hex, this, "]]"));
+      BlitToDDrawSurface<IDirectDrawSurface, DDSURFACEDESC>(GetProxiedOrShadow(), m_commonSurf->GetD3D9Surface(),
+                                                            m_commonSurf->IsDXTFormat());
+      m_commonSurf->UnDirtyD3D9Surface();
+    }
+  }
+
+  inline HRESULT DDrawSurface::UploadSurfaceData() {
+    // Fast skip
+    if (!m_commonSurf->IsDDrawSurfaceDirty())
+      return DD_OK;
+
+    //Logger::debug(str::format("DDrawSurface::UploadSurfaceData: Uploading nr. [[1-", std::hex, this, "]]"));
+
+    const D3D9SurfaceType surfaceType9 = m_commonSurf->GetD3D9SurfaceType();
+
+    switch (surfaceType9) {
+      case D3D9SurfaceType::Texture:
+        BlitToD3D9Texture<IDirectDrawSurface, DDSURFACEDESC>(m_commonSurf->GetD3D9Texture(), m_proxy.ptr(),
+                                                             m_commonSurf->GetMipCount(), m_commonSurf->IsDXTFormat());
+        break;
+      default:
+        BlitToD3D9Surface<IDirectDrawSurface, DDSURFACEDESC>(m_commonSurf->GetD3D9Surface(), GetProxiedOrShadow(),
+                                                             m_commonSurf->IsDXTFormat());
+        break;
+    }
+
+    m_commonSurf->UnDirtyDDrawSurface();
+
+    return DD_OK;
+  }
+
+  inline HRESULT DDrawSurface::CreateDeviceInternal(REFIID riid, void** ppvObject) {
+    // Clean up any previous device use, otherwise we can end up blitting
+    // on stale images from D3D9, as is observed in the case of 3DMark 2000.
+    // This is only relevant in the context of later swapchain resets.
+    m_commonSurf->RefreshD3DDevice();
+
+    const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
+
+    DWORD deviceCreationFlags9 = D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+    bool  isHALDevice          = false;
+    bool  halFallback          = false;
+    bool  rgbFallback          = false;
+
+    if (riid == IID_IDirect3DHALDevice) {
+      Logger::info("DDrawSurface::CreateDeviceInternal: Creating an IID_IDirect3DHALDevice device");
+      if (likely(!d3dOptions->forceSWVP))
+        deviceCreationFlags9 = D3DCREATE_MIXED_VERTEXPROCESSING;
+      isHALDevice = true;
+    } else if (riid == IID_IDirect3DRGBDevice) {
+      Logger::info("DDrawSurface::CreateDeviceInternal: Creating an IID_IDirect3DRGBDevice device");
+    } else if (riid == IID_IDirect3DMMXDevice) {
+      Logger::warn("DDrawSurface::CreateDeviceInternal: Unsupported MMX device, falling back to RGB");
+      rgbFallback = true;
+    } else if (riid == IID_IDirect3DRampDevice) {
+      Logger::warn("DDrawSurface::CreateDeviceInternal: Unsupported Ramp device, falling back to RGB");
+      rgbFallback = true;
+    } else if (unlikely(riid == IID_IUnknown)) {
+      Logger::warn("DDrawSurface::CreateDeviceInternal: Unsupported IID_IUnknown, falling back to RGB");
+      rgbFallback = true;
+    } else {
+      if (unlikely(riid != IID_WineD3DDevice)) {
+        Logger::warn("DDrawSurface::CreateDeviceInternal: Unknown device type, falling back to HAL");
+        Logger::warn(str::format(riid));
+      } else {
+        Logger::info("DDrawSurface::CreateDeviceInternal: Creating an IID_WineD3DDevice HAL device");
+      }
+      halFallback = true;
+      // Don't enforce isHALDevice RT validations
+    }
+
+    const IID rclsidOverride = halFallback ? IID_IDirect3DHALDevice :
+                               rgbFallback ? IID_IDirect3DRGBDevice : riid;
+
+    HRESULT hr = m_commonSurf->ValidateRTUsage(isHALDevice, true, true);
+    if (unlikely(FAILED(hr)))
+      return hr;
+
+    const DDSURFACEDESC2* desc = m_commonSurf->GetDesc();
+
+    DWORD backBufferWidth  = desc->dwWidth;
+    DWORD backBufferHeight = desc->dwHeight;
+    RECT presentRect = { };
+
+    const DWORD cooperativeLevel = m_commonIntf->GetCooperativeLevel();
+
+    // Ignore any mode size dimensions when in windowed present mode
+    if (d3dOptions->backBufferResize && (cooperativeLevel & DDSCL_EXCLUSIVE)) {
+      DDrawModeSize* modeSize = m_commonIntf->GetModeSize();
+      // Wayland apparently needs this for somewhat proper back buffer sizing
+      if ((modeSize->width  && modeSize->width  < desc->dwWidth)
+       || (modeSize->height && modeSize->height < desc->dwHeight)) {
+        Logger::warn("DDrawSurface::CreateDeviceInternal: Back buffer resizing has known limitations");
+
+        // Note: The DDraw surface will remain larger than our back buffer,
+        // which will cause issues on any locks and blits done to it...
+        backBufferWidth  = modeSize->width;
+        backBufferHeight = modeSize->height;
+
+        if (d3dOptions->preserveAspectRatio) {
+          GetCenteredRect(&presentRect, desc->dwWidth, desc->dwHeight, modeSize->width, modeSize->height);
+        } else {
+          GetStretchedRect(&presentRect, desc->dwWidth, desc->dwHeight);
+        }
+      }
+    }
+
+    const d3d9::D3DFORMAT backBufferFormat = m_commonSurf->GetD3D9Format();
+
+    if ((cooperativeLevel & DDSCL_MULTITHREADED) || d3dOptions->forceMultiThreaded) {
+      Logger::info("DDrawSurface::CreateDeviceInternal: Using thread safe runtime synchronization");
+      deviceCreationFlags9 |= D3DCREATE_MULTITHREADED;
+    }
+    // DDSCL_FPUPRESERVE does not exist prior to DDraw7,
+    // and DDSCL_FPUSETUP is NOT the default state
+    if (!(cooperativeLevel & DDSCL_FPUSETUP))
+      deviceCreationFlags9 |= D3DCREATE_FPU_PRESERVE;
+    if (cooperativeLevel & DDSCL_NOWINDOWCHANGES)
+      deviceCreationFlags9 |= D3DCREATE_NOWINDOWCHANGES;
+
+    Logger::info(str::format("DDrawSurface::CreateDeviceInternal: Back buffer size: ", desc->dwWidth, "x", desc->dwHeight));
+
+    const DWORD backBufferCount = DetermineBackBufferCount<IDirectDrawSurface>(m_proxy.ptr());
+    Logger::info(str::format("DDrawSurface::CreateDeviceInternal: Back buffer count: ", backBufferCount));
+
+    D3D3Interface* d3d3Intf = m_commonIntf->GetOrCreateD3D3Interface();
+    // D3D3 is "special", so in odd cases we might not have a valid D3D3 interface to work with
+    if (unlikely(d3d3Intf == nullptr)) {
+      Logger::err("DDrawSurface::CreateDeviceInternal: Unable to retrieve a valid D3D3 interface");
+      return DDERR_UNSUPPORTED;
+    }
+
+    D3DCommonInterface* commonD3DIntf = d3d3Intf->GetCommonD3DInterface();
+
+    // Determine the supported AA sample count by querying the D3D9 interface
+    const d3d9::D3DMULTISAMPLE_TYPE multiSampleType = d3dOptions->emulateFSAA != FSAAEmulation::Disabled ?
+                                                      commonD3DIntf->GetMultiSampleType(backBufferFormat) :
+                                                      d3d9::D3DMULTISAMPLE_NONE;
+
+    HWND hWnd = m_commonIntf->GetHWND();
+    if (unlikely(hWnd == nullptr))
+      Logger::debug("DDrawSurface::CreateDeviceInternal: HWND is NULL");
+
+    // Always appears to be enabled when running in non-exclusive mode
+    const bool vBlankStatus = m_commonIntf->GetWaitForVBlank();
+
+    d3d9::D3DPRESENT_PARAMETERS params;
+    params.BackBufferWidth    = backBufferWidth;
+    params.BackBufferHeight   = backBufferHeight;
+    params.BackBufferFormat   = backBufferFormat;
+    params.BackBufferCount    = backBufferCount;
+    params.MultiSampleType    = multiSampleType; // Controlled through D3DRENDERSTATE_ANTIALIAS
+    params.MultiSampleQuality = 0;
+    params.SwapEffect         = d3d9::D3DSWAPEFFECT_DISCARD;
+    params.hDeviceWindow      = hWnd;
+    params.Windowed           = TRUE; // Always use windowed, so that we can delegate mode switching to DDraw
+    params.EnableAutoDepthStencil     = FALSE;
+    params.AutoDepthStencilFormat     = d3d9::D3DFMT_UNKNOWN;
+    params.Flags                      = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER; // Needed for back buffer locks
+    params.FullScreen_RefreshRateInHz = 0; // We'll get the right mode/refresh rate set by DDraw, just play along
+    params.PresentationInterval       = vBlankStatus ? D3DPRESENT_INTERVAL_DEFAULT : D3DPRESENT_INTERVAL_IMMEDIATE;
+
+    // Validate that the underlying interface is indeed operating
+    // on the proper compatibility level before creating a D3D9 device,
+    // since games may create a variety of D3D interfaces before deciding
+    // which interface version to actually create a device from
+    IDxvkLegacyD3DInterfaceBridge* intfBridge = commonD3DIntf->GetD3D9InterfaceBridge();
+    if (unlikely(!intfBridge->IsD3DCompatible(D3DCompatibility::D3D3)))
+      intfBridge->SetD3DCompatibility(D3DCompatibility::D3D3);
+
+    Com<d3d9::IDirect3DDevice9> device9;
+    hr = commonD3DIntf->GetD3D9Interface()->CreateDevice(
+      D3DADAPTER_DEFAULT,
+      d3d9::D3DDEVTYPE_HAL,
+      hWnd,
+      deviceCreationFlags9,
+      &params,
+      &device9
+    );
+
+    if (unlikely(FAILED(hr))) {
+      Logger::err("DDrawSurface::CreateDeviceInternal: Failed to create the D3D9 device");
+      return hr;
+    }
+
+    try {
+      m_device3 = new D3D3Device(nullptr, this, rclsidOverride, multiSampleType,
+                                 std::move(device9), deviceCreationFlags9);
+
+      // Set the common device on the common interface
+      m_commonIntf->SetCommonD3DDevice(m_device3->GetCommonD3DDevice());
+      // Now that we have a valid common D3D device on the DDraw interface,
+      // we can initialize the render target and depth stencil (if any)
+      hr = m_device3->InitializeRTAndDS();
+      if (unlikely(FAILED(hr))) {
+        Logger::err("DDrawSurface::CreateDeviceInternal: Failed to initialize the render target");
+        return hr;
+      }
+
+      m_device3->GetCommonD3DDevice()->SetPresentRect(&presentRect);
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return DDERR_GENERIC;
+    }
+
+    return DD_OK;
+  }
+
+}
